@@ -1,0 +1,155 @@
+From 0c1b12d1c3afc5d4297f60fbbb971f9783acf20f Mon Sep 17 00:00:00 2001
+From: "Huang, Tao" <huangtao@rock-chips.com>
+Date: Mon, 18 May 2015 17:17:28 +0800
+Subject: [PATCH] cpuquiet: Update averaging of nr_runnables
+
+Doing a Exponential moving average per nr_running++/-- does not
+guarantee a fixed sample rate which induces errors if there are lots of
+threads being enqueued/dequeued from the rq (Linpack mt). Instead of
+keeping track of the avg, the scheduler now keeps track of the integral
+of nr_running and allows the readers to perform filtering on top.
+
+Implemented a proper exponential moving average for the runnables
+governor and a straight 100ms average for the balanced governor. Tweaked
+the thresholds for the runnables governor to minimize latency. Also,
+decreased sample_rate for the runnables governor to the absolute minimum
+of 10msecs.
+
+Signed-off-by: Huang, Tao <huangtao@rock-chips.com>
+---
+ include/linux/sched.h |  3 +++
+ kernel/sched/core.c   | 29 ++++++++++++++++++++++++++++
+ kernel/sched/sched.h  | 45 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 77 insertions(+)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 5229df9d7107..a30441e110f2 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -100,6 +100,9 @@ DECLARE_PER_CPU(unsigned long, process_counts);
+ extern int nr_processes(void);
+ extern unsigned long nr_running(void);
+ extern unsigned long nr_iowait(void);
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++extern u64 nr_running_integral(unsigned int cpu);
++#endif
+ extern unsigned long nr_iowait_cpu(int cpu);
+ extern unsigned long this_cpu_load(void);
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index ea4e780697b4..fbd6ccd99be3 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2104,6 +2104,35 @@ unsigned long this_cpu_load(void)
+ 	return this->cpu_load[0];
+ }
+ 
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++u64 nr_running_integral(unsigned int cpu)
++{
++	unsigned int seqcnt;
++	u64 integral;
++	struct rq *q;
++
++	if (cpu >= nr_cpu_ids)
++		return 0;
++
++	q = cpu_rq(cpu);
++
++	/*
++	 * Update average to avoid reading stalled value if there were
++	 * no run-queue changes for a long time. On the other hand if
++	 * the changes are happening right now, just read current value
++	 * directly.
++	 */
++
++	seqcnt = read_seqcount_begin(&q->ave_seqcnt);
++	integral = do_nr_running_integral(q);
++	if (read_seqcount_retry(&q->ave_seqcnt, seqcnt)) {
++		read_seqcount_begin(&q->ave_seqcnt);
++		integral = q->nr_running_integral;
++	}
++
++	return integral;
++}
++#endif
+ 
+ /*
+  * Global load-average calculations
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 0d19ede6849e..3aa1001a89e8 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -415,6 +415,13 @@ struct rq {
+ #endif
+ 	int skip_clock_update;
+ 
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++	/* time-based average load */
++	u64 nr_last_stamp;
++	u64 nr_running_integral;
++	seqcount_t ave_seqcnt;
++#endif
++
+ 	/* capture load from *all* tasks on this cpu: */
+ 	struct load_weight load;
+ 	unsigned long nr_load_updates;
+@@ -1083,9 +1090,39 @@ static inline u64 steal_ticks(u64 steal)
+ }
+ #endif
+ 
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++/* 27 ~= 134217728ns = 134.2ms
++ * 26 ~=  67108864ns =  67.1ms
++ * 25 ~=  33554432ns =  33.5ms
++ * 24 ~=  16777216ns =  16.8ms
++ */
++#define NR_AVE_SCALE(x)		((x) << FSHIFT)
++
++static inline u64 do_nr_running_integral(struct rq *rq)
++{
++	s64 nr, deltax;
++	u64 nr_running_integral = rq->nr_running_integral;
++
++	deltax = rq->clock_task - rq->nr_last_stamp;
++	nr = NR_AVE_SCALE(rq->nr_running);
++
++	nr_running_integral += nr * deltax;
++
++	return nr_running_integral;
++}
++#endif
++
+ static inline void inc_nr_running(struct rq *rq)
+ {
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++	write_seqcount_begin(&rq->ave_seqcnt);
++	rq->nr_running_integral = do_nr_running_integral(rq);
++	rq->nr_last_stamp = rq->clock_task;
++#endif
+ 	rq->nr_running++;
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++	write_seqcount_end(&rq->ave_seqcnt);
++#endif
+ 
+ #ifdef CONFIG_NO_HZ_FULL
+ 	if (rq->nr_running == 2) {
+@@ -1100,7 +1137,15 @@ static inline void inc_nr_running(struct rq *rq)
+ 
+ static inline void dec_nr_running(struct rq *rq)
+ {
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++	write_seqcount_begin(&rq->ave_seqcnt);
++	rq->nr_running_integral = do_nr_running_integral(rq);
++	rq->nr_last_stamp = rq->clock_task;
++#endif
+ 	rq->nr_running--;
++#ifdef CONFIG_CPUQUIET_FRAMEWORK
++	write_seqcount_end(&rq->ave_seqcnt);
++#endif
+ }
+ 
+ static inline void rq_last_tick_reset(struct rq *rq)
+-- 
+2.35.3
+

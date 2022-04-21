@@ -1,0 +1,131 @@
+From 6d3bead41490daf929a2286700f22dfe98b91f00 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 20 Aug 2020 21:32:43 +0800
+Subject: [PATCH] media: rockchip: isp: add cru reset for rv1126
+
+Change-Id: Ib94a0b082e4e060eb861bfcc608c47689bb4f301
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/hw.c    | 23 ++++++++++++++++-----
+ drivers/media/platform/rockchip/isp/hw.h    |  2 ++
+ drivers/media/platform/rockchip/isp/rkisp.c | 17 +--------------
+ 3 files changed, 21 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/hw.c b/drivers/media/platform/rockchip/isp/hw.c
+index 88aee2527273..3717c296af0c 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -14,6 +14,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/pm_runtime.h>
++#include <linux/reset.h>
+ 
+ #include "common.h"
+ #include "dev.h"
+@@ -466,14 +467,20 @@ static inline bool is_iommu_enable(struct device *dev)
+ 	return true;
+ }
+ 
+-static void isp_soft_reset(struct rkisp_hw_dev *dev)
++void rkisp_soft_reset(struct rkisp_hw_dev *dev)
+ {
+ 	void __iomem *base = dev->base_addr;
+ 	struct iommu_domain *domain = iommu_get_domain_for_dev(dev->dev);
+ 
+-	writel(CIF_ISP_CTRL_ISP_MODE_BAYER_ITU601, base + CIF_ISP_CTRL);
+-	writel(0xffff, base + CIF_IRCL);
+-	usleep_range(100, 200);
++	if (dev->reset) {
++		reset_control_assert(dev->reset);
++		udelay(10);
++		reset_control_deassert(dev->reset);
++	} else {
++		writel(CIF_ISP_CTRL_ISP_MODE_BAYER_ITU601, base + CIF_ISP_CTRL);
++		writel(0xffff, base + CIF_IRCL);
++		udelay(10);
++	}
+ 	if (domain) {
+ #ifdef CONFIG_IOMMU_API
+ 		domain->ops->detach_dev(domain, dev->dev);
+@@ -547,7 +554,7 @@ static int enable_sys_clk(struct rkisp_hw_dev *dev)
+ 		clk_set_rate(dev->clks[0], 500 * 1000000UL);
+ 
+ 	if (!dev->is_thunderboot) {
+-		isp_soft_reset(dev);
++		rkisp_soft_reset(dev);
+ 		isp_config_clk(dev, true);
+ 	}
+ 
+@@ -632,6 +639,12 @@ static int rkisp_hw_probe(struct platform_device *pdev)
+ 	hw_dev->clk_rate_tbl = match_data->clk_rate_tbl;
+ 	hw_dev->num_clk_rate_tbl = match_data->num_clk_rate_tbl;
+ 
++	hw_dev->reset = devm_reset_control_array_get(dev, false, false);
++	if (IS_ERR(hw_dev->reset)) {
++		dev_dbg(dev, "failed to get reset\n");
++		hw_dev->reset = NULL;
++	}
++
+ 	hw_dev->dev_num = 0;
+ 	hw_dev->cur_dev_id = 0;
+ 	hw_dev->mipi_dev_id = 0;
+diff --git a/drivers/media/platform/rockchip/isp/hw.h b/drivers/media/platform/rockchip/isp/hw.h
+index e37654ecea1b..0a0e3fd6b435 100644
+--- a/drivers/media/platform/rockchip/isp/hw.h
++++ b/drivers/media/platform/rockchip/isp/hw.h
+@@ -18,6 +18,7 @@ struct rkisp_hw_dev {
+ 	int num_clks;
+ 	const unsigned int *clk_rate_tbl;
+ 	int num_clk_rate_tbl;
++	struct reset_control *reset;
+ 	int mipi_irq;
+ 	enum rkisp_isp_ver isp_ver;
+ 	struct rkisp_device *isp[DEV_MAX];
+@@ -45,4 +46,5 @@ struct rkisp_hw_dev {
+ };
+ 
+ int rkisp_register_irq(struct rkisp_hw_dev *dev);
++void rkisp_soft_reset(struct rkisp_hw_dev *dev);
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index eddc7d8c5c94..5fcea1f894f0 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -923,13 +923,10 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
+ 			clk_set_rate(dev->hw_dev->clks[0], safe_rate);
+ 			udelay(100);
+ 		}
+-		writel(CIF_IRCL_CIF_SW_RST, base + CIF_IRCL);
++		rkisp_soft_reset(dev->hw_dev);
+ 		/* restore the old ispclk after reset */
+ 		if (old_rate != safe_rate)
+ 			clk_set_rate(dev->hw_dev->clks[0], old_rate);
+-	} else {
+-		/* abnormal case, in irq function */
+-		writel(CIF_IRCL_CIF_SW_RST, base + CIF_IRCL);
+ 	}
+ 	rkisp_write(dev, CTRL_VI_ISP_CLK_CTRL, val, true);
+ 
+@@ -943,18 +940,6 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
+ 		writel(0, base + CSI2RX_CSI2_RESETN);
+ 	}
+ 
+-	if (!in_interrupt()) {
+-		struct iommu_domain *domain;
+-
+-		domain = iommu_get_domain_for_dev(dev->dev);
+-		if (domain) {
+-#ifdef CONFIG_IOMMU_API
+-			domain->ops->detach_dev(domain, dev->dev);
+-			domain->ops->attach_dev(domain, dev->dev);
+-#endif
+-		}
+-	}
+-
+ 	dev->hw_dev->is_idle = true;
+ 	dev->hw_dev->is_mi_update = false;
+ end:
+-- 
+2.35.3
+

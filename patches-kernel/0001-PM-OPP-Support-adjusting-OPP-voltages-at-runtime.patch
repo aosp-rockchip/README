@@ -1,0 +1,162 @@
+From d471e018c061f56e5d78d82e454b54c9beb576bc Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Mon, 31 Oct 2016 18:10:59 +0800
+Subject: [PATCH] PM / OPP: Support adjusting OPP voltages at runtime
+
+On some SoCs the Adaptive Voltage Scaling (AVS) technique is
+employed to optimize the operating voltage of a device. At a
+given frequency, the hardware monitors dynamic factors and either
+makes a suggestion for how much to adjust a voltage for the
+current frequency, or it automatically adjusts the voltage
+without software intervention. Add an API to the OPP library for
+the former case, so that AVS type devices can update the voltages
+for an OPP when the hardware determines the voltage should
+change. The assumption is that drivers like CPUfreq or devfreq
+will register for the OPP notifiers and adjust the voltage
+according to suggestions that AVS makes.
+
+Change-Id: Ia6dddc0976f116555965f784794b8eca37582737
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/base/power/opp/core.c | 88 +++++++++++++++++++++++++++++++++++
+ include/linux/pm_opp.h        | 11 +++++
+ 2 files changed, 99 insertions(+)
+
+diff --git a/drivers/base/power/opp/core.c b/drivers/base/power/opp/core.c
+index 433b60092972..9d232ea6c718 100644
+--- a/drivers/base/power/opp/core.c
++++ b/drivers/base/power/opp/core.c
+@@ -1769,6 +1769,94 @@ static int _opp_set_availability(struct device *dev, unsigned long freq,
+ 	return r;
+ }
+ 
++/*
++ * dev_pm_opp_adjust_voltage() - helper to change the voltage of an OPP
++ * @dev:		device for which we do this operation
++ * @freq:		OPP frequency to adjust voltage of
++ * @u_volt:		new OPP voltage
++ *
++ * Change the voltage of an OPP with an RCU operation.
++ *
++ * Return: -EINVAL for bad pointers, -ENOMEM if no memory available for the
++ * copy operation, returns 0 if no modifcation was done OR modification was
++ * successful.
++ *
++ * Locking: The internal device_opp and opp structures are RCU protected.
++ * Hence this function internally uses RCU updater strategy with mutex locks to
++ * keep the integrity of the internal data structures. Callers should ensure
++ * that this function is *NOT* called under RCU protection or in contexts where
++ * mutex locking or synchronize_rcu() blocking calls cannot be used.
++ */
++int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
++			      unsigned long u_volt)
++{
++	struct opp_table *opp_table;
++	struct dev_pm_opp *new_opp, *tmp_opp, *opp = ERR_PTR(-ENODEV);
++	int r = 0;
++
++	/* keep the node allocated */
++	new_opp = kmalloc(sizeof(*new_opp), GFP_KERNEL);
++	if (!new_opp)
++		return -ENOMEM;
++
++	mutex_lock(&opp_table_lock);
++
++	/* Find the opp_table */
++	opp_table = _find_opp_table(dev);
++	if (IS_ERR(opp_table)) {
++		r = PTR_ERR(opp_table);
++		dev_warn(dev, "%s: Device OPP not found (%d)\n", __func__, r);
++		goto unlock;
++	}
++
++	/* Do we have the frequency? */
++	list_for_each_entry(tmp_opp, &opp_table->opp_list, node) {
++		if (tmp_opp->rate == freq) {
++			opp = tmp_opp;
++			break;
++		}
++	}
++	if (IS_ERR(opp)) {
++		r = PTR_ERR(opp);
++		goto unlock;
++	}
++
++	/* Is update really needed? */
++	if (opp->u_volt == u_volt)
++		goto unlock;
++	/* copy the old data over */
++	*new_opp = *opp;
++
++	/* plug in new node */
++	new_opp->u_volt = u_volt;
++
++	if (new_opp->u_volt_min > u_volt)
++		new_opp->u_volt_min = u_volt;
++	if (new_opp->u_volt_max < u_volt)
++		new_opp->u_volt_max = u_volt;
++
++	_opp_remove(opp_table, opp, false);
++	r = _opp_add(dev, new_opp, opp_table);
++	if (r) {
++		dev_err(dev, "Failed to add new_opp (u_volt=%lu)\n", u_volt);
++		_opp_add(dev, opp, opp_table);
++		goto unlock;
++	}
++
++	mutex_unlock(&opp_table_lock);
++
++	/* Notify the change of the OPP */
++	srcu_notifier_call_chain(&opp_table->srcu_head,
++				 OPP_EVENT_ADJUST_VOLTAGE, new_opp);
++
++	return 0;
++
++unlock:
++	mutex_unlock(&opp_table_lock);
++	kfree(new_opp);
++	return r;
++}
++
+ /**
+  * dev_pm_opp_enable() - Enable a specific OPP
+  * @dev:	device for which we do this operation
+diff --git a/include/linux/pm_opp.h b/include/linux/pm_opp.h
+index cccaf4a29e9f..8c0c6d86e2b4 100644
+--- a/include/linux/pm_opp.h
++++ b/include/linux/pm_opp.h
+@@ -22,6 +22,7 @@ struct device;
+ 
+ enum dev_pm_opp_event {
+ 	OPP_EVENT_ADD, OPP_EVENT_REMOVE, OPP_EVENT_ENABLE, OPP_EVENT_DISABLE,
++	OPP_EVENT_ADJUST_VOLTAGE,
+ };
+ 
+ #if defined(CONFIG_PM_OPP)
+@@ -52,6 +53,9 @@ int dev_pm_opp_add(struct device *dev, unsigned long freq,
+ 		   unsigned long u_volt);
+ void dev_pm_opp_remove(struct device *dev, unsigned long freq);
+ 
++int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
++			      unsigned long u_volt);
++
+ int dev_pm_opp_enable(struct device *dev, unsigned long freq);
+ 
+ int dev_pm_opp_disable(struct device *dev, unsigned long freq);
+@@ -134,6 +138,13 @@ static inline void dev_pm_opp_remove(struct device *dev, unsigned long freq)
+ {
+ }
+ 
++static inline int
++dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
++			  unsigned long u_volt)
++{
++	return 0;
++}
++
+ static inline int dev_pm_opp_enable(struct device *dev, unsigned long freq)
+ {
+ 	return 0;
+-- 
+2.35.3
+

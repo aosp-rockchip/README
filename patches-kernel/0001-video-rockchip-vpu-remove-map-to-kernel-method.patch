@@ -1,0 +1,827 @@
+From 77a680a340545b0ec74d03c310f7b9f3ed17e381 Mon Sep 17 00:00:00 2001
+From: Randy Li <randy.li@rock-chips.com>
+Date: Fri, 22 Sep 2017 11:44:26 +0800
+Subject: [PATCH] video: rockchip: vpu: remove map to kernel method
+
+The scaling list buffer handle under the pps unit
+will be translated into the DMA address for the device,
+but the processing is done under the kernel, so the
+iommu of the device won't be invoked. We don't need to
+cache it.
+
+Using the standard kernel method is enough to access
+the memory under the kernel space, so all the map to
+kernel methods of the memory management are removed.
+
+A few steps for memory mapping are also merged in
+this patch.
+
+Change-Id: Ia3f6f38568aed8021baff757720453c4eea03b90
+Signed-off-by: ayaka <ayaka@soulik.info>
+Signed-off-by: Randy Li <randy.li@rock-chips.com>
+---
+ drivers/video/rockchip/vcodec/vcodec_hw_rkv.h |   6 +-
+ .../video/rockchip/vcodec/vcodec_iommu_drm.c  | 129 +-----------
+ .../video/rockchip/vcodec/vcodec_iommu_ion.c  |  64 +-----
+ .../video/rockchip/vcodec/vcodec_iommu_ops.c  |  30 +--
+ .../video/rockchip/vcodec/vcodec_iommu_ops.h  |  13 +-
+ .../video/rockchip/vcodec/vcodec_service.c    | 191 ++++++++----------
+ 6 files changed, 105 insertions(+), 328 deletions(-)
+
+diff --git a/drivers/video/rockchip/vcodec/vcodec_hw_rkv.h b/drivers/video/rockchip/vcodec/vcodec_hw_rkv.h
+index 68399594db03..ba0456a13ffa 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_hw_rkv.h
++++ b/drivers/video/rockchip/vcodec/vcodec_hw_rkv.h
+@@ -79,7 +79,7 @@ static struct vpu_task_info task_rkv[TASK_TYPE_BUTT] = {
+ 		.reg_irq = 0,
+ 		.reg_len = 0,
+ 		.reg_dir_mv = 0,
+-		.reg_pps = 0,
++		.reg_pps = -1,
+ 		.reg_pipe = 0,
+ 		.enable_mask = 0,
+ 		.gating_mask = 0,
+@@ -112,7 +112,7 @@ static struct vpu_task_info task_rkv[TASK_TYPE_BUTT] = {
+ 		.reg_irq = 0,
+ 		.reg_len = 0,
+ 		.reg_dir_mv = 0,
+-		.reg_pps = 0,
++		.reg_pps = -1,
+ 		.reg_pipe = 0,
+ 		.enable_mask = 0,
+ 		.gating_mask = 0,
+@@ -128,7 +128,7 @@ static struct vpu_task_info task_rkv[TASK_TYPE_BUTT] = {
+ 		.reg_irq = 0,
+ 		.reg_len = 0,
+ 		.reg_dir_mv = 0,
+-		.reg_pps = 0,
++		.reg_pps = -1,
+ 		.reg_pipe = 0,
+ 		.enable_mask = 0,
+ 		.gating_mask = 0,
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c b/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
+index 23d03427ef1b..0368ffa7688b 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
+@@ -13,29 +13,15 @@
+  * GNU General Public License for more details.
+  *
+  */
+-#include <linux/dma-iommu.h>
+ 
++#include <linux/dma-iommu.h>
+ #include <linux/dma-buf.h>
+-#include <drm/drmP.h>
+-#include <drm/drm_atomic.h>
+-#include <drm/drm_crtc_helper.h>
+-#include <drm/drm_fb_helper.h>
+-#include <drm/drm_sync_helper.h>
+-#include <drm/rockchip_drm.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/rockchip-iovmm.h>
+-#include <linux/pm_runtime.h>
+-#include <linux/memblock.h>
+-#include <linux/module.h>
+-#include <linux/of_address.h>
+-#include <linux/of_graph.h>
+-#include <linux/component.h>
+ #include <linux/fence.h>
+-#include <linux/console.h>
++#include <linux/iova.h>
+ #include <linux/kref.h>
+-#include <linux/fdtable.h>
+ #include <linux/ktime.h>
+-#include <linux/iova.h>
++#include <linux/memblock.h>
+ 
+ #include "vcodec_iommu_ops.h"
+ 
+@@ -43,10 +29,9 @@ struct vcodec_drm_buffer {
+ 	struct list_head list;
+ 	struct dma_buf *dma_buf;
+ 	union {
+-		unsigned long iova;
++		dma_addr_t iova;
+ 		unsigned long phys;
+ 	};
+-	void *cpu_addr;
+ 	unsigned long size;
+ 	int index;
+ 	struct dma_buf_attachment *attach;
+@@ -168,42 +153,6 @@ static int vcodec_drm_attach(struct vcodec_iommu_info *iommu_info)
+ 	return ret;
+ }
+ 
+-static void *vcodec_drm_sgt_map_kernel(struct vcodec_drm_buffer *drm_buffer)
+-{
+-	struct vcodec_iommu_session_info *session_info =
+-		drm_buffer->session_info;
+-	struct device *dev = session_info->dev;
+-	struct scatterlist *sgl, *sg;
+-	int nr_pages = PAGE_ALIGN(drm_buffer->size) >> PAGE_SHIFT;
+-	int i = 0, j = 0, k = 0;
+-	struct page *page;
+-
+-	drm_buffer->pages = kmalloc_array(nr_pages, sizeof(*drm_buffer->pages),
+-					  GFP_KERNEL);
+-	if (!(drm_buffer->pages)) {
+-		dev_err(dev, "drm map can not alloc pages\n");
+-
+-		return NULL;
+-	}
+-
+-	sgl = drm_buffer->sgt->sgl;
+-
+-	for_each_sg(sgl, sg, drm_buffer->sgt->nents, i) {
+-		page = sg_page(sg);
+-		for (j = 0; j < sg->length / PAGE_SIZE; j++)
+-			drm_buffer->pages[k++] = page++;
+-	}
+-
+-	return vmap(drm_buffer->pages, nr_pages, VM_MAP,
+-		    pgprot_noncached(PAGE_KERNEL));
+-}
+-
+-static void vcodec_drm_sgt_unmap_kernel(struct vcodec_drm_buffer *drm_buffer)
+-{
+-	vunmap(drm_buffer->cpu_addr);
+-	kfree(drm_buffer->pages);
+-}
+-
+ static int vcodec_finalise_sg(struct scatterlist *sg,
+ 			      int nents,
+ 			      dma_addr_t dma_addr)
+@@ -374,11 +323,6 @@ static void vcodec_drm_clear_map(struct kref *ref)
+ 	mutex_lock(&iommu_info->iommu_mutex);
+ 	drm_info = session_info->iommu_info->private;
+ 
+-	if (drm_buffer->cpu_addr) {
+-		vcodec_drm_sgt_unmap_kernel(drm_buffer);
+-		drm_buffer->cpu_addr = NULL;
+-	}
+-
+ 	if (drm_buffer->attach) {
+ 		vcodec_dma_unmap_sg(drm_info->domain, drm_buffer->iova);
+ 		sg_free_table(drm_buffer->copy_sgt);
+@@ -402,9 +346,9 @@ static void vcdoec_drm_dump_info(struct vcodec_iommu_session_info *session_info)
+ 	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
+ 				 list) {
+ 		vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_OPS_DUMP,
+-				"index %d drm_buffer dma_buf %p cpu_addr %p\n",
++				"index %d drm_buffer dma_buf %p\n",
+ 				drm_buffer->index,
+-				drm_buffer->dma_buf, drm_buffer->cpu_addr);
++				drm_buffer->dma_buf);
+ 	}
+ }
+ 
+@@ -445,10 +389,6 @@ vcodec_drm_unmap_iommu(struct vcodec_iommu_session_info *session_info,
+ 	struct device *dev = session_info->dev;
+ 	struct vcodec_drm_buffer *drm_buffer;
+ 
+-	/* Force to flush iommu table */
+-	if (of_machine_is_compatible("rockchip,rk3288"))
+-		rockchip_iovmm_invalidate_tlb(session_info->mmu_dev);
+-
+ 	mutex_lock(&session_info->list_mutex);
+ 	drm_buffer = vcodec_drm_get_buffer_no_lock(session_info, idx);
+ 	mutex_unlock(&session_info->list_mutex);
+@@ -465,16 +405,12 @@ vcodec_drm_unmap_iommu(struct vcodec_iommu_session_info *session_info,
+ 
+ static int vcodec_drm_map_iommu(struct vcodec_iommu_session_info *session_info,
+ 				int idx,
+-				unsigned long *iova,
++				dma_addr_t *iova,
+ 				unsigned long *size)
+ {
+ 	struct device *dev = session_info->dev;
+ 	struct vcodec_drm_buffer *drm_buffer;
+ 
+-	/* Force to flush iommu table */
+-	if (of_machine_is_compatible("rockchip,rk3288"))
+-		rockchip_iovmm_invalidate_tlb(session_info->mmu_dev);
+-
+ 	mutex_lock(&session_info->list_mutex);
+ 	drm_buffer = vcodec_drm_get_buffer_no_lock(session_info, idx);
+ 	mutex_unlock(&session_info->list_mutex);
+@@ -492,31 +428,6 @@ static int vcodec_drm_map_iommu(struct vcodec_iommu_session_info *session_info,
+ 	return 0;
+ }
+ 
+-static int
+-vcodec_drm_unmap_kernel(struct vcodec_iommu_session_info *session_info, int idx)
+-{
+-	struct device *dev = session_info->dev;
+-	struct vcodec_drm_buffer *drm_buffer;
+-
+-	mutex_lock(&session_info->list_mutex);
+-	drm_buffer = vcodec_drm_get_buffer_no_lock(session_info, idx);
+-	mutex_unlock(&session_info->list_mutex);
+-
+-	if (!drm_buffer) {
+-		dev_err(dev, "can not find %d buffer in list\n", idx);
+-
+-		return -EINVAL;
+-	}
+-
+-	if (drm_buffer->cpu_addr) {
+-		vcodec_drm_sgt_unmap_kernel(drm_buffer);
+-		drm_buffer->cpu_addr = NULL;
+-	}
+-
+-	kref_put(&drm_buffer->ref, vcodec_drm_clear_map);
+-	return 0;
+-}
+-
+ static int
+ vcodec_drm_free_fd(struct vcodec_iommu_session_info *session_info, int fd)
+ {
+@@ -563,30 +474,6 @@ vcodec_drm_clear_session(struct vcodec_iommu_session_info *session_info)
+ 	}
+ }
+ 
+-static void *
+-vcodec_drm_map_kernel(struct vcodec_iommu_session_info *session_info, int idx)
+-{
+-	struct device *dev = session_info->dev;
+-	struct vcodec_drm_buffer *drm_buffer;
+-
+-	mutex_lock(&session_info->list_mutex);
+-	drm_buffer = vcodec_drm_get_buffer_no_lock(session_info, idx);
+-	mutex_unlock(&session_info->list_mutex);
+-
+-	if (!drm_buffer) {
+-		dev_err(dev, "can not find %d buffer in list\n", idx);
+-		return NULL;
+-	}
+-
+-	if (!drm_buffer->cpu_addr)
+-		drm_buffer->cpu_addr =
+-			vcodec_drm_sgt_map_kernel(drm_buffer);
+-
+-	kref_get(&drm_buffer->ref);
+-
+-	return drm_buffer->cpu_addr;
+-}
+-
+ static int vcodec_drm_import(struct vcodec_iommu_session_info *session_info,
+ 			     int fd)
+ {
+@@ -798,8 +685,6 @@ static struct vcodec_iommu_ops drm_ops = {
+ 	.import = vcodec_drm_import,
+ 	.free = vcodec_drm_free,
+ 	.free_fd = vcodec_drm_free_fd,
+-	.map_kernel = vcodec_drm_map_kernel,
+-	.unmap_kernel = vcodec_drm_unmap_kernel,
+ 	.map_iommu = vcodec_drm_map_iommu,
+ 	.unmap_iommu = vcodec_drm_unmap_iommu,
+ 	.destroy = vcodec_drm_destroy,
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_ion.c b/drivers/video/rockchip/vcodec/vcodec_iommu_ion.c
+index 658e9d65d119..00145e562dcf 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_ion.c
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_ion.c
+@@ -14,19 +14,13 @@
+  *
+  */
+ 
++#include <linux/fence.h>
++#include <linux/kref.h>
++#include <linux/memblock.h>
++#include <linux/module.h>
+ #include <linux/rockchip_ion.h>
+ #include <linux/rockchip-iovmm.h>
+ #include <linux/slab.h>
+-#include <linux/pm_runtime.h>
+-#include <linux/memblock.h>
+-#include <linux/module.h>
+-#include <linux/of_address.h>
+-#include <linux/of_graph.h>
+-#include <linux/component.h>
+-#include <linux/fence.h>
+-#include <linux/console.h>
+-#include <linux/kref.h>
+-#include <linux/fdtable.h>
+ 
+ #include "vcodec_iommu_ops.h"
+ 
+@@ -157,7 +151,7 @@ vcodec_ion_unmap_iommu(struct vcodec_iommu_session_info *session_info, int idx)
+ 
+ static int
+ vcodec_ion_map_iommu(struct vcodec_iommu_session_info *session_info, int idx,
+-		     unsigned long *iova, unsigned long *size)
++		     dma_addr_t *iova, unsigned long *size)
+ {
+ 	struct vcodec_ion_buffer *ion_buffer;
+ 	struct device *dev = session_info->dev;
+@@ -180,55 +174,15 @@ vcodec_ion_map_iommu(struct vcodec_iommu_session_info *session_info, int idx,
+ 
+ 	if (session_info->mmu_dev)
+ 		ret = ion_map_iommu(dev, ion_info->ion_client,
+-				    ion_buffer->handle, iova, size);
++				    ion_buffer->handle, (unsigned long *)iova,
++				    size);
+ 	else
+ 		ret = ion_phys(ion_info->ion_client, ion_buffer->handle,
+-			       iova, (size_t *)size);
++			       (ion_phys_addr_t *)iova, (size_t *)size);
+ 
+ 	return ret;
+ }
+ 
+-static int
+-vcodec_ion_unmap_kernel(struct vcodec_iommu_session_info *session_info,
+-			int idx)
+-{
+-	struct vcodec_ion_buffer *ion_buffer;
+-
+-	mutex_lock(&session_info->list_mutex);
+-	ion_buffer = vcodec_ion_get_buffer_no_lock(session_info, idx);
+-	mutex_unlock(&session_info->list_mutex);
+-
+-	if (!ion_buffer) {
+-		pr_err("%s can not find %d buffer in list\n", __func__, idx);
+-
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-static void *
+-vcodec_ion_map_kernel(struct vcodec_iommu_session_info *session_info, int idx)
+-{
+-	struct vcodec_ion_buffer *ion_buffer;
+-	struct vcodec_iommu_info *iommu_info = session_info->iommu_info;
+-	struct vcodec_iommu_ion_info *ion_info = iommu_info->private;
+-
+-	rockchip_iovmm_invalidate_tlb(session_info->dev);
+-
+-	mutex_lock(&session_info->list_mutex);
+-	ion_buffer = vcodec_ion_get_buffer_no_lock(session_info, idx);
+-	mutex_unlock(&session_info->list_mutex);
+-
+-	if (!ion_buffer) {
+-		pr_err("%s can not find %d buffer in list\n", __func__, idx);
+-
+-		return NULL;
+-	}
+-
+-	return ion_map_kernel(ion_info->ion_client, ion_buffer->handle);
+-}
+-
+ static int
+ vcodec_ion_import(struct vcodec_iommu_session_info *session_info, int fd)
+ {
+@@ -278,8 +232,6 @@ static struct vcodec_iommu_ops ion_ops = {
+ 	.import = vcodec_ion_import,
+ 	.free = vcodec_ion_free,
+ 	.free_fd = NULL,
+-	.map_kernel = vcodec_ion_map_kernel,
+-	.unmap_kernel = vcodec_ion_unmap_kernel,
+ 	.map_iommu = vcodec_ion_map_iommu,
+ 	.unmap_iommu = vcodec_ion_unmap_iommu,
+ 	.dump = NULL,
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
+index bb25db4d2656..e9fd423b7aeb 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
+@@ -100,35 +100,9 @@ int vcodec_iommu_free_fd(struct vcodec_iommu_info *iommu_info,
+ 	return iommu_info->ops->free_fd(session_info, fd);
+ }
+ 
+-void *vcodec_iommu_map_kernel(struct vcodec_iommu_info *iommu_info,
+-				 struct vpu_session *session, int idx)
+-{
+-	struct vcodec_iommu_session_info *session_info = NULL;
+-
+-	session_info = vcodec_iommu_get_session_info(iommu_info, session);
+-
+-	if (!iommu_info || !iommu_info->ops->map_kernel || !session_info)
+-		return NULL;
+-
+-	return iommu_info->ops->map_kernel(session_info, idx);
+-}
+-
+-int vcodec_iommu_unmap_kernel(struct vcodec_iommu_info *iommu_info,
+-			      struct vpu_session *session, int idx)
+-{
+-	struct vcodec_iommu_session_info *session_info = NULL;
+-
+-	session_info = vcodec_iommu_get_session_info(iommu_info, session);
+-
+-	if (!iommu_info || !iommu_info->ops->unmap_kernel || !session_info)
+-		return -EINVAL;
+-
+-	return iommu_info->ops->unmap_kernel(session_info, idx);
+-}
+-
+ int vcodec_iommu_map_iommu(struct vcodec_iommu_info *iommu_info,
+ 			   struct vpu_session *session,
+-			   int idx, unsigned long *iova,
++			   int idx, dma_addr_t *iova,
+ 			   unsigned long *size)
+ {
+ 	struct vcodec_iommu_session_info *session_info = NULL;
+@@ -154,7 +128,7 @@ int vcodec_iommu_unmap_iommu(struct vcodec_iommu_info *iommu_info,
+ 	return iommu_info->ops->unmap_iommu(session_info, idx);
+ }
+ 
+-int vcodec_iommu_destroy(struct vcodec_iommu_info *iommu_info)
++static int vcodec_iommu_destroy(struct vcodec_iommu_info *iommu_info)
+ {
+ 	if (!iommu_info || !iommu_info->ops->destroy)
+ 		return -EINVAL;
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
+index 807ad2f83145..3e65d3aa0edd 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
+@@ -49,13 +49,9 @@ struct vcodec_iommu_ops {
+ 	int (*import)(struct vcodec_iommu_session_info *session_info, int fd);
+ 	int (*free)(struct vcodec_iommu_session_info *session_info, int idx);
+ 	int (*free_fd)(struct vcodec_iommu_session_info *session_info, int fd);
+-	void *(*map_kernel)(struct vcodec_iommu_session_info *session_info,
+-			       int idx);
+-	int (*unmap_kernel)(struct vcodec_iommu_session_info *session_info,
+-			    int idx);
+ 	int (*map_iommu)(struct vcodec_iommu_session_info *session_info,
+ 			 int idx,
+-			 unsigned long *iova, unsigned long *size);
++			 dma_addr_t *iova, unsigned long *size);
+ 	int (*unmap_iommu)(struct vcodec_iommu_session_info *session_info,
+ 			   int idx);
+ 	int (*destroy)(struct vcodec_iommu_info *iommu_info);
+@@ -108,19 +104,14 @@ int vcodec_iommu_free(struct vcodec_iommu_info *iommu_info,
+ 		      struct vpu_session *session, int idx);
+ int vcodec_iommu_free_fd(struct vcodec_iommu_info *iommu_info,
+ 			 struct vpu_session *session, int fd);
+-void *vcodec_iommu_map_kernel(struct vcodec_iommu_info *iommu_info,
+-				 struct vpu_session *session, int idx);
+-int vcodec_iommu_unmap_kernel(struct vcodec_iommu_info *iommu_info,
+-			      struct vpu_session *session, int idx);
+ int vcodec_iommu_map_iommu(struct vcodec_iommu_info *iommu_info,
+ 			   struct vpu_session *session,
+ 			   int idx,
+-			   unsigned long *iova,
++			   dma_addr_t *iova,
+ 			   unsigned long *size);
+ int vcodec_iommu_unmap_iommu(struct vcodec_iommu_info *iommu_info,
+ 			     struct vpu_session *session,
+ 			     int idx);
+-int vcodec_iommu_destroy(struct vcodec_iommu_info *iommu_info);
+ void vcodec_iommu_dump(struct vcodec_iommu_info *iommu_info,
+ 		       struct vpu_session *session);
+ void vcodec_iommu_clear(struct vcodec_iommu_info *iommu_info,
+diff --git a/drivers/video/rockchip/vcodec/vcodec_service.c b/drivers/video/rockchip/vcodec/vcodec_service.c
+index c6c7d5239bc2..8bc2bf29a119 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_service.c
++++ b/drivers/video/rockchip/vcodec/vcodec_service.c
+@@ -316,7 +316,8 @@ struct vcodec_mem_region {
+ 	struct list_head srv_lnk;
+ 	struct list_head reg_lnk;
+ 	struct list_head session_lnk;
+-	unsigned long iova;	/* virtual address for iommu */
++	/* virtual address for iommu */
++	dma_addr_t iova;
+ 	unsigned long len;
+ 	u32 reg_idx;
+ 	int hdl;
+@@ -353,11 +354,6 @@ struct vpu_subdev_data {
+ 	u32 reg_size;
+ 	unsigned long state;
+ 
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs_dir;
+-	struct dentry *debugfs_file_regs;
+-#endif
+-
+ 	struct device *mmu_dev;
+ 	struct vcodec_iommu_info *iommu_info;
+ 	struct work_struct set_work;
+@@ -936,10 +932,9 @@ static inline int reg_probe_hevc_y_stride(struct vpu_reg *reg)
+ 	return y_virstride;
+ }
+ 
+-static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+-		struct vpu_session *session,
+-		struct vpu_reg *reg,
+-		int fd)
++static dma_addr_t vcodec_fd_to_iova(struct vpu_subdev_data *data,
++				    struct vpu_session *session,
++				    struct vpu_reg *reg, int fd)
+ {
+ 	int hdl;
+ 	int ret = 0;
+@@ -960,7 +955,7 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+ 	ret = vcodec_iommu_map_iommu(data->iommu_info, session, mem_region->hdl,
+ 				     &mem_region->iova, &mem_region->len);
+ 	if (ret < 0) {
+-		vpu_err("fd %d ion map iommu failed\n", fd);
++		vpu_err("fd %d iommu map to device failed\n", fd);
+ 		kfree(mem_region);
+ 		vcodec_iommu_free(data->iommu_info, session, hdl);
+ 
+@@ -968,6 +963,7 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+ 	}
+ 	INIT_LIST_HEAD(&mem_region->reg_lnk);
+ 	list_add_tail(&mem_region->reg_lnk, &reg->mem_region_list);
++
+ 	return mem_region->iova;
+ }
+ 
+@@ -986,43 +982,65 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+  * on current decoding task. Then kernel driver can only translate the first
+  * address then copy it all pps buffer.
+  */
+-static int fill_scaling_list_addr_in_pps(
+-		struct vpu_subdev_data *data,
+-		struct vpu_reg *reg,
+-		char *pps,
+-		int pps_info_count,
+-		int pps_info_size,
+-		int scaling_list_addr_offset)
++static int fill_scaling_list_pps(struct vpu_subdev_data *data,
++				 struct vpu_reg *reg, int fd,
++				 int offset, int count,
++				 int pps_info_size,
++				 int sub_addr_offset)
+ {
+-	int base = scaling_list_addr_offset;
+-	int scaling_fd = 0;
++	struct dma_buf *dmabuf = NULL;
++	void *vaddr = NULL;
++	u8 *pps = NULL;
++	u32 base = sub_addr_offset;
++	u32 scaling_fd = 0;
+ 	u32 scaling_offset;
++	int ret = 0;
++
++	dmabuf = dma_buf_get(fd);
++	if (IS_ERR_OR_NULL(dmabuf)) {
++		dev_err(data->dev, "invliad pps buffer\n");
++		return -ENOENT;
++	}
+ 
+-	scaling_offset  = (u32)pps[base + 0];
+-	scaling_offset += (u32)pps[base + 1] << 8;
+-	scaling_offset += (u32)pps[base + 2] << 16;
+-	scaling_offset += (u32)pps[base + 3] << 24;
++	ret = dma_buf_begin_cpu_access(dmabuf, 0, dmabuf->size,
++				       DMA_FROM_DEVICE);
++	if (ret) {
++		dev_err(data->dev, "can't access the pps buffer\n");
++		return ret;
++	}
++
++	vaddr = dma_buf_vmap(dmabuf);
++	if (!vaddr) {
++		dev_err(data->dev, "can't access the pps buffer\n");
++		return -EIO;
++	}
++	pps = vaddr + offset;
++
++	memcpy(&scaling_offset, pps + base, sizeof(scaling_offset));
++	scaling_offset = le32_to_cpu(scaling_offset);
+ 
+ 	scaling_fd = scaling_offset & 0x3ff;
+ 	scaling_offset = scaling_offset >> 10;
+ 
+ 	if (scaling_fd > 0) {
+ 		int i = 0;
+-		u32 tmp = vcodec_fd_to_iova(data, reg->session, reg,
+-					    scaling_fd);
++		dma_addr_t tmp = vcodec_fd_to_iova(data, reg->session, reg,
++						   scaling_fd);
+ 
+ 		if (IS_ERR_VALUE(tmp))
+-			return -1;
++			return tmp;
+ 		tmp += scaling_offset;
++		tmp = cpu_to_le32(tmp);
+ 
+-		for (i = 0; i < pps_info_count; i++, base += pps_info_size) {
+-			pps[base + 0] = (tmp >>  0) & 0xff;
+-			pps[base + 1] = (tmp >>  8) & 0xff;
+-			pps[base + 2] = (tmp >> 16) & 0xff;
+-			pps[base + 3] = (tmp >> 24) & 0xff;
+-		}
++		/* Fill the scaling list address in each pps entries */
++		for (i = 0; i < count; i++, base += pps_info_size)
++			memcpy(pps + base, &tmp, sizeof(tmp));
+ 	}
+ 
++	dma_buf_vunmap(dmabuf, vaddr);
++	dma_buf_end_cpu_access(dmabuf, 0, dmabuf->size, DMA_FROM_DEVICE);
++	dma_buf_put(dmabuf);
++
+ 	return 0;
+ }
+ 
+@@ -1035,26 +1053,25 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
+ 	struct vpu_service_info *pservice = data->pservice;
+ 	struct vpu_task_info *task = reg->task;
+ 	enum FORMAT_TYPE type;
+-	int hdl;
++	int offset = 0;
+ 	int ret = 0;
+-	struct vcodec_mem_region *mem_region;
+ 	int i;
+-	int offset = 0;
+ 
+ 	if (tbl == NULL || size <= 0) {
+ 		dev_err(pservice->dev, "input arguments invalidate\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (task->get_fmt)
++	if (task->get_fmt) {
+ 		type = task->get_fmt(reg->reg);
+-	else {
++	} else {
+ 		dev_err(pservice->dev, "invalid task with NULL get_fmt\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	for (i = 0; i < size; i++) {
+ 		int usr_fd = reg->reg[tbl[i]] & 0x3FF;
++		dma_addr_t iova = 0;
+ 
+ 		/* if userspace do not set the fd at this register, skip */
+ 		if (usr_fd == 0)
+@@ -1087,88 +1104,54 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
+ 		vpu_debug(DEBUG_IOMMU, "pos %3d fd %3d offset %10d i %d\n",
+ 			  tbl[i], usr_fd, offset, i);
+ 
+-		hdl = vcodec_iommu_import(data->iommu_info, session, usr_fd);
+-
++		/* Only apply for RKVDEC */
+ 		if (task->reg_pps > 0 && task->reg_pps == tbl[i]) {
+-			int pps_info_offset;
+ 			int pps_info_count;
+ 			int pps_info_size;
+-			int scaling_list_addr_offset;
++			int scaling_offset;
+ 
+ 			switch (type) {
+ 			case FMT_H264D: {
+-				pps_info_offset = offset;
+ 				pps_info_count = 256;
+ 				pps_info_size = 32;
+-				scaling_list_addr_offset = 23;
++				scaling_offset = 23;
+ 			} break;
+ 			case FMT_H265D: {
+-				pps_info_offset = 0;
+ 				pps_info_count = 64;
+ 				pps_info_size = 80;
+-				scaling_list_addr_offset = 74;
++				scaling_offset = 74;
+ 			} break;
+ 			default: {
+-				pps_info_offset = 0;
+ 				pps_info_count = 0;
+ 				pps_info_size = 0;
+-				scaling_list_addr_offset = 0;
++				scaling_offset = 0;
+ 			} break;
+ 			}
+ 
+ 			vpu_debug(DEBUG_PPS_FILL,
+ 				  "scaling list filling parameter:\n");
+ 			vpu_debug(DEBUG_PPS_FILL,
+-				  "pps_info_offset %d\n", pps_info_offset);
+-			vpu_debug(DEBUG_PPS_FILL,
+-				  "pps_info_count  %d\n", pps_info_count);
++				  "pps_info_count = %d\n", pps_info_count);
+ 			vpu_debug(DEBUG_PPS_FILL,
+-				  "pps_info_size   %d\n", pps_info_size);
++				  "pps_info_size = %d\n", pps_info_size);
+ 			vpu_debug(DEBUG_PPS_FILL,
+-				  "scaling_list_addr_offset %d\n",
+-				  scaling_list_addr_offset);
++				  "scaling_list_addr_offset = %d\n",
++				  scaling_offset);
+ 
+ 			if (pps_info_count) {
+-				u8 *pps;
+-
+-				pps = vcodec_iommu_map_kernel
+-					(data->iommu_info, session, hdl);
+-
+-				vpu_debug(DEBUG_PPS_FILL,
+-					  "scaling list setting pps %p\n", pps);
+-				pps += pps_info_offset;
+-
+-				fill_scaling_list_addr_in_pps
+-					(data, reg, pps, pps_info_count,
+-					 pps_info_size,
+-					 scaling_list_addr_offset);
+-
+-				vcodec_iommu_unmap_kernel
+-					(data->iommu_info, session, hdl);
++				ret = fill_scaling_list_pps(data, reg, usr_fd,
++							    offset,
++							    pps_info_count,
++							    pps_info_size,
++							    scaling_offset);
++				if (ret)
++					return ret;
+ 			}
+ 		}
+ 
+-		mem_region = kzalloc(sizeof(*mem_region), GFP_KERNEL);
+-
+-		if (!mem_region) {
+-			vcodec_iommu_free(data->iommu_info, session, hdl);
+-			return -ENOMEM;
+-		}
+-
+-		mem_region->hdl = hdl;
+-		mem_region->reg_idx = tbl[i];
+-
+-		ret = vcodec_iommu_map_iommu(data->iommu_info, session,
+-					     mem_region->hdl, &mem_region->iova,
+-					     &mem_region->len);
+-		if (ret < 0) {
+-			dev_err(pservice->dev,
+-				"reg %d fd %d ion map iommu failed\n",
+-				tbl[i], usr_fd);
+-			kfree(mem_region);
+-			vcodec_iommu_free(data->iommu_info, session, hdl);
+-			return ret;
+-		}
++		iova = vcodec_fd_to_iova(data, session, reg, usr_fd);
++		if (IS_ERR_VALUE(iova))
++			return iova;
+ 
+ 		/*
+ 		 * special for vpu dec num 12: record decoded length
+@@ -1176,14 +1159,12 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data,
+ 		 * NOTE: not a perfect fix, the fd is not recorded
+ 		 */
+ 		if (task->reg_len > 0 && task->reg_len == tbl[i]) {
+-			reg->dec_base = mem_region->iova + offset;
++			reg->dec_base = iova + offset;
+ 			vpu_debug(DEBUG_REGISTER, "dec_set %08x\n",
+ 				  reg->dec_base);
+ 		}
+ 
+-		reg->reg[tbl[i]] = mem_region->iova + offset;
+-		INIT_LIST_HEAD(&mem_region->reg_lnk);
+-		list_add_tail(&mem_region->reg_lnk, &reg->mem_region_list);
++		reg->reg[tbl[i]] = iova + offset;
+ 	}
+ 
+ 	if (ext_inf != NULL && ext_inf->magic == EXTRA_INFO_MAGIC) {
+@@ -2301,30 +2282,29 @@ int vcodec_sysmmu_fault_hdl(struct device *dev,
+ 		int i = 0;
+ 
+ 		pr_err("vcodec, fault addr 0x%08lx\n", fault_addr);
+-		if (!list_empty(&reg->mem_region_list)) {
++		if (!list_empty(&reg->mem_region_list))
+ 			list_for_each_entry_safe(mem, n, &reg->mem_region_list,
+ 						 reg_lnk) {
+-				pr_err("vcodec, reg[%02u] mem region [%02d] 0x%lx %lx\n",
+-				       mem->reg_idx, i, mem->iova, mem->len);
++				dev_err(dev, "reg[%02u] mem region [%02d] %pad %lx\n",
++					mem->reg_idx, i, &mem->iova, mem->len);
+ 				i++;
+ 			}
+-		} else {
+-			pr_err("no memory region mapped\n");
+-		}
++		else
++			dev_err(dev, "no memory region mapped\n");
+ 
+ 		if (reg->data) {
+ 			struct vpu_subdev_data *data = reg->data;
+ 			u32 *base = (u32 *)data->dec_dev.regs;
+ 			u32 len = data->hw_info->dec_reg_num;
+ 
+-			pr_err("current errror register set:\n");
++			dev_err(dev, "current errror register set:\n");
+ 
+ 			for (i = 0; i < len; i++)
+ 				pr_err("reg[%02d] %08x\n",
+ 				       i, readl_relaxed(base + i));
+ 		}
+ 
+-		pr_alert("vcodec, page fault occur, reset hw\n");
++		dev_alert(dev, "page fault occur, reset hw\n");
+ 
+ 		/* reg->reg[101] = 1; */
+ 		_vpu_reset(data);
+@@ -2557,11 +2537,6 @@ static void vcodec_subdev_remove(struct vpu_subdev_data *data)
+ 	class_destroy(data->cls);
+ 	cdev_del(&data->cdev);
+ 	unregister_chrdev_region(data->dev_t, 1);
+-
+-#ifdef CONFIG_DEBUG_FS
+-	if (!IS_ERR_OR_NULL(data->debugfs_dir))
+-		debugfs_remove_recursive(data->debugfs_dir);
+-#endif
+ }
+ 
+ static void vcodec_read_property(struct device_node *np,
+-- 
+2.35.3
+

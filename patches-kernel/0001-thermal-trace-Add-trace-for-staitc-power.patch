@@ -1,0 +1,228 @@
+From f536573bf6824180957a7a4e13f0ccd2f7ba0c13 Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Mon, 18 Feb 2019 16:18:23 +0800
+Subject: [PATCH] thermal: trace: Add trace for staitc power
+
+Change-Id: I65fa7e60c606d414e6f5941c5a73347db9874c27
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/soc/rockchip/rockchip_ipa.c | 73 ++++++++++++++---------------
+ include/soc/rockchip/rockchip_ipa.h |  4 +-
+ include/trace/events/thermal.h      | 38 +++++++++++++++
+ 3 files changed, 74 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/soc/rockchip/rockchip_ipa.c b/drivers/soc/rockchip/rockchip_ipa.c
+index 8b85bebfee40..0c91147527d5 100644
+--- a/drivers/soc/rockchip/rockchip_ipa.c
++++ b/drivers/soc/rockchip/rockchip_ipa.c
+@@ -6,6 +6,7 @@
+ #include <linux/of.h>
+ #include <linux/thermal.h>
+ #include <soc/rockchip/rockchip_ipa.h>
++#include <trace/events/thermal.h>
+ 
+ #define FALLBACK_STATIC_TEMPERATURE 55000
+ 
+@@ -71,33 +72,29 @@ EXPORT_SYMBOL(rockchip_ipa_power_model_init);
+ /**
+  * calculate_temp_scaling_factor() - Calculate temperature scaling coefficient
+  * @ts:		Signed coefficients, in order t^0 to t^3, with units Deg^-N
+- * @t:		Temperature, in mDeg C. Range: -2^17 < t < 2^17
++ * @t:		Temperature, in mDeg C. Range: -40000 < t < 125000
+  *
+  * Scale the temperature according to a cubic polynomial whose coefficients are
+  * provided in the device tree. The result is used to scale the static power
+  * coefficient, where 1000000 means no change.
+  *
+- * Return: Temperature scaling factor. Range 0 <= ret <= 10,000,000.
++ * Return: Temperature scaling factor.
+  */
+ static u32 calculate_temp_scaling_factor(s32 ts[4], s64 t)
+ {
+-	/* Range: -2^24 < t2 < 2^24 m(Deg^2) */
+ 	const s64 t2 = div_s64((t * t), 1000);
+ 
+-	/* Range: -2^31 < t3 < 2^31 m(Deg^3) */
+ 	const s64 t3 = div_s64((t * t2), 1000);
+ 
+ 	/*
+ 	 * Sum the parts. t^[1-3] are in m(Deg^N), but the coefficients are in
+ 	 * Deg^-N, so we need to multiply the last coefficient by 1000.
+-	 * Range: -2^63 < res_big < 2^63
+ 	 */
+-	const s64 res_big = ts[3] * t3    /* +/- 2^62 */
+-			  + ts[2] * t2    /* +/- 2^55 */
+-			  + ts[1] * t     /* +/- 2^48 */
+-			  + ts[0] * 1000; /* +/- 2^41 */
++	const s64 res_big = ts[3] * t3
++			  + ts[2] * t2
++			  + ts[1] * t
++			  + ts[0] * 1000;
+ 
+-	/* Range: -2^60 < res_unclamped < 2^60 */
+ 	s64 res_unclamped = div_s64(res_big, 1000);
+ 
+ 	/* Clamp to range of 0x to 10x the static power */
+@@ -105,39 +102,34 @@ static u32 calculate_temp_scaling_factor(s32 ts[4], s64 t)
+ }
+ 
+ /**
+- * scale_static_power() - Scale a static power coefficient to an OPP
+- * @c:		Static model coefficient, in uW/V^3. Should be in range
+- *		0 < c < 2^32 to prevent overflow.
+- * @voltage:	Voltage, in mV. Range: 2^9 < voltage < 2^13 (~0.5V to ~8V)
++ * calculate_volt_scaling_factor() - Calculate voltage scaling coefficient
++ * voltage_mv:	Voltage, in mV. Range: 750 < voltage < 1350
+  *
+- * Return: Power consumption, in mW. Range: 0 < p < 2^13 (0W to ~8W)
++ * Return: Voltage scaling factor.
+  */
+-static u32 scale_static_power(const u32 c, const u32 voltage)
++static u32 calculate_volt_scaling_factor(const u32 voltage_mv)
+ {
+-	/* Range: 2^8 < v2 < 2^16 m(V^2) */
+-	const u32 v2 = (voltage * voltage) / 1000;
++	const u32 v2 = (voltage_mv * voltage_mv) / 1000;
+ 
+-	/* Range: 2^17 < v3_big < 2^29 m(V^2) mV */
+-	const u32 v3_big = v2 * voltage;
++	const u32 v3_big = v2 * voltage_mv;
+ 
+-	/* Range: 2^7 < v3 < 2^19 m(V^3) */
+ 	const u32 v3 = v3_big / 1000;
+ 
+-	/*
+-	 * Range (working backwards from next line): 0 < v3c_big < 2^33 nW.
+-	 * The result should be < 2^52 to avoid overflowing the return value.
+-	 */
+-	const u64 v3c_big = (u64)c * (u64)v3;
+-
+-	/* Range: 0 < v3c_big / 1000000 < 2^13 mW */
+-	return div_u64(v3c_big, 1000000);
++	return v3;
+ }
+ 
++/**
++ * rockchip_ipa_get_static_power() - Calculate static power
++ * @data:	Pointer to IPA model
++ * voltage_mv:	Voltage, in mV. Range: 750 < voltage < 1350
++ *
++ * Return: Static power.
++ */
+ unsigned long
+ rockchip_ipa_get_static_power(struct ipa_power_model_data *data,
+-			      unsigned long voltage)
++			      unsigned long voltage_mv)
+ {
+-	u32 temp_scaling_factor, coeffp, static_power;
++	u32 temp_scaling_factor, volt_scaling_factor, static_power;
+ 	u64 coeff_big;
+ 	int temp;
+ 	int ret;
+@@ -149,21 +141,24 @@ rockchip_ipa_get_static_power(struct ipa_power_model_data *data,
+ 		temp = FALLBACK_STATIC_TEMPERATURE;
+ 	}
+ 
+-	/* Range: 0 <= temp_scaling_factor < 2^24 */
+ 	temp_scaling_factor = calculate_temp_scaling_factor(data->ts, temp);
+-	/*
+-	 * Range: 0 <= coeff_big < 2^52 to avoid overflowing *coeffp. This
+-	 * means static_coefficient must be in range
+-	 * 0 <= static_coefficient < 2^28.
+-	 */
+ 	coeff_big = (u64)data->static_coefficient * (u64)temp_scaling_factor;
+-	coeffp = div_u64(coeff_big, 1000000);
++	static_power = div_u64(coeff_big, 1000000);
+ 
+-	static_power = scale_static_power(coeffp, (u32)voltage);
++	volt_scaling_factor = calculate_volt_scaling_factor((u32)voltage_mv);
++	coeff_big = (u64)static_power * (u64)volt_scaling_factor;
++	static_power = div_u64(coeff_big, 1000000);
+ 	if (data->leakage && data->ref_leakage)
+ 		static_power = static_power * data->leakage /
+ 			data->ref_leakage;
+ 
++	trace_thermal_power_get_static_power(data->static_coefficient, temp,
++					     temp_scaling_factor,
++					     (u32)voltage_mv,
++					     volt_scaling_factor,
++					     data->leakage, data->ref_leakage,
++					     static_power);
++
+ 	return static_power;
+ }
+ EXPORT_SYMBOL(rockchip_ipa_get_static_power);
+diff --git a/include/soc/rockchip/rockchip_ipa.h b/include/soc/rockchip/rockchip_ipa.h
+index e4415b78a34b..9525f45a17c1 100644
+--- a/include/soc/rockchip/rockchip_ipa.h
++++ b/include/soc/rockchip/rockchip_ipa.h
+@@ -19,7 +19,7 @@ int rockchip_ipa_power_model_init(struct device *dev,
+ 				  struct ipa_power_model_data **data);
+ unsigned long
+ rockchip_ipa_get_static_power(struct ipa_power_model_data *model_data,
+-			      unsigned long voltage);
++			      unsigned long voltage_mv);
+ #else
+ static inline int
+ rockchip_ipa_power_model_init(struct device *dev,
+@@ -30,7 +30,7 @@ rockchip_ipa_power_model_init(struct device *dev,
+ 
+ static inline unsigned long
+ rockchip_ipa_get_static_power(struct ipa_power_model_data *data,
+-			      unsigned long voltage)
++			      unsigned long voltage_mv)
+ {
+ 	return 0;
+ }
+diff --git a/include/trace/events/thermal.h b/include/trace/events/thermal.h
+index 135e5421f003..44f5ece26ebb 100644
+--- a/include/trace/events/thermal.h
++++ b/include/trace/events/thermal.h
+@@ -91,6 +91,44 @@ TRACE_EVENT(thermal_zone_trip,
+ 		show_tzt_type(__entry->trip_type))
+ );
+ 
++#ifdef CONFIG_ROCKCHIP_IPA
++TRACE_EVENT(thermal_power_get_static_power,
++	TP_PROTO(u32 coefficient, s32 temp, u32 temp_scaling_factor, u32 volt,
++		 u32 volt_scaling_factor, u32 leakage, u32 ref_leakage,
++		 u32 static_power),
++
++	TP_ARGS(coefficient, temp, temp_scaling_factor, volt,
++		volt_scaling_factor, leakage, ref_leakage, static_power),
++
++	TP_STRUCT__entry(
++		__field(u32,	coefficient)
++		__field(s32,	temp)
++		__field(u32,	temp_scaling_factor)
++		__field(u32,	volt)
++		__field(u32,	volt_scaling_factor)
++		__field(u32,	leakage)
++		__field(u32,	ref_leakage)
++		__field(u32,	static_power)
++	),
++
++	TP_fast_assign(
++		__entry->coefficient = coefficient;
++		__entry->temp = temp;
++		__entry->temp_scaling_factor = temp_scaling_factor;
++		__entry->volt = volt;
++		__entry->volt_scaling_factor = volt_scaling_factor;
++		__entry->leakage = leakage;
++		__entry->ref_leakage = ref_leakage;
++		__entry->static_power = static_power;
++	),
++	TP_printk("c=%u t=%d ts=%u v=%u vs=%u lkg=%u ref_lkg=%u static_power=%u",
++		  __entry->coefficient, __entry->temp,
++		  __entry->temp_scaling_factor, __entry->volt,
++		  __entry->volt_scaling_factor, __entry->leakage,
++		  __entry->ref_leakage, __entry->static_power)
++);
++#endif /* CONFIG_ROCKCHIP_IPA */
++
+ #ifdef CONFIG_CPU_THERMAL
+ TRACE_EVENT(thermal_power_cpu_get_power,
+ 	TP_PROTO(const struct cpumask *cpus, unsigned long freq, u32 *load,
+-- 
+2.35.3
+

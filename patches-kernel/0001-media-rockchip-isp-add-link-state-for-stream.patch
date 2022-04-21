@@ -1,0 +1,348 @@
+From e0e2ec0d317dc7d2355a4fe66d11cded138b73af Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 8 Apr 2020 20:45:02 +0800
+Subject: [PATCH] media: rockchip: isp: add link state for stream
+
+Disable mp/sp link and enable mpfbc default for isp2.0.
+Using ispp video to capture image, or disable mpfbc then
+to use mp/sp.
+
+Change-Id: I5d21cdaf212cdf77fb3c052e9ad77d1c1166ce0d
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/capture.c | 42 ++++++++++---------
+ drivers/media/platform/rockchip/isp/capture.h |  2 +
+ drivers/media/platform/rockchip/isp/csi.c     |  6 +++
+ drivers/media/platform/rockchip/isp/csi.h     |  2 +-
+ drivers/media/platform/rockchip/isp/dmarx.c   | 11 ++++-
+ drivers/media/platform/rockchip/isp/mpfbc.c   | 12 ++++--
+ drivers/media/platform/rockchip/isp/mpfbc.h   |  1 +
+ drivers/media/platform/rockchip/isp/rkisp.c   | 30 ++++++++++++-
+ 8 files changed, 79 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index e5a5135e4fa4..d374c57752b0 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -2045,6 +2045,9 @@ static void rkisp_stop_streaming(struct vb2_queue *queue)
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+ 		 "%s %d\n", __func__, stream->id);
+ 
++	if (!stream->streaming)
++		return;
++
+ 	rkisp_stream_stop(stream);
+ 	if (stream->id == RKISP_STREAM_MP ||
+ 	    stream->id == RKISP_STREAM_SP) {
+@@ -2116,6 +2119,11 @@ rkisp_start_streaming(struct vb2_queue *queue, unsigned int count)
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+ 		 "%s %d\n", __func__, stream->id);
+ 
++	if (!stream->linked) {
++		v4l2_err(v4l2_dev, "link stream first\n");
++		return -EINVAL;
++	}
++
+ 	if (WARN_ON(stream->streaming))
+ 		return -EBUSY;
+ 
+@@ -2727,25 +2735,14 @@ static int rkisp_register_stream_vdev(struct rkisp_stream *stream)
+ 
+ 	source = &dev->csi_dev.sd.entity;
+ 	switch (stream->id) {
+-	case RKISP_STREAM_DMATX0:
+-		pad = CSI_SRC_CH1;
+-		dev->csi_dev.sink[1].linked = true;
+-		dev->csi_dev.sink[1].index = BIT(1);
+-		break;
+-	case RKISP_STREAM_DMATX1:
+-		pad = CSI_SRC_CH2;
+-		dev->csi_dev.sink[2].linked = true;
+-		dev->csi_dev.sink[2].index = BIT(2);
+-		break;
+-	case RKISP_STREAM_DMATX2:
+-		pad = CSI_SRC_CH3;
+-		dev->csi_dev.sink[3].linked = true;
+-		dev->csi_dev.sink[3].index = BIT(3);
+-		break;
+-	case RKISP_STREAM_DMATX3:
+-		pad = CSI_SRC_CH4;
+-		dev->csi_dev.sink[4].linked = true;
+-		dev->csi_dev.sink[4].index = BIT(4);
++	case RKISP_STREAM_DMATX0://CSI_SRC_CH1
++	case RKISP_STREAM_DMATX1://CSI_SRC_CH2
++	case RKISP_STREAM_DMATX2://CSI_SRC_CH3
++	case RKISP_STREAM_DMATX3://CSI_SRC_CH4
++		pad = stream->id;
++		stream->linked = true;
++		dev->csi_dev.sink[pad - 1].linked = true;
++		dev->csi_dev.sink[pad - 1].index = BIT(pad - 1);
+ 		break;
+ 	default:
+ 		source = &dev->isp_sdev.sd.entity;
+@@ -2753,7 +2750,7 @@ static int rkisp_register_stream_vdev(struct rkisp_stream *stream)
+ 	}
+ 	sink = &vdev->entity;
+ 	ret = media_create_pad_link(source, pad,
+-		sink, 0, MEDIA_LNK_FL_ENABLED);
++		sink, 0, stream->linked);
+ 	if (ret < 0)
+ 		goto unreg;
+ 	return 0;
+@@ -2779,6 +2776,11 @@ static int rkisp_stream_init(struct rkisp_device *dev, u32 id)
+ 	init_waitqueue_head(&stream->done);
+ 	spin_lock_init(&stream->vbq_lock);
+ 
++	/* isp2 disable MP/SP, enable MPFBC default */
++	if ((id == RKISP_STREAM_SP || id == RKISP_STREAM_MP) &&
++	    dev->isp_ver == ISP_V20)
++		stream->linked = false;
++
+ 	switch (id) {
+ 	case RKISP_STREAM_SP:
+ 		strlcpy(vdev->name, SP_VDEV_NAME,
+diff --git a/drivers/media/platform/rockchip/isp/capture.h b/drivers/media/platform/rockchip/isp/capture.h
+index d1798ceeeef9..a1a89385eae0 100644
+--- a/drivers/media/platform/rockchip/isp/capture.h
++++ b/drivers/media/platform/rockchip/isp/capture.h
+@@ -187,6 +187,7 @@ struct streams_ops {
+  * rkisp use shadowsock registers, so it need two buffer at a time
+  * @curr_buf: the buffer used for current frame
+  * @next_buf: the buffer used for next frame
++ * @linked: stream link to isp
+  * @done: wait frame end event queue
+  * @burst: burst length for Y and CB/CR
+  * @sequence: damtx video frame sequence
+@@ -209,6 +210,7 @@ struct rkisp_stream {
+ 	bool streaming;
+ 	bool stopping;
+ 	bool frame_end;
++	bool linked;
+ 	wait_queue_head_t done;
+ 	unsigned int burst;
+ 	atomic_t sequence;
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index ee2fe1fe6837..f828bc1cfbde 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -68,6 +68,7 @@ static int rkisp_csi_link_setup(struct media_entity *entity,
+ {
+ 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
+ 	struct rkisp_csi_device *csi;
++	struct rkisp_stream *stream = NULL;
+ 	int ret = 0;
+ 	u8 id;
+ 
+@@ -77,6 +78,8 @@ static int rkisp_csi_link_setup(struct media_entity *entity,
+ 	csi = v4l2_get_subdevdata(sd);
+ 	if (local->flags & MEDIA_PAD_FL_SOURCE) {
+ 		id = local->index - 1;
++		if (id && id < RKISP_STREAM_DMATX3)
++			stream = &csi->ispdev->cap_dev.stream[id + 1];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (csi->sink[id].linked) {
+ 				ret = -EBUSY;
+@@ -88,7 +91,10 @@ static int rkisp_csi_link_setup(struct media_entity *entity,
+ 			csi->sink[id].linked = false;
+ 			csi->sink[id].index = 0;
+ 		}
++		if (stream)
++			stream->linked = csi->sink[id].linked;
+ 	}
++
+ 	return 0;
+ out:
+ 	v4l2_err(sd, "pad%d is already linked\n", local->index);
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 47658d9a3aa8..c51d0b1e37f9 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -37,7 +37,7 @@ enum hdr_op_mode {
+ };
+ 
+ enum rkisp_csi_pad {
+-	CSI_SINK,
++	CSI_SINK = 0,
+ 	CSI_SRC_CH0,
+ 	CSI_SRC_CH1,
+ 	CSI_SRC_CH2,
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 8a2677ce8dc2..358671c62d8a 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -523,6 +523,9 @@ static void dmarx_stop_streaming(struct vb2_queue *queue)
+ {
+ 	struct rkisp_stream *stream = queue->drv_priv;
+ 
++	if (!stream->streaming)
++		return;
++
+ 	dmarx_stop(stream);
+ 	destroy_buf_queue(stream, VB2_BUF_STATE_ERROR);
+ }
+@@ -535,6 +538,11 @@ static int dmarx_start_streaming(struct vb2_queue *queue,
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+ 	int ret = -1;
+ 
++	if (!stream->linked) {
++		v4l2_err(v4l2_dev, "link stream first\n");
++		return -EINVAL;
++	}
++
+ 	if (WARN_ON(stream->streaming))
+ 		return -EBUSY;
+ 
+@@ -872,6 +880,7 @@ static int dmarx_init(struct rkisp_device *dev, u32 id)
+ 	stream->id = id;
+ 	stream->ispdev = dev;
+ 	vdev = &stream->vnode.vdev;
++	stream->linked = false;
+ 
+ 	switch (id) {
+ 	case RKISP_STREAM_DMARX:
+@@ -910,7 +919,7 @@ static int dmarx_init(struct rkisp_device *dev, u32 id)
+ 	source = &vdev->entity;
+ 	sink = &dev->isp_sdev.sd.entity;
+ 	return media_create_pad_link(source, 0, sink,
+-				     RKISP_ISP_PAD_SINK, 0);
++		RKISP_ISP_PAD_SINK, stream->linked);
+ }
+ 
+ u32 rkisp_dmarx_get_frame_id(struct rkisp_device *dev)
+diff --git a/drivers/media/platform/rockchip/isp/mpfbc.c b/drivers/media/platform/rockchip/isp/mpfbc.c
+index 6fb843cc7de9..c524f6e9c35c 100644
+--- a/drivers/media/platform/rockchip/isp/mpfbc.c
++++ b/drivers/media/platform/rockchip/isp/mpfbc.c
+@@ -185,8 +185,13 @@ static int mpfbc_start_stream(struct v4l2_subdev *sd)
+ 	struct rkisp_device *dev = mpfbc_dev->ispdev;
+ 	int ret;
+ 
+-	if (WARN_ON(mpfbc_dev->en) ||
+-	    !dev->isp_inp)
++	if (!mpfbc_dev->linked || !dev->isp_inp) {
++		v4l2_err(&dev->v4l2_dev,
++			 "mpfbc no linked or isp inval input\n");
++		return -EINVAL;
++	}
++
++	if (WARN_ON(mpfbc_dev->en))
+ 		return -EBUSY;
+ 
+ 	if (dev->isp_inp & INP_CSI ||
+@@ -354,10 +359,11 @@ int rkisp_register_mpfbc_subdev(struct rkisp_device *dev,
+ 	}
+ 
+ 	/* mpfbc links */
++	mpfbc_dev->linked = true;
+ 	source = &dev->isp_sdev.sd.entity;
+ 	sink = &sd->entity;
+ 	ret = media_create_pad_link(source, RKISP_ISP_PAD_SOURCE_PATH,
+-				    sink, 0, MEDIA_LNK_FL_ENABLED);
++				    sink, 0, mpfbc_dev->linked);
+ 
+ 	init_waitqueue_head(&mpfbc_dev->done);
+ 	return ret;
+diff --git a/drivers/media/platform/rockchip/isp/mpfbc.h b/drivers/media/platform/rockchip/isp/mpfbc.h
+index 3f6729d6b65d..150ce64cfe00 100644
+--- a/drivers/media/platform/rockchip/isp/mpfbc.h
++++ b/drivers/media/platform/rockchip/isp/mpfbc.h
+@@ -28,6 +28,7 @@ struct rkisp_mpfbc_device {
+ 	u8 pingpong;
+ 	u8 stopping;
+ 	u8 en;
++	bool linked;
+ };
+ 
+ int rkisp_register_mpfbc_subdev(struct rkisp_device *dev,
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index b53bb8eab638..a11dc1973b57 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1557,12 +1557,14 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ {
+ 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
+ 	struct rkisp_device *dev;
++	struct rkisp_stream *stream = NULL;
+ 	u8 rawrd = INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2;
+ 
+ 	if (!sd)
+ 		return -ENODEV;
+ 	dev = sd_to_isp_dev(sd);
+ 	if (!strcmp(remote->entity->name, DMA_VDEV_NAME)) {
++		stream = &dev->dmarx_dev.stream[RKISP_STREAM_DMARX];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (dev->isp_inp)
+ 				goto err;
+@@ -1581,6 +1583,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 			dev->isp_inp &= ~INP_CSI;
+ 		}
+ 	} else if (!strcmp(remote->entity->name, DMARX0_VDEV_NAME)) {
++		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD0];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (dev->isp_inp == INP_DMARX_ISP)
+ 				goto err;
+@@ -1589,6 +1592,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 			dev->isp_inp &= ~INP_RAWRD0;
+ 		}
+ 	} else if (!strcmp(remote->entity->name, DMARX1_VDEV_NAME)) {
++		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD1];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (dev->isp_inp == INP_DMARX_ISP)
+ 				goto err;
+@@ -1597,6 +1601,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 			dev->isp_inp &= ~INP_RAWRD1;
+ 		}
+ 	} else if (!strcmp(remote->entity->name, DMARX2_VDEV_NAME)) {
++		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (dev->isp_inp == INP_DMARX_ISP)
+ 				goto err;
+@@ -1604,6 +1609,22 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 		} else {
+ 			dev->isp_inp &= ~INP_RAWRD2;
+ 		}
++	} else if (!strcmp(remote->entity->name, SP_VDEV_NAME)) {
++		stream = &dev->cap_dev.stream[RKISP_STREAM_SP];
++		if (flags & MEDIA_LNK_FL_ENABLED &&
++		    dev->mpfbc_dev.linked)
++			goto err;
++	} else if (!strcmp(remote->entity->name, MP_VDEV_NAME)) {
++		stream = &dev->cap_dev.stream[RKISP_STREAM_MP];
++		if (flags & MEDIA_LNK_FL_ENABLED &&
++		    dev->mpfbc_dev.linked)
++			goto err;
++	} else if (!strcmp(remote->entity->name, MPFBC_DEV_NAME)) {
++		if (flags & MEDIA_LNK_FL_ENABLED &&
++		    (dev->cap_dev.stream[RKISP_STREAM_SP].linked ||
++		     dev->cap_dev.stream[RKISP_STREAM_MP].linked))
++			goto err;
++		dev->mpfbc_dev.linked = flags & MEDIA_LNK_FL_ENABLED;
+ 	} else {
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+ 			if (dev->isp_inp & ~(INP_DVP | rawrd))
+@@ -1614,6 +1635,8 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 		}
+ 	}
+ 
++	if (stream)
++		stream->linked = flags & MEDIA_LNK_FL_ENABLED;
+ 	if (dev->isp_inp & rawrd)
+ 		dev->dmarx_dev.trigger = T_MANUAL;
+ 	else
+@@ -1623,8 +1646,11 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 		 "isp input:0x%x\n", dev->isp_inp);
+ 	return 0;
+ err:
+-	v4l2_err(sd, "dmaread can't work with other input\n"
+-		 "csi dvp can't work together\n");
++	v4l2_err(sd, "link error %s -> %s\n"
++		 "\tdmaread can't work with other input\n"
++		 "\tcsi dvp can't work together\n"
++		 "\tmpfbc can't work with mainpath/selfpath\n",
++		 local->entity->name, remote->entity->name);
+ 	return -EINVAL;
+ }
+ 
+-- 
+2.35.3
+

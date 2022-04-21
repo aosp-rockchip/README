@@ -1,0 +1,346 @@
+From c4e657e5ac82f8d80998e74592dbf7e7a708a1a2 Mon Sep 17 00:00:00 2001
+From: Zhen Chen <chenzhen@rock-chips.com>
+Date: Thu, 27 Jun 2019 16:36:05 +0800
+Subject: [PATCH] Mali: midgard: remove kbase_mem_phy_alloc::zone_cache and
+ relative codes
+
+Some relative codes,
+such as 'zone_page_state_add(1, zone, NR_SLAB_RECLAIMABLE);',
+caused compile errors, when compiled with clang.
+The corresponding interface(NR_SLAB_RECLAIMABLE, et.) was changed
+between kernel v4.4 and v4.19.
+
+These codes were used to updates the cachelines with the statistics,
+and are removed in Midgard DDK r22.
+Here, I remove them too, in current Midgard DDK r18.
+
+Change-Id: I3a7e789c0456f28eba623b20564ea8a97109051f
+Signed-off-by: Zhen Chen <chenzhen@rock-chips.com>
+---
+ drivers/gpu/arm/midgard/mali_kbase_mem.c      |  17 ---
+ drivers/gpu/arm/midgard/mali_kbase_mem.h      |  36 -----
+ .../gpu/arm/midgard/mali_kbase_mem_linux.c    | 142 +-----------------
+ drivers/gpu/arm/midgard/mali_kbase_mem_pool.c |  13 --
+ 4 files changed, 2 insertions(+), 206 deletions(-)
+
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem.c b/drivers/gpu/arm/midgard/mali_kbase_mem.c
+index 0e367e283d9d..573068b20fe5 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem.c
+@@ -1432,15 +1432,6 @@ int kbase_alloc_phy_pages_helper(
+ 			nr_pages_requested, alloc->pages + old_page_count) != 0)
+ 		goto no_alloc;
+ 
+-	/*
+-	 * Request a zone cache update, this scans only the new pages an
+-	 * appends their information to the zone cache. if the update
+-	 * fails then clear the cache so we fall-back to doing things
+-	 * page by page.
+-	 */
+-	if (kbase_zone_cache_update(alloc, old_page_count) != 0)
+-		kbase_zone_cache_clear(alloc);
+-
+ 	KBASE_TLSTREAM_AUX_PAGESALLOC(
+ 			(u32)alloc->imported.kctx->id,
+ 			(u64)new_page_count);
+@@ -1479,14 +1470,6 @@ int kbase_free_phy_pages_helper(
+ 
+ 	syncback = alloc->properties & KBASE_MEM_PHY_ALLOC_ACCESSED_CACHED;
+ 
+-	/*
+-	 * Clear the zone cache, we don't expect JIT allocations to be
+-	 * shrunk in parts so there is no point trying to optimize for that
+-	 * by scanning for the changes caused by freeing this memory and
+-	 * updating the existing cache entries.
+-	 */
+-	kbase_zone_cache_clear(alloc);
+-
+ 	kbase_mem_pool_free_pages(&kctx->mem_pool,
+ 				  nr_pages_to_free,
+ 				  start_free,
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem.h b/drivers/gpu/arm/midgard/mali_kbase_mem.h
+index 75f3ad16bfc6..3f3eaa3fda98 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem.h
+@@ -129,8 +129,6 @@ struct kbase_mem_phy_alloc {
+ 
+ 	unsigned long properties;
+ 
+-	struct list_head       zone_cache;
+-
+ 	/* member in union valid based on @a type */
+ 	union {
+ #ifdef CONFIG_UMP
+@@ -386,7 +384,6 @@ static inline struct kbase_mem_phy_alloc *kbase_alloc_create(size_t nr_pages, en
+ 	alloc->pages = (void *)(alloc + 1);
+ 	INIT_LIST_HEAD(&alloc->mappings);
+ 	alloc->type = type;
+-	INIT_LIST_HEAD(&alloc->zone_cache);
+ 
+ 	if (type == KBASE_MEM_TYPE_IMPORTED_USER_BUF)
+ 		alloc->imported.user_buf.dma_addrs =
+@@ -1068,37 +1065,4 @@ bool kbase_sticky_resource_release(struct kbase_context *kctx,
+  */
+ void kbase_sticky_resource_term(struct kbase_context *kctx);
+ 
+-/**
+- * kbase_zone_cache_update - Update the memory zone cache after new pages have
+- * been added.
+- * @alloc:        The physical memory allocation to build the cache for.
+- * @start_offset: Offset to where the new pages start.
+- *
+- * Updates an existing memory zone cache, updating the counters for the
+- * various zones.
+- * If the memory allocation doesn't already have a zone cache assume that
+- * one isn't created and thus don't do anything.
+- *
+- * Return: Zero cache was updated, negative error code on error.
+- */
+-int kbase_zone_cache_update(struct kbase_mem_phy_alloc *alloc,
+-		size_t start_offset);
+-
+-/**
+- * kbase_zone_cache_build - Build the memory zone cache.
+- * @alloc:        The physical memory allocation to build the cache for.
+- *
+- * Create a new zone cache for the provided physical memory allocation if
+- * one doesn't already exist, if one does exist then just return.
+- *
+- * Return: Zero if the zone cache was created, negative error code on error.
+- */
+-int kbase_zone_cache_build(struct kbase_mem_phy_alloc *alloc);
+-
+-/**
+- * kbase_zone_cache_clear - Clear the memory zone cache.
+- * @alloc:        The physical memory allocation to clear the cache on.
+- */
+-void kbase_zone_cache_clear(struct kbase_mem_phy_alloc *alloc);
+-
+ #endif				/* _KBASE_MEM_H_ */
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c b/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+index f3cf53b4c383..7770610f13c1 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -463,100 +463,6 @@ void kbase_mem_evictable_deinit(struct kbase_context *kctx)
+ 	unregister_shrinker(&kctx->reclaim);
+ }
+ 
+-struct kbase_mem_zone_cache_entry {
+-	/* List head used to link the cache entry to the memory allocation. */
+-	struct list_head zone_node;
+-	/* The zone the cacheline is for. */
+-	struct zone *zone;
+-	/* The number of pages in the allocation which belong to this zone. */
+-	u64 count;
+-};
+-
+-static bool kbase_zone_cache_builder(struct kbase_mem_phy_alloc *alloc,
+-		size_t start_offset)
+-{
+-	struct kbase_mem_zone_cache_entry *cache = NULL;
+-	size_t i;
+-	int ret = 0;
+-
+-	for (i = start_offset; i < alloc->nents; i++) {
+-		struct page *p = phys_to_page(alloc->pages[i]);
+-		struct zone *zone = page_zone(p);
+-		bool create = true;
+-
+-		if (cache && (cache->zone == zone)) {
+-			/*
+-			 * Fast path check as most of the time adjacent
+-			 * pages come from the same zone.
+-			 */
+-			create = false;
+-		} else {
+-			/*
+-			 * Slow path check, walk all the cache entries to see
+-			 * if we already know about this zone.
+-			 */
+-			list_for_each_entry(cache, &alloc->zone_cache, zone_node) {
+-				if (cache->zone == zone) {
+-					create = false;
+-					break;
+-				}
+-			}
+-		}
+-
+-		/* This zone wasn't found in the cache, create an entry for it */
+-		if (create) {
+-			cache = kmalloc(sizeof(*cache), GFP_KERNEL);
+-			if (!cache) {
+-				ret = -ENOMEM;
+-				goto bail;
+-			}
+-			cache->zone = zone;
+-			cache->count = 0;
+-			list_add(&cache->zone_node, &alloc->zone_cache);
+-		}
+-
+-		cache->count++;
+-	}
+-	return 0;
+-
+-bail:
+-	return ret;
+-}
+-
+-int kbase_zone_cache_update(struct kbase_mem_phy_alloc *alloc,
+-		size_t start_offset)
+-{
+-	/*
+-	 * Bail if the zone cache is empty, only update the cache if it
+-	 * existed in the first place.
+-	 */
+-	if (list_empty(&alloc->zone_cache))
+-		return 0;
+-
+-	return kbase_zone_cache_builder(alloc, start_offset);
+-}
+-
+-int kbase_zone_cache_build(struct kbase_mem_phy_alloc *alloc)
+-{
+-	/* Bail if the zone cache already exists */
+-	if (!list_empty(&alloc->zone_cache))
+-		return 0;
+-
+-	return kbase_zone_cache_builder(alloc, 0);
+-}
+-
+-void kbase_zone_cache_clear(struct kbase_mem_phy_alloc *alloc)
+-{
+-	struct kbase_mem_zone_cache_entry *walker;
+-
+-	while(!list_empty(&alloc->zone_cache)){
+-		walker = list_first_entry(&alloc->zone_cache,
+-				struct kbase_mem_zone_cache_entry, zone_node);
+-		list_del(&walker->zone_node);
+-		kfree(walker);
+-	}
+-}
+-
+ /**
+  * kbase_mem_evictable_mark_reclaim - Mark the pages as reclaimable.
+  * @alloc: The physical allocation
+@@ -564,29 +470,7 @@ void kbase_zone_cache_clear(struct kbase_mem_phy_alloc *alloc)
+ static void kbase_mem_evictable_mark_reclaim(struct kbase_mem_phy_alloc *alloc)
+ {
+ 	struct kbase_context *kctx = alloc->imported.kctx;
+-	struct kbase_mem_zone_cache_entry *zone_cache;
+ 	int __maybe_unused new_page_count;
+-	int err;
+-
+-	/* Attempt to build a zone cache of tracking */
+-	err = kbase_zone_cache_build(alloc);
+-	if (err == 0) {
+-		/* Bulk update all the zones */
+-		list_for_each_entry(zone_cache, &alloc->zone_cache, zone_node) {
+-			zone_page_state_add(zone_cache->count,
+-					zone_cache->zone, NR_SLAB_RECLAIMABLE);
+-		}
+-	} else {
+-		/* Fall-back to page by page updates */
+-		int i;
+-
+-		for (i = 0; i < alloc->nents; i++) {
+-			struct page *p = phys_to_page(alloc->pages[i]);
+-			struct zone *zone = page_zone(p);
+-
+-			zone_page_state_add(1, zone, NR_SLAB_RECLAIMABLE);
+-		}
+-	}
+ 
+ 	kbase_process_page_usage_dec(kctx, alloc->nents);
+ 	new_page_count = kbase_atomic_sub_pages(alloc->nents,
+@@ -606,39 +490,17 @@ static
+ void kbase_mem_evictable_unmark_reclaim(struct kbase_mem_phy_alloc *alloc)
+ {
+ 	struct kbase_context *kctx = alloc->imported.kctx;
+-	struct kbase_mem_zone_cache_entry *zone_cache;
+ 	int __maybe_unused new_page_count;
+-	int err;
+ 
+ 	new_page_count = kbase_atomic_add_pages(alloc->nents,
+ 						&kctx->used_pages);
+ 	kbase_atomic_add_pages(alloc->nents, &kctx->kbdev->memdev.used_pages);
+ 
+ 	/* Increase mm counters so that the allocation is accounted for
+-	 * against the process and thus is visible to the OOM killer,
+-	 * then remove it from the reclaimable accounting. */
++	 * against the process and thus is visible to the OOM killer.
++	 */
+ 	kbase_process_page_usage_inc(kctx, alloc->nents);
+ 
+-	/* Attempt to build a zone cache of tracking */
+-	err = kbase_zone_cache_build(alloc);
+-	if (err == 0) {
+-		/* Bulk update all the zones */
+-		list_for_each_entry(zone_cache, &alloc->zone_cache, zone_node) {
+-			zone_page_state_add(-zone_cache->count,
+-					zone_cache->zone, NR_SLAB_RECLAIMABLE);
+-		}
+-	} else {
+-		/* Fall-back to page by page updates */
+-		int i;
+-
+-		for (i = 0; i < alloc->nents; i++) {
+-			struct page *p = phys_to_page(alloc->pages[i]);
+-			struct zone *zone = page_zone(p);
+-
+-			zone_page_state_add(-1, zone, NR_SLAB_RECLAIMABLE);
+-		}
+-	}
+-
+ 	KBASE_TLSTREAM_AUX_PAGESALLOC(
+ 			(u32)kctx->id,
+ 			(u64)new_page_count);
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem_pool.c b/drivers/gpu/arm/midgard/mali_kbase_mem_pool.c
+index 25c3128ec3cc..a8269940a037 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem_pool.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem_pool.c
+@@ -70,8 +70,6 @@ static void kbase_mem_pool_add_locked(struct kbase_mem_pool *pool,
+ 	list_add(&p->lru, &pool->page_list);
+ 	pool->cur_size++;
+ 
+-	zone_page_state_add(1, page_zone(p), NR_SLAB_RECLAIMABLE);
+-
+ 	pool_dbg(pool, "added page\n");
+ }
+ 
+@@ -85,14 +83,8 @@ static void kbase_mem_pool_add(struct kbase_mem_pool *pool, struct page *p)
+ static void kbase_mem_pool_add_list_locked(struct kbase_mem_pool *pool,
+ 		struct list_head *page_list, size_t nr_pages)
+ {
+-	struct page *p;
+-
+ 	lockdep_assert_held(&pool->pool_lock);
+ 
+-	list_for_each_entry(p, page_list, lru) {
+-		zone_page_state_add(1, page_zone(p), NR_SLAB_RECLAIMABLE);
+-	}
+-
+ 	list_splice(page_list, &pool->page_list);
+ 	pool->cur_size += nr_pages;
+ 
+@@ -120,8 +112,6 @@ static struct page *kbase_mem_pool_remove_locked(struct kbase_mem_pool *pool)
+ 	list_del_init(&p->lru);
+ 	pool->cur_size--;
+ 
+-	zone_page_state_add(-1, page_zone(p), NR_SLAB_RECLAIMABLE);
+-
+ 	pool_dbg(pool, "removed page\n");
+ 
+ 	return p;
+@@ -570,9 +560,6 @@ void kbase_mem_pool_free_pages(struct kbase_mem_pool *pool, size_t nr_pages,
+ 			continue;
+ 
+ 		p = phys_to_page(pages[i]);
+-		if (reclaimed)
+-			zone_page_state_add(-1, page_zone(p),
+-					NR_SLAB_RECLAIMABLE);
+ 
+ 		kbase_mem_pool_free_page(pool, p);
+ 		pages[i] = 0;
+-- 
+2.35.3
+

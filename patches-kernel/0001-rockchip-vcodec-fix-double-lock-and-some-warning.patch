@@ -1,0 +1,161 @@
+From de935f332508189376f66579335a4edc75d3a058 Mon Sep 17 00:00:00 2001
+From: alpha lin <alpha.lin@rock-chips.com>
+Date: Fri, 11 Nov 2016 18:25:26 +0800
+Subject: [PATCH] rockchip/vcodec: fix double lock and some warning
+
+fix following problems:
+
+vcodec_service.c:1613 try_set_reg()
+error: double lock 'mutex:&pservice->shutdown_lock'
+vcodec_service.c:1682 try_set_reg()
+warn: inconsistent returns 'mutex:&pservice->shutdown_lock'.
+  Locked on:   line 1614
+  Unlocked on: line 1682
+
+vcodec_service.c:599 vpu_get_clk()
+warn: missing break? reassigning 'pservice->pd_video'
+vcodec_service.c:901 vcodec_fd_to_iova()
+warn: returning -1 instead of -ENOMEM is sloppy
+vcodec_service.c:1100 vcodec_bufid_to_iova()
+warn: returning -1 instead of -ENOMEM is sloppy
+vcodec_service.c:1209 reg_init()
+warn: passing __func__ while the format string already
+contains the name of the function 'reg_init'
+vcodec_service.c:1231 reg_init()
+warn: passing __func__ while the format string already
+contains the name of the function 'reg_init'
+vcodec_service.c:1237 reg_init()
+warn: passing __func__ while the format string already
+contains the name of the function 'reg_init'
+vcodec_service.c:1714 return_reg()
+warn: passing __func__ while the format string already
+contains the name of the function 'return_reg'
+
+Change-Id: Ia2d3be7ad7a726d9af9e58c25079e6c11a7d302f
+Signed-off-by: alpha lin <alpha.lin@rock-chips.com>
+---
+ .../video/rockchip/vcodec/vcodec_service.c    | 30 ++++++++++++-------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/video/rockchip/vcodec/vcodec_service.c b/drivers/video/rockchip/vcodec/vcodec_service.c
+index 4c837de2c06a..871b44c64ad6 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_service.c
++++ b/drivers/video/rockchip/vcodec/vcodec_service.c
+@@ -898,7 +898,7 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+ 	if (mem_region == NULL) {
+ 		vpu_err("allocate memory for iommu memory region failed\n");
+ 		ion_free(pservice->ion_client, hdl);
+-		return -1;
++		return -ENOMEM;
+ 	}
+ 
+ 	mem_region->hdl = hdl;
+@@ -916,7 +916,7 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+ 		vpu_err("fd %d ion map iommu failed\n", fd);
+ 		kfree(mem_region);
+ 		ion_free(pservice->ion_client, hdl);
+-		return ret;
++		return -EFAULT;
+ 	}
+ 	INIT_LIST_HEAD(&mem_region->reg_lnk);
+ 	list_add_tail(&mem_region->reg_lnk, &reg->mem_region_list);
+@@ -938,7 +938,7 @@ static int vcodec_fd_to_iova(struct vpu_subdev_data *data,
+  * on current decoding task. Then kernel driver can only translate the first
+  * address then copy it all pps buffer.
+  */
+-static void fill_scaling_list_addr_in_pps(
++static int fill_scaling_list_addr_in_pps(
+ 		struct vpu_subdev_data *data,
+ 		struct vpu_reg *reg,
+ 		char *pps,
+@@ -961,6 +961,9 @@ static void fill_scaling_list_addr_in_pps(
+ 	if (scaling_fd > 0) {
+ 		int i = 0;
+ 		u32 tmp = vcodec_fd_to_iova(data, reg, scaling_fd);
++
++		if (IS_ERR_VALUE(tmp))
++			return -1;
+ 		tmp += scaling_offset;
+ 
+ 		for (i = 0; i < pps_info_count; i++, base += pps_info_size) {
+@@ -970,6 +973,8 @@ static void fill_scaling_list_addr_in_pps(
+ 			pps[base + 3] = (tmp >> 24) & 0xff;
+ 		}
+ 	}
++
++	return 0;
+ }
+ 
+ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data, const u8 *tbl,
+@@ -1085,11 +1090,14 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data, const u8 *tbl,
+ 					  "scaling list setting pps %p\n", pps);
+ 				pps += pps_info_offset;
+ 
+-				fill_scaling_list_addr_in_pps(
++				if (fill_scaling_list_addr_in_pps(
+ 						data, reg, pps,
+ 						pps_info_count,
+ 						pps_info_size,
+-						scaling_list_addr_offset);
++						scaling_list_addr_offset) < 0) {
++					ion_free(pservice->ion_client, hdl);
++					return -1;
++				}
+ 			}
+ 		}
+ 
+@@ -1097,7 +1105,7 @@ static int vcodec_bufid_to_iova(struct vpu_subdev_data *data, const u8 *tbl,
+ 
+ 		if (!mem_region) {
+ 			ion_free(pservice->ion_client, hdl);
+-			return -1;
++			return -ENOMEM;
+ 		}
+ 
+ 		mem_region->hdl = hdl;
+@@ -1206,7 +1214,7 @@ static struct vpu_reg *reg_init(struct vpu_subdev_data *data,
+ 	vpu_debug_enter();
+ 
+ 	if (NULL == reg) {
+-		vpu_err("error: kmalloc fail in reg_init\n");
++		vpu_err("error: kmalloc failed\n");
+ 		return NULL;
+ 	}
+ 
+@@ -1228,13 +1236,13 @@ static struct vpu_reg *reg_init(struct vpu_subdev_data *data,
+ 	INIT_LIST_HEAD(&reg->mem_region_list);
+ 
+ 	if (copy_from_user(&reg->reg[0], (void __user *)src, size)) {
+-		vpu_err("error: copy_from_user failed in reg_init\n");
++		vpu_err("error: copy_from_user failed\n");
+ 		kfree(reg);
+ 		return NULL;
+ 	}
+ 
+ 	if (copy_from_user(&extra_info, (u8 *)src + size, extra_size)) {
+-		vpu_err("error: copy_from_user failed in reg_init\n");
++		vpu_err("error: copy_from_user failed\n");
+ 		kfree(reg);
+ 		return NULL;
+ 	}
+@@ -1610,7 +1618,7 @@ static void try_set_reg(struct vpu_subdev_data *data)
+ 
+ 	mutex_lock(&pservice->shutdown_lock);
+ 	if (atomic_read(&pservice->service_on) == 0) {
+-		mutex_lock(&pservice->shutdown_lock);
++		mutex_unlock(&pservice->shutdown_lock);
+ 		return;
+ 	}
+ 	if (!list_empty(&pservice->waiting)) {
+@@ -1711,7 +1719,7 @@ static int return_reg(struct vpu_subdev_data *data,
+ 	}
+ 
+ 	if (copy_to_user(dst, &reg->reg[base], size)) {
+-		vpu_err("error: return_reg copy_to_user failed\n");
++		vpu_err("error: copy_to_user failed\n");
+ 		return -EFAULT;
+ 	}
+ 
+-- 
+2.35.3
+

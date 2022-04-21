@@ -1,0 +1,134 @@
+From 7b0c2a06a1e87df71d8097bfa1e29d42711980a0 Mon Sep 17 00:00:00 2001
+From: William wu <wulf@rock-chips.com>
+Date: Tue, 8 Nov 2016 16:43:29 +0800
+Subject: [PATCH] CHROMIUM: xhci: fix hung task timeout when rm xhci-hcd
+
+On some special platforms (e.g. rk3399), they will call
+usb_remove_hcd() to remove xhci hcd if no device connected,
+and add xhci hcd again when detect usb device. But they
+just simply remove xhci hcd, and the usb core hub_event
+don't know it at all. The hub_event just find usb device
+disconnect, and try to call usb_disconnect() -> usb_disable
+_endpoint() -> usb_kill_urb() -> usb_hcd_unlink_urb() ->
+xhci_urb_dequeue -> queue a stop endpoint command, and
+then the usb_kill_urb will wait_event(usb_kill_urb_queue,
+atomic_read(&urb->use_count) == 0).
+
+But in this case, we have removed xhci hcd and stop xhci
+controller, so xhci can't complete stop endpoint command
+and fail to call usb_hcd_giveback_urb() which can wakeup
+usb_kill_urb_queue, this cause stall in usb_kill_urb()
+with the following backstrace.
+
+[  240.202208] INFO: task kworker/0:2:130 blocked for more than 120 seconds.
+[  240.208996]       Not tainted 4.4.21 #454
+[  240.213008] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  240.220828] kworker/0:2     D ffffffc000204fd8     0   130      2 0x00000000
+[  240.227919] Workqueue: usb_hub_wq hub_event
+[  240.232117] Call trace:
+[  240.234576] [<ffffffc000204fd8>] __switch_to+0x9c/0xa8
+[  240.239713] [<ffffffc000919cb4>] __schedule+0x440/0x6d8
+[  240.244938] [<ffffffc000919fe0>] schedule+0x94/0xb4
+[  240.249814] [<ffffffc000654530>] usb_kill_urb+0xc4/0x110
+[  240.255128] [<ffffffc000653538>] usb_hcd_flush_endpoint+0x128/0x148
+[  240.261755] [<ffffffc0006560e4>] usb_disable_endpoint+0x70/0xa4
+[  240.267679] [<ffffffc00065617c>] usb_disable_interface+0x64/0x7c
+[  240.273680] [<ffffffc000658760>] usb_unbind_interface+0x88/0x1f8
+[  240.279687] [<ffffffc0005eb260>] __device_release_driver+0xb4/0x114
+[  240.285952] [<ffffffc0005eb2ec>] device_release_driver+0x2c/0x40
+[  240.291956] [<ffffffc0005ea38c>] bus_remove_device+0x110/0x128
+[  240.297783] [<ffffffc0005e730c>] device_del+0x164/0x1f4
+[  240.303006] [<ffffffc000656228>] usb_disable_device+0x94/0x1c8
+[  240.308834] [<ffffffc00064dd08>] usb_disconnect+0x9c/0x1d0
+[  240.314317] [<ffffffc00064f51c>] hub_event+0x58c/0xde0
+[  240.319451] [<ffffffc0002397f0>] process_one_work+0x240/0x424
+[  240.325193] [<ffffffc00023a28c>] worker_thread+0x2fc/0x424
+[  240.330725] [<ffffffc00023f5fc>] kthread+0x10c/0x114
+[  240.335708] [<ffffffc000203dd0>] ret_from_fork+0x10/0x40
+...
+[  240.466674] kworker/4:2     D ffffffc000204fd8     0   153      2 0x00000000
+[  240.473752] Workqueue: events dwc3_rockchip_otg_extcon_evt_work
+[  240.479680] Call trace:
+[  240.482131] [<ffffffc000204fd8>] __switch_to+0x9c/0xa8
+[  240.487265] [<ffffffc000919cb4>] __schedule+0x440/0x6d8
+[  240.492487] [<ffffffc000919fe0>] schedule+0x94/0xb4
+[  240.497361] [<ffffffc00091a364>] schedule_preempt_disabled+0x28/0x44
+[  240.503713] [<ffffffc00091be20>] __mutex_lock_slowpath+0x120/0x1ac
+[  240.509885] [<ffffffc00091bef8>] mutex_lock+0x4c/0x68
+[  240.514936] [<ffffffc00064dcc8>] usb_disconnect+0x5c/0x1d0
+[  240.520415] [<ffffffc000652278>] usb_remove_hcd+0xc8/0x1e0
+[  240.525899] [<ffffffc000668ce8>] dwc3_rockchip_otg_extcon_evt_work+0x154/0x198
+[  240.533112] [<ffffffc0002397f0>] process_one_work+0x240/0x424
+[  240.538856] [<ffffffc00023a28c>] worker_thread+0x2fc/0x424
+[  240.544335] [<ffffffc00023f5fc>] kthread+0x10c/0x114
+[  240.549296] [<ffffffc000203dd0>] ret_from_fork+0x10/0x40
+
+This patch try to do the same thing as XHCI_STATE_HALTED in
+xhci_urb_dequeue() if xhci->xhc_state is XHCI_STATE_REMOVING.
+Because XHCI_STATE_REMOVING means that we are removing xhci
+hcd, and need to call usb_hcd_giveback_urb() directly without
+queueing any stop endpoint command.
+
+In addition, this patch also forbid xhci to queue command or
+slot control if it's in XHCI_STATE_REMOVING. It maybe helpful
+to avoid the other unexpected problems, though I haven't met
+them so far.
+
+BUG=chrome-os-partner:59103
+TEST=do plug/unplug USB-C HUB with an USB3 flash drive,
+check if kernel blocked for more than 120 seconds.
+
+Change-Id: I35ec94dcc742d29d52f73fa30f79cf005063ea55
+Signed-off-by: William wu <wulf@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/408127
+Commit-Ready: Guenter Roeck <groeck@chromium.org>
+Tested-by: Guenter Roeck <groeck@chromium.org>
+Tested-by: Inno Park <ih.yoo.park@samsung.com>
+Reviewed-by: Guenter Roeck <groeck@chromium.org>
+Signed-off-by: William Wu <wulf@rock-chips.com>
+---
+ drivers/usb/host/xhci-ring.c | 3 ++-
+ drivers/usb/host/xhci.c      | 6 ++++--
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 62a5c8d5e028..3bc2295669c8 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -4033,7 +4033,8 @@ static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
+ 	int ret;
+ 
+ 	if ((xhci->xhc_state & XHCI_STATE_DYING) ||
+-		(xhci->xhc_state & XHCI_STATE_HALTED)) {
++		(xhci->xhc_state & XHCI_STATE_HALTED) ||
++		(xhci->xhc_state & XHCI_STATE_REMOVING)) {
+ 		xhci_dbg(xhci, "xHCI dying or halted, can't queue_command\n");
+ 		return -ESHUTDOWN;
+ 	}
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index e6ed6b2eab8e..c4e2b1886f5d 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1558,7 +1558,8 @@ int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 	if (ret || !urb->hcpriv)
+ 		goto done;
+ 	temp = readl(&xhci->op_regs->status);
+-	if (temp == 0xffffffff || (xhci->xhc_state & XHCI_STATE_HALTED)) {
++	if (temp == 0xffffffff || (xhci->xhc_state & XHCI_STATE_HALTED) ||
++	    (xhci->xhc_state & XHCI_STATE_REMOVING)) {
+ 		xhci_dbg_trace(xhci, trace_xhci_dbg_cancel_urb,
+ 				"HW died, freeing TD.");
+ 		urb_priv = urb->hcpriv;
+@@ -3661,7 +3662,8 @@ void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 	/* Don't disable the slot if the host controller is dead. */
+ 	state = readl(&xhci->op_regs->status);
+ 	if (state == 0xffffffff || (xhci->xhc_state & XHCI_STATE_DYING) ||
+-			(xhci->xhc_state & XHCI_STATE_HALTED)) {
++			(xhci->xhc_state & XHCI_STATE_HALTED) ||
++			(xhci->xhc_state & XHCI_STATE_REMOVING)) {
+ 		xhci_free_virt_device(xhci, udev->slot_id);
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		kfree(command);
+-- 
+2.35.3
+

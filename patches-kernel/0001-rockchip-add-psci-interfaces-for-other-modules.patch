@@ -1,0 +1,238 @@
+From d95eb4fdf34f7f16fc8c66a3a63d5d282295034e Mon Sep 17 00:00:00 2001
+From: Huibin Hong <huibin.hong@rock-chips.com>
+Date: Tue, 1 Sep 2015 18:10:37 +0800
+Subject: [PATCH] rockchip: add psci interfaces for other modules
+
+Change-Id: I000e3033305f695a8929fbab98a87eea608e76cd
+Signed-off-by: Huibin Hong <huibin.hong@rock-chips.com>
+---
+ arch/arm/mach-rockchip/psci.c     | 133 ++++++++++++++++++++++++++++++
+ arch/arm64/mach-rockchip/Makefile |   1 +
+ include/linux/rockchip/psci.h     |  63 ++++++++++++++
+ 3 files changed, 197 insertions(+)
+ create mode 100644 arch/arm/mach-rockchip/psci.c
+ create mode 100644 include/linux/rockchip/psci.h
+
+diff --git a/arch/arm/mach-rockchip/psci.c b/arch/arm/mach-rockchip/psci.c
+new file mode 100644
+index 000000000000..66d4905e0930
+--- /dev/null
++++ b/arch/arm/mach-rockchip/psci.c
+@@ -0,0 +1,133 @@
++/*
++ * arch/arm/mach-rockchip/psci.c
++ *
++ * PSCI call interface for rockchip
++ *
++ * Copyright (C) 2015 ROCKCHIP, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/of.h>
++#include <linux/types.h>
++#include <linux/rockchip/psci.h>
++#include <asm/compiler.h>
++#include <asm/smp_plat.h>
++
++static u32 reg_rd_fn_smc(u64 function_id, u64 arg0, u64 arg1, u64 arg2,
++			 u64 *val)
++{
++	asm volatile(
++			__asmeq("%0", "x0")
++			__asmeq("%1", "x1")
++			__asmeq("%2", "x2")
++			__asmeq("%3", "x3")
++			"smc	#0\n"
++		: "+r" (function_id), "+r" (arg0)
++		: "r" (arg1), "r" (arg2));
++
++		if (val)
++			*val = arg0;
++
++	return function_id;
++}
++
++static u32 reg_wr_fn_smc(u64 function_id, u64 arg0, u64 arg1, u64 arg2)
++{
++	asm volatile(
++			__asmeq("%0", "x0")
++			__asmeq("%1", "x1")
++			__asmeq("%2", "x2")
++			__asmeq("%3", "x3")
++			"smc	#0\n"
++		: "+r" (function_id), "+r" (arg0)
++		: "r" (arg1), "r" (arg2));
++
++	return function_id;
++}
++
++static u32 (*reg_wr_fn)(u64, u64, u64, u64) = reg_wr_fn_smc;
++static u32 (*reg_rd_fn)(u64, u64, u64, u64, u64 *) = reg_rd_fn_smc;
++
++/*
++ * u64 *val: another return value
++ */
++u32 rockchip_psci_smc_read(u64 function_id, u64 arg0, u64 arg1, u64 arg2,
++			   u64 *val)
++{
++	return reg_rd_fn(function_id, arg0, arg1, arg2, val);
++}
++
++u32 rockchip_psci_smc_write(u64 function_id, u64 arg0, u64 arg1, u64 arg2)
++{
++	return reg_wr_fn(function_id, arg0, arg1, arg2);
++}
++
++u32 rockchip_secure_reg_read32(u64 addr_phy)
++{
++	u64 val = 0;
++
++	reg_rd_fn(PSCI_SIP_ACCESS_REG, 0, addr_phy, SEC_REG_RD_32, &val);
++
++	return val;
++}
++
++u32 rockchip_secure_reg_write32(u64 addr_phy, u32 val)
++{
++	u64 val_64 = val;
++
++	return reg_wr_fn(PSCI_SIP_ACCESS_REG, val_64, addr_phy, SEC_REG_WR_32);
++}
++
++/*
++ * get trust firmware verison
++ */
++u32 rockchip_psci_smc_get_tf_ver(void)
++{
++	return reg_rd_fn(PSCI_SIP_RKTF_VER, 0, 0, 0, NULL);
++}
++
++/*************************** fiq debug *****************************/
++static u64 ft_fiq_mem_phy;
++static void __iomem *ft_fiq_mem_base;
++static void (*psci_fiq_debugger_uart_irq_tf)(void *reg_base, u64 sp_el1);
++
++void psci_fiq_debugger_uart_irq_tf_cb(u64 sp_el1, u64 offset)
++{
++	psci_fiq_debugger_uart_irq_tf((char *)ft_fiq_mem_base + offset, sp_el1);
++
++	reg_wr_fn(PSCI_SIP_UARTDBG_CFG, 0, 0, UARTDBG_CFG_OSHDL_TO_OS);
++}
++
++void psci_fiq_debugger_uart_irq_tf_init(u32 irq_id, void *callback)
++{
++	psci_fiq_debugger_uart_irq_tf = callback;
++
++	ft_fiq_mem_phy = reg_wr_fn(PSCI_SIP_UARTDBG_CFG, irq_id,
++				   (u64)psci_fiq_debugger_uart_irq_tf_cb,
++				   UARTDBG_CFG_INIT);
++	ft_fiq_mem_base = ioremap(ft_fiq_mem_phy, 8 * 1024);
++}
++
++u32 psci_fiq_debugger_switch_cpu(u32 cpu)
++{
++	return reg_wr_fn(PSCI_SIP_UARTDBG_CFG, cpu_logical_map(cpu),
++			 0, UARTDBG_CFG_OSHDL_CPUSW);
++}
++
++void psci_fiq_debugger_enable_debug(bool val)
++{
++	if (val)
++		reg_wr_fn(PSCI_SIP_UARTDBG_CFG, 0,
++			  0, UARTDBG_CFG_OSHDL_DEBUG_ENABLE);
++	else
++		reg_wr_fn(PSCI_SIP_UARTDBG_CFG, 0,
++			  0, UARTDBG_CFG_OSHDL_DEBUG_DISABLE);
++}
+diff --git a/arch/arm64/mach-rockchip/Makefile b/arch/arm64/mach-rockchip/Makefile
+index 3fab65b04aef..2b2435be89a7 100644
+--- a/arch/arm64/mach-rockchip/Makefile
++++ b/arch/arm64/mach-rockchip/Makefile
+@@ -4,6 +4,7 @@ obj-y += ../../arm/mach-rockchip/efuse.o
+ obj-y += ../../arm/mach-rockchip/pvtm.o
+ obj-y += ../../arm/mach-rockchip/rk_system_status.o
+ obj-y += ../../arm/mach-rockchip/ddr_freq.o
++obj-y += ../../arm/mach-rockchip/psci.o
+ obj-$(CONFIG_PM) += ../../arm/mach-rockchip/rockchip_pm.o pm-rk3368.o
+ obj-$(CONFIG_RK_LAST_LOG) += ../../arm/mach-rockchip/last_log.o
+ obj-$(CONFIG_DVFS) += ../../arm/mach-rockchip/dvfs.o
+diff --git a/include/linux/rockchip/psci.h b/include/linux/rockchip/psci.h
+new file mode 100644
+index 000000000000..93c7c827a69f
+--- /dev/null
++++ b/include/linux/rockchip/psci.h
+@@ -0,0 +1,63 @@
++#ifndef __ROCKCHIP_PSCI_H
++#define __ROCKCHIP_PSCI_H
++
++#define SEC_REG_RW_SHT (0x0)
++#define SEC_REG_RD (0x0)
++#define SEC_REG_WR (0x1)
++
++#define SEC_REG_BITS_SHT (0x1)
++#define SEC_REG_32 (0x0)
++#define SEC_REG_64 (0x2)
++
++#define SEC_REG_RD_32 (SEC_REG_RD | SEC_REG_32)
++#define SEC_REG_RD_64 (SEC_REG_RD | SEC_REG_64)
++#define SEC_REG_WR_32 (SEC_REG_WR | SEC_REG_32)
++#define SEC_REG_WR_64 (SEC_REG_WR | SEC_REG_64)
++
++/*
++ * trust firmware verison
++ */
++#define RKTF_VER_MAJOR(ver)		(((ver) >> 16) & 0xffff)
++#define RKTF_VER_MINOR(ver)		((ver) & 0xffff)
++
++/*
++ * pcsi smc funciton id
++ */
++#define PSCI_SIP_RKTF_VER		(0x82000001)
++#define PSCI_SIP_ACCESS_REG		(0x82000002)
++#define PSCI_SIP_SUSPEND_WR_CTRBITS	(0x82000003)
++#define PSCI_SIP_PENDING_CPUS		(0x82000004)
++#define PSCI_SIP_UARTDBG_CFG		(0x82000005)
++#define PSCI_SIP_EL3FIQ_CFG		(0x82000006)
++
++/*
++ * pcsi smc funciton err code
++ */
++#define PSCI_SMC_FUNC_UNK		0xffffffff
++
++/*
++ * define PSCI_SIP_UARTDBG_CFG call type
++ */
++#define UARTDBG_CFG_INIT		0xf0
++#define UARTDBG_CFG_OSHDL_TO_OS		0xf1
++#define UARTDBG_CFG_OSHDL_CPUSW		0xf3
++#define UARTDBG_CFG_OSHDL_DEBUG_ENABLE	0xf4
++#define UARTDBG_CFG_OSHDL_DEBUG_DISABLE	0xf5
++
++/*
++ * rockchip psci function call interface
++ */
++u32 rockchip_psci_smc_read(u64 function_id, u64 arg0, u64 arg1, u64 arg2,
++			   u64 *val);
++u32 rockchip_psci_smc_write(u64 function_id, u64 arg0, u64 arg1, u64 arg2);
++
++u32 rockchip_psci_smc_get_tf_ver(void);
++u32 rockchip_secure_reg_read32(u64 addr_phy);
++u32 rockchip_secure_reg_write32(u64 addr_phy, u32 val);
++
++u32 psci_fiq_debugger_switch_cpu(u32 cpu);
++void psci_fiq_debugger_uart_irq_tf_cb(u64 sp_el1, u64 offset);
++void psci_fiq_debugger_uart_irq_tf_init(u32 irq_id, void *callback);
++void psci_fiq_debugger_enable_debug(bool val);
++
++#endif /* __ROCKCHIP_PSCI_H */
+-- 
+2.35.3
+

@@ -1,0 +1,267 @@
+From a78e027a8488907edfbe843b1da3d6e85c51e719 Mon Sep 17 00:00:00 2001
+From: ljf <ljf@rock-chips.com>
+Date: Tue, 22 Apr 2014 16:53:43 +0800
+Subject: [PATCH] rk3288: iep support iommu
+
+---
+ drivers/video/rockchip/iep/hw_iep_reg.c | 95 +++++++++++++++++++++++++
+ drivers/video/rockchip/iep/iep_drv.c    | 40 +++++++++++
+ drivers/video/rockchip/iep/iep_drv.h    | 30 ++++++++
+ 3 files changed, 165 insertions(+)
+
+diff --git a/drivers/video/rockchip/iep/hw_iep_reg.c b/drivers/video/rockchip/iep/hw_iep_reg.c
+index b52210f9fb01..f926bee4404c 100755
+--- a/drivers/video/rockchip/iep/hw_iep_reg.c
++++ b/drivers/video/rockchip/iep/hw_iep_reg.c
+@@ -1111,6 +1111,89 @@ void iep_switch_input_address(void *base) {
+     IEP_REGB_SRC_ADDR_CR1  (base, src_addr_cr);
+ }
+ 
++#if defined(CONFIG_IEP_IOMMU)
++static int iep_bufid_to_iova(iep_service_info *pservice, u8 *tbl, int size, struct iep_reg *reg)
++{
++    int i;
++    int usr_fd = 0;
++    int offset = 0;
++    
++    if (tbl == NULL || size <= 0) {
++        dev_err(pservice->iommu_dev, "input arguments invalidate\n");
++        return -1;
++    }
++   
++    for (i=0; i<size; i++) {
++#if 0
++        if (copy_from_user(&usr_fd, &reg->reg[addr_tbl_vpu_dec[i]], sizeof(usr_fd)))
++            return -EFAULT;
++#else
++        usr_fd = reg->reg[tbl[i]] & 0x3FF;
++        offset = reg->reg[tbl[i]] >> 10;
++        
++#endif
++        if (usr_fd != 0) {
++            struct ion_handle *hdl;
++            
++            hdl = ion_import_dma_buf(pservice->ion_client, usr_fd);
++            if (IS_ERR(hdl)) {
++                dev_err(pservice->iommu_dev, "import dma-buf from fd %d failed, reg[%d]\n", usr_fd, tbl[i]);
++                return PTR_ERR(hdl);
++            }
++
++#if 0
++            {
++                ion_phys_addr_t phy_addr;
++                size_t len;
++                ion_phys(pservice->ion_client, hdl, &phy_addr, &len);
++    
++                reg->reg[tbl[i]] = phy_addr + offset;
++                
++                ion_free(pservice->ion_client, hdl);
++            }
++#else 
++            {
++                int ret;
++                struct iep_mem_region *mem_region;
++                mem_region = kzalloc(sizeof(struct iep_mem_region), GFP_KERNEL);
++     
++                if (mem_region == NULL) {
++                    dev_err(pservice->iommu_dev, "allocate memory for iommu memory region failed\n");
++                    ion_free(pservice->ion_client, hdl);
++                    return -1;
++                }
++                
++                mem_region->hdl = hdl;
++                
++                ret = ion_map_iommu(pservice->iommu_dev, pservice->ion_client, mem_region->hdl, &mem_region->iova, &mem_region->len);
++                if (ret < 0) {
++                    dev_err(pservice->iommu_dev, "ion map iommu failed\n");
++                    kfree(mem_region);
++                    ion_free(pservice->ion_client, hdl);
++                    return ret;
++                }
++                
++                reg->reg[tbl[i]] = mem_region->iova + offset;
++                INIT_LIST_HEAD(&mem_region->reg_lnk);
++                list_add_tail(&mem_region->reg_lnk, &reg->mem_region_list);
++            }
++#endif
++        }
++    }
++    
++    return 0;
++}
++
++static u8 addr_tbl_iep[] = {
++    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55
++};
++
++static int iep_reg_address_translate(iep_service_info *pservice, struct iep_reg *reg)
++{
++    return iep_bufid_to_iova(pservice, addr_tbl_iep, sizeof(addr_tbl_iep), reg);
++}
++#endif
++
+ /**
+  * generating a series of registers copy from iep message
+  */
+@@ -1125,6 +1208,10 @@ void iep_config(iep_session *session, IEP_MSG *iep_msg)
+ 
+     INIT_LIST_HEAD(&reg->session_link);
+     INIT_LIST_HEAD(&reg->status_link);
++    
++#if defined(CONFIG_IEP_IOMMU)
++    INIT_LIST_HEAD(&reg->mem_region_list);    
++#endif    
+ 
+     //write config
+     iep_config_src_size(iep_msg);
+@@ -1177,6 +1264,14 @@ void iep_config(iep_session *session, IEP_MSG *iep_msg)
+     iep_config_mmu_dte_addr(iep_msg->base, (uint32_t)virt_to_phys((uint32_t*)session->dte_table));
+ #endif
+ 
++#if defined(CONFIG_IEP_IOMMU)
++    if (0 > iep_reg_address_translate(&iep_service, reg)) {
++        pr_err("error: translate reg address failed\n");
++        kfree(reg);
++        return;
++    }
++#endif
++
+     mutex_lock(&iep_service.lock);
+ 
+     list_add_tail(&reg->status_link, &iep_service.waiting);
+diff --git a/drivers/video/rockchip/iep/iep_drv.c b/drivers/video/rockchip/iep/iep_drv.c
+index 55fcf2ddfcbd..7135b7bd0ca3 100755
+--- a/drivers/video/rockchip/iep/iep_drv.c
++++ b/drivers/video/rockchip/iep/iep_drv.c
+@@ -76,6 +76,16 @@ iep_service_info iep_service;
+ 
+ static void iep_reg_deinit(struct iep_reg *reg)
+ {
++#if defined(CONFIG_IEP_IOMMU)
++    struct iep_mem_region *mem_region = NULL, *n;
++    // release memory region attach to this registers table.
++    list_for_each_entry_safe(mem_region, n, &reg->mem_region_list, reg_lnk) {
++        ion_unmap_iommu(iep_service.iommu_dev, iep_service.ion_client, mem_region->hdl);
++        ion_free(iep_service.ion_client, mem_region->hdl);
++        list_del_init(&mem_region->reg_lnk);
++        kfree(mem_region);
++    }
++#endif 
+     list_del_init(&reg->session_link);
+     list_del_init(&reg->status_link);
+     kfree(reg);
+@@ -710,6 +720,9 @@ static long iep_ioctl(struct file *filp, uint32_t cmd, unsigned long arg)
+             
+             if (ret == 0) {
+                 if (atomic_read(&iep_service.waitcnt) < 10) {
++#if defined(CONFIG_IEP_IOMMU)
++                    iep_power_on(); /* for iep iommu reg configure. */
++#endif
+                     iep_config(session, msg);
+                     atomic_inc(&iep_service.waitcnt);
+                 } else {
+@@ -762,11 +775,17 @@ static struct miscdevice iep_dev = {
+     .fops  = &iep_fops,
+ };
+ 
++#if defined(CONFIG_IEP_IOMMU)
++extern struct ion_client *rockchip_ion_client_create(const char * name);
++#endif
+ static int iep_drv_probe(struct platform_device *pdev)
+ {
+     struct iep_drvdata *data;
+     int ret = 0;
+     struct resource *res = NULL;
++#if defined(CONFIG_IEP_IOMMU)
++    struct device *mmu_dev = NULL;
++#endif
+ 
+     data = (struct iep_drvdata*)devm_kzalloc(&pdev->dev, sizeof(struct iep_drvdata), GFP_KERNEL);
+     if (NULL == data) {
+@@ -849,6 +868,27 @@ static int iep_drv_probe(struct platform_device *pdev)
+         IEP_ERR("cannot register miscdev (%d)\n", ret);
+         goto err_misc_register;
+     }
++    
++#if defined(CONFIG_IEP_IOMMU)
++    iep_power_on();
++    iep_service.ion_client = rockchip_ion_client_create("iep");
++    if (IS_ERR(iep_service.ion_client)) {
++        dev_err(&pdev->dev, "failed to create ion client for vcodec");
++        return PTR_ERR(iep_service.ion_client);
++    } else {
++        dev_info(&pdev->dev, "vcodec ion client create success!\n");
++    }
++   
++    mmu_dev = rockchip_get_sysmmu_device_by_compatible("iommu,iep");
++    
++    if (mmu_dev) {
++        platform_set_sysmmu(mmu_dev, &pdev->dev);
++        iovmm_activate(&pdev->dev);
++    }
++    
++    iep_service.iommu_dev = &pdev->dev;
++    iep_power_off();
++#endif
+ 
+     IEP_INFO("IEP Driver loaded succesfully\n");
+ 
+diff --git a/drivers/video/rockchip/iep/iep_drv.h b/drivers/video/rockchip/iep/iep_drv.h
+index 5ebbe3fec9a5..39c650a6a4fd 100755
+--- a/drivers/video/rockchip/iep/iep_drv.h
++++ b/drivers/video/rockchip/iep/iep_drv.h
+@@ -4,6 +4,17 @@
+ #include <linux/device.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mutex.h>
++
++#if defined(CONFIG_ROCKCHIP_IOMMU) && defined(CONFIG_ION_ROCKCHIP)
++//#define CONFIG_IEP_IOMMU
++#endif
++
++#ifdef CONFIG_IEP_IOMMU
++#include <linux/rockchip_ion.h>
++#include <linux/rockchip/iovmm.h>
++#include <linux/rockchip/sysmmu.h>
++#include <linux/dma-buf.h>
++#endif
+ #include "iep.h"
+ 
+ #define IEP_REG_LEN         0x100
+@@ -131,6 +142,11 @@ typedef struct iep_service_info {
+     bool                enable;
+ 
+     struct mutex	    mutex;  // mutex
++    
++#ifdef CONFIG_IEP_IOMMU
++    struct ion_client *ion_client;
++    struct device *iommu_dev;
++#endif 
+ } iep_service_info;
+ 
+ struct iep_reg {
+@@ -147,7 +163,21 @@ struct iep_reg {
+     int                 vir_height;
+     int                 layer;
+     unsigned int        format;
++#if defined(CONFIG_IEP_IOMMU)    
++    struct list_head    mem_region_list;
++#endif        
+ };
+ 
++#if defined(CONFIG_IEP_IOMMU)
++struct iep_mem_region {
++    struct list_head srv_lnk;
++    struct list_head reg_lnk;
++    struct list_head session_lnk;
++    unsigned long iova;              /* virtual address for iommu */
++    unsigned long len;
++    struct ion_handle *hdl;
++};
++#endif
++
+ #endif
+ 
+-- 
+2.35.3
+

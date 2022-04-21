@@ -1,0 +1,305 @@
+From 726afe84316cce23e68e20bf86f04872009aa5ee Mon Sep 17 00:00:00 2001
+From: Wyon Bi <bivvy.bi@rock-chips.com>
+Date: Fri, 12 Jul 2019 09:09:58 +0800
+Subject: [PATCH] drm/rockchip: cdn-dp: support dp training outside dp firmware
+
+DP firmware uses fixed phy config values to do training, but some
+boards need to adjust these values to fit for their unique hardware
+design. So get phy config values from dts and use software link training
+instead of relying on firmware, if software training fail, keep firmware
+training as a fallback if sw training fails.
+
+Change-Id: I075bff6aa153a5e18b6a5ddec2645131f1411913
+Signed-off-by: Chris Zhong <zyw@rock-chips.com>
+Signed-off-by: Lin Huang <hl@rock-chips.com>
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/Makefile             |  3 +-
+ drivers/gpu/drm/rockchip/cdn-dp-core.c        | 24 ++++++-----
+ drivers/gpu/drm/rockchip/cdn-dp-core.h        |  2 +
+ .../gpu/drm/rockchip/cdn-dp-link-training.c   | 23 ++++++++---
+ drivers/gpu/drm/rockchip/cdn-dp-reg.c         | 29 +++++++++++++-
+ drivers/gpu/drm/rockchip/cdn-dp-reg.h         | 40 ++++++++++++++++++-
+ 6 files changed, 103 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/Makefile b/drivers/gpu/drm/rockchip/Makefile
+index 6982d2f59181..65eb7b91705d 100644
+--- a/drivers/gpu/drm/rockchip/Makefile
++++ b/drivers/gpu/drm/rockchip/Makefile
+@@ -9,7 +9,8 @@ rockchipdrm-y := rockchip_drm_drv.o rockchip_drm_fb.o \
+ rockchipdrm-$(CONFIG_DRM_FBDEV_EMULATION) += rockchip_drm_fbdev.o
+ 
+ rockchipdrm-$(CONFIG_ROCKCHIP_ANALOGIX_DP) += analogix_dp-rockchip.o
+-rockchipdrm-$(CONFIG_ROCKCHIP_CDN_DP) += cdn-dp-core.o cdn-dp-reg.o
++rockchipdrm-$(CONFIG_ROCKCHIP_CDN_DP) += cdn-dp-core.o cdn-dp-reg.o \
++					 cdn-dp-link-training.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_DW_HDMI) += dw_hdmi-rockchip.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_DW_MIPI_DSI) += dw-mipi-dsi.o
+ rockchipdrm-$(CONFIG_ROCKCHIP_INNO_HDMI) += inno_hdmi.o
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.c b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+index 1c51de86f1ea..407da0ea738d 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+@@ -670,11 +670,13 @@ static void cdn_dp_encoder_enable(struct drm_encoder *encoder)
+ 			goto out;
+ 		}
+ 	}
+-
+-	ret = cdn_dp_set_video_status(dp, CONTROL_VIDEO_IDLE);
+-	if (ret) {
+-		DRM_DEV_ERROR(dp->dev, "Failed to idle video %d\n", ret);
+-		goto out;
++	if (dp->use_fw_training) {
++		ret = cdn_dp_set_video_status(dp, CONTROL_VIDEO_IDLE);
++		if (ret) {
++			DRM_DEV_ERROR(dp->dev,
++				      "Failed to idle video %d\n", ret);
++			goto out;
++		}
+ 	}
+ 
+ 	ret = cdn_dp_config_video(dp);
+@@ -683,11 +685,15 @@ static void cdn_dp_encoder_enable(struct drm_encoder *encoder)
+ 		goto out;
+ 	}
+ 
+-	ret = cdn_dp_set_video_status(dp, CONTROL_VIDEO_VALID);
+-	if (ret) {
+-		DRM_DEV_ERROR(dp->dev, "Failed to valid video %d\n", ret);
+-		goto out;
++	if (dp->use_fw_training) {
++		ret = cdn_dp_set_video_status(dp, CONTROL_VIDEO_VALID);
++		if (ret) {
++			DRM_DEV_ERROR(dp->dev,
++				"Failed to valid video %d\n", ret);
++			goto out;
++		}
+ 	}
++
+ out:
+ 	mutex_unlock(&dp->lock);
+ }
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.h b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+index 46159b279a48..77a97934b4e9 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+@@ -84,6 +84,7 @@ struct cdn_dp_device {
+ 	bool connected;
+ 	bool active;
+ 	bool suspended;
++	bool use_fw_training;
+ 
+ 	const struct firmware *fw;	/* cdn dp firmware */
+ 	unsigned int fw_version;	/* cdn fw version */
+@@ -106,6 +107,7 @@ struct cdn_dp_device {
+ 	u8 ports;
+ 	u8 lanes;
+ 	int active_port;
++	u8 train_set[4];
+ 
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	bool sink_has_audio;
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-link-training.c b/drivers/gpu/drm/rockchip/cdn-dp-link-training.c
+index 73c329008c27..f5c0f6924352 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-link-training.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-link-training.c
+@@ -7,7 +7,6 @@
+ #include <linux/device.h>
+ #include <linux/delay.h>
+ #include <linux/phy/phy.h>
+-#include <soc/rockchip/rockchip_phy_typec.h>
+ 
+ #include "cdn-dp-core.h"
+ #include "cdn-dp-reg.h"
+@@ -15,15 +14,13 @@
+ static void cdn_dp_set_signal_levels(struct cdn_dp_device *dp)
+ {
+ 	struct cdn_dp_port *port = dp->port[dp->active_port];
+-	struct rockchip_typec_phy *tcphy = phy_get_drvdata(port->phy);
+-
+ 	int rate = drm_dp_bw_code_to_link_rate(dp->link.rate);
+ 	u8 swing = (dp->train_set[0] & DP_TRAIN_VOLTAGE_SWING_MASK) >>
+ 		   DP_TRAIN_VOLTAGE_SWING_SHIFT;
+ 	u8 pre_emphasis = (dp->train_set[0] & DP_TRAIN_PRE_EMPHASIS_MASK)
+ 			  >> DP_TRAIN_PRE_EMPHASIS_SHIFT;
+ 
+-	tcphy->typec_phy_config(port->phy, rate, dp->link.num_lanes,
++	tcphy_dp_set_phy_config(port->phy, rate, dp->link.num_lanes,
+ 				swing, pre_emphasis);
+ }
+ 
+@@ -354,9 +351,11 @@ static int cdn_dp_get_lower_link_rate(struct cdn_dp_device *dp)
+ 
+ int cdn_dp_software_train_link(struct cdn_dp_device *dp)
+ {
++	struct cdn_dp_port *port = dp->port[dp->active_port];
+ 	int ret, stop_err;
+ 	u8 link_config[2];
+ 	u32 rate, sink_max, source_max;
++	bool ssc_on;
+ 
+ 	ret = drm_dp_dpcd_read(&dp->aux, DP_DPCD_REV, dp->dpcd,
+ 			       sizeof(dp->dpcd));
+@@ -374,13 +373,27 @@ int cdn_dp_software_train_link(struct cdn_dp_device *dp)
+ 	rate = min(source_max, sink_max);
+ 	dp->link.rate = drm_dp_link_rate_to_bw_code(rate);
+ 
+-	link_config[0] = 0;
++	ssc_on = !!(dp->dpcd[DP_MAX_DOWNSPREAD] & DP_MAX_DOWNSPREAD_0_5);
++	link_config[0] = ssc_on ? DP_SPREAD_AMP_0_5 : 0;
+ 	link_config[1] = 0;
+ 	if (dp->dpcd[DP_MAIN_LINK_CHANNEL_CODING] & 0x01)
+ 		link_config[1] = DP_SET_ANSI_8B10B;
+ 	drm_dp_dpcd_write(&dp->aux, DP_DOWNSPREAD_CTRL, link_config, 2);
+ 
+ 	while (true) {
++		ret = tcphy_dp_set_link_rate(port->phy,
++				drm_dp_bw_code_to_link_rate(dp->link.rate),
++				ssc_on);
++		if (ret) {
++			DRM_ERROR("failed to set link rate: %d\n", ret);
++			return ret;
++		}
++
++		ret = tcphy_dp_set_lane_count(port->phy, dp->link.num_lanes);
++		if (ret) {
++			DRM_ERROR("failed to set lane count: %d\n", ret);
++			return ret;
++		}
+ 
+ 		/* Write the link configuration data */
+ 		link_config[0] = dp->link.rate;
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.c b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+index 65db9b5a52f3..60138d8b19df 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+@@ -189,7 +189,7 @@ static int cdn_dp_mailbox_send(struct cdn_dp_device *dp, u8 module_id,
+ 	return 0;
+ }
+ 
+-static int cdn_dp_reg_write(struct cdn_dp_device *dp, u16 addr, u32 val)
++int cdn_dp_reg_write(struct cdn_dp_device *dp, u16 addr, u32 val)
+ {
+ 	u8 msg[6];
+ 
+@@ -609,6 +609,31 @@ int cdn_dp_train_link(struct cdn_dp_device *dp)
+ {
+ 	int ret;
+ 
++	/*
++	 * DP firmware uses fixed phy config values to do training, but some
++	 * boards need to adjust these values to fit for their unique hardware
++	 * design. So if the phy is using custom config values, do software
++	 * link training instead of relying on firmware, if software training
++	 * fail, keep firmware training as a fallback if sw training fails.
++	 */
++	ret = cdn_dp_software_train_link(dp);
++	if (ret) {
++		DRM_DEV_ERROR(dp->dev,
++			"Failed to do software training %d\n", ret);
++		goto do_fw_training;
++	}
++	ret = cdn_dp_reg_write(dp, SOURCE_HDTX_CAR, 0xf);
++	if (ret) {
++		DRM_DEV_ERROR(dp->dev,
++			"Failed to write SOURCE_HDTX_CAR register %d\n", ret);
++		goto do_fw_training;
++	}
++	dp->use_fw_training = false;
++	return 0;
++
++do_fw_training:
++	dp->use_fw_training = true;
++	DRM_DEV_DEBUG_KMS(dp->dev, "use fw training\n");
+ 	ret = cdn_dp_training_start(dp);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dp->dev, "Failed to start training %d\n", ret);
+@@ -623,7 +648,7 @@ int cdn_dp_train_link(struct cdn_dp_device *dp)
+ 
+ 	DRM_DEV_DEBUG_KMS(dp->dev, "rate:0x%x, lanes:%d\n", dp->link.rate,
+ 			  dp->link.num_lanes);
+-	return ret;
++	return 0;
+ }
+ 
+ int cdn_dp_set_video_status(struct cdn_dp_device *dp, int active)
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.h b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+index 6580b11dd06b..a85a9387f987 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+@@ -16,6 +16,8 @@
+ #define _CDN_DP_REG_H
+ 
+ #include <linux/bitops.h>
++#include <linux/phy/phy.h>
++#include <linux/phy/phy-rockchip-typec.h>
+ 
+ #define ADDR_IMEM		0x10000
+ #define ADDR_DMEM		0x20000
+@@ -137,7 +139,7 @@
+ #define HPD_EVENT_MASK			0x211c
+ #define HPD_EVENT_DET			0x2120
+ 
+-/* dpyx framer addr */
++/* dptx framer addr */
+ #define DP_FRAMER_GLOBAL_CONFIG		0x2200
+ #define DP_SW_RESET			0x2204
+ #define DP_FRAMER_TU			0x2208
+@@ -431,6 +433,40 @@
+ /* Reference cycles when using lane clock as reference */
+ #define LANE_REF_CYC				0x8000
+ 
++/* register CM_VID_CTRL */
++#define LANE_VID_REF_CYC(x)                    (((x) & (BIT(24) - 1)) << 0)
++#define NMVID_MEAS_TOLERANCE(x)                        (((x) & 0xf) << 24)
++
++/* register DP_TX_PHY_CONFIG_REG */
++#define DP_TX_PHY_TRAINING_ENABLE(x)           ((x) & 1)
++#define DP_TX_PHY_TRAINING_TYPE_PRBS7          (0 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_TPS1           (1 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_TPS2           (2 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_TPS3           (3 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_TPS4           (4 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_PLTPAT         (5 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_D10_2          (6 << 1)
++#define DP_TX_PHY_TRAINING_TYPE_HBR2CPAT       (8 << 1)
++#define DP_TX_PHY_TRAINING_PATTERN(x)          ((x) << 1)
++#define DP_TX_PHY_SCRAMBLER_BYPASS(x)          (((x) & 1) << 5)
++#define DP_TX_PHY_ENCODER_BYPASS(x)            (((x) & 1) << 6)
++#define DP_TX_PHY_SKEW_BYPASS(x)               (((x) & 1) << 7)
++#define DP_TX_PHY_DISPARITY_RST(x)             (((x) & 1) << 8)
++#define DP_TX_PHY_LANE0_SKEW(x)                (((x) & 7) << 9)
++#define DP_TX_PHY_LANE1_SKEW(x)                (((x) & 7) << 12)
++#define DP_TX_PHY_LANE2_SKEW(x)                (((x) & 7) << 15)
++#define DP_TX_PHY_LANE3_SKEW(x)                (((x) & 7) << 18)
++#define DP_TX_PHY_10BIT_ENABLE(x)              (((x) & 1) << 21)
++
++/* register DP_FRAMER_GLOBAL_CONFIG */
++#define NUM_LANES(x)           ((x) & 3)
++#define SST_MODE               (0 << 2)
++#define RG_EN                  (0 << 4)
++#define GLOBAL_EN              BIT(3)
++#define NO_VIDEO               BIT(5)
++#define ENC_RST_DIS            BIT(6)
++#define WR_VHSYNC_FALL         BIT(7)
++
+ enum voltage_swing_level {
+ 	VOLTAGE_LEVEL_0,
+ 	VOLTAGE_LEVEL_1,
+@@ -476,6 +512,7 @@ int cdn_dp_set_host_cap(struct cdn_dp_device *dp, u8 lanes, bool flip);
+ int cdn_dp_event_config(struct cdn_dp_device *dp);
+ u32 cdn_dp_get_event(struct cdn_dp_device *dp);
+ int cdn_dp_get_hpd_status(struct cdn_dp_device *dp);
++int cdn_dp_reg_write(struct cdn_dp_device *dp, u16 addr, u32 val);
+ ssize_t cdn_dp_dpcd_write(struct cdn_dp_device *dp, u32 addr,
+ 			  u8 *data, u16 len);
+ ssize_t cdn_dp_dpcd_read(struct cdn_dp_device *dp, u32 addr,
+@@ -489,4 +526,5 @@ int cdn_dp_config_video(struct cdn_dp_device *dp);
+ int cdn_dp_audio_stop(struct cdn_dp_device *dp, struct audio_info *audio);
+ int cdn_dp_audio_mute(struct cdn_dp_device *dp, bool enable);
+ int cdn_dp_audio_config(struct cdn_dp_device *dp, struct audio_info *audio);
++int cdn_dp_software_train_link(struct cdn_dp_device *dp);
+ #endif /* _CDN_DP_REG_H */
+-- 
+2.35.3
+

@@ -1,0 +1,396 @@
+From 789e4ff867d2bd27c3190e42ca32fe89deeeedbc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Fri, 24 Dec 2010 09:09:36 +0800
+Subject: [PATCH] rk29: vpu: manager clock
+
+---
+ arch/arm/mach-rk29/Kconfig            |   8 --
+ arch/arm/mach-rk29/clock.c            |  10 +-
+ arch/arm/mach-rk29/include/mach/vpu.h |  15 +--
+ arch/arm/mach-rk29/vpu.c              | 168 +++++++++++++-------------
+ 4 files changed, 86 insertions(+), 115 deletions(-)
+
+diff --git a/arch/arm/mach-rk29/Kconfig b/arch/arm/mach-rk29/Kconfig
+index e7bc0ff9ee01..ded023c1fc7a 100644
+--- a/arch/arm/mach-rk29/Kconfig
++++ b/arch/arm/mach-rk29/Kconfig
+@@ -43,14 +43,6 @@ config RK29_VPU_DEBUG
+           This is an option for the developers; most people should
+           say N here.  This enables RK29 VPU driver debugging.
+ 
+-config RK29_VPU_HW_PERFORMANCE
+-	bool "RK29 VPU HW_PERFORMANCE ioctl support"
+-        depends on RK29_VPU != n
+-	default n
+-        help
+-          This is an option for the developers; most people should
+-          say N here.  This enables RK29 VPU driver HW_PERFORMANCE ioctl.
+-
+ endmenu
+ 
+ endif
+diff --git a/arch/arm/mach-rk29/clock.c b/arch/arm/mach-rk29/clock.c
+index 1e3a30b0672f..cdf713a6562b 100755
+--- a/arch/arm/mach-rk29/clock.c
++++ b/arch/arm/mach-rk29/clock.c
+@@ -2324,14 +2324,6 @@ static void __init clk_enable_init_clocks(void)
+ #ifdef CONFIG_DEBUG_LL
+ 	clk_enable_nolock(&clk_uart1);
+ #endif
+-	/* vpu */
+-	clk_enable_nolock(&aclk_vdpu);
+-	clk_enable_nolock(&hclk_vdpu);
+-	clk_enable_nolock(&clk_aclk_ddr_vdpu);
+-	clk_enable_nolock(&aclk_vepu);
+-	clk_enable_nolock(&hclk_vepu);
+-	clk_enable_nolock(&clk_aclk_ddr_vepu);
+-	clk_enable_nolock(&clk_hclk_cpu_vcodec);
+ }
+ 
+ static int __init clk_disable_unused(void)
+@@ -2349,7 +2341,7 @@ static int __init clk_disable_unused(void)
+ 	}
+ 	mutex_unlock(&clocks_mutex);
+ 
+-//	pmu_set_power_domain(PD_VCODEC, false);
++	pmu_set_power_domain(PD_VCODEC, false);
+ //	pmu_set_power_domain(PD_DISPLAY, false);
+ //	pmu_set_power_domain(PD_GPU, false);
+ 
+diff --git a/arch/arm/mach-rk29/include/mach/vpu.h b/arch/arm/mach-rk29/include/mach/vpu.h
+index d376f27a3ae9..6748633afdda 100644
+--- a/arch/arm/mach-rk29/include/mach/vpu.h
++++ b/arch/arm/mach-rk29/include/mach/vpu.h
+@@ -31,18 +31,7 @@
+ /* Use 'k' as magic number */
+ #define VPU_IOC_MAGIC  'k'
+ 
+-#define VPU_IOC_PP_INSTANCE     _IO(VPU_IOC_MAGIC, 1)   /* the client is pp instance */
+-#define VPU_IOC_HW_PERFORMANCE  _IO(VPU_IOC_MAGIC, 2)   /* get monotonic time (struct timespec) for HW performance */
+-
+-#define VPU_IOC_GHWOFFSET       _IOR(VPU_IOC_MAGIC, 3, unsigned long *)
+-#define VPU_IOC_GHWIOSIZE       _IOR(VPU_IOC_MAGIC, 4, unsigned int *)
+-
+-#define VPU_IOC_CLI             _IO(VPU_IOC_MAGIC, 5)
+-#define VPU_IOC_STI             _IO(VPU_IOC_MAGIC, 6)
+-
+-#define VPU_IOC_DEC_INSTANCE    _IO(VPU_IOC_MAGIC, 7)
+-#define VPU_IOC_ENC_INSTANCE    _IO(VPU_IOC_MAGIC, 8)
+-
+-#define VPU_IOC_MAXNR           8
++#define VPU_IOC_POWER_ON	_IO(VPU_IOC_MAGIC, 1)
++#define VPU_IOC_POWER_OFF	_IO(VPU_IOC_MAGIC, 2)
+ 
+ #endif
+diff --git a/arch/arm/mach-rk29/vpu.c b/arch/arm/mach-rk29/vpu.c
+index 7bab707e9abd..35ccca7a3e02 100644
+--- a/arch/arm/mach-rk29/vpu.c
++++ b/arch/arm/mach-rk29/vpu.c
+@@ -20,6 +20,8 @@
+ #define pr_fmt(fmt) "VPU: " fmt
+ #endif
+ 
++#include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+@@ -30,15 +32,13 @@
+ #include <linux/miscdevice.h>
+ #include <linux/mm.h>
+ #include <linux/poll.h>
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-#include <linux/time.h>
+-#endif
+ 
+ #include <asm/uaccess.h>
+ 
+ #include <mach/irqs.h>
+ #include <mach/vpu.h>
+ #include <mach/rk29_iomap.h>
++#include <mach/pmu.h>
+ 
+ #define DEC_INTERRUPT_REGISTER     1
+ #define PP_INTERRUPT_REGISTER      60
+@@ -66,87 +66,86 @@ static struct vpu_device pp_dev;
+ static struct vpu_device enc_dev;
+ 
+ struct vpu_client {
+-	struct vpu_device	*dev;
+ 	atomic_t		dec_event;
+ 	atomic_t		enc_event;
+ 	struct fasync_struct	*async_queue;
+ 	wait_queue_head_t	wait;
+ 	struct file		*filp;	/* for /proc/vpu */
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-	struct timespec		end_time;
+-#endif
++	bool			enabled;
+ };
+ static struct vpu_client client;
+ 
++static struct clk *aclk_vepu;
++static struct clk *hclk_vepu;
++static struct clk *aclk_ddr_vepu;
++static struct clk *hclk_cpu_vcodec;
++
+ static void vpu_release_io(void);
+ 
+-static long vpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++static void vpu_get_clk(void)
+ {
+-	int err = 0;
+-	struct vpu_device *dev = client.dev;
++	aclk_vepu = clk_get(NULL, "aclk_vepu");
++	hclk_vepu = clk_get(NULL, "hclk_vepu");
++	aclk_ddr_vepu = clk_get(NULL, "aclk_ddr_vepu");
++	hclk_cpu_vcodec = clk_get(NULL, "hclk_cpu_vcodec");
++}
+ 
+-	pr_debug("ioctl cmd 0x%08x\n", cmd);
++static void vpu_put_clk(void)
++{
++	clk_put(aclk_vepu);
++	clk_put(hclk_vepu);
++	clk_put(aclk_ddr_vepu);
++	clk_put(hclk_cpu_vcodec);
++}
+ 
+-	if (!dev)
+-		return -EINVAL;
++static void vpu_power_on(void)
++{
++	pr_debug("power on\n");
++	if (client.enabled)
++		return;
++	pr_debug("power domain on\n");
++	pmu_set_power_domain(PD_VCODEC, true);
++	udelay(10);	// max 5358 ns
++	while (!pmu_power_domain_is_on(PD_VCODEC)) {
++		pr_debug("waiting for on\n");
++		msleep(1);
++	}
++	clk_enable(aclk_vepu);
++	clk_enable(hclk_vepu);
++	clk_enable(aclk_ddr_vepu);
++	clk_enable(hclk_cpu_vcodec);
++	client.enabled = true;
++}
+ 
+-	/*
+-	 * extract the type and number bitfields, and don't decode
+-	 * wrong cmds: return ENOTTY (inappropriate ioctl) before access_ok()
+-	 */
+-	if (_IOC_TYPE(cmd) != VPU_IOC_MAGIC)
+-		return -ENOTTY;
+-	if (_IOC_NR(cmd) > VPU_IOC_MAXNR)
+-		return -ENOTTY;
++static void vpu_power_off(void)
++{
++	pr_debug("power off\n");
++	if (!client.enabled)
++		return;
++	clk_disable(hclk_cpu_vcodec);
++	clk_disable(aclk_ddr_vepu);
++	clk_disable(hclk_vepu);
++	clk_disable(aclk_vepu);
++	pr_debug("power domain off\n");
++	pmu_set_power_domain(PD_VCODEC, false);
++	client.enabled = false;
++}
+ 
+-	/*
+-	 * the direction is a bitmask, and VERIFY_WRITE catches R/W
+-	 * transfers. `Type' is user-oriented, while
+-	 * access_ok is kernel-oriented, so the concept of "read" and
+-	 * "write" is reversed
+-	 */
+-	if (_IOC_DIR(cmd) & _IOC_READ)
+-		err = !access_ok(VERIFY_WRITE, (void *)arg, _IOC_SIZE(cmd));
+-	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+-		err = !access_ok(VERIFY_READ, (void *)arg, _IOC_SIZE(cmd));
+-	if (err)
+-		return -EFAULT;
++static long vpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	pr_debug("ioctl cmd 0x%08x\n", cmd);
+ 
+ 	switch (cmd) {
+-	case VPU_IOC_CLI:
+-		disable_irq(dev->irq);
+-		break;
+-
+-	case VPU_IOC_STI:
+-		enable_irq(dev->irq);
+-		break;
+-
+-	case VPU_IOC_GHWOFFSET:
+-		put_user(dev->iobaseaddr, (unsigned long *)arg);
+-		break;
+-
+-	case VPU_IOC_GHWIOSIZE:
+-		put_user(dev->iosize, (unsigned int *)arg);
+-		break;
+-
+-	case VPU_IOC_DEC_INSTANCE:
+-		client.dev = &dec_dev;
+-		break;
+-
+-	case VPU_IOC_PP_INSTANCE:
+-		client.dev = &pp_dev;
+-		break;
+-
+-	case VPU_IOC_ENC_INSTANCE:
+-		client.dev = &enc_dev;
++	case VPU_IOC_POWER_ON: {
++		vpu_power_on();
+ 		break;
+-
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-	case VPU_IOC_HW_PERFORMANCE:
+-		put_user(client.end_time.tv_sec, (long *)arg);
+-		put_user(client.end_time.tv_nsec, (long *)arg + 1);
++	}
++	case VPU_IOC_POWER_OFF: {
++		vpu_power_off();
+ 		break;
+-#endif
++	}
++	default:
++		return -ENOTTY;
+ 	}
+ 
+ 	return 0;
+@@ -156,8 +155,10 @@ static int vpu_open(struct inode *inode, struct file *filp)
+ {
+ 	if (client.filp)
+ 		return -EBUSY;
+-	client.dev = &dec_dev;
++
+ 	client.filp = filp;
++	vpu_power_on();
++
+ 	pr_debug("dev opened\n");
+ 	return nonseekable_open(inode, filp);
+ }
+@@ -175,6 +176,8 @@ static int vpu_release(struct inode *inode, struct file *filp)
+ 	client.async_queue = NULL;
+ 	client.filp = NULL;
+ 
++	vpu_power_off();
++
+ 	pr_debug("dev closed\n");
+ 	return 0;
+ }
+@@ -271,9 +274,6 @@ static irqreturn_t hx170dec_isr(int irq, void *dev_id)
+ 	irq_status_pp = readl(dev->hwregs + PP_INTERRUPT_REGISTER);
+ 
+ 	if (irq_status_dec & DEC_INTERRUPT_BIT) {
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-		ktime_get_ts(&client.end_time);
+-#endif
+ 		/* clear dec IRQ */
+ 		writel(irq_status_dec & (~DEC_INTERRUPT_BIT),
+ 				dev->hwregs + DEC_INTERRUPT_REGISTER);
+@@ -284,9 +284,6 @@ static irqreturn_t hx170dec_isr(int irq, void *dev_id)
+ 	}
+ 
+ 	if (irq_status_pp & PP_INTERRUPT_BIT) {
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-		ktime_get_ts(&client.end_time);
+-#endif
+ 		/* clear pp IRQ */
+ 		writel(irq_status_pp & (~DEC_INTERRUPT_BIT),
+ 				dev->hwregs + PP_INTERRUPT_REGISTER);
+@@ -311,9 +308,6 @@ static irqreturn_t hx280enc_isr(int irq, void *dev_id)
+ 	irq_status = readl(dev->hwregs + ENC_INTERRUPT_REGISTER);
+ 
+ 	if (likely(irq_status & ENC_INTERRUPT_BIT)) {
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-		ktime_get_ts(&client.end_time);
+-#endif
+ 		/* clear enc IRQ */
+ 		writel(irq_status & (~ENC_INTERRUPT_BIT),
+ 				dev->hwregs + ENC_INTERRUPT_REGISTER);
+@@ -450,6 +444,9 @@ static int __init vpu_init(void)
+ 	enc_dev.iosize = ENC_IO_SIZE;
+ 	enc_dev.irq = IRQ_VEPU;
+ 
++	vpu_get_clk();
++	vpu_power_on();
++
+ 	ret = vpu_reserve_io();
+ 	if (ret < 0) {
+ 		goto err_reserve_io;
+@@ -482,6 +479,7 @@ static int __init vpu_init(void)
+ 		goto err_register;
+ 	}
+ 
++	vpu_power_off();
+ 	pr_info("init success\n");
+ 
+ 	return 0;
+@@ -493,12 +491,16 @@ static int __init vpu_init(void)
+ err_req_vdpu_irq:
+ 	vpu_release_io();
+ err_reserve_io:
++	vpu_power_off();
++	vpu_put_clk();
+ 	pr_info("init failed\n");
+ 	return ret;
+ }
+ 
+ static void __exit vpu_exit(void)
+ {
++	vpu_power_on();
++
+ 	/* clear dec IRQ */
+ 	writel(0, dec_dev.hwregs + DEC_INTERRUPT_REGISTER);
+ 	/* clear pp IRQ */
+@@ -512,6 +514,9 @@ static void __exit vpu_exit(void)
+ 	free_irq(IRQ_VEPU, (void *)&enc_dev);
+ 	free_irq(IRQ_VDPU, (void *)&dec_dev);
+ 	vpu_release_io();
++
++	vpu_power_off();
++	vpu_put_clk();
+ }
+ 
+ module_init(vpu_init);
+@@ -527,23 +532,15 @@ static int proc_vpu_show(struct seq_file *s, void *v)
+ 	unsigned int i, n;
+ 	s32 irq_event = atomic_read(&client.dec_event) | atomic_read(&client.enc_event);
+ 
+-	if (client.filp) {
+-		seq_printf(s, "Opened\n");
+-		seq_printf(s, "%s instance\n", client.dev == &dec_dev ? "DEC" : client.dev == &pp_dev ? "PP" : "ENC");
+-	} else {
+-		seq_printf(s, "Closed\n");
+-	}
+-
++	seq_printf(s, client.filp ? "Opened\n" : "Closed\n");
+ 	seq_printf(s, "irq_event: 0x%08x (%s%s%s%s%s)\n", irq_event,
+ 		   irq_event & VPU_IRQ_EVENT_DEC_BIT ? "DEC " : "",
+ 		   irq_event & VPU_IRQ_EVENT_DEC_IRQ_BIT ? "DEC_IRQ " : "",
+ 		   irq_event & VPU_IRQ_EVENT_PP_IRQ_BIT ? "PP_IRQ " : "",
+ 		   irq_event & VPU_IRQ_EVENT_ENC_BIT ? "ENC " : "",
+ 		   irq_event & VPU_IRQ_EVENT_ENC_IRQ_BIT ? "ENC_IRQ" : "");
+-#ifdef CONFIG_RK29_VPU_HW_PERFORMANCE
+-	seq_printf(s, "end_time: %ld.%09ld\n", client.end_time.tv_sec, client.end_time.tv_nsec);
+-#endif
+ 
++	vpu_power_on();
+ 	seq_printf(s, "\nENC Registers:\n");
+ 	n = enc_dev.iosize >> 2;
+ 	for (i = 0; i < n; i++) {
+@@ -554,6 +551,7 @@ static int proc_vpu_show(struct seq_file *s, void *v)
+ 	for (i = 0; i < n; i++) {
+ 		seq_printf(s, "\tswreg%d = %08X\n", i, readl(dec_dev.hwregs + i));
+ 	}
++	vpu_power_off();
+ 	return 0;
+ }
+ 
+-- 
+2.35.3
+

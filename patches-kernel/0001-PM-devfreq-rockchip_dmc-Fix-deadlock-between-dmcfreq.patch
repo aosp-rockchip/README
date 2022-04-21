@@ -1,0 +1,488 @@
+From c95036feef0459dcd5b6af1ad7a30f30cc1d03ed Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Wed, 16 May 2018 17:01:32 +0800
+Subject: [PATCH] PM / devfreq: rockchip_dmc: Fix deadlock between dmcfreq and
+ vop on/off
+
+When change vop status and ddr frequency at the same time,
+the following deadlock will happen:
+
+vop no/off                            dmcfreq
+vop_crtc_disable                      update_devfreq
+->mutex_lock(&vop->vop_lock);         ->mutex_lock(&pd->pmu->mutex);
+->pm_runtime_put(vop->dev);           ->mutex_lock(&vop->vop_lock);
+  ->mutex_lock(&pd->pmu->mutex);      ...
+
+Use new dmcfreq rwsem to decouple vop and pd driver, and get better
+parallelism.
+
+Change-Id: I56a4ee944200826d2a09e3ae8d2f4837f6f769d6
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ drivers/devfreq/rockchip_dmc.c              |  30 ++++--
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 101 ++++----------------
+ drivers/soc/rockchip/pm_domains.c           |  63 +++++-------
+ include/soc/rockchip/pm_domains.h           |   7 --
+ include/soc/rockchip/rockchip_dmc.h         |  19 ++--
+ 5 files changed, 73 insertions(+), 147 deletions(-)
+
+diff --git a/drivers/devfreq/rockchip_dmc.c b/drivers/devfreq/rockchip_dmc.c
+index cfef9aabc97e..476b2cba0606 100644
+--- a/drivers/devfreq/rockchip_dmc.c
++++ b/drivers/devfreq/rockchip_dmc.c
+@@ -812,6 +812,20 @@ struct rockchip_dmcfreq {
+ 
+ static struct pm_qos_request pm_qos;
+ 
++static DECLARE_RWSEM(rockchip_dmcfreq_sem);
++
++void rockchip_dmcfreq_lock(void)
++{
++	down_read(&rockchip_dmcfreq_sem);
++}
++EXPORT_SYMBOL(rockchip_dmcfreq_lock);
++
++void rockchip_dmcfreq_unlock(void)
++{
++	up_read(&rockchip_dmcfreq_sem);
++}
++EXPORT_SYMBOL(rockchip_dmcfreq_unlock);
++
+ /*
+  * function: packaging de-skew setting to px30_ddr_dts_config_timing,
+  *           px30_ddr_dts_config_timing will pass to trust firmware, and
+@@ -1016,8 +1030,18 @@ static int rockchip_dmcfreq_target(struct device *dev, unsigned long *freq,
+ 		}
+ 	}
+ 
++	/*
++	 * Writer in rwsem may block readers even during its waiting in queue,
++	 * and this may lead to a deadlock when the code path takes read sem
++	 * twice (e.g. one in vop_lock() and another in rockchip_pmu_lock()).
++	 * As a (suboptimal) workaround, let writer to spin until it gets the
++	 * lock.
++	 */
++	while (!down_write_trylock(&rockchip_dmcfreq_sem))
++		cond_resched();
+ 	dev_dbg(dev, "%lu-->%lu\n", old_clk_rate, target_rate);
+ 	err = clk_set_rate(dmcfreq->dmc_clk, target_rate);
++	up_write(&rockchip_dmcfreq_sem);
+ 	if (err) {
+ 		dev_err(dev, "Cannot set frequency %lu (%d)\n",
+ 			target_rate, err);
+@@ -3060,12 +3084,6 @@ static int rockchip_dmcfreq_probe(struct platform_device *pdev)
+ 	data->devfreq->last_status.current_frequency = opp_rate;
+ 	reset_last_status(data->devfreq);
+ 
+-	if (rockchip_drm_register_notifier_to_dmc(data->devfreq))
+-		dev_err(dev, "drm fail to register notifier to dmc\n");
+-
+-	if (rockchip_pm_register_notify_to_dmc(data->devfreq))
+-		dev_err(dev, "pd fail to register notify to dmc\n");
+-
+ 	if (vop_register_dmc())
+ 		dev_err(dev, "fail to register notify to vop.\n");
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index c4e119fda346..435eda863692 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -22,7 +22,6 @@
+ #include <dt-bindings/clock/rk_system_status.h>
+ 
+ #include <linux/debugfs.h>
+-#include <linux/devfreq.h>
+ #include <linux/fixp-arith.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
+@@ -40,6 +39,7 @@
+ #include <linux/reset.h>
+ #include <linux/delay.h>
+ #include <linux/sort.h>
++#include <soc/rockchip/rockchip_dmc.h>
+ #include <soc/rockchip/rockchip-system-status.h>
+ #include <uapi/drm/rockchip_drm.h>
+ #include <uapi/linux/videodev2.h>
+@@ -271,16 +271,23 @@ struct vop {
+ 	/* vop dclk reset */
+ 	struct reset_control *dclk_rst;
+ 
+-	struct notifier_block dmc_nb;
+-
+ 	struct rockchip_dclk_pll *pll;
+ 
+ 	struct vop_win win[];
+ };
+ 
+-static struct vop *dmc_vop[MAX_VOPS];
+-static struct devfreq *devfreq_vop;
+-static DEFINE_MUTEX(register_devfreq_lock);
++static void vop_lock(struct vop *vop)
++{
++	mutex_lock(&vop->vop_lock);
++	rockchip_dmcfreq_lock();
++}
++
++static void vop_unlock(struct vop *vop)
++{
++	rockchip_dmcfreq_unlock();
++	mutex_unlock(&vop->vop_lock);
++}
++
+ static inline void vop_grf_writel(struct vop *vop, struct vop_reg reg, u32 v)
+ {
+ 	u32 val = 0;
+@@ -1367,7 +1374,7 @@ static void vop_crtc_disable(struct drm_crtc *crtc)
+ 	int sys_status = drm_crtc_index(crtc) ?
+ 				SYS_STATUS_LCDC1 : SYS_STATUS_LCDC0;
+ 
+-	mutex_lock(&vop->vop_lock);
++	vop_lock(vop);
+ 	VOP_CTRL_SET(vop, reg_done_frm, 1);
+ 	VOP_CTRL_SET(vop, dsp_interlace, 0);
+ 	drm_crtc_vblank_off(crtc);
+@@ -1411,7 +1418,7 @@ static void vop_crtc_disable(struct drm_crtc *crtc)
+ 	clk_disable_unprepare(vop->dclk);
+ 	clk_disable_unprepare(vop->aclk);
+ 	clk_disable_unprepare(vop->hclk);
+-	mutex_unlock(&vop->vop_lock);
++	vop_unlock(vop);
+ 
+ 	rockchip_clear_system_status(sys_status);
+ 
+@@ -2572,7 +2579,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 	bool dclk_inv;
+ 
+ 	rockchip_set_system_status(sys_status);
+-	mutex_lock(&vop->vop_lock);
++	vop_lock(vop);
+ 	DRM_DEV_INFO(vop->dev, "Update mode to %dx%d%s%d, type: %d\n",
+ 		     hdisplay, vdisplay, interlaced ? "i" : "p",
+ 		     adjusted_mode->vrefresh, s->output_type);
+@@ -2714,7 +2721,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	enable_irq(vop->irq);
+ 	drm_crtc_vblank_on(crtc);
+-	mutex_unlock(&vop->vop_lock);
++	vop_unlock(vop);
+ }
+ 
+ static int vop_zpos_cmp(const void *a, const void *b)
+@@ -4233,45 +4240,6 @@ int rockchip_drm_wait_line_flag(struct drm_crtc *crtc, unsigned int line_num,
+ }
+ EXPORT_SYMBOL(rockchip_drm_wait_line_flag);
+ 
+-static int dmc_notifier_call(struct notifier_block *nb, unsigned long event,
+-			     void *data)
+-{
+-	struct vop *vop = container_of(nb, struct vop, dmc_nb);
+-
+-	if (event == DEVFREQ_PRECHANGE)
+-		mutex_lock(&vop->vop_lock);
+-	else if (event == DEVFREQ_POSTCHANGE)
+-		mutex_unlock(&vop->vop_lock);
+-
+-	return NOTIFY_OK;
+-}
+-
+-int rockchip_drm_register_notifier_to_dmc(struct devfreq *devfreq)
+-{
+-	int i, j = 0;
+-
+-	mutex_lock(&register_devfreq_lock);
+-
+-	devfreq_vop = devfreq;
+-
+-	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+-		if (!dmc_vop[i])
+-			continue;
+-		dmc_vop[i]->dmc_nb.notifier_call = dmc_notifier_call;
+-		devfreq_register_notifier(devfreq_vop, &dmc_vop[i]->dmc_nb,
+-					  DEVFREQ_TRANSITION_NOTIFIER);
+-		j++;
+-	}
+-
+-	mutex_unlock(&register_devfreq_lock);
+-
+-	if (j == 0)
+-		return -ENOMEM;
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL(rockchip_drm_register_notifier_to_dmc);
+-
+ static void vop_backlight_config_done(struct device *dev, bool async)
+ {
+ 	struct vop *vop = dev_get_drvdata(dev);
+@@ -4437,47 +4405,12 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
+ 	of_rockchip_drm_sub_backlight_register(dev, &vop->crtc,
+ 					       &rockchip_sub_backlight_ops);
+ 
+-	mutex_lock(&register_devfreq_lock);
+-
+-	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+-		if (dmc_vop[i])
+-			continue;
+-		if (devfreq_vop) {
+-			vop->dmc_nb.notifier_call = dmc_notifier_call;
+-			devfreq_register_notifier(devfreq_vop,
+-						  &vop->dmc_nb,
+-						  DEVFREQ_TRANSITION_NOTIFIER);
+-		}
+-		dmc_vop[i] = vop;
+-		break;
+-	}
+-
+-	mutex_unlock(&register_devfreq_lock);
+-
+ 	return 0;
+ }
+ 
+ static void vop_unbind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct vop *vop = dev_get_drvdata(dev);
+-	int i;
+-
+-	mutex_lock(&register_devfreq_lock);
+-
+-	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+-		if (dmc_vop[i] != vop)
+-			continue;
+-		dmc_vop[i] = NULL;
+-
+-		if (!devfreq_vop)
+-			break;
+-		devfreq_unregister_notifier(devfreq_vop,
+-					    &vop->dmc_nb,
+-					    DEVFREQ_TRANSITION_NOTIFIER);
+-		break;
+-	}
+-
+-	mutex_unlock(&register_devfreq_lock);
+ 
+ 	pm_runtime_disable(dev);
+ 	vop_destroy_crtc(vop);
+diff --git a/drivers/soc/rockchip/pm_domains.c b/drivers/soc/rockchip/pm_domains.c
+index 61eb34e7b6fe..c8878798bccb 100644
+--- a/drivers/soc/rockchip/pm_domains.c
++++ b/drivers/soc/rockchip/pm_domains.c
+@@ -8,7 +8,6 @@
+  * published by the Free Software Foundation.
+  */
+ 
+-#include <linux/devfreq.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/err.h>
+@@ -20,6 +19,7 @@
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include <soc/rockchip/pm_domains.h>
++#include <soc/rockchip/rockchip_dmc.h>
+ #include <dt-bindings/power/px30-power.h>
+ #include <dt-bindings/power/rk3036-power.h>
+ #include <dt-bindings/power/rk3128-power.h>
+@@ -84,12 +84,20 @@ struct rockchip_pmu {
+ 	const struct rockchip_pmu_info *info;
+ 	struct mutex mutex; /* mutex lock for pmu */
+ 	struct genpd_onecell_data genpd_data;
+-	struct devfreq *devfreq;
+-	struct notifier_block dmc_nb;
+ 	struct generic_pm_domain *domains[];
+ };
+ 
+-static struct rockchip_pmu *dmc_pmu;
++static void rockchip_pmu_lock(struct rockchip_pm_domain *pd)
++{
++	mutex_lock(&pd->pmu->mutex);
++	rockchip_dmcfreq_lock();
++}
++
++static void rockchip_pmu_unlock(struct rockchip_pm_domain *pd)
++{
++	rockchip_dmcfreq_unlock();
++	mutex_unlock(&pd->pmu->mutex);
++}
+ 
+ #define to_rockchip_pd(gpd) container_of(gpd, struct rockchip_pm_domain, genpd)
+ 
+@@ -222,9 +230,9 @@ int rockchip_pmu_idle_request(struct device *dev, bool idle)
+ 	genpd = pd_to_genpd(dev->pm_domain);
+ 	pd = to_rockchip_pd(genpd);
+ 
+-	mutex_lock(&pd->pmu->mutex);
++	rockchip_pmu_lock(pd);
+ 	ret = rockchip_pmu_set_idle_request(pd, idle);
+-	mutex_unlock(&pd->pmu->mutex);
++	rockchip_pmu_unlock(pd);
+ 
+ 	return ret;
+ }
+@@ -294,9 +302,9 @@ int rockchip_save_qos(struct device *dev)
+ 	genpd = pd_to_genpd(dev->pm_domain);
+ 	pd = to_rockchip_pd(genpd);
+ 
+-	mutex_lock(&pd->pmu->mutex);
++	rockchip_pmu_lock(pd);
+ 	ret = rockchip_pmu_save_qos(pd);
+-	mutex_unlock(&pd->pmu->mutex);
++	rockchip_pmu_unlock(pd);
+ 
+ 	return ret;
+ }
+@@ -317,9 +325,9 @@ int rockchip_restore_qos(struct device *dev)
+ 	genpd = pd_to_genpd(dev->pm_domain);
+ 	pd = to_rockchip_pd(genpd);
+ 
+-	mutex_lock(&pd->pmu->mutex);
++	rockchip_pmu_lock(pd);
+ 	ret = rockchip_pmu_restore_qos(pd);
+-	mutex_unlock(&pd->pmu->mutex);
++	rockchip_pmu_unlock(pd);
+ 
+ 	return ret;
+ }
+@@ -380,7 +388,7 @@ static int rockchip_pd_power(struct rockchip_pm_domain *pd, bool power_on)
+ 	int i, ret = 0;
+ 	struct generic_pm_domain *genpd = &pd->genpd;
+ 
+-	mutex_lock(&pd->pmu->mutex);
++	rockchip_pmu_lock(pd);
+ 
+ 	if (rockchip_pmu_domain_is_on(pd) != power_on) {
+ 		for (i = 0; i < pd->num_clks; i++)
+@@ -423,7 +431,7 @@ static int rockchip_pd_power(struct rockchip_pm_domain *pd, bool power_on)
+ 			clk_disable(pd->clks[i]);
+ 	}
+ 
+-	mutex_unlock(&pd->pmu->mutex);
++	rockchip_pmu_unlock(pd);
+ 	return ret;
+ }
+ 
+@@ -643,9 +651,9 @@ static void rockchip_pm_remove_one_domain(struct rockchip_pm_domain *pd)
+ 	}
+ 
+ 	/* protect the zeroing of pm->num_clks */
+-	mutex_lock(&pd->pmu->mutex);
++	rockchip_pmu_lock(pd);
+ 	pd->num_clks = 0;
+-	mutex_unlock(&pd->pmu->mutex);
++	rockchip_pmu_unlock(pd);
+ 
+ 	/* devm will free our memory */
+ }
+@@ -744,31 +752,6 @@ static int rockchip_pm_add_subdomain(struct rockchip_pmu *pmu,
+ 	return error;
+ }
+ 
+-static int dmc_notify(struct notifier_block *nb, unsigned long event,
+-		      void *data)
+-{
+-	if (event == DEVFREQ_PRECHANGE)
+-		mutex_lock(&dmc_pmu->mutex);
+-	else if (event == DEVFREQ_POSTCHANGE)
+-		mutex_unlock(&dmc_pmu->mutex);
+-
+-	return NOTIFY_OK;
+-}
+-
+-int rockchip_pm_register_notify_to_dmc(struct devfreq *devfreq)
+-{
+-	if (!dmc_pmu)
+-		return -ENOMEM;
+-
+-	dmc_pmu->devfreq = devfreq;
+-	dmc_pmu->dmc_nb.notifier_call = dmc_notify;
+-	dmc_pmu->dmc_nb.priority = -100; /* notified after vop */
+-	devfreq_register_notifier(dmc_pmu->devfreq, &dmc_pmu->dmc_nb,
+-				  DEVFREQ_TRANSITION_NOTIFIER);
+-	return 0;
+-}
+-EXPORT_SYMBOL(rockchip_pm_register_notify_to_dmc);
+-
+ static void __iomem *pd_base;
+ 
+ void rockchip_dump_pmu(void)
+@@ -891,8 +874,6 @@ static int rockchip_pm_domain_probe(struct platform_device *pdev)
+ 
+ 	of_genpd_add_provider_onecell(np, &pmu->genpd_data);
+ 
+-	dmc_pmu = pmu;
+-
+ 	atomic_notifier_chain_register(&panic_notifier_list,
+ 				       &pmu_panic_block);
+ 
+diff --git a/include/soc/rockchip/pm_domains.h b/include/soc/rockchip/pm_domains.h
+index 37ff702acd0c..b566cb8a5ef2 100644
+--- a/include/soc/rockchip/pm_domains.h
++++ b/include/soc/rockchip/pm_domains.h
+@@ -4,14 +4,12 @@
+ 
+ #include <linux/errno.h>
+ 
+-struct devfreq;
+ struct device;
+ 
+ #ifdef CONFIG_ROCKCHIP_PM_DOMAINS
+ int rockchip_pmu_idle_request(struct device *dev, bool idle);
+ int rockchip_save_qos(struct device *dev);
+ int rockchip_restore_qos(struct device *dev);
+-int rockchip_pm_register_notify_to_dmc(struct devfreq *devfreq);
+ void rockchip_dump_pmu(void);
+ #else
+ static inline int rockchip_pmu_idle_request(struct device *dev, bool idle)
+@@ -29,11 +27,6 @@ static inline int rockchip_restore_qos(struct device *dev)
+ 	return -ENOTSUPP;
+ }
+ 
+-static inline int rockchip_pm_register_notify_to_dmc(struct devfreq *devfreq)
+-{
+-	return -ENOTSUPP;
+-}
+-
+ static inline void rockchip_dump_pmu(void)
+ {
+ }
+diff --git a/include/soc/rockchip/rockchip_dmc.h b/include/soc/rockchip/rockchip_dmc.h
+index f8d6addfa8b4..aaa8cbeed94e 100644
+--- a/include/soc/rockchip/rockchip_dmc.h
++++ b/include/soc/rockchip/rockchip_dmc.h
+@@ -15,16 +15,9 @@
+ 
+ #include <linux/devfreq.h>
+ 
+-#ifdef CONFIG_DRM_ROCKCHIP
+-int rockchip_drm_register_notifier_to_dmc(struct devfreq *devfreq);
+-#else
+-static inline int rockchip_drm_register_notifier_to_dmc(struct devfreq *devfreq)
+-{
+-	return 0;
+-}
+-#endif
+-
+ #ifdef CONFIG_ARM_ROCKCHIP_DMC_DEVFREQ
++void rockchip_dmcfreq_lock(void);
++void rockchip_dmcfreq_unlock(void);
+ int rockchip_dmcfreq_wait_complete(void);
+ int rockchip_dmcfreq_vop_bandwidth_request(struct devfreq *devfreq,
+ 					   unsigned int bw_mbyte);
+@@ -32,6 +25,14 @@ void rockchip_dmcfreq_vop_bandwidth_update(struct devfreq *devfreq,
+ 					   unsigned int bw_mbyte);
+ 
+ #else
++static inline void rockchip_dmcfreq_lock(void)
++{
++}
++
++static inline void rockchip_dmcfreq_unlock(void)
++{
++}
++
+ static inline int rockchip_dmcfreq_wait_complete(void)
+ {
+ 	return 0;
+-- 
+2.35.3
+

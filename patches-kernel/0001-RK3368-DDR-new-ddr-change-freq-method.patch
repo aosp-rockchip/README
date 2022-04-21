@@ -1,0 +1,201 @@
+From e0f1b4b3f45d84eb9e25ad0acedb93600ff5add6 Mon Sep 17 00:00:00 2001
+From: Tang Yun ping <typ@rock-chips.com>
+Date: Fri, 21 Aug 2015 17:14:10 +0800
+Subject: [PATCH] RK3368 DDR: new ddr change freq method
+
+Using fiq to notify trust to stop cpu when ddr changing freq.
+1.bl30 must update to rk3368bl30_v2.10.bin  and bl31 must update to
+rk3368bl31_v1.5.bin.
+2.Insure kernel commit 7643ffa0e67d5 and cc6e554e54fe1 were merged.
+
+Change-Id: I2449613221c49a49ba14dab54e77714e961dcd16
+Signed-off-by: Tang Yun ping <typ@rock-chips.com>
+---
+ drivers/devfreq/ddr_rk3368.c    | 73 +++++++++++++++++++++++++++++++--
+ drivers/mailbox/scpi_protocol.c |  5 ++-
+ include/linux/scpi_protocol.h   |  3 +-
+ 3 files changed, 74 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/devfreq/ddr_rk3368.c b/drivers/devfreq/ddr_rk3368.c
+index 87e2bcb725df..dec864295b44 100644
+--- a/drivers/devfreq/ddr_rk3368.c
++++ b/drivers/devfreq/ddr_rk3368.c
+@@ -42,11 +42,20 @@
+ #include <linux/rockchip/pmu.h>
+ #include <linux/rk_fb.h>
+ #include <linux/scpi_protocol.h>
++#include <asm/compiler.h>
+ 
+ #define GRF_DDRC0_CON0    0x600
+ #define GRF_SOC_STATUS5  0x494
+ #define DDR_PCTL_TOGCNT_1U  0xc0
+ 
++#define PSCI_SIP_RKTF_VER		(0x82000001)
++#define FIQ_CPU_TGT_BOOT		0x0 /* to booting cpu */
++#define RKSIP_EL3FIQ_CFG		(0x82000006)
++#define FIQ_NUM_FOR_DCF		(143)  /*NA irq map to fiq for dcf*/
++
++
++#define DDR_VERSION			"V1.01 20150819"
++
+ enum ddr_bandwidth_id {
+ 	ddrbw_wr_num = 0,
+ 	ddrbw_rd_num,
+@@ -64,6 +73,24 @@ struct rockchip_ddr {
+ 
+ static struct rockchip_ddr *ddr_data = NULL;
+ 
++static noinline int __invoke_reg_dcf_fn_smc(u64 function_id, u64 arg0, u64 arg1,
++					    u64 arg2)
++{
++	asm volatile(
++			__asmeq("%0", "x0")
++			__asmeq("%1", "x1")
++			__asmeq("%2", "x2")
++			__asmeq("%3", "x3")
++			"smc	#0\n"
++		: "+r" (function_id)
++		: "r" (arg0), "r" (arg1), "r" (arg2));
++
++	return function_id;
++}
++
++static int (*invoke_reg_dcf_fn_smc)(u64, u64 , u64, u64) =
++	    __invoke_reg_dcf_fn_smc;
++
+ static int _ddr_recalc_rate(void)
+ {
+ 	int ddr_freq;
+@@ -254,12 +281,16 @@ static void _ddr_bandwidth_get(struct ddr_bw_info *ddr_bw_ch0,
+ 	ddr_monitor_start();
+ }
+ 
+-static void ddr_init(u32 dram_speed_bin, u32 freq)
++static void ddr_init(u32 dram_speed_bin, u32 freq, u32 addr_mcu_el3)
+ {
+ 	int lcdc_type;
++	static u32 addr = 0;
+ 
+ 	struct rk_lcdc_driver *lcdc_dev = NULL;
+ 
++	if (addr == 0)
++		addr = addr_mcu_el3;
++
+ 	lcdc_dev = rk_get_lcdc_drv("lcdc0");
+ 	if (lcdc_dev == NULL)
+ 		lcdc_type = 0;
+@@ -267,7 +298,7 @@ static void ddr_init(u32 dram_speed_bin, u32 freq)
+ 		lcdc_type = (u32)lcdc_dev->cur_screen->type;
+ 	printk(KERN_DEBUG pr_fmt("In Func:%s,dram_speed_bin:%d,freq:%d,lcdc_type:%d\n"),
+ 	       __func__, dram_speed_bin, freq, lcdc_type);
+-	if (scpi_ddr_init(dram_speed_bin, freq, lcdc_type))
++	if (scpi_ddr_init(dram_speed_bin, freq, lcdc_type, addr))
+ 		pr_info("ddr init error\n");
+ 	else
+ 		printk(KERN_DEBUG pr_fmt("%s out\n"), __func__);
+@@ -275,14 +306,43 @@ static void ddr_init(u32 dram_speed_bin, u32 freq)
+ 
+ static int ddr_init_resume(struct platform_device *pdev)
+ {
+-	ddr_init(DDR3_DEFAULT, 0);
++	ddr_init(DDR3_DEFAULT, 0, 0);
++	return 0;
++}
++#define RKTF_VER_MAJOR(ver) (((ver) >> 16) & 0xffff)
++#define RKTF_VER_MINOR(ver) ((ver) & 0xffff)
++/* valid ver */
++#define RKTF_VLDVER_MAJOR (1)
++#define RKTF_VLDVER_MINOR (5)
++
++static int __init rockchip_tf_ver_check(void)
++{
++	u32 version;
++
++	version = invoke_reg_dcf_fn_smc(PSCI_SIP_RKTF_VER, 0, 0, 0);
++
++	if ((RKTF_VER_MAJOR(version) >= RKTF_VLDVER_MAJOR) &&
++	    (RKTF_VER_MINOR(version) >= RKTF_VLDVER_MINOR))
++		return 0;
++
++	pr_err("read tf version 0x%x!\n", version);
++
++	do {
++		mdelay(1000);
++		pr_err("trusted firmware need to update to(%d.%d) or is invaild!\n",
++		       RKTF_VLDVER_MAJOR, RKTF_VLDVER_MINOR);
++	} while (1);
++
+ 	return 0;
+ }
+ 
++
+ static int __init rockchip_ddr_probe(struct platform_device *pdev)
+ {
++	u32 addr_mcu_el3;
+ 	struct device_node *np;
+ 
++	pr_info("Rockchip DDR Initialize, verision: "DDR_VERSION"\n");
+ 	np = pdev->dev.of_node;
+ 	ddr_data =
+ 	    devm_kzalloc(&pdev->dev, sizeof(struct rockchip_ddr), GFP_KERNEL);
+@@ -322,7 +382,12 @@ static int __init rockchip_ddr_probe(struct platform_device *pdev)
+ 	ddr_set_auto_self_refresh = _ddr_set_auto_self_refresh;
+ 	ddr_bandwidth_get = _ddr_bandwidth_get;
+ 	ddr_recalc_rate = _ddr_recalc_rate;
+-	ddr_init(DDR3_DEFAULT, 0);
++	rockchip_tf_ver_check();
++	addr_mcu_el3 = invoke_reg_dcf_fn_smc(RKSIP_EL3FIQ_CFG, FIQ_NUM_FOR_DCF,
++					     FIQ_CPU_TGT_BOOT, 0);
++	if ((addr_mcu_el3 == 0) || (addr_mcu_el3 > 0x80000))
++		pr_info("Trust version error, pls check trust version\n");
++	ddr_init(DDR3_DEFAULT, 0, addr_mcu_el3);
+ 	pr_info("%s: success\n", __func__);
+ 	return 0;
+ }
+diff --git a/drivers/mailbox/scpi_protocol.c b/drivers/mailbox/scpi_protocol.c
+index 673437a5deea..efcc92721c20 100644
+--- a/drivers/mailbox/scpi_protocol.c
++++ b/drivers/mailbox/scpi_protocol.c
+@@ -492,7 +492,7 @@ int scpi_sys_set_mcu_state_resume(void)
+ }
+ EXPORT_SYMBOL_GPL(scpi_sys_set_mcu_state_resume);
+ 
+-int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type)
++int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type, u32 addr_mcu_el3)
+ {
+ 	struct scpi_data_buf sdata;
+ 	struct rockchip_mbox_msg mdata;
+@@ -500,6 +500,7 @@ int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type)
+ 		u32 dram_speed_bin;
+ 		u32 freq;
+ 		u32 lcdc_type;
++		u32 addr_mcu_el3;
+ 	} tx_buf;
+ 	struct __packed2 {
+ 		u32 status;
+@@ -508,7 +509,7 @@ int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type)
+ 	tx_buf.dram_speed_bin = (u32)dram_speed_bin;
+ 	tx_buf.freq = (u32)freq;
+ 	tx_buf.lcdc_type = (u32)lcdc_type;
+-
++	tx_buf.addr_mcu_el3 = addr_mcu_el3;
+ 	SCPI_SETUP_DBUF(sdata, mdata, SCPI_CL_DDR,
+ 			SCPI_DDR_INIT, tx_buf, rx_buf);
+ 	return scpi_execute_cmd(&sdata);
+diff --git a/include/linux/scpi_protocol.h b/include/linux/scpi_protocol.h
+index 5219ff13fdb4..c472ddfa58b5 100644
+--- a/include/linux/scpi_protocol.h
++++ b/include/linux/scpi_protocol.h
+@@ -40,7 +40,8 @@ int scpi_get_sensor_value(u16 sensor, u32 *val);
+ int scpi_sys_set_mcu_state_suspend(void);
+ int scpi_sys_set_mcu_state_resume(void);
+ 
+-int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type);
++int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type,
++		  u32 addr_mcu_el3);
+ int scpi_ddr_set_clk_rate(u32 rate, u32 lcdc_type);
+ int scpi_ddr_round_rate(u32 m_hz);
+ int scpi_ddr_set_auto_self_refresh(u32 en);
+-- 
+2.35.3
+

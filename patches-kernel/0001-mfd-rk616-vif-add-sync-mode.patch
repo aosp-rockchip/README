@@ -1,0 +1,229 @@
+From 304e07b32cbc5e19b0ffe6a5460086faac95b243 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Fri, 28 Jun 2013 12:10:48 +0800
+Subject: [PATCH] mfd:rk616: vif:add sync mode 	       core:add write_dev_bits
+ interface
+
+---
+ drivers/mfd/rk616-core.c  | 36 ++++++++++++++++++++++++++++++++++++
+ drivers/mfd/rk616-vif.c   | 31 ++++++++++++++++++++++++-------
+ include/linux/mfd/rk616.h | 17 +++++++++++++----
+ 3 files changed, 73 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/mfd/rk616-core.c b/drivers/mfd/rk616-core.c
+index 97d1b662e8f5..376ecb07b990 100755
+--- a/drivers/mfd/rk616-core.c
++++ b/drivers/mfd/rk616-core.c
+@@ -94,6 +94,40 @@ static int rk616_i2c_write_reg(struct mfd_rk616 *rk616, u16 reg,u32 *pval)
+ }
+ 
+ 
++static int rk616_i2c_write_bits(struct mfd_rk616 *rk616, u16 reg,u32 mask,u32 *pval)
++{
++	
++	struct i2c_client *client = rk616->client;
++	struct i2c_adapter *adap = client->adapter;
++	struct i2c_msg msg;
++	int ret;
++	u32 reg_val;
++	char *tx_buf = NULL;
++	mutex_lock(&rk616->reg_lock);
++	tx_buf = (char *)kmalloc(6, GFP_KERNEL);
++	if(!tx_buf)
++		return -ENOMEM;
++	
++	rk616->read_dev(rk616,reg,&reg_val);
++	reg_val &= ~mask;
++	reg_val |= *pval;
++	*pval = reg_val;
++	memcpy(tx_buf, &reg, 2); 
++	memcpy(tx_buf+2, (char *)pval, 4); 
++
++	msg.addr = client->addr;
++	msg.flags = client->flags;
++	msg.len = 6;
++	msg.buf = (char *)tx_buf;
++	msg.scl_rate = rk616->pdata->scl_rate;
++	msg.udelay = client->udelay;
++
++	ret = i2c_transfer(adap, &msg, 1);
++	kfree(tx_buf);
++	mutex_unlock(&rk616->reg_lock);
++	
++	return (ret == 1) ? 4 : ret;
++}
+ #if defined(CONFIG_DEBUG_FS)
+ static int rk616_reg_show(struct seq_file *s, void *v)
+ {
+@@ -444,12 +478,14 @@ static int rk616_i2c_probe(struct i2c_client *client,const struct i2c_device_id
+ 		//clk_put(iis_clk);
+ 	}
+ 
++	mutex_init(&rk616->reg_lock);
+ 	
+ 	if(rk616->pdata->power_init)
+ 		rk616->pdata->power_init();
+ 	
+ 	rk616->read_dev = rk616_i2c_read_reg;
+ 	rk616->write_dev = rk616_i2c_write_reg;
++	rk616->write_dev_bits = rk616_i2c_write_bits;
+ 	
+ #if defined(CONFIG_DEBUG_FS)
+ 	rk616->debugfs_dir = debugfs_create_dir("rk616", NULL);
+diff --git a/drivers/mfd/rk616-vif.c b/drivers/mfd/rk616-vif.c
+index 83e5d09eec1f..238366a8da3c 100755
+--- a/drivers/mfd/rk616-vif.c
++++ b/drivers/mfd/rk616-vif.c
+@@ -203,6 +203,7 @@ int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *screen,int id)
+ 	}
+ 
+ 	
++	
+ 	ret = rk616->write_dev(rk616,VIF0_REG1 + offset,&val);
+ 
+ 	val = (screen->hsync_len << 16) | (screen->hsync_len + screen->left_margin + 
+@@ -223,6 +224,16 @@ int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *screen,int id)
+ 		(screen->vsync_len + screen->upper_margin);
+ 	ret = rk616->write_dev(rk616,VIF0_REG5 + offset,&val);
+ 
++	if(id == 0)
++	{
++		val = VIF0_SYNC_EN | (VIF0_SYNC_EN << 16);
++		rk616->write_dev(rk616,CRU_IO_CON0,&val);
++	}
++	else
++	{
++		val = VIF1_SYNC_EN | (VIF1_SYNC_EN << 16);
++		rk616->write_dev(rk616,CRU_IO_CON0,&val);
++	}
+ 	rk616_vif_enable(rk616,id);
+ 	
+ 	return ret;
+@@ -436,7 +447,8 @@ static int rk616_dual_input_cfg(struct mfd_rk616 *rk616,rk_screen *screen,
+ 	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
+ 	route->pll1_clk_sel = PLL1_CLK_SEL(LCD1_DCLK);
+ 	route->vif1_clk_sel = VIF1_CLKIN_SEL(VIF_CLKIN_SEL_PLL1);
+-	route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF1);
++	route->hdmi_sel     = HDMI_IN_SEL(HDMI_IN_SEL_VIF1);
++	route->hdmi_clk_sel = HDMI_CLK_SEL(HDMI_CLK_SEL_VIF1);
+ 	if(enable)  //hdmi plug in
+ 	{
+ 		route->vif1_bypass  = 0;
+@@ -491,8 +503,8 @@ static int rk616_lcd0_input_lcd1_unused_cfg(struct mfd_rk616 *rk616,rk_screen *s
+ 		route->scl_en       = 1;
+ 		route->sclk_sel     = SCLK_SEL(SCLK_SEL_PLL1);
+ 		route->dither_sel   = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
+-		route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
+-		
++		route->hdmi_sel     = HDMI_IN_SEL(HDMI_IN_SEL_VIF0);//from vif0
++		route->hdmi_clk_sel = HDMI_CLK_SEL(HDMI_CLK_SEL_VIF0);	
+ 	}
+ 	else
+ 	{
+@@ -501,7 +513,7 @@ static int rk616_lcd0_input_lcd1_unused_cfg(struct mfd_rk616 *rk616,rk_screen *s
+ 		route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
+ 		route->scl_en      = 0;
+ 		route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_VIF0); //dither from sclaer
+-		route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
++		route->hdmi_sel    = HDMI_IN_SEL(HDMI_IN_SEL_VIF0);//from vif0
+ 	}
+ 	route->pll1_clk_sel = PLL1_CLK_SEL(LCD0_DCLK);
+ 	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
+@@ -544,7 +556,8 @@ static int rk616_lcd0_input_lcd1_output_cfg(struct mfd_rk616 *rk616,rk_screen *s
+ 		route->scl_en       = 1;
+ 		route->sclk_sel     = SCLK_SEL(SCLK_SEL_PLL1);
+ 		route->dither_sel   = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
+-		route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
++		route->hdmi_sel     = HDMI_IN_SEL(HDMI_IN_SEL_VIF0);//from vif0
++		route->hdmi_clk_sel = HDMI_CLK_SEL(HDMI_CLK_SEL_VIF0);
+ 	}
+ 	else
+ 	{
+@@ -553,7 +566,8 @@ static int rk616_lcd0_input_lcd1_output_cfg(struct mfd_rk616 *rk616,rk_screen *s
+ 		route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
+ 		route->scl_en      = 0;
+ 		route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_VIF0); //dither from sclaer
+-		route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0	
++		route->hdmi_sel    = HDMI_IN_SEL(HDMI_IN_SEL_VIF0);//from vif0
++		route->hdmi_clk_sel = HDMI_CLK_SEL(HDMI_CLK_SEL_VIF1);
+ 	}
+ 	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
+ 	route->pll1_clk_sel = PLL1_CLK_SEL(LCD0_DCLK);
+@@ -598,7 +612,8 @@ static int rk616_lcd0_unused_lcd1_input_cfg(struct mfd_rk616 *rk616,rk_screen *s
+ 	route->sclk_sel    = SCLK_SEL(SCLK_SEL_PLL0);
+ 	
+ 	route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
+-	route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF1); //from vif1
++	route->hdmi_sel    = HDMI_IN_SEL(HDMI_IN_SEL_VIF1); //from vif1
++	route->hdmi_clk_sel = HDMI_CLK_SEL(HDMI_CLK_SEL_VIF1);
+ 	route->lcd1_input  = 1;  
+ 	if(screen->type == SCREEN_RGB)
+ 	{
+@@ -687,6 +702,8 @@ static int rk616_router_cfg(struct mfd_rk616 *rk616)
+ 		(route->hdmi_sel) | (route->vif1_bypass) | (route->vif0_bypass) |
+ 		(route->vif1_clk_sel)| (route->vif0_clk_sel); 
+ 	ret = rk616->write_dev(rk616,CRU_CLKSEL2_CON,&val);
++	val = route->hdmi_clk_sel;
++	ret = rk616->write_dev_bits(rk616,CRU_CFGMISC_CON,HDMI_CLK_SEL_MASK,&val);
+ 
+ 	return ret;
+ }
+diff --git a/include/linux/mfd/rk616.h b/include/linux/mfd/rk616.h
+index 8803d1bd5d8e..937d5ecf630c 100755
+--- a/include/linux/mfd/rk616.h
++++ b/include/linux/mfd/rk616.h
+@@ -100,10 +100,10 @@
+ #define DITHER_SEL_VIF0		0
+ #define DITHER_SEL_SCL		1
+ 
+-#define HDMI_IN_SEL(x)		(((x)&3)<<12)
+-#define HDMI_CLK_SEL_VIF1	0
+-#define HDMI_CLK_SEL_SCL	1
+-#define HDMI_CLK_SEL_VIF0	2
++#define HDMI_IN_SEL(x)		(((x)&3)<<12)  //hdmi data in select
++#define HDMI_IN_SEL_VIF1	0
++#define HDMI_IN_SEL_SCL		1
++#define HDMI_IN_SEL_VIF0	2
+ #define VIF1_CLK_DIV(x) 	(((x)&7)<<9)
+ #define VIF1_CLK_GATE		(1<<8)
+ #define VIF1_CLK_BYPASS		(1<<7)
+@@ -185,6 +185,8 @@
+ 
+ 
+ #define CRU_IO_CON0    		0x0088
++#define VIF1_SYNC_EN		(1<<15)
++#define VIF0_SYNC_EN		(1<<14)
+ #define I2S1_OUT_DISABLE	(1<<13)
+ #define I2S0_OUT_DISABLE	(1<<12)
+ #define LVDS_OUT_EN		(1<<11)
+@@ -216,6 +218,11 @@
+ #define CRU_PCM2IS2_CON1	0x0094
+ #define CRU_PCM2IS2_CON2	0x0098
+ #define CRU_CFGMISC_CON		0x009C
++#define HDMI_CLK_SEL_MASK	(3<<12)
++#define HDMI_CLK_SEL(x)		(((x)&3)<<12)  //hdmi data in select
++#define HDMI_CLK_SEL_VIF1	0
++#define HDMI_CLK_SEL_SCL	1
++#define HDMI_CLK_SEL_VIF0	2
+ 
+ 
+ enum lcd_port_func{       // the function of lcd ports(lcd0,lcd1),the lcd0 only can be used as input or unused
+@@ -252,6 +259,7 @@ struct rk616_route {
+ 	u8  scl_bypass;
+ 	u16 dither_sel;
+ 	u16 hdmi_sel;
++	u16 hdmi_clk_sel;
+ 	u16 pll0_clk_sel;
+ 	u16 pll1_clk_sel;
+ 	u16 sclk_sel;
+@@ -275,6 +283,7 @@ struct mfd_rk616 {
+ 	struct dentry *debugfs_dir;
+ 	int (*read_dev)(struct mfd_rk616 *rk616,u16 reg,u32 *pval);
+ 	int (*write_dev)(struct mfd_rk616 *rk616,u16 reg,u32 *pval);
++	int (*write_dev_bits)(struct mfd_rk616 *rk616,u16 reg,u32 mask,u32 *pval);
+ };
+ 
+ extern int rk616_set_vif(struct mfd_rk616 * rk616,rk_screen * screen,bool connect);
+-- 
+2.35.3
+

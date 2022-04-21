@@ -1,0 +1,172 @@
+From 37389934947a7fdf7b7bddcfd24243e0bbb10c55 Mon Sep 17 00:00:00 2001
+From: Jung Zhao <jung.zhao@rock-chips.com>
+Date: Mon, 19 Dec 2016 15:11:39 +0800
+Subject: [PATCH] video: rockchip: vcodec: add buffer recycle mechanism in vpu
+
+when info change, vpu driver doesn't know when to release
+buffers. with this mechanism, vpu driver will auto release
+when buffer nums bigger than BUFFER_LIST_MAX_NUMS.
+
+Change-Id: Id4fb91257d260bfd2e18388731941c4f0cc191b0
+Signed-off-by: Jung Zhao <jung.zhao@rock-chips.com>
+---
+ .../video/rockchip/vcodec/vcodec_iommu_drm.c  | 34 ++++++++++++++++++-
+ .../video/rockchip/vcodec/vcodec_iommu_ops.c  |  1 +
+ .../video/rockchip/vcodec/vcodec_iommu_ops.h  |  3 ++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c b/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
+index 9ad03507d8bb..d10e2e0650cc 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_drm.c
+@@ -34,6 +34,7 @@
+ #include <linux/console.h>
+ #include <linux/kref.h>
+ #include <linux/fdtable.h>
++#include <linux/ktime.h>
+ 
+ #include "vcodec_iommu_ops.h"
+ 
+@@ -52,6 +53,7 @@ struct vcodec_drm_buffer {
+ 	struct page **pages;
+ 	struct kref ref;
+ 	struct vcodec_iommu_session_info *session_info;
++	ktime_t last_used;
+ };
+ 
+ struct vcodec_iommu_drm_info {
+@@ -67,8 +69,10 @@ vcodec_drm_get_buffer_no_lock(struct vcodec_iommu_session_info *session_info,
+ 
+ 	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
+ 				 list) {
+-		if (drm_buffer->index == idx)
++		if (drm_buffer->index == idx) {
++			drm_buffer->last_used = ktime_get();
+ 			return drm_buffer;
++		}
+ 	}
+ 
+ 	return NULL;
+@@ -86,6 +90,7 @@ vcodec_drm_get_buffer_fd_no_lock(struct vcodec_iommu_session_info *session_info,
+ 	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
+ 				 list) {
+ 		if (drm_buffer->dma_buf == dma_buf) {
++			drm_buffer->last_used = ktime_get();
+ 			dma_buf_put(dma_buf);
+ 			return drm_buffer;
+ 		}
+@@ -276,6 +281,7 @@ static int vcodec_drm_free(struct vcodec_iommu_session_info *session_info,
+ 		dma_buf_put(drm_buffer->dma_buf);
+ 		list_del_init(&drm_buffer->list);
+ 		kfree(drm_buffer);
++		session_info->buffer_nums--;
+ 	}
+ 	mutex_unlock(&session_info->list_mutex);
+ 
+@@ -386,6 +392,7 @@ vcodec_drm_free_fd(struct vcodec_iommu_session_info *session_info, int fd)
+ 		dma_buf_put(drm_buffer->dma_buf);
+ 		list_del_init(&drm_buffer->list);
+ 		kfree(drm_buffer);
++		session_info->buffer_nums--;
+ 	}
+ 	mutex_unlock(&session_info->list_mutex);
+ 
+@@ -432,12 +439,15 @@ static int vcodec_drm_import(struct vcodec_iommu_session_info *session_info,
+ 			     int fd)
+ {
+ 	struct vcodec_drm_buffer *drm_buffer = NULL, *n;
++	struct vcodec_drm_buffer *oldest_buffer = NULL, *loop_buffer = NULL;
+ 	struct vcodec_iommu_info *iommu_info = session_info->iommu_info;
+ 	struct vcodec_iommu_drm_info *drm_info = iommu_info->private;
++	struct iommu_domain *domain = drm_info->domain;
+ 	struct device *dev = session_info->dev;
+ 	struct dma_buf_attachment *attach;
+ 	struct sg_table *sgt;
+ 	struct dma_buf *dma_buf;
++	ktime_t oldest_time = ktime_set(0, 0);
+ 	int ret = 0;
+ 
+ 	dma_buf = dma_buf_get(fd);
+@@ -450,6 +460,7 @@ static int vcodec_drm_import(struct vcodec_iommu_session_info *session_info,
+ 				 &session_info->buffer_list, list) {
+ 		if (drm_buffer->dma_buf == dma_buf) {
+ 			dma_buf_put(dma_buf);
++			drm_buffer->last_used = ktime_get();
+ 			return drm_buffer->index;
+ 		}
+ 	}
+@@ -462,6 +473,7 @@ static int vcodec_drm_import(struct vcodec_iommu_session_info *session_info,
+ 
+ 	drm_buffer->dma_buf = dma_buf;
+ 	drm_buffer->session_info = session_info;
++	drm_buffer->last_used = ktime_get();
+ 
+ 	kref_init(&drm_buffer->ref);
+ 
+@@ -493,10 +505,30 @@ static int vcodec_drm_import(struct vcodec_iommu_session_info *session_info,
+ 	drm_buffer->attach = attach;
+ 	drm_buffer->sgt = sgt;
+ 
++	if (!drm_info->attached)
++		iommu_detach_device(domain, dev);
++
+ 	mutex_unlock(&iommu_info->iommu_mutex);
+ 
+ 	INIT_LIST_HEAD(&drm_buffer->list);
+ 	mutex_lock(&session_info->list_mutex);
++	session_info->buffer_nums++;
++	if (session_info->buffer_nums > BUFFER_LIST_MAX_NUMS) {
++		list_for_each_entry_safe(loop_buffer, n,
++				 &session_info->buffer_list, list) {
++			if (ktime_to_ns(oldest_time) == 0 ||
++			    ktime_after(oldest_time,
++					loop_buffer->last_used)) {
++				oldest_time = loop_buffer->last_used;
++				oldest_buffer = loop_buffer;
++			}
++		}
++		kref_put(&oldest_buffer->ref, vcodec_drm_clear_map);
++		dma_buf_put(oldest_buffer->dma_buf);
++		list_del_init(&oldest_buffer->list);
++		kfree(oldest_buffer);
++		session_info->buffer_nums--;
++	}
+ 	drm_buffer->index = session_info->max_idx;
+ 	list_add_tail(&drm_buffer->list, &session_info->buffer_list);
+ 	session_info->max_idx++;
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
+index 384c8ce7b97e..bb25db4d2656 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.c
+@@ -63,6 +63,7 @@ int vcodec_iommu_import(struct vcodec_iommu_info *iommu_info,
+ 		session_info->mmu_dev = iommu_info->mmu_dev;
+ 		session_info->dev = iommu_info->dev;
+ 		session_info->iommu_info = iommu_info;
++		session_info->buffer_nums = 0;
+ 		mutex_lock(&iommu_info->list_mutex);
+ 		list_add_tail(&session_info->head, &iommu_info->session_list);
+ 		mutex_unlock(&iommu_info->list_mutex);
+diff --git a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
+index 86069985c13d..46c721a9094b 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
++++ b/drivers/video/rockchip/vcodec/vcodec_iommu_ops.h
+@@ -19,6 +19,8 @@
+ #include <linux/platform_device.h>
+ #include "vcodec_service.h"
+ 
++#define BUFFER_LIST_MAX_NUMS	30
++
+ #define ALLOCATOR_USE_ION		0x00000000
+ #define ALLOCATOR_USE_DRM		0x00000001
+ 
+@@ -65,6 +67,7 @@ struct vcodec_iommu_ops {
+ struct vcodec_iommu_session_info {
+ 	struct list_head head;
+ 	struct vpu_session *session;
++	int buffer_nums;
+ 	struct list_head buffer_list;
+ 	struct mutex list_mutex;
+ 	int max_idx;
+-- 
+2.35.3
+

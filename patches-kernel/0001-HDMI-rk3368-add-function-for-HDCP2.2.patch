@@ -1,0 +1,252 @@
+From 61d46c90ee7fbada784b9c0946f28f5bd4625fc2 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Tue, 28 Apr 2015 19:17:27 +0800
+Subject: [PATCH] HDMI: rk3368: add function for HDCP2.2.
+
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+---
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c    | 24 +++++--
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h    |  5 ++
+ .../rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c    | 70 +++++++++++++++++--
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c | 10 ++-
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h |  2 +
+ 5 files changed, 98 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+index eaa91be7097e..82e8b9cc203a 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+@@ -250,6 +250,9 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 	struct hdmi *hdmi = hdmi_dev->hdmi;
+ 	struct delayed_work *delay_work;
+ 	struct pinctrl_state *gpio_state;
++#ifdef CONFIG_PINCTRL
++	struct dev_pin_info *pins = hdmi_dev->dev->pins;
++#endif
+ 
+ 	if (action == FB_EARLY_EVENT_BLANK) {
+ 		switch (blank_mode) {
+@@ -264,9 +267,16 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 							 0, NULL);
+ 				if (delay_work)
+ 					flush_delayed_work(delay_work);
++				if (hdmi_dev->hdcp2_en)
++					hdmi_dev->hdcp2_en(0);
+ 				rockchip_hdmiv2_clk_disable(hdmi_dev);
+-				gpio_state = pinctrl_lookup_state(hdmi_dev->dev->pins->p, "gpio");
+-				pinctrl_select_state(hdmi_dev->dev->pins->p, gpio_state);
++				#ifdef CONFIG_PINCTRL
++				gpio_state =
++				pinctrl_lookup_state(pins->p,
++						     "gpio");
++				pinctrl_select_state(pins->p,
++						     gpio_state);
++				#endif
+ 			}
+ 			break;
+ 		}
+@@ -275,12 +285,18 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 		case FB_BLANK_UNBLANK:
+ 			HDMIDBG("resume hdmi\n");
+ 			if (hdmi->sleep) {
+-				pinctrl_select_state(hdmi_dev->dev->pins->p,
+-						     hdmi_dev->dev->pins->default_state);
++				#ifdef CONFIG_PINCTRL
++				pinctrl_select_state(pins->p,
++						     pins->default_state);
++				#endif
+ 				rockchip_hdmiv2_clk_enable(hdmi_dev);
+ 				rockchip_hdmiv2_dev_initial(hdmi_dev);
+ 				if (hdmi->ops->hdcp_power_on_cb)
+ 					hdmi->ops->hdcp_power_on_cb();
++				if (hdmi_dev->hdcp2_reset)
++					hdmi_dev->hdcp2_reset();
++				if (hdmi_dev->hdcp2_en)
++					hdmi_dev->hdcp2_en(1);
+ 				hdmi_submit_work(hdmi, HDMI_RESUME_CTL,
+ 						 0, NULL);
+ 			}
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+index 7e4b4535c0f4..1bb9561a1a33 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+@@ -38,6 +38,7 @@ struct hdmi_dev {
+ 	int			soctype;
+ 	int			audiosrc;
+ 	int			enable;
++	int			hdcp2_enable;
+ 	unsigned char		clk_disable;
+ 	unsigned char		clk_on;
+ 
+@@ -48,5 +49,9 @@ struct hdmi_dev {
+ 
+ 	bool			tmdsclk_ratio_change;
+ 	struct mutex		ddc_lock;	/*mutex for ddc operation */
++
++	void			(*hdcp2_en)(int);
++	void			(*hdcp2_reset)(void);
++	void			(*hdcp2_start)(void);
+ };
+ #endif /*__RK32_HDMI_H__*/
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
+index d321811dd81f..0e5a76c55d24 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
+@@ -30,7 +30,7 @@ struct hdcp {
+ };
+ 
+ static struct miscdevice mdev;
+-static struct hdcp *hdcp = NULL;
++static struct hdcp *hdcp;
+ 
+ static void hdcp_load_key(struct hdmi *hdmi, struct hdcp_keys *key)
+ {
+@@ -111,6 +111,52 @@ static void hdcp_load_keys_cb(const struct firmware *fw,
+ 	hdcp_load_key(hdmi, hdcp->keys);
+ }
+ 
++void rockchip_hdmiv2_hdcp2_enable(int enable)
++{
++	struct hdmi_dev *hdmi_dev;
++
++	if (!hdcp) {
++		pr_err("rockchip hdmiv2 hdcp is not exist\n");
++		return;
++	}
++	hdmi_dev = hdcp->hdmi->property->priv;
++	if (hdmi_dev->soctype == HDMI_SOC_RK3368 &&
++	    hdmi_dev->hdcp2_enable != enable) {
++		hdmi_dev->hdcp2_enable = enable;
++		if (hdmi_dev->hdcp2_enable == 0) {
++			hdmi_msk_reg(hdmi_dev, HDCP2REG_CTRL,
++				     m_HDCP2_OVR_EN | m_HDCP2_FORCE,
++				     v_HDCP2_OVR_EN(1) | v_HDCP2_FORCE(0));
++			hdmi_writel(hdmi_dev, HDCP2REG_MASK, 0xff);
++			hdmi_writel(hdmi_dev, HDCP2REG_MUTE, 0xff);
++		} else {
++			hdmi_msk_reg(hdmi_dev, HDCP2REG_CTRL,
++				     m_HDCP2_OVR_EN | m_HDCP2_FORCE,
++				     v_HDCP2_OVR_EN(0) | v_HDCP2_FORCE(0));
++			hdmi_writel(hdmi_dev, HDCP2REG_MASK, 0x00);
++			hdmi_writel(hdmi_dev, HDCP2REG_MUTE, 0x00);
++		}
++	}
++}
++EXPORT_SYMBOL(rockchip_hdmiv2_hdcp2_enable);
++
++void rockchip_hdmiv2_hdcp2_init(void (*hdcp2_enble)(int),
++				void (*hdcp2_reset)(void),
++				void (*hdcp2_start)(void))
++{
++	struct hdmi_dev *hdmi_dev;
++
++	if (!hdcp) {
++		pr_err("rockchip hdmiv2 hdcp is not exist\n");
++		return;
++	}
++	hdmi_dev = hdcp->hdmi->property->priv;
++	hdmi_dev->hdcp2_en = hdcp2_enble;
++	hdmi_dev->hdcp2_reset = hdcp2_reset;
++	hdmi_dev->hdcp2_start = hdcp2_start;
++}
++EXPORT_SYMBOL(rockchip_hdmiv2_hdcp2_init);
++
+ static void rockchip_hdmiv2_hdcp_start(struct hdmi *hdmi)
+ {
+ 	struct hdmi_dev *hdmi_dev = hdmi->property->priv;
+@@ -118,11 +164,19 @@ static void rockchip_hdmiv2_hdcp_start(struct hdmi *hdmi)
+ 	if (!hdcp->enable)
+ 		return;
+ 	if (hdmi_dev->soctype == HDMI_SOC_RK3368) {
+-		hdmi_msk_reg(hdmi_dev, HDCP2REG_CTRL,
+-			     m_HDCP2_OVR_EN | m_HDCP2_FORCE,
+-			     v_HDCP2_OVR_EN(1) | v_HDCP2_FORCE(0));
+-		hdmi_writel(hdmi_dev, HDCP2REG_MASK, 0x00);
+-		hdmi_writel(hdmi_dev, HDCP2REG_MUTE, 0x00);
++		if (hdmi_dev->hdcp2_enable == 0) {
++			hdmi_msk_reg(hdmi_dev, HDCP2REG_CTRL,
++				     m_HDCP2_OVR_EN | m_HDCP2_FORCE,
++				     v_HDCP2_OVR_EN(1) | v_HDCP2_FORCE(0));
++			hdmi_writel(hdmi_dev, HDCP2REG_MASK, 0xff);
++			hdmi_writel(hdmi_dev, HDCP2REG_MUTE, 0xff);
++		} else {
++			hdmi_msk_reg(hdmi_dev, HDCP2REG_CTRL,
++				     m_HDCP2_OVR_EN | m_HDCP2_FORCE,
++				     v_HDCP2_OVR_EN(0) | v_HDCP2_FORCE(0));
++			hdmi_writel(hdmi_dev, HDCP2REG_MASK, 0x00);
++			hdmi_writel(hdmi_dev, HDCP2REG_MUTE, 0x00);
++		}
+ 	}
+ 
+ 	hdmi_msk_reg(hdmi_dev, FC_INVIDCONF,
+@@ -146,6 +200,8 @@ static void rockchip_hdmiv2_hdcp_start(struct hdmi *hdmi)
+ 
+ 	hdmi_msk_reg(hdmi_dev, MC_CLKDIS,
+ 		     m_HDCPCLK_DISABLE, v_HDCPCLK_DISABLE(0));
++	if (hdmi_dev->hdcp2_start)
++		hdmi_dev->hdcp2_start();
+ 	pr_info("%s success\n", __func__);
+ }
+ 
+@@ -160,6 +216,7 @@ static void rockchip_hdmiv2_hdcp_stop(struct hdmi *hdmi)
+ 		     m_HDCPCLK_DISABLE, v_HDCPCLK_DISABLE(1));
+ 	hdmi_writel(hdmi_dev, A_APIINTMSK, 0xff);
+ 	hdmi_msk_reg(hdmi_dev, A_HDCPCFG0, m_RX_DETECT, v_RX_DETECT(0));
++	rockchip_hdmiv2_hdcp2_enable(0);
+ }
+ 
+ static ssize_t hdcp_enable_read(struct device *device,
+@@ -296,4 +353,3 @@ void rockchip_hdmiv2_hdcp_init(struct hdmi *hdmi)
+ 	else
+ 		hdcp_load_key(hdmi, hdcp->keys);
+ }
+-
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index afa3b3974ed3..e1ef8a6d9cac 100755
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -1511,8 +1511,8 @@ static int hdmi_dev_config_audio(struct hdmi *hdmi, struct hdmi_audio *audio)
+ 			HDMIDBG("hbr mode.\n");
+ 			hdmi_writel(hdmi_dev, AUD_CONF2, 0x1);
+ 			word_length = I2S_24BIT_SAMPLE;
+-		} else if ((HDMI_AUDIO_FS_48000 == audio->rate)
+-			   || (HDMI_AUDIO_FS_192000 == audio->rate)) {
++		} else if ((HDMI_AUDIO_FS_48000 == audio->rate) ||
++			   (HDMI_AUDIO_FS_192000 == audio->rate)) {
+ 			HDMIDBG("nlpcm mode.\n");
+ 			hdmi_writel(hdmi_dev, AUD_CONF2, 0x2);
+ 			word_length = I2S_24BIT_SAMPLE;
+@@ -1751,6 +1751,12 @@ irqreturn_t rockchip_hdmiv2_dev_irq(int irq, void *priv)
+ 	if (hdcp2_int) {
+ 		hdmi_writel(hdmi_dev, HDCP2REG_STAT, hdcp2_int);
+ 		pr_info("hdcp2_int is 0x%02x\n", hdcp2_int);
++		if ((hdcp2_int & m_HDCP2_AUTH_FAIL ||
++		     hdcp2_int & m_HDCP2_AUTH_LOST) &&
++		    hdmi_dev->hdcp2_start) {
++			pr_info("hdcp2 failed or lost\n");
++			hdmi_dev->hdcp2_start();
++		}
+ 	}
+ 	return IRQ_HANDLED;
+ }
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+index 83b7924051b6..ac69f94935b7 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+@@ -1314,6 +1314,7 @@ enum {
+ 	#define m_HDCP2_AUTH_LOST	(1 << 2)
+ 	#define m_HDCP2_AUTH_OK		(1 << 3)
+ 	#define m_HDCP2_AUTH_FAIL	(1 << 4)
++	#define m_HDCP2_DECRYPTED_CHG	(1 << 5)
+ 
+ /* CEC Engine Registers */
+ #define CEC_ENGINE_BASE			0x7d00
+@@ -1565,4 +1566,5 @@ void rockchip_hdmiv2_cec_init(struct hdmi *hdmi);
+ void rockchip_hdmiv2_cec_isr(struct hdmi_dev *hdmi_dev, char cec_int);
+ void rockchip_hdmiv2_dump_phy_regs(struct hdmi_dev *hdmi_dev);
+ void rockchip_hdmiv2_hdcp_init(struct hdmi *hdmi);
++void rockchip_hdmiv2_hdcp2_enable(int enable);
+ #endif
+-- 
+2.35.3
+

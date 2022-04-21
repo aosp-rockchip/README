@@ -1,0 +1,544 @@
+From d942ab87acd9a780a60646682ae2427653a5e66e Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Mon, 8 Jun 2015 17:20:01 +0800
+Subject: [PATCH] mmc: host: Add facility to support re-tuning
+
+  This commit comes from community but not upstreram.
+We cannot wait for picking up such a great movement without
+upstream admit it. We just take a light way to merge it and
+minimize the change.
+
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+Signed-off-by: xiaoyao <xiaoyao@rock-chips.com>
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+---
+ drivers/mmc/card/block.c    | 13 ++++++-
+ drivers/mmc/card/queue.h    |  1 +
+ drivers/mmc/core/core.c     | 69 ++++++++++++++++++++++++++++++++-----
+ drivers/mmc/core/core.h     |  1 +
+ drivers/mmc/core/host.c     | 47 +++++++++++++++++++++++++
+ drivers/mmc/core/mmc.c      |  4 +++
+ drivers/mmc/core/mmc_ops.c  | 45 +++++++++++++++---------
+ drivers/mmc/core/mmc_ops.h  |  2 +-
+ drivers/mmc/host/rk_sdmmc.c |  3 ++
+ include/linux/mmc/host.h    | 39 +++++++++++++++++++++
+ 10 files changed, 197 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index e4aa64d5d958..b0f1ec892934 100755
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -1127,6 +1127,7 @@ static int mmc_blk_err_check(struct mmc_card *card,
+ 						    mmc_active);
+ 	struct mmc_blk_request *brq = &mq_mrq->brq;
+ 	struct request *req = mq_mrq->req;
++	int need_retune = card->host->need_retune;
+ 	int ecc_err = 0, gen_err = 0;
+ 
+ 	/*
+@@ -1224,6 +1225,14 @@ static int mmc_blk_err_check(struct mmc_card *card,
+ 	}
+ 
+ 	if (brq->data.error) {
++		pr_err("need_retune:%d,brq->retune_retry_done:%d.\n",need_retune,brq->retune_retry_done);
++		if (need_retune && !brq->retune_retry_done) {
++			pr_err("%s: retrying because a re-tune was needed\n",
++			       req->rq_disk->disk_name);
++			brq->retune_retry_done = 1;
++			return MMC_BLK_RETRY;
++		}
++
+ 		pr_err("%s: error %d transferring data, sector %u, nr %u, cmd response %#x, card status %#x\n",
+ 		       req->rq_disk->disk_name, brq->data.error,
+ 		       (unsigned)blk_rq_pos(req),
+@@ -1782,7 +1791,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+ 	struct mmc_blk_data *md = mq->data;
+ 	struct mmc_card *card = md->queue.card;
+ 	struct mmc_blk_request *brq = &mq->mqrq_cur->brq;
+-	int ret = 1, disable_multi = 0, retry = 0, type;
++	int ret = 1, disable_multi = 0, retry = 0, retune_retry_done = 0, type;
+ 	enum mmc_blk_status status;
+ 	struct mmc_queue_req *mq_rq;
+ 	struct request *req = rqc;
+@@ -1866,6 +1875,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+ 				break;
+ 			goto cmd_abort;
+ 		case MMC_BLK_RETRY:
++			retune_retry_done = brq->retune_retry_done;
+ 			if (retry++ < 5)
+ 				break;
+ 			/* Fall through */
+@@ -1928,6 +1938,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+ 				mmc_start_req(card->host,
+ 						&mq_rq->mmc_active, NULL);
+ 			}
++		mq_rq->brq.retune_retry_done = retune_retry_done;
+ 		}
+ 	} while (ret);
+ 
+diff --git a/drivers/mmc/card/queue.h b/drivers/mmc/card/queue.h
+index 99e6521e6169..e7959fb0ebc6 100644
+--- a/drivers/mmc/card/queue.h
++++ b/drivers/mmc/card/queue.h
+@@ -12,6 +12,7 @@ struct mmc_blk_request {
+ 	struct mmc_command	cmd;
+ 	struct mmc_command	stop;
+ 	struct mmc_data		data;
++	int	retune_retry_done;
+ };
+ 
+ enum mmc_packed_type {
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index e487872795ad..21233c158987 100755
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -193,6 +193,21 @@ void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
+ }
+ EXPORT_SYMBOL(mmc_request_done);
+ 
++static void __mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
++{
++	int err;
++
++	/* Assumes host controller has been runtime resumed by mmc_claim_host */
++	err = mmc_retune(host);
++	if (err) {
++		mrq->cmd->error = err;
++		mmc_request_done(host, mrq);
++		return;
++	}
++
++	host->ops->request(host, mrq);
++}
++
+ static void
+ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ {
+@@ -200,6 +215,7 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 	unsigned int i, sz;
+ 	struct scatterlist *sg;
+ #endif
++	mmc_retune_hold(host);
+ 
+ 	if (mrq->sbc) {
+ 		pr_debug("<%s: starting CMD%u arg %08x flags %08x>\n",
+@@ -253,7 +269,7 @@ mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
+ 	}
+ 	mmc_host_clk_hold(host);
+ 	led_trigger_event(host->led, LED_FULL);
+-	host->ops->request(host, mrq);
++	__mmc_start_request(host, mrq);
+ }
+ 
+ /**
+@@ -296,6 +312,8 @@ void mmc_start_bkops(struct mmc_card *card, bool from_exception)
+ 		timeout = MMC_BKOPS_MAX_TIMEOUT;
+ 		use_busy_signal = true;
+ 	} else {
++		/* Hold re-tuning for ongoing bkops */
++		mmc_retune_hold(card->host);
+ 		timeout = 0;
+ 		use_busy_signal = false;
+ 	}
+@@ -306,6 +324,9 @@ void mmc_start_bkops(struct mmc_card *card, bool from_exception)
+ 	if (err) {
+ 		pr_warn("%s: Error %d starting bkops\n",
+ 			mmc_hostname(card->host), err);
++		/* bkops not ongoing, so release re-tuning */
++		if (!use_busy_signal)
++			mmc_retune_release(card->host);
+ 		goto out;
+ 	}
+ 
+@@ -413,22 +434,22 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
+ 							    host->areq);
+ 				break; /* return err */
+ 			} else {
++				mmc_retune_recheck(host);
+ 				pr_info("%s: req failed (CMD%u): %d, retrying...\n",
+ 					mmc_hostname(host),
+ 					cmd->opcode, cmd->error);
+ 				cmd->retries--;
+ 				cmd->error = 0;
+-				host->ops->request(host, mrq);
++				__mmc_start_request(host, mrq);
+ 				continue; /* wait for done/new event again */
+ 			}
+ 		} else if (context_info->is_new_req) {
+ 			context_info->is_new_req = false;
+-			if (!next_req) {
+-				err = MMC_BLK_NEW_REQUEST;
+-				break; /* return err */
+-			}
++			if (!next_req)
++				return MMC_BLK_NEW_REQUEST;
+ 		}
+ 	}
++	mmc_retune_release(host);
+ 	return err;
+ }
+ 
+@@ -503,8 +524,9 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
+ 			 mmc_hostname(host), cmd->opcode, cmd->error);
+ 		cmd->retries--;
+ 		cmd->error = 0;
+-		host->ops->request(host, mrq);
++		__mmc_start_request(host, mrq);
+ 	}
++	mmc_retune_release(host);
+ }
+ 
+ /**
+@@ -751,6 +773,7 @@ int mmc_stop_bkops(struct mmc_card *card)
+ 	 */
+ 	if (!err || (err == -EINVAL)) {
+ 		mmc_card_clr_doing_bkops(card);
++		mmc_retune_release(card->host);
+ 		err = 0;
+ 	}
+ 
+@@ -1116,6 +1139,32 @@ void mmc_set_ungated(struct mmc_host *host)
+ }
+ #endif
+ 
++int mmc_execute_tuning(struct mmc_card *card)
++{
++	struct mmc_host *host = card->host;
++	u32 opcode;
++	int err;
++
++	if (!host->ops->execute_tuning)
++		return 0;
++
++	if (mmc_card_mmc(card))
++		opcode = MMC_SEND_TUNING_BLOCK_HS200;
++	else
++		opcode = MMC_SEND_TUNING_BLOCK;
++
++	mmc_host_clk_hold(host);
++	err = host->ops->execute_tuning(host, opcode);
++	mmc_host_clk_release(host);
++
++	if (err)
++		pr_err("%s: tuning execution failed\n", mmc_hostname(host));
++	else
++		mmc_retune_enable(host);
++
++	return err;
++}
++
+ /*
+  * Change the bus mode (open drain/push-pull) of a host.
+  */
+@@ -1576,6 +1625,7 @@ void mmc_power_up(struct mmc_host *host, u32 ocr)
+ 		return;
+ 
+ 	mmc_host_clk_hold(host);
++	mmc_retune_disable(host);
+ 
+ 	host->ios.vdd = fls(ocr) - 1;
+ 	if (mmc_host_is_spi(host))
+@@ -1617,6 +1667,7 @@ void mmc_power_off(struct mmc_host *host)
+ 		return;
+ 
+ 	mmc_host_clk_hold(host);
++	mmc_retune_disable(host);
+ 
+ 	host->ios.clock = 0;
+ 	host->ios.vdd = 0;
+@@ -1961,6 +2012,8 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 	unsigned int fr, nr;
+ 	int err;
+ 
++	mmc_retune_hold(card->host);
++
+ 	fr = from;
+ 	nr = to - from + 1;
+ 
+@@ -2067,7 +2120,7 @@ static int mmc_do_erase(struct mmc_card *card, unsigned int from,
+ 	} while (!(cmd.resp[0] & R1_READY_FOR_DATA) ||
+ 		 (R1_CURRENT_STATE(cmd.resp[0]) == R1_STATE_PRG));
+ out:
+-
++	mmc_retune_release(card->host);
+ 	return err;
+ }
+ 
+diff --git a/drivers/mmc/core/core.h b/drivers/mmc/core/core.h
+index 443a584660f0..cab4a76f1400 100644
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@ -81,5 +81,6 @@ void mmc_add_card_debugfs(struct mmc_card *card);
+ void mmc_remove_card_debugfs(struct mmc_card *card);
+ 
+ void mmc_init_context_info(struct mmc_host *host);
++int mmc_execute_tuning(struct mmc_card *card);
+ #endif
+ 
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index 2385b6f33c3e..5cca83629049 100755
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -300,6 +300,53 @@ static inline void mmc_host_clk_sysfs_init(struct mmc_host *host)
+ 
+ #endif
+ 
++void mmc_retune_enable(struct mmc_host *host)
++{
++	host->can_retune = 1;
++}
++
++void mmc_retune_disable(struct mmc_host *host)
++{
++	host->can_retune = 0;
++	host->need_retune = 0;
++}
++
++void mmc_retune_hold(struct mmc_host *host)
++{
++	if (!host->hold_retune)
++		host->retune_now = 1;
++	host->hold_retune += 1;
++}
++EXPORT_SYMBOL(mmc_retune_hold);
++
++void mmc_retune_release(struct mmc_host *host)
++{
++	if (host->hold_retune)
++		host->hold_retune -= 1;
++	else
++		WARN_ON(1);
++}
++EXPORT_SYMBOL(mmc_retune_release);
++
++int mmc_retune(struct mmc_host *host)
++{
++	int err;
++
++	if (!host->need_retune || host->doing_retune || !host->card)
++		return 0;
++
++	host->need_retune = 0;
++
++	host->doing_retune = 1;
++
++	err = mmc_execute_tuning(host->card);
++
++	host->doing_retune = 0;
++
++	return err;
++}
++EXPORT_SYMBOL(mmc_retune);
++
+ /**
+  *	mmc_of_parse() - parse host's device-tree node
+  *	@host: host whose node should be parsed.
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index e67293b2f670..d4517603db46 100755
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -1112,6 +1112,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 		 * 3. set the clock to > 52Mhz <=200MHz and
+ 		 * 4. execute tuning for HS200
+ 		 */
++		/*
+ 		if ((host->caps2 & MMC_CAP2_HS200) &&
+ 		    card->host->ops->execute_tuning) {
+ 			mmc_host_clk_hold(card->host);
+@@ -1124,6 +1125,9 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 				   mmc_hostname(card->host));
+ 			goto err;
+ 		}
++		*/
++		if (host->caps2 & MMC_CAP2_HS200)
++			mmc_execute_tuning(card);
+ 
+ 		ext_csd_bits = (bus_width == MMC_BUS_WIDTH_8) ?
+ 				EXT_CSD_BUS_WIDTH_8 : EXT_CSD_BUS_WIDTH_4;
+diff --git a/drivers/mmc/core/mmc_ops.c b/drivers/mmc/core/mmc_ops.c
+index e5b5eeb548d1..07fb48dc67ae 100644
+--- a/drivers/mmc/core/mmc_ops.c
++++ b/drivers/mmc/core/mmc_ops.c
+@@ -395,6 +395,21 @@ int mmc_spi_set_crc(struct mmc_host *host, int use_crc)
+ 	return err;
+ }
+ 
++int mmc_switch_status_error(struct mmc_host *host, u32 status)
++{
++	if (mmc_host_is_spi(host)) {
++		if (status & R1_SPI_ILLEGAL_COMMAND)
++			return -EBADMSG;
++	} else {
++		if (status & 0xFDFFA000)
++			pr_warn("%s: unexpected status %#x after switch\n",
++				mmc_hostname(host), status);
++		if (status & R1_SWITCH_ERROR)
++			return -EBADMSG;
++	}
++	return 0;
++}
++
+ /**
+  *	__mmc_switch - modify EXT_CSD register
+  *	@card: the MMC card associated with the data transfer
+@@ -411,6 +426,7 @@ int mmc_spi_set_crc(struct mmc_host *host, int use_crc)
+ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+ 		unsigned int timeout_ms, bool use_busy_signal, bool send_status)
+ {
++	struct mmc_host *host = card->host;
+ 	int err;
+ 	struct mmc_command cmd = {0};
+ 	unsigned long timeout;
+@@ -420,6 +436,8 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+ 	BUG_ON(!card);
+ 	BUG_ON(!card->host);
+ 
++	mmc_retune_hold(host);
++
+ 	cmd.opcode = MMC_SWITCH;
+ 	cmd.arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) |
+ 		  (index << 16) |
+@@ -438,11 +456,11 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+ 
+ 	err = mmc_wait_for_cmd(card->host, &cmd, MMC_CMD_RETRIES);
+ 	if (err)
+-		return err;
++		goto out;
+ 
+ 	/* No need to check card status in case of unblocking command */
+ 	if (!use_busy_signal)
+-		return 0;
++		goto out;
+ 
+ 	/*
+ 	 * Must check status to be sure of no errors
+@@ -458,7 +476,7 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+ 		if (send_status) {
+ 			err = __mmc_send_status(card, &status, ignore_crc);
+ 			if (err)
+-				return err;
++				goto out;
+ 		}
+ 		if (card->host->caps & MMC_CAP_WAIT_WHILE_BUSY)
+ 			break;
+@@ -472,29 +490,22 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
+ 		 */
+ 		if (!send_status) {
+ 			mmc_delay(timeout_ms);
+-			return 0;
++			goto out;
+ 		}
+ 
+ 		/* Timeout if the device never leaves the program state. */
+ 		if (time_after(jiffies, timeout)) {
+ 			pr_err("%s: Card stuck in programming state! %s\n",
+ 				mmc_hostname(card->host), __func__);
+-			return -ETIMEDOUT;
++			err = -ETIMEDOUT;
++			goto out;
+ 		}
+ 	} while (R1_CURRENT_STATE(status) == R1_STATE_PRG);
+ 
+-	if (mmc_host_is_spi(card->host)) {
+-		if (status & R1_SPI_ILLEGAL_COMMAND)
+-			return -EBADMSG;
+-	} else {
+-		if (status & 0xFDFFA000)
+-			pr_warning("%s: unexpected status %#x after "
+-			       "switch", mmc_hostname(card->host), status);
+-		if (status & R1_SWITCH_ERROR)
+-			return -EBADMSG;
+-	}
+-
+-	return 0;
++	err = mmc_switch_status_error(host, status);
++out:
++	mmc_retune_release(host);
++	return err;
+ }
+ EXPORT_SYMBOL_GPL(__mmc_switch);
+ 
+diff --git a/drivers/mmc/core/mmc_ops.h b/drivers/mmc/core/mmc_ops.h
+index 80ae9f4e0293..40f66480866c 100644
+--- a/drivers/mmc/core/mmc_ops.h
++++ b/drivers/mmc/core/mmc_ops.h
+@@ -26,6 +26,6 @@ int mmc_spi_read_ocr(struct mmc_host *host, int highcap, u32 *ocrp);
+ int mmc_spi_set_crc(struct mmc_host *host, int use_crc);
+ int mmc_bus_test(struct mmc_card *card, u8 bus_width);
+ int mmc_send_hpi_cmd(struct mmc_card *card, u32 *status);
+-
++int mmc_switch_status_error(struct mmc_host *host, u32 status);
+ #endif
+ 
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index 4fdcf930232a..e26b0d4b10e1 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -2914,6 +2914,9 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ 			mci_writel(host, RINTSTS, DW_MCI_DATA_ERROR_FLAGS);
+ 			host->data_status = pending;
+ 			smp_wmb();
++			printk(KERN_ERR "[%s] Data transmission error !!!!  MINTSTS: [0x%08x]\n",
++			       mmc_hostname(host->mmc), pending);
++			mmc_retune_needed(host->mmc);
+ 			set_bit(EVENT_DATA_ERROR, &host->pending_events);
+ 
+ 			MMC_DBG_INFO_FUNC(host->mmc,
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 4303be83cc63..e401512a20a4 100755
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -334,6 +334,13 @@ struct mmc_host {
+ 	int			rescan_disable;	/* disable card detection */
+ 	int			rescan_entered;	/* used with nonremovable devices */
+ 
++
++	unsigned int		can_retune:1;	/* re-tuning can be used */
++	unsigned int		doing_retune:1;	/* re-tuning in progress */
++	unsigned int		retune_now:1;	/* do re-tuning at next req */
++	int			need_retune;	/* re-tuning is needed */
++	int			hold_retune;	/* hold off re-tuning */
++
+ 	struct mmc_card		*card;		/* device attached to this host */
+ 
+ 	wait_queue_head_t	wq;
+@@ -533,4 +540,36 @@ static inline unsigned int mmc_host_clk_rate(struct mmc_host *host)
+ 	return host->ios.clock;
+ }
+ #endif
++
++void mmc_retune_enable(struct mmc_host *host);
++void mmc_retune_disable(struct mmc_host *host);
++void mmc_retune_hold(struct mmc_host *host);
++void mmc_retune_release(struct mmc_host *host);
++int mmc_retune(struct mmc_host *host);
++
++static inline void mmc_retune_needed(struct mmc_host *host)
++{
++	if ((host->can_retune) && (host->doing_retune == 0)) {
++		host->need_retune = 1;
++		pr_err("[%s] Data transmission error, need to "
++		       "try retuning %d.\n", mmc_hostname(host),
++		       host->need_retune);
++	} else {
++		pr_err("[%s] host was already tuning, Don't"
++		       " need to retry tune again ignore %d.\n",
++		       mmc_hostname(host), host->need_retune);
++	}
++}
++
++static inline void mmc_retune_not_needed(struct mmc_host *host)
++{
++	host->need_retune = 0;
++}
++
++static inline void mmc_retune_recheck(struct mmc_host *host)
++{
++	if (host->hold_retune <= 1)
++		host->retune_now = 1;
++}
++
+ #endif /* LINUX_MMC_HOST_H */
+-- 
+2.35.3
+

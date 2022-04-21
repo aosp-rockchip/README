@@ -1,0 +1,186 @@
+From 01eed837f6a2551d49425b3ebdc230d713caaa29 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=88=E4=BA=AE?= <cl@rock-chips.com>
+Date: Sun, 4 May 2014 04:22:30 -0700
+Subject: [PATCH] reboot: lock core rate and volt(1.0V), cancle temp control,
+ cancel ddr freq thread
+
+---
+ arch/arm/mach-rockchip/ddr_freq.c  | 23 +++++++++++++++++++----
+ arch/arm/mach-rockchip/dvfs.c      | 12 +++++++++---
+ drivers/cpufreq/rockchip-cpufreq.c | 19 ++++++++++++++++---
+ 3 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arm/mach-rockchip/ddr_freq.c b/arch/arm/mach-rockchip/ddr_freq.c
+index c371a042fcaa..2f024791b9f7 100755
+--- a/arch/arm/mach-rockchip/ddr_freq.c
++++ b/arch/arm/mach-rockchip/ddr_freq.c
+@@ -25,9 +25,12 @@
+ #include <asm/io.h>
+ #include <linux/rockchip/grf.h>
+ #include <linux/rockchip/iomap.h>
++
++extern int rockchip_cpufreq_reboot_limit_freq(void);
++
+ static struct dvfs_node *clk_cpu_dvfs_node = NULL;
+ static int ddr_boost = 0;
+-
++static int reboot_config_done = 0;
+ 
+ enum {
+ 	DEBUG_DDR = 1U << 0,
+@@ -78,6 +81,9 @@ static noinline void ddrfreq_clear_sys_status(int status)
+ 
+ static void ddrfreq_mode(bool auto_self_refresh, unsigned long *target_rate, char *name)
+ {
++	unsigned int min_rate, max_rate;
++	int freq_limit_en;
++
+ 	ddr.mode = name;
+ 	if (auto_self_refresh != ddr.auto_self_refresh) {
+ 		ddr_set_auto_self_refresh(auto_self_refresh);
+@@ -85,12 +91,18 @@ static void ddrfreq_mode(bool auto_self_refresh, unsigned long *target_rate, cha
+ 		dprintk(DEBUG_DDR, "change auto self refresh to %d when %s\n", auto_self_refresh, name);
+ 	}
+ 	if (*target_rate != dvfs_clk_get_rate(ddr.clk_dvfs_node)) {
++		freq_limit_en = dvfs_clk_get_limit(clk_cpu_dvfs_node, &min_rate, &max_rate);
+ 		dvfs_clk_enable_limit(clk_cpu_dvfs_node, 600000000, -1);
+ 		if (dvfs_clk_set_rate(ddr.clk_dvfs_node, *target_rate) == 0) {
+ 			*target_rate = dvfs_clk_get_rate(ddr.clk_dvfs_node);
+ 			dprintk(DEBUG_DDR, "change freq to %lu MHz when %s\n", *target_rate / MHZ, name);
+ 		}
+-		dvfs_clk_enable_limit(clk_cpu_dvfs_node, 0, -1);
++
++		if (freq_limit_en) {
++			dvfs_clk_enable_limit(clk_cpu_dvfs_node, min_rate, max_rate);
++		} else {
++			dvfs_clk_disable_limit(clk_cpu_dvfs_node);
++		}
+ 	}
+ }
+ 
+@@ -309,6 +321,8 @@ static noinline void ddrfreq_work(unsigned long sys_status)
+ 	
+ 	if (ddr.reboot_rate && (s & SYS_STATUS_REBOOT)) {
+ 		ddrfreq_mode(false, &ddr.reboot_rate, "shutdown/reboot");
++		rockchip_cpufreq_reboot_limit_freq();
++		reboot_config_done = 1;
+ 	} else if (ddr.suspend_rate && (s & SYS_STATUS_SUSPEND)) {
+ 		ddrfreq_mode(true, &ddr.suspend_rate, "suspend");
+ 	} else if (ddr.dualview_rate && 
+@@ -342,7 +356,7 @@ static int ddrfreq_task(void *data)
+ 		unsigned long status = ddr.sys_status;
+ 		ddrfreq_work(status);
+ 		wait_event_freezable(ddr.wait, (status != ddr.sys_status) || kthread_should_stop());
+-	} while (!kthread_should_stop());
++	} while (!kthread_should_stop() && !reboot_config_done);
+ 
+ 	return 0;
+ }
+@@ -491,12 +505,13 @@ static int ddrfreq_reboot_notifier_event(struct notifier_block *this, unsigned l
+ {
+ 	u32 timeout = 1000; // 10s
+ 	ddrfreq_set_sys_status(SYS_STATUS_REBOOT);
+-	while (dvfs_clk_get_rate(ddr.clk_dvfs_node) != ddr.reboot_rate && --timeout) {
++	while (!reboot_config_done && --timeout) {
+ 		msleep(10);
+ 	}
+ 	if (!timeout) {
+ 		pr_err("failed to set ddr clk from %luMHz to %luMHz when shutdown/reboot\n", dvfs_clk_get_rate(ddr.clk_dvfs_node) / MHZ, ddr.reboot_rate / MHZ);
+ 	}
++
+ 	return NOTIFY_OK;
+ }
+ 
+diff --git a/arch/arm/mach-rockchip/dvfs.c b/arch/arm/mach-rockchip/dvfs.c
+index 1b52d4782782..c37fbca59a05 100644
+--- a/arch/arm/mach-rockchip/dvfs.c
++++ b/arch/arm/mach-rockchip/dvfs.c
+@@ -616,6 +616,11 @@ int dvfs_clk_disable_limit(struct dvfs_node *clk_dvfs_node)
+ }
+ EXPORT_SYMBOL(dvfs_clk_disable_limit);
+ 
++void dvfs_disable_temp_limit(void) {
++	temp_limit_enable = 0;
++	cancel_delayed_work_sync(&dvfs_temp_limit_work);
++}
++
+ int dvfs_clk_get_limit(struct dvfs_node *clk_dvfs_node, unsigned int *min_rate, unsigned int *max_rate) 
+ {
+ 	int freq_limit_en;
+@@ -830,9 +835,10 @@ static unsigned long dvfs_get_limit_rate(struct dvfs_node *clk_dvfs_node, unsign
+ 		} else if (rate > clk_dvfs_node->max_rate) {
+ 			limit_rate = clk_dvfs_node->max_rate;
+ 		}
+-
+-		if (limit_rate > clk_dvfs_node->temp_limit_rate) {
+-			limit_rate = clk_dvfs_node->temp_limit_rate;
++		if (temp_limit_enable) {
++			if (limit_rate > clk_dvfs_node->temp_limit_rate) {
++				limit_rate = clk_dvfs_node->temp_limit_rate;
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/cpufreq/rockchip-cpufreq.c b/drivers/cpufreq/rockchip-cpufreq.c
+index 22a7baedd8a5..ef3347272842 100644
+--- a/drivers/cpufreq/rockchip-cpufreq.c
++++ b/drivers/cpufreq/rockchip-cpufreq.c
+@@ -33,6 +33,8 @@
+ #include <asm/unistd.h>
+ #include <asm/uaccess.h>
+ 
++extern void dvfs_disable_temp_limit(void);
++
+ #define VERSION "1.0"
+ 
+ #ifdef DEBUG
+@@ -109,6 +111,7 @@ static unsigned int get_freq_from_table(unsigned int max_freq)
+ 
+ static int cpufreq_notifier_policy(struct notifier_block *nb, unsigned long val, void *data)
+ {
++	static unsigned int min_rate=0, max_rate=-1;
+ 	struct cpufreq_policy *policy = data;
+ 
+ 	if (val != CPUFREQ_ADJUST)
+@@ -116,10 +119,10 @@ static int cpufreq_notifier_policy(struct notifier_block *nb, unsigned long val,
+ 
+ 	if (cpufreq_is_ondemand(policy)) {
+ 		FREQ_DBG("queue work\n");
+-		dvfs_clk_enable_limit(clk_cpu_dvfs_node, 0, ~0);
++		dvfs_clk_enable_limit(clk_cpu_dvfs_node, min_rate, max_rate);
+ 	} else {
+ 		FREQ_DBG("cancel work\n");
+-		dvfs_clk_disable_limit(clk_cpu_dvfs_node);
++		dvfs_clk_get_limit(clk_cpu_dvfs_node, &min_rate, &max_rate);
+ 	}
+ 
+ 	return 0;
+@@ -397,6 +400,16 @@ static int cpufreq_reboot_notifier_event(struct notifier_block *this, unsigned l
+ 	return NOTIFY_OK;
+ }
+ 
++int cpufreq_reboot_limit_freq(void)
++{
++	dvfs_disable_temp_limit();
++	dvfs_clk_enable_limit(clk_cpu_dvfs_node, 1000*suspend_freq, 1000*suspend_freq);
++	printk("cpufreq: reboot set core rate=%lu, volt=%d\n", dvfs_clk_get_rate(clk_cpu_dvfs_node), 
++		regulator_get_voltage(clk_cpu_dvfs_node->vd->regulator));
++
++	return 0;
++}
++
+ static struct notifier_block cpufreq_reboot_notifier = {
+ 	.notifier_call = cpufreq_reboot_notifier_event,
+ };
+@@ -415,7 +428,7 @@ static struct cpufreq_driver cpufreq_driver = {
+ static int __init cpufreq_driver_init(void)
+ {
+ 	register_pm_notifier(&cpufreq_pm_notifier);
+-	register_reboot_notifier(&cpufreq_reboot_notifier);
++	//register_reboot_notifier(&cpufreq_reboot_notifier);
+ 	return cpufreq_register_driver(&cpufreq_driver);
+ }
+ 
+-- 
+2.35.3
+

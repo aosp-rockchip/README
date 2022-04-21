@@ -1,0 +1,111 @@
+From 020b3e1a109f75e954c756dd1a5bf9eb705f7a12 Mon Sep 17 00:00:00 2001
+From: William Wu <wulf@rock-chips.com>
+Date: Wed, 15 Feb 2017 21:12:31 +0800
+Subject: [PATCH] phy: rockchip-inno-usb3: workaround for USB3 PHY
+ disconnection det issue
+
+The rk322xh USB3 PHY has a problem to detect disconnection,
+it loses the ability to detect an absence of a far-end
+receiver termination specified in USB3 spec Table 6-21,
+and this causes the linkstate to change between SS.Inactive
+and Polling state, but not return to correct state Rx.detect.
+
+To workaround this bug, we depends on the hub_event to
+detect the port linkstate change and do soft disconnect.
+And then do USB3 PHY reset and reinit HCD to recovery
+the whole USB3.
+
+The workaround process is:
+Plug out USB3 device -> hub_event detect PLC and find
+USB 3.0 port in the Inactive -> call usb_remove_device()
+to do soft disconnect -> call usb_phy_notify_connect()
+-> send notifier to DWC3 controller driver to do USB3
+PHY reset and reinit HCD.
+
+Change-Id: Icb975581c6fbbb34a7da90ddca47e04a46e5da48
+Signed-off-by: William Wu <wulf@rock-chips.com>
+---
+ drivers/phy/phy-rockchip-inno-usb3.c | 46 ++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/drivers/phy/phy-rockchip-inno-usb3.c b/drivers/phy/phy-rockchip-inno-usb3.c
+index cc415cdb61c5..62e71a2bf9c5 100644
+--- a/drivers/phy/phy-rockchip-inno-usb3.c
++++ b/drivers/phy/phy-rockchip-inno-usb3.c
+@@ -30,6 +30,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/usb/phy.h>
+ 
+ #define U3PHY_PORT_NUM	2
+ #define U3PHY_MAX_CLKS	4
+@@ -140,6 +141,7 @@ struct rockchip_u3phy {
+ 	struct rockchip_u3phy_apbcfg apbcfg;
+ 	const struct rockchip_u3phy_cfg *cfgs;
+ 	struct rockchip_u3phy_port ports[U3PHY_PORT_NUM];
++	struct usb_phy usb_phy;
+ };
+ 
+ static inline int param_write(void __iomem *base,
+@@ -650,6 +652,43 @@ static int rockchip_u3phy_port_init(struct rockchip_u3phy *u3phy,
+ 	return 0;
+ }
+ 
++static int rockchip_u3phy_on_init(struct usb_phy *usb_phy)
++{
++	struct rockchip_u3phy *u3phy =
++		container_of(usb_phy, struct rockchip_u3phy, usb_phy);
++
++	reset_control_deassert(u3phy->rsts[U3_POR_RSTN]);
++	usleep_range(250, 300);
++	reset_control_deassert(u3phy->rsts[PIPE_MAC_RSTN]);
++
++	return 0;
++}
++
++static void rockchip_u3phy_on_shutdown(struct usb_phy *usb_phy)
++{
++	struct rockchip_u3phy *u3phy =
++		container_of(usb_phy, struct rockchip_u3phy, usb_phy);
++
++	reset_control_assert(u3phy->rsts[U3_POR_RSTN]);
++	reset_control_assert(u3phy->rsts[PIPE_MAC_RSTN]);
++	usleep_range(15, 20);
++}
++
++static int rockchip_u3phy_on_disconnect(struct usb_phy *usb_phy,
++					enum usb_device_speed speed)
++{
++	struct rockchip_u3phy *u3phy =
++		container_of(usb_phy, struct rockchip_u3phy, usb_phy);
++
++	dev_info(u3phy->dev, "%s device has disconnected\n",
++		 (speed == USB_SPEED_SUPER) ? "U3" : "UW/U2/U1.1/U1");
++
++	if (speed == USB_SPEED_SUPER)
++		atomic_notifier_call_chain(&usb_phy->notifier, 0, NULL);
++
++	return 0;
++}
++
+ static int rockchip_u3phy_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -742,6 +781,13 @@ static int rockchip_u3phy_probe(struct platform_device *pdev)
+ 	rockchip_u3phy_rest_deassert(u3phy, U3PHY_MAC_RST);
+ 	rockchip_u3phy_clk_disable(u3phy);
+ 
++	u3phy->usb_phy.dev = dev;
++	u3phy->usb_phy.init = rockchip_u3phy_on_init;
++	u3phy->usb_phy.shutdown = rockchip_u3phy_on_shutdown;
++	u3phy->usb_phy.notify_disconnect = rockchip_u3phy_on_disconnect;
++	usb_add_phy(&u3phy->usb_phy, USB_PHY_TYPE_USB3);
++	ATOMIC_INIT_NOTIFIER_HEAD(&u3phy->usb_phy.notifier);
++
+ 	dev_info(dev, "Rockchip u3phy initialized successfully\n");
+ 	return 0;
+ 
+-- 
+2.35.3
+

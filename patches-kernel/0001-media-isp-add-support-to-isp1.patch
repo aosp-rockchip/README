@@ -1,0 +1,380 @@
+From eb1f4ff9ba146a861d5dda6841dcac91a56e0b77 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Mon, 21 Aug 2017 20:38:49 +0800
+Subject: [PATCH] media: isp: add support to isp1
+
+The running of isp0 or isp1 is ok,
+but running of isp0 and isp1 at the same time has not been tested.
+
+Change-Id: I430aafb6060eb5aea464ddce05614604ee015e78
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ .../platform/rk-isp10/cif_isp10_pltfrm.c      |  13 +-
+ .../platform/rk-isp10/cif_isp10_rk3399.c      | 230 +++++++++++++-----
+ .../platform/rk-isp10/cif_isp10_version.h     |   7 +-
+ 3 files changed, 187 insertions(+), 63 deletions(-)
+
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
+index 9304f83bbe27..a85053909164 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
+@@ -1154,6 +1154,8 @@ int cif_isp10_pltfrm_dev_init(
+ 	struct iommu_domain *domain;
+ 	struct iommu_group *group;
+ 	struct device_node *np;
++	struct device_node *of_node = pdev->dev.of_node;
++	const char *compatible;
+ 	int err = 0;
+ #endif
+ 
+@@ -1175,6 +1177,7 @@ int cif_isp10_pltfrm_dev_init(
+ 		ret = -ENODEV;
+ 		goto err;
+ 	}
++
+ 	base_addr = devm_ioremap_resource(&pdev->dev, res);
+ 	if (IS_ERR_OR_NULL(base_addr)) {
+ 		cif_isp10_pltfrm_pr_err(NULL, "devm_ioremap_resource failed\n");
+@@ -1241,7 +1244,13 @@ int cif_isp10_pltfrm_dev_init(
+ 		pdata->irq_handlers[i].mis = -EINVAL;
+ 
+ #ifdef CIF_ISP10_MODE_DMA_SG
+-		np = of_find_node_by_name(NULL, "isp0_mmu");
++		of_property_read_string(of_node, "compatible", &compatible);
++		if ((strcmp(compatible, "rockchip,rk3399-cif-isp") == 0) &&
++			(res->start == 0xFF920000)) {
++			np = of_find_node_by_name(NULL, "isp1_mmu");
++		} else {
++			np = of_find_node_by_name(NULL, "isp0_mmu");
++		}
+ 		if (!np) {
+ 			int index = 0;
+ 			/* iommu domain */
+@@ -1275,7 +1284,7 @@ int cif_isp10_pltfrm_dev_init(
+ 
+ 			cif_isp10_drm_iommu_cb(&pdev->dev, cif_isp10_dev, true);
+ 		} else {
+-			//cif_isp10_mrv_iommu_cb();
++			/*cif_isp10_mrv_iommu_cb();*/
+ 		}
+ #endif
+ 
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c b/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
+index 1188891e0583..39f615f546a7 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
+@@ -108,6 +108,11 @@
+ #define read_dsihost_reg(addr)	\
+ 		__raw_readl((addr) + rk3399->dsihost_base)
+ 
++enum cif_isp10_isp_idx {
++	CIF_ISP10_ISP0 = 0,
++	CIF_ISP10_ISP1 = 1
++};
++
+ struct cif_isp10_clk_rst_rk3399 {
+ 	struct clk      *hclk_isp0_noc;
+ 	struct clk      *hclk_isp0_wrapper;
+@@ -135,6 +140,7 @@ struct cif_isp10_rk3399 {
+ 	void __iomem *isp_base;
+ 	struct cif_isp10_clk_rst_rk3399 clk_rst;
+ 	struct cif_isp10_device *cif_isp10;
++	enum cif_isp10_isp_idx isp_idx;
+ };
+ 
+ struct mipi_dphy_hsfreqrange {
+@@ -254,7 +260,7 @@ static int mipi_dphy1_rd_reg(unsigned char addr)
+ 	write_dsihost_reg(DSIHOST_PHY_TEST_CTRL1, (0x00010000 | addr));
+ 	/* TESTCLK=0 */
+ 	write_dsihost_reg(DSIHOST_PHY_TEST_CTRL0, 0x00000000);
+-	return (read_dsihost_reg(DSIHOST_PHY_TEST_CTRL1) >> 8);
++	return ((read_dsihost_reg(DSIHOST_PHY_TEST_CTRL1) & 0xff00) >> 8);
+ }
+ 
+ static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
+@@ -416,8 +422,12 @@ static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
+ 		 */
+ 		write_dsihost_reg(DSIHOST_PHY_TEST_CTRL0, 0x00000002);
+ 		write_dsihost_reg(DSIHOST_PHY_TEST_CTRL1, 0x00000000);
+-		write_dsihost_reg(DSIHOST_PHY_SHUTDOWNZ, 0x00000001);
+-		write_dsihost_reg(DSIHOST_DPHY_RSTZ, 0x00000001);
++		/*SHUTDOWNZ=1,  RSTZ=1*/
++		write_dsihost_reg(DSIHOST_DPHY_RSTZ, 0x00000003);
++
++		write_cifisp_reg((MRV_MIPI_BASE + MRV_MIPI_CTRL),
++			read_cifisp_reg(MRV_MIPI_BASE + MRV_MIPI_CTRL)
++			| (0x0f << 8));
+ 	} else {
+ 		goto fail;
+ 	}
+@@ -431,14 +441,28 @@ static int soc_clk_enable(void)
+ {
+ 	struct cif_isp10_clk_rst_rk3399 *clk_rst = &rk3399->clk_rst;
+ 
+-	clk_prepare_enable(clk_rst->hclk_isp0_noc);
+-	clk_prepare_enable(clk_rst->hclk_isp0_wrapper);
+-	clk_prepare_enable(clk_rst->aclk_isp0_noc);
+-	clk_prepare_enable(clk_rst->aclk_isp0_wrapper);
+-	clk_prepare_enable(clk_rst->clk_isp0);
+-	clk_prepare_enable(clk_rst->cif_clk_out);
+-	clk_prepare_enable(clk_rst->pclk_dphyrx);
+-	clk_prepare_enable(clk_rst->pclk_dphy_ref);
++	if (rk3399->isp_idx == CIF_ISP10_ISP0) {
++		clk_prepare_enable(clk_rst->hclk_isp0_noc);
++		clk_prepare_enable(clk_rst->hclk_isp0_wrapper);
++		clk_prepare_enable(clk_rst->aclk_isp0_noc);
++		clk_prepare_enable(clk_rst->aclk_isp0_wrapper);
++		clk_prepare_enable(clk_rst->clk_isp0);
++		clk_prepare_enable(clk_rst->pclk_dphyrx);
++		clk_prepare_enable(clk_rst->cif_clk_out);
++		clk_prepare_enable(clk_rst->pclk_dphy_ref);
++	} else {
++		clk_prepare_enable(clk_rst->hclk_isp1_noc);
++		clk_prepare_enable(clk_rst->hclk_isp1_wrapper);
++		clk_prepare_enable(clk_rst->aclk_isp1_noc);
++		clk_prepare_enable(clk_rst->aclk_isp1_wrapper);
++		clk_prepare_enable(clk_rst->clk_isp1);
++		clk_prepare_enable(clk_rst->pclkin_isp1);
++		clk_prepare_enable(clk_rst->pclk_dphytxrx);
++		clk_prepare_enable(clk_rst->cif_clk_mipi_dsi);
++		clk_prepare_enable(clk_rst->cif_clk_mipi_dphy_cfg);
++		clk_prepare_enable(clk_rst->cif_clk_out);
++		clk_prepare_enable(clk_rst->pclk_dphy_ref);
++	}
+ 
+ 	return 0;
+ }
+@@ -447,18 +471,30 @@ static int soc_clk_disable(void)
+ {
+ 	struct cif_isp10_clk_rst_rk3399 *clk_rst = &rk3399->clk_rst;
+ 
+-	clk_disable_unprepare(clk_rst->hclk_isp0_noc);
+-	clk_disable_unprepare(clk_rst->hclk_isp0_wrapper);
+-	clk_disable_unprepare(clk_rst->aclk_isp0_noc);
+-	clk_disable_unprepare(clk_rst->aclk_isp0_wrapper);
+-	clk_disable_unprepare(clk_rst->clk_isp0);
+-	clk_disable_unprepare(clk_rst->pclk_dphyrx);
+-	clk_disable_unprepare(clk_rst->pclk_dphy_ref);
+-	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_pll)) {
+-		clk_set_parent(clk_rst->cif_clk_out,
+-			clk_rst->cif_clk_pll);
++	if (rk3399->isp_idx == CIF_ISP10_ISP0) {
++		clk_disable_unprepare(clk_rst->hclk_isp0_noc);
++		clk_disable_unprepare(clk_rst->hclk_isp0_wrapper);
++		clk_disable_unprepare(clk_rst->aclk_isp0_noc);
++		clk_disable_unprepare(clk_rst->aclk_isp0_wrapper);
++		clk_disable_unprepare(clk_rst->clk_isp0);
++		clk_disable_unprepare(clk_rst->pclk_dphyrx);
++		clk_set_parent(clk_rst->cif_clk_out, clk_rst->cif_clk_pll);
++		clk_disable_unprepare(clk_rst->cif_clk_out);
++		clk_disable_unprepare(clk_rst->pclk_dphy_ref);
++	} else {
++		clk_disable_unprepare(clk_rst->hclk_isp1_noc);
++		clk_disable_unprepare(clk_rst->hclk_isp1_wrapper);
++		clk_disable_unprepare(clk_rst->aclk_isp1_noc);
++		clk_disable_unprepare(clk_rst->aclk_isp1_wrapper);
++		clk_disable_unprepare(clk_rst->clk_isp1);
++		clk_disable_unprepare(clk_rst->pclkin_isp1);
++		clk_disable_unprepare(clk_rst->pclk_dphytxrx);
++		clk_disable_unprepare(clk_rst->cif_clk_mipi_dsi);
++		clk_disable_unprepare(clk_rst->cif_clk_mipi_dphy_cfg);
++		clk_set_parent(clk_rst->cif_clk_out, clk_rst->cif_clk_pll);
++		clk_disable_unprepare(clk_rst->cif_clk_out);
++		clk_disable_unprepare(clk_rst->pclk_dphy_ref);
+ 	}
+-	clk_disable_unprepare(clk_rst->cif_clk_out);
+ 
+ 	return 0;
+ }
+@@ -511,41 +547,91 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 
+ 	clk_rst = &rk3399->clk_rst;
+ 
+-	clk_rst->hclk_isp0_noc	   =
+-		devm_clk_get(&pdev->dev, "hclk_isp0_noc");
+-	clk_rst->hclk_isp0_wrapper =
+-		devm_clk_get(&pdev->dev, "hclk_isp0_wrapper");
+-	clk_rst->aclk_isp0_noc	   =
+-		devm_clk_get(&pdev->dev, "aclk_isp0_noc");
+-	clk_rst->aclk_isp0_wrapper =
+-		devm_clk_get(&pdev->dev, "aclk_isp0_wrapper");
+-	clk_rst->clk_isp0		   =
+-		devm_clk_get(&pdev->dev, "clk_isp0");
+-	clk_rst->cif_clk_out	   =
+-		devm_clk_get(&pdev->dev, "clk_cif_out");
+-	clk_rst->cif_clk_pll	   =
+-		devm_clk_get(&pdev->dev, "cif_clk_pll");
+-	clk_rst->pclk_dphyrx	   =
+-		devm_clk_get(&pdev->dev, "pclk_dphyrx");
+-	clk_rst->pclk_dphy_ref	   =
+-		devm_clk_get(&pdev->dev, "pclk_dphy_ref");
+-
+-	if (IS_ERR_OR_NULL(clk_rst->hclk_isp0_noc)		 ||
+-		IS_ERR_OR_NULL(clk_rst->hclk_isp0_wrapper)	 ||
+-		IS_ERR_OR_NULL(clk_rst->aclk_isp0_noc)		 ||
+-		IS_ERR_OR_NULL(clk_rst->aclk_isp0_wrapper)	 ||
+-		IS_ERR_OR_NULL(clk_rst->clk_isp0)			 ||
+-		IS_ERR_OR_NULL(clk_rst->cif_clk_out)		 ||
+-		IS_ERR_OR_NULL(clk_rst->pclk_dphy_ref)		 ||
+-		IS_ERR_OR_NULL(clk_rst->pclk_dphyrx)) {
+-		dev_err(&pdev->dev, "Get rk3399 cif isp10 clock resouce failed !\n");
+-		err = -EINVAL;
+-		goto clk_failed;
+-	}
++	if (strcmp(pdev->name, "ff910000.cif_isp") == 0) {
++		clk_rst->hclk_isp0_noc	   =
++			devm_clk_get(&pdev->dev, "hclk_isp0_noc");
++		clk_rst->hclk_isp0_wrapper =
++			devm_clk_get(&pdev->dev, "hclk_isp0_wrapper");
++		clk_rst->aclk_isp0_noc	   =
++			devm_clk_get(&pdev->dev, "aclk_isp0_noc");
++		clk_rst->aclk_isp0_wrapper =
++			devm_clk_get(&pdev->dev, "aclk_isp0_wrapper");
++		clk_rst->clk_isp0		   =
++			devm_clk_get(&pdev->dev, "clk_isp0");
++		clk_rst->pclk_dphyrx	   =
++			devm_clk_get(&pdev->dev, "pclk_dphyrx");
++		clk_rst->cif_clk_out	   =
++			devm_clk_get(&pdev->dev, "clk_cif_out");
++		clk_rst->cif_clk_pll	   =
++			devm_clk_get(&pdev->dev, "cif_clk_pll");
++		clk_rst->pclk_dphy_ref	   =
++			devm_clk_get(&pdev->dev, "pclk_dphy_ref");
++
++		if (IS_ERR_OR_NULL(clk_rst->hclk_isp0_noc)		 ||
++			IS_ERR_OR_NULL(clk_rst->hclk_isp0_wrapper)	 ||
++			IS_ERR_OR_NULL(clk_rst->aclk_isp0_noc)		 ||
++			IS_ERR_OR_NULL(clk_rst->aclk_isp0_wrapper)	 ||
++			IS_ERR_OR_NULL(clk_rst->clk_isp0)		 ||
++			IS_ERR_OR_NULL(clk_rst->pclk_dphyrx)		 ||
++			IS_ERR_OR_NULL(clk_rst->cif_clk_out)		 ||
++			IS_ERR_OR_NULL(clk_rst->pclk_dphy_ref)) {
++			dev_err(&pdev->dev, "Get rk3399 cif isp10 clock resouce failed !\n");
++			err = -EINVAL;
++			goto clk_failed;
++		}
++
++		clk_set_rate(clk_rst->clk_isp0, 420000000);
++		rk3399->isp_idx = CIF_ISP10_ISP0;
++	} else {
++		clk_rst->hclk_isp1_noc	   =
++			devm_clk_get(&pdev->dev, "hclk_isp1_noc");
++		clk_rst->hclk_isp1_wrapper =
++			devm_clk_get(&pdev->dev, "hclk_isp1_wrapper");
++		clk_rst->aclk_isp1_noc	   =
++			devm_clk_get(&pdev->dev, "aclk_isp1_noc");
++		clk_rst->aclk_isp1_wrapper =
++			devm_clk_get(&pdev->dev, "aclk_isp1_wrapper");
++		clk_rst->clk_isp1		   =
++			devm_clk_get(&pdev->dev, "clk_isp1");
++		clk_rst->pclkin_isp1	   =
++			devm_clk_get(&pdev->dev, "pclkin_isp1");
++		clk_rst->pclk_dphytxrx	   =
++			devm_clk_get(&pdev->dev, "pclk_dphytxrx");
++
++		clk_rst->cif_clk_mipi_dsi	   =
++			devm_clk_get(&pdev->dev, "pclk_mipi_dsi");
++		clk_rst->cif_clk_mipi_dphy_cfg	   =
++			devm_clk_get(&pdev->dev, "mipi_dphy_cfg");
++
++		clk_rst->cif_clk_out	   =
++			devm_clk_get(&pdev->dev, "clk_cif_out");
++		clk_rst->cif_clk_pll	   =
++			devm_clk_get(&pdev->dev, "cif_clk_pll");
++		clk_rst->pclk_dphy_ref	   =
++			devm_clk_get(&pdev->dev, "pclk_dphy_ref");
++
++		if (IS_ERR_OR_NULL(clk_rst->hclk_isp1_noc)		 ||
++			IS_ERR_OR_NULL(clk_rst->hclk_isp1_wrapper)	 ||
++			IS_ERR_OR_NULL(clk_rst->aclk_isp1_noc)		 ||
++			IS_ERR_OR_NULL(clk_rst->aclk_isp1_wrapper)	 ||
++			IS_ERR_OR_NULL(clk_rst->clk_isp1)		 ||
++			IS_ERR_OR_NULL(clk_rst->pclkin_isp1)		 ||
++			IS_ERR_OR_NULL(clk_rst->pclk_dphytxrx)		 ||
++			IS_ERR_OR_NULL(clk_rst->cif_clk_mipi_dsi)	 ||
++			IS_ERR_OR_NULL(clk_rst->cif_clk_mipi_dphy_cfg)	 ||
++			IS_ERR_OR_NULL(clk_rst->cif_clk_out)		 ||
++			IS_ERR_OR_NULL(clk_rst->pclk_dphy_ref)) {
++			dev_err(&pdev->dev, "Get rk3399 cif isp10 clock resouce failed !\n");
++			err = -EINVAL;
++			goto clk_failed;
++		}
+ 
+-	clk_set_rate(clk_rst->clk_isp0, 420000000);
++		clk_set_rate(clk_rst->clk_isp1, 420000000);
++		rk3399->isp_idx = CIF_ISP10_ISP1;
++	}
+ 
+ 	rk3399->isp_base = init->isp_base;
++
+ 	return 0;
+ 
+ clk_failed:
+@@ -564,15 +650,39 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 	if (!IS_ERR_OR_NULL(clk_rst->clk_isp0))
+ 		devm_clk_put(&pdev->dev, clk_rst->clk_isp0);
+ 
+-	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_out))
+-		devm_clk_put(&pdev->dev, clk_rst->cif_clk_out);
+-
+-	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_pll))
+-		devm_clk_put(&pdev->dev, clk_rst->cif_clk_pll);
+-
+ 	if (!IS_ERR_OR_NULL(clk_rst->pclk_dphyrx))
+ 		devm_clk_put(&pdev->dev, clk_rst->pclk_dphyrx);
+ 
++	if (!IS_ERR_OR_NULL(clk_rst->hclk_isp1_noc))
++		devm_clk_put(&pdev->dev, clk_rst->hclk_isp1_noc);
++
++	if (!IS_ERR_OR_NULL(clk_rst->hclk_isp1_wrapper))
++		devm_clk_put(&pdev->dev, clk_rst->hclk_isp1_wrapper);
++
++	if (!IS_ERR_OR_NULL(clk_rst->aclk_isp1_noc))
++		devm_clk_put(&pdev->dev, clk_rst->aclk_isp1_noc);
++
++	if (!IS_ERR_OR_NULL(clk_rst->aclk_isp1_wrapper))
++		devm_clk_put(&pdev->dev, clk_rst->aclk_isp1_wrapper);
++
++	if (!IS_ERR_OR_NULL(clk_rst->clk_isp1))
++		devm_clk_put(&pdev->dev, clk_rst->clk_isp1);
++
++	if (!IS_ERR_OR_NULL(clk_rst->pclkin_isp1))
++		devm_clk_put(&pdev->dev, clk_rst->pclkin_isp1);
++
++	if (!IS_ERR_OR_NULL(clk_rst->pclk_dphytxrx))
++		devm_clk_put(&pdev->dev, clk_rst->pclk_dphytxrx);
++
++	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_mipi_dsi))
++		devm_clk_put(&pdev->dev, clk_rst->cif_clk_mipi_dsi);
++
++	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_mipi_dphy_cfg))
++		devm_clk_put(&pdev->dev, clk_rst->cif_clk_mipi_dphy_cfg);
++
++	if (!IS_ERR_OR_NULL(clk_rst->cif_clk_out))
++		devm_clk_put(&pdev->dev, clk_rst->cif_clk_out);
++
+ 	if (!IS_ERR_OR_NULL(clk_rst->pclk_dphy_ref))
+ 		devm_clk_put(&pdev->dev, clk_rst->pclk_dphy_ref);
+ 
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_version.h b/drivers/media/platform/rk-isp10/cif_isp10_version.h
+index 4a01ec307b9b..3188a55634b4 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_version.h
++++ b/drivers/media/platform/rk-isp10/cif_isp10_version.h
+@@ -57,8 +57,13 @@
+  *v0.1.6:
+  *Add isp output size in struct isp_supplemental_sensor_mode_data.
+  *
++ *v0.1.7:
++ *Add support to isp1.
++ *The running of isp0 or isp1 is ok,
++ *but running of isp0 and isp1 at the same time has not been tested.
++ *
+  */
+ 
+-#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 1, 6)
++#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 1, 7)
+ 
+ #endif
+-- 
+2.35.3
+

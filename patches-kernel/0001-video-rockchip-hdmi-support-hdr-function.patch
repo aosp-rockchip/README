@@ -1,0 +1,378 @@
+From ec1daf23e45a1de48e382494cf7d972ec6ff7837 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Fri, 7 Oct 2016 15:38:32 +0800
+Subject: [PATCH] video: rockchip: hdmi: support hdr function
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HDR is introduced by HDMI2.0a, which need parsing HDR Static
+Metedata data Block defined in EDID, and send Dynamic Range
+and Mastering InfoFrame to inform TV to switch to HDR mode.
+
+If TV support HDR, it's EOTF is shown in sysfs node
+/sys/class/display/HDMI/color with key word "Supported EOTF:".
+
+For example, "Support EOTF: 0x7" means support following EOTF:
+BIT0: Traditional gamma - SDR
+BIT1: Traditional gamma - HDR
+BIT2: ST_2084
+
+To switch eotf mode, you can use following command:
+echo hdr=value > /sys/class/display/HDMI/color
+value could be:
+	0 - Disable sending Dynamic Range and Mastering InfoFrame
+	1 - Traditional gamma - SDR
+	2 - Traditional gamma - HDR
+	4 - ST_2084
+0、1 both means SDR mode， 4 is HDR10/Dolby HDR mode.
+
+Change-Id: Ia3d19bbca9b9368cde8dcb11265fbff4684ac603
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+(cherry picked from commit 08ea9d12f34f8ea6f79bdd5b7eb1ff74d2cd796f)
+---
+ .../video/rockchip/hdmi/rockchip-hdmi-core.c  | 12 +++
+ .../video/rockchip/hdmi/rockchip-hdmi-edid.c  |  6 ++
+ .../video/rockchip/hdmi/rockchip-hdmi-lcdc.c  | 27 ++++--
+ .../video/rockchip/hdmi/rockchip-hdmi-sysfs.c | 13 +++
+ drivers/video/rockchip/hdmi/rockchip-hdmi.h   | 35 ++++++++
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c | 85 ++++++++++++++++++-
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h | 11 +++
+ 7 files changed, 181 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+index 852d0e6013fe..e6aa989e1660 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+@@ -141,8 +141,20 @@ static void hdmi_wq_set_video(struct hdmi *hdmi)
+ 			video->vic = hdmi->vic;
+ 		}
+ 		video->color_output_depth = 8;
++		video->eotf = 0;
+ 	} else {
+ 		video->vic = hdmi->vic & HDMI_VIC_MASK;
++		video->eotf = hdmi->eotf;
++		/* ST_2084 must be 10bit and bt2020 */
++		if (video->eotf & EOTF_ST_2084) {
++			video->color_output_depth = 10;
++			if (video->color_output > HDMI_COLOR_RGB_16_235)
++				video->colorimetry =
++					HDMI_COLORIMETRY_EXTEND_BT_2020_YCC;
++			else
++				video->colorimetry =
++					HDMI_COLORIMETRY_EXTEND_BT_2020_RGB;
++		}
+ 	}
+ 
+ 	if (hdmi->uboot) {
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-edid.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-edid.c
+index 70564716dd71..1a9ee37c1166 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-edid.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-edid.c
+@@ -464,6 +464,12 @@ static int hdmi_edid_parse_extensions_cea(unsigned char *buf,
+ 				EDBG("value is %02x\n", buf[cur_offset + 2]);
+ 				pedid->colorimetry = buf[cur_offset + 2];
+ 				break;
++			case 0x06:
++				EDBG("[CEA] HDR Static Metedata data Block\n");
++				for (i = 0; i < count - 1; i++)
++					pedid->hdr.data[i] =
++						buf[cur_offset + 2 + i];
++				break;
+ 			case 0x0e:
+ 				EDBG("[CEA] YCBCR 4:2:0 Video Data Block\n");
+ 				for (i = 0; i < count - 1; i++) {
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
+index 9b0b945081c5..e077ca01d4b3 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
+@@ -710,7 +710,7 @@ static const struct hdmi_video_timing hdmi_mode[] = {
+ 			.name = "1440x900p@60Hz",
+ 			.refresh = 60,
+ 			.xres = 1440,
+-			.yres = 768,
++			.yres = 900,
+ 			.pixclock = 106500000,
+ 			.left_margin = 232,
+ 			.right_margin = 80,
+@@ -889,7 +889,7 @@ static const struct hdmi_video_timing hdmi_mode[] = {
+ 
+ static int hdmi_set_info(struct rk_screen *screen, struct hdmi *hdmi)
+ {
+-	int i, vic;
++	int i, vic, colorimetry;
+ 	struct fb_videomode *mode;
+ 
+ 	if (!screen || !hdmi)
+@@ -928,10 +928,27 @@ static int hdmi_set_info(struct rk_screen *screen, struct hdmi *hdmi)
+ 
+ 	/* screen type & face */
+ 	screen->type = SCREEN_HDMI;
+-	if (hdmi->video.color_input == HDMI_COLOR_RGB_0_255)
++	colorimetry = hdmi->video.colorimetry;
++	mode = (struct fb_videomode *)&hdmi_mode[i].mode;
++	if (hdmi->video.color_input == HDMI_COLOR_RGB_0_255) {
+ 		screen->color_mode = COLOR_RGB;
+-	else
++	} else if (mode->xres >= 3840 &&
++		   mode->yres >= 2160 &&
++		   colorimetry > HDMI_COLORIMETRY_EXTEND_ADOBE_RGB) {
++		screen->color_mode = COLOR_YCBCR_BT2020;
++		if (hdmi->video.eotf == EOTF_ST_2084)
++			screen->data_space = 1;
++	} else if (colorimetry == HDMI_COLORIMETRY_NO_DATA) {
++		if (mode->xres > 720 && mode->yres > 576)
++			screen->color_mode = COLOR_YCBCR_BT709;
++		else
++			screen->color_mode = COLOR_YCBCR;
++	} else if (colorimetry == HDMI_COLORIMETRY_SMTPE_170M) {
+ 		screen->color_mode = COLOR_YCBCR;
++	} else {
++		screen->color_mode = COLOR_YCBCR_BT709;
++	}
++
+ 	if (hdmi->vic & HDMI_VIDEO_YUV420) {
+ 		if (hdmi->video.color_output_depth == 10)
+ 			screen->face = OUT_YUV_420_10BIT;
+@@ -944,8 +961,6 @@ static int hdmi_set_info(struct rk_screen *screen, struct hdmi *hdmi)
+ 			screen->face = hdmi_mode[i].interface;
+ 	}
+ 	screen->pixelrepeat = hdmi_mode[i].pixelrepeat - 1;
+-	mode = (struct fb_videomode *)&hdmi_mode[i].mode;
+-
+ 	screen->mode = *mode;
+ 	if (hdmi->video.format_3d == HDMI_3D_FRAME_PACKING) {
+ 		screen->mode.pixclock = 2 * mode->pixclock;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+index c11d3452efb7..37e0af0e8d0d 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+@@ -221,6 +221,10 @@ static int hdmi_get_color(struct rk_display_device *device, char *buf)
+ 		      "Supported Colorimetry: %d\n", hdmi->edid.colorimetry);
+ 	i += snprintf(buf + i, PAGE_SIZE - i,
+ 		      "Current Colorimetry: %d\n", hdmi->colorimetry);
++	i += snprintf(buf + i, PAGE_SIZE - i,
++		      "Supported EOTF: 0x%x\n", hdmi->edid.hdr.hdrinfo.eotf);
++	i += snprintf(buf + i, PAGE_SIZE - i,
++		      "Current EOTF: 0x%x\n", hdmi->eotf);
+ 	return i;
+ }
+ 
+@@ -251,6 +255,15 @@ static int hdmi_set_color(struct rk_display_device *device,
+ 			 hdmi->colorimetry, value);
+ 		if (hdmi->colorimetry != value)
+ 			hdmi->colorimetry = value;
++	} else if (!strncmp(buf, "hdr", 3)) {
++		if (sscanf(buf, "hdr=%d", &value) == -1)
++			return -1;
++		pr_debug("current hdr eotf is %d input hdr eotf is %d\n",
++			 hdmi->eotf, value);
++		if (hdmi->eotf != value &&
++		    (hdmi->eotf & hdmi->edid.hdr.hdrinfo.eotf ||
++		     hdmi->eotf == 0))
++			hdmi->eotf = value;
+ 	} else {
+ 		return -1;
+ 	}
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi.h b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+index f10744224b8e..a003bd6788c6 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+@@ -274,6 +274,7 @@ struct hdmi_video {
+ 	unsigned int colorimetry;	/* Output Colorimetry */
+ 	unsigned int sink_hdmi;		/* Output signal is DVI or HDMI*/
+ 	unsigned int format_3d;		/* Output 3D mode*/
++	unsigned int eotf;		/* EOTF */
+ };
+ 
+ /* HDMI Audio Parameters */
+@@ -284,6 +285,35 @@ struct hdmi_audio {
+ 	u32	word_length;		/*Audio data word length*/
+ };
+ 
++enum hdmi_hdr_eotf {
++	EOTF_TRADITIONAL_GMMA_SDR = 1,
++	EOFT_TRADITIONAL_GMMA_HDR = 2,
++	EOTF_ST_2084 = 4,
++};
++
++struct hdmi_hdr_metadata {
++	u16	prim_x0;
++	u16	prim_y0;
++	u16	prim_x1;
++	u16	prim_y1;
++	u16	prim_x2;
++	u16	prim_y2;
++	u16	white_px;
++	u16	white_py;
++	u16	max_dml;
++	u16	min_dml;
++	u16	max_cll;		/*max content light level*/
++	u16	max_fall;		/*max frame-average light level*/
++};
++
++struct hdmi_hdr {
++	u8	eotf;
++	u8	metadata;	/*Staic Metadata Descriptor*/
++	u8	maxluminance;
++	u8	max_average_luminance;
++	u8	minluminance;
++};
++
+ #define HDMI_MAX_EDID_BLOCK		8
+ 
+ struct edid_prop_value {
+@@ -355,6 +385,10 @@ struct hdmi_edid {
+ 
+ 	unsigned int status;		/*EDID read status, success or failed*/
+ 	char *raw[HDMI_MAX_EDID_BLOCK]; /*Raw EDID Data*/
++	union {
++		u8	data[5];
++		struct hdmi_hdr hdrinfo;
++	} hdr;
+ };
+ 
+ struct hdmi;
+@@ -456,6 +490,7 @@ struct hdmi {
+ 	int sleep;			/* Sleep flag*/
+ 	int vic;			/* HDMI output video information code*/
+ 	int mode_3d;			/* HDMI output video 3d mode*/
++	int eotf;			/* HDMI HDR EOTF */
+ 	struct hdmi_audio audio;	/* HDMI output audio information.*/
+ 	struct hdmi_video video;	/* HDMI output video information.*/
+ 	int xscale;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index 9bf154d27c3b..1d14209de973 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -1522,7 +1522,8 @@ static void hdmi_dev_config_avi(struct hdmi_dev *hdmi_dev,
+ 
+ 	if (vpara->colorimetry > HDMI_COLORIMETRY_ITU709) {
+ 		colorimetry = AVI_COLORIMETRY_EXTENDED;
+-		ext_colorimetry = vpara->colorimetry;
++		ext_colorimetry = vpara->colorimetry -
++				HDMI_COLORIMETRY_EXTEND_XVYCC_601;
+ 	} else if (vpara->color_output == HDMI_COLOR_RGB_16_235 ||
+ 		 vpara->color_output == HDMI_COLOR_RGB_0_255) {
+ 		colorimetry = AVI_COLORIMETRY_NO_DATA;
+@@ -1596,6 +1597,85 @@ static int hdmi_dev_config_vsi(struct hdmi *hdmi,
+ 	return 0;
+ }
+ 
++#define HDR_LSB(n) ((n) & 0xff)
++#define HDR_MSB(n) (((n) & 0xff) >> 8)
++
++static void hdmi_dev_config_hdr(struct hdmi_dev *hdmi_dev,
++				int eotf,
++				struct hdmi_hdr_metadata *hdr)
++{
++	/* hdr is supportted after disignid = 0x21 */
++	if (!hdmi_dev || hdmi_readl(hdmi_dev, DESIGN_ID) < 0x21)
++		return;
++
++	hdmi_writel(hdmi_dev, FC_DRM_HB, 1);/*verion = 0x1*/
++	hdmi_writel(hdmi_dev, (FC_DRM_HB + 1), 27);/*length of following data*/
++	hdmi_writel(hdmi_dev, FC_DRM_PB, eotf / 2);
++	hdmi_writel(hdmi_dev, FC_DRM_PB + 1, 0);
++
++	if (hdr) {
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 2, HDR_LSB(hdr->prim_x0));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 3, HDR_MSB(hdr->prim_x0));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 4, HDR_LSB(hdr->prim_y0));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 5, HDR_MSB(hdr->prim_y0));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 6, HDR_LSB(hdr->prim_x1));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 7, HDR_MSB(hdr->prim_x1));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 8, HDR_LSB(hdr->prim_y1));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 9, HDR_MSB(hdr->prim_y1));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 10, HDR_LSB(hdr->prim_x2));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 11, HDR_MSB(hdr->prim_x2));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 12, HDR_LSB(hdr->prim_y2));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 13, HDR_MSB(hdr->prim_y2));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 14, HDR_LSB(hdr->white_px));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 15, HDR_MSB(hdr->white_px));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 16, HDR_LSB(hdr->white_py));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 17, HDR_MSB(hdr->white_py));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 18, HDR_LSB(hdr->max_dml));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 19, HDR_MSB(hdr->max_dml));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 20, HDR_LSB(hdr->min_dml));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 21, HDR_MSB(hdr->min_dml));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 22, HDR_LSB(hdr->max_cll));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 23, HDR_MSB(hdr->max_cll));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 24, HDR_LSB(hdr->max_fall));
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 25, HDR_MSB(hdr->max_fall));
++	} else {
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 1, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 2, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 3, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 4, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 5, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 6, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 7, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 8, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 9, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 10, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 11, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 12, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 13, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 14, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 15, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 16, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 17, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 18, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 19, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 20, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 21, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 22, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 23, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 24, 0);
++		hdmi_writel(hdmi_dev, FC_DRM_PB + 25, 0);
++	}
++	if (eotf) {
++		hdmi_msk_reg(hdmi_dev, FC_PACK_TXE, m_DRM_TXEN, v_DRM_TXEN(1));
++		hdmi_msk_reg(hdmi_dev, FC_MASK2, m_DRM_MASK, v_DRM_MASK(0));
++		hdmi_msk_reg(hdmi_dev, FC_DRM_UP, m_DRM_PUPD, v_DRM_PUPD(1));
++	} else {
++		hdmi_msk_reg(hdmi_dev, FC_PACK_TXE, m_DRM_TXEN, v_DRM_TXEN(0));
++		hdmi_msk_reg(hdmi_dev, FC_MASK2, m_DRM_MASK, v_DRM_MASK(1));
++		hdmi_msk_reg(hdmi_dev, FC_DRM_UP, m_DRM_PUPD, v_DRM_PUPD(1));
++	}
++}
++
+ static int hdmi_dev_config_spd(struct hdmi *hdmi, const char *vendor,
+ 			       const char *product, char deviceinfo)
+ {
+@@ -1706,7 +1786,8 @@ static int hdmi_dev_config_video(struct hdmi *hdmi, struct hdmi_video *vpara)
+ 					    vpara->vic,
+ 					    HDMI_VIDEO_FORMAT_NORMAL);
+ 		}
+-		dev_info(hdmi->dev, "[%s] success output HDMI.\n", __func__);
++		hdmi_dev_config_hdr(hdmi_dev, vpara->eotf, NULL);
++		dev_info(hdmi->dev, "[%s] sucess output HDMI.\n", __func__);
+ 	} else {
+ 		dev_info(hdmi->dev, "[%s] success output DVI.\n", __func__);
+ 	}
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+index 0d763007c3ca..592d771cb075 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+@@ -728,6 +728,17 @@ enum {
+ #define	FC_GMD_HB			0x1104
+ #define	FC_GMD_PB0			0x1105	/*0~27*/
+ 
++#define	FC_PACK_TXE			0x10e3
++	#define m_DRM_TXEN		BIT(7)
++	#define v_DRM_TXEN(n)		(((n) & 0x01) << 7)
++#define FC_DRM_UP			0x1167
++	#define m_DRM_PUPD		BIT(0)
++	#define v_DRM_PUPD(n)		(((n) & 0x01) << 0)
++#define FC_DRM_HB			0x1168
++#define FC_DRM_PB			0x116a
++#define m_DRM_MASK			BIT(4)
++#define v_DRM_MASK(n)			(((n) & 0x01) << 4)
++
+ #define FC_DBGFORCE			0x1200
+ #define m_FC_FORCEAUDIO		BIT(4)
+ #define v_FC_FORCEAUDIO(n)	(((n) & 0x01) << 4)
+-- 
+2.35.3
+

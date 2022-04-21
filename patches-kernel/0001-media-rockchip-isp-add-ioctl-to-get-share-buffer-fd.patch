@@ -1,0 +1,316 @@
+From 8461719770276d9237ad870889aa7d9b5d74bb61 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Wed, 2 Dec 2020 18:03:12 +0800
+Subject: [PATCH] media: rockchip: isp: add ioctl to get share buffer fd
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: I3b33429007539ccb75859373f6598b5a2c2f7203
+---
+ drivers/media/platform/rockchip/isp/rkisp.c   |  14 ++
+ .../platform/rockchip/isp/rkisp_tb_helper.c   | 171 ++++++++++++++++++
+ .../platform/rockchip/isp/rkisp_tb_helper.h   |   7 +
+ include/uapi/linux/rkisp2-config.h            |  12 ++
+ 4 files changed, 204 insertions(+)
+
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 036cd53192b8..b9d9f55119f6 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1862,6 +1862,7 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 	struct rkisp_thunderboot_resmem_head *head;
+ 	struct rkisp_ldchbuf_info *ldchbuf;
+ 	struct rkisp_ldchbuf_size *ldchsize;
++	struct rkisp_thunderboot_shmem *shmem;
+ 	void *resmem_va;
+ 	long ret = 0;
+ 
+@@ -1920,6 +1921,10 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 		ldchsize = (struct rkisp_ldchbuf_size *)arg;
+ 		rkisp_params_set_ldchbuf_size(&isp_dev->params_vdev, ldchsize);
+ 		break;
++	case RKISP_CMD_GET_SHM_BUFFD:
++		shmem = (struct rkisp_thunderboot_shmem *)arg;
++		ret = rkisp_tb_shm_ioctl(shmem);
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+@@ -1936,6 +1941,7 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 	struct rkisp_thunderboot_resmem resmem;
+ 	struct rkisp_ldchbuf_info ldchbuf;
+ 	struct rkisp_ldchbuf_size ldchsize;
++	struct rkisp_thunderboot_shmem shmem;
+ 	long ret = 0;
+ 	int mode;
+ 
+@@ -1971,6 +1977,14 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 		if (!ret)
+ 			ret = rkisp_ioctl(sd, cmd, &ldchsize);
+ 		break;
++	case RKISP_CMD_GET_SHM_BUFFD:
++		ret = copy_from_user(&shmem, up, sizeof(shmem));
++		if (!ret) {
++			ret = rkisp_ioctl(sd, cmd, &shmem);
++			if (!ret)
++				ret = copy_to_user(up, &shmem, sizeof(shmem));
++		}
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+diff --git a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
+index 84523e3d10c4..6bc9b347cbf9 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
++++ b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
+@@ -15,10 +15,164 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/regmap.h>
++#include <linux/dma-buf.h>
++#include <linux/highmem.h>
+ 
+ #include "rkisp_tb_helper.h"
+ 
+ static struct platform_device *rkisp_tb_pdev;
++
++struct shm_data {
++	int npages;
++	struct page *pages[];
++};
++
++static struct sg_table *shm_map_dma_buf(struct dma_buf_attachment *attachment,
++					enum dma_data_direction dir)
++{
++	struct shm_data *data = attachment->dmabuf->priv;
++	struct sg_table *table;
++	struct scatterlist *sg;
++	int i;
++
++	table = kmalloc(sizeof(*table), GFP_KERNEL);
++	if (!table)
++		return ERR_PTR(-ENOMEM);
++
++	sg_alloc_table(table, data->npages, GFP_KERNEL);
++	sg = table->sgl;
++	for (i = 0; i < data->npages; i++) {
++		sg_set_page(sg, data->pages[i], PAGE_SIZE, 0);
++		sg = sg_next(sg);
++	}
++
++	dma_map_sg_attrs(attachment->dev, table->sgl, table->nents, dir, DMA_ATTR_SKIP_CPU_SYNC);
++
++	return table;
++}
++
++static void shm_unmap_dma_buf(struct dma_buf_attachment *attachment,
++			      struct sg_table *table,
++			      enum dma_data_direction dir)
++{
++	dma_unmap_sg(attachment->dev, table->sgl, table->nents, dir);
++	sg_free_table(table);
++	kfree(table);
++}
++
++static void shm_release(struct dma_buf *dma_buf)
++{
++	struct shm_data *data = dma_buf->priv;
++
++	kfree(data);
++}
++
++static void *shm_vmap(struct dma_buf *dma_buf)
++{
++	struct shm_data *data = dma_buf->priv;
++
++	return vm_map_ram(data->pages, data->npages, 0, PAGE_KERNEL);
++}
++
++static void shm_vunmap(struct dma_buf *dma_buf, void *vaddr)
++{
++	struct shm_data *data = dma_buf->priv;
++
++	vm_unmap_ram(vaddr, data->npages);
++}
++
++static void *shm_kmap(struct dma_buf *dma_buf, unsigned long page_num)
++{
++	struct shm_data *data = dma_buf->priv;
++
++	return kmap(data->pages[page_num]);
++}
++
++static void shm_kunmap(struct dma_buf *dma_buf, unsigned long page_num, void *addr)
++{
++	struct shm_data *data = dma_buf->priv;
++
++	return kunmap(data->pages[page_num]);
++}
++
++static int shm_mmap(struct dma_buf *dma_buf, struct vm_area_struct *vma)
++{
++	struct shm_data *data = dma_buf->priv;
++	unsigned long vm_start = vma->vm_start;
++	int i;
++
++	for (i = 0; i < data->npages; i++) {
++		remap_pfn_range(vma, vm_start, page_to_pfn(data->pages[i]),
++				PAGE_SIZE, vma->vm_page_prot);
++		vm_start += PAGE_SIZE;
++	}
++
++	return 0;
++}
++
++static int shm_begin_cpu_access(struct dma_buf *dmabuf, enum dma_data_direction dir)
++{
++	struct dma_buf_attachment *attachment;
++	struct sg_table *table;
++
++	attachment = list_first_entry(&dmabuf->attachments, struct dma_buf_attachment, node);
++	table = attachment->priv;
++	dma_sync_sg_for_cpu(NULL, table->sgl, table->nents, dir);
++
++	return 0;
++}
++
++static int shm_end_cpu_access(struct dma_buf *dmabuf, enum dma_data_direction dir)
++{
++	struct dma_buf_attachment *attachment;
++	struct sg_table *table;
++
++	attachment = list_first_entry(&dmabuf->attachments, struct dma_buf_attachment, node);
++	table = attachment->priv;
++	dma_sync_sg_for_device(NULL, table->sgl, table->nents, dir);
++
++	return 0;
++}
++
++static const struct dma_buf_ops shm_dmabuf_ops = {
++	.map_dma_buf = shm_map_dma_buf,
++	.unmap_dma_buf = shm_unmap_dma_buf,
++	.release = shm_release,
++	.map = shm_kmap,
++	.unmap = shm_kunmap,
++	.mmap = shm_mmap,
++	.vmap = shm_vmap,
++	.vunmap = shm_vunmap,
++	.begin_cpu_access = shm_begin_cpu_access,
++	.end_cpu_access = shm_end_cpu_access,
++};
++
++static struct dma_buf *shm_alloc(struct rkisp_thunderboot_shmem *shmem)
++{
++	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++	struct dma_buf *dmabuf;
++	struct shm_data *data;
++	int i, npages;
++
++	npages = PAGE_ALIGN(shmem->shm_size) / PAGE_SIZE;
++	data = kmalloc(sizeof(*data) + npages * sizeof(struct page *), GFP_KERNEL);
++	if (!data)
++		return ERR_PTR(-ENOMEM);
++
++	data->npages = npages;
++	for (i = 0; i < npages; i++)
++		data->pages[i] = phys_to_page(shmem->shm_start + i * PAGE_SIZE);
++
++	exp_info.ops = &shm_dmabuf_ops;
++	exp_info.size = npages * PAGE_SIZE;
++	exp_info.flags = O_RDWR;
++	exp_info.priv = data;
++
++	dmabuf = dma_buf_export(&exp_info);
++
++	return dmabuf;
++}
++
+ static int __maybe_unused rkisp_tb_clocks_loader_protect(void)
+ {
+ 	if (rkisp_tb_pdev) {
+@@ -90,6 +244,23 @@ static int __init rkisp_tb_plat_drv_init(void)
+ 
+ arch_initcall_sync(rkisp_tb_plat_drv_init);
+ 
++long rkisp_tb_shm_ioctl(struct rkisp_thunderboot_shmem *shmem)
++{
++	struct dma_buf *dmabuf;
++	int fd, ret;
++
++	dmabuf = shm_alloc(shmem);
++	if (IS_ERR(dmabuf)) {
++		ret = PTR_ERR(dmabuf);
++		return ret;
++	}
++
++	fd = dma_buf_fd(dmabuf, O_CLOEXEC);
++	shmem->shm_fd = fd;
++
++	return 0;
++}
++
+ void rkisp_tb_unprotect_clk(void)
+ {
+ 	rkisp_tb_clocks_loader_unprotect();
+diff --git a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
+index 1d94306210ae..79d06469a354 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
++++ b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
+@@ -4,6 +4,8 @@
+ #ifndef _RKISP_TB_HELPER_H
+ #define _RKISP_TB_HELPER_H
+ 
++#include <linux/rkisp1-config.h>
++
+ enum rkisp_tb_state {
+ 	RKISP_TB_RUN = 0,
+ 	RKISP_TB_OK,
+@@ -14,6 +16,7 @@ enum rkisp_tb_state {
+ void rkisp_tb_unprotect_clk(void);
+ void rkisp_tb_set_state(enum rkisp_tb_state result);
+ enum rkisp_tb_state rkisp_tb_get_state(void);
++long rkisp_tb_shm_ioctl(struct rkisp_thunderboot_shmem *shmem);
+ #else
+ static inline void rkisp_tb_unprotect_clk(void) {}
+ static inline void rkisp_tb_set_state(enum rkisp_tb_state result) {}
+@@ -21,6 +24,10 @@ static inline enum rkisp_tb_state rkisp_tb_get_state(void)
+ {
+ 	return RKISP_TB_OK;
+ }
++static inline long rkisp_tb_shm_ioctl(struct rkisp_thunderboot_shmem *shmem)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index 8963c962144d..a3809b0ef360 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -30,6 +30,9 @@
+ #define RKISP_CMD_SET_LDCHBUF_SIZE \
+ 	_IOW('V', BASE_VIDIOC_PRIVATE + 5, struct rkisp_ldchbuf_size)
+ 
++#define RKISP_CMD_GET_SHM_BUFFD \
++	_IOWR('V', BASE_VIDIOC_PRIVATE + 6, struct rkisp_thunderboot_shmem)
++
+ #define ISP2X_ID_DPCC			(0)
+ #define ISP2X_ID_BLS			(1)
+ #define ISP2X_ID_SDG			(2)
+@@ -1701,4 +1704,13 @@ struct rkisp_thunderboot_resmem {
+ 	u32 resmem_size;
+ } __attribute__ ((packed));
+ 
++/**
++ * struct rkisp_thunderboot_shmem
++ */
++struct rkisp_thunderboot_shmem {
++	u32 shm_start;
++	u32 shm_size;
++	s32 shm_fd;
++} __attribute__ ((packed));
++
+ #endif /* _UAPI_RKISP2_CONFIG_H */
+-- 
+2.35.3
+

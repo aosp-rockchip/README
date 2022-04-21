@@ -1,0 +1,641 @@
+From ff83b530e9447c66722c945b30190ab13ab68191 Mon Sep 17 00:00:00 2001
+From: lanshh <lsh@rock-chips.com>
+Date: Sun, 28 Aug 2016 19:08:55 +0800
+Subject: [PATCH] iio: imu: add usb sensor driver to support rkvr
+
+Change-Id: I7aeaba5a90f427304b0debf0e0063685fa2f6f09
+Signed-off-by: lanshh <lsh@rock-chips.com>
+Signed-off-by: Zorro Liu <lyx@rock-chips.com>
+---
+ drivers/staging/iio/imu/inv_mpu/Makefile      |   3 +
+ .../staging/iio/imu/inv_mpu/inv_mpu_core.c    |  10 +-
+ drivers/staging/iio/imu/inv_mpu/inv_mpu_hid.c | 304 ++++++++++++++++++
+ drivers/staging/iio/imu/inv_mpu/inv_mpu_iio.h |   3 +
+ .../staging/iio/imu/inv_mpu/inv_mpu_misc.c    |  33 +-
+ .../staging/iio/imu/inv_mpu/inv_mpu_ring.c    | 131 ++++++--
+ 6 files changed, 440 insertions(+), 44 deletions(-)
+ create mode 100644 drivers/staging/iio/imu/inv_mpu/inv_mpu_hid.c
+
+diff --git a/drivers/staging/iio/imu/inv_mpu/Makefile b/drivers/staging/iio/imu/inv_mpu/Makefile
+index 471676a6fbc7..c11ad51899d7 100644
+--- a/drivers/staging/iio/imu/inv_mpu/Makefile
++++ b/drivers/staging/iio/imu/inv_mpu/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_INV_MPU_IIO) += inv-mpu-iio.o
+ 
+ inv-mpu-iio-objs := inv_mpu_spi.o
+ inv-mpu-iio-objs += inv_mpu_i2c.o
++inv-mpu-iio-objs += inv_mpu_hid.o
+ inv-mpu-iio-objs += inv_mpu_core.o
+ inv-mpu-iio-objs += inv_mpu_ring.o
+ inv-mpu-iio-objs += inv_mpu_trigger.o
+@@ -20,6 +21,7 @@ ifeq ($(PATCHLEVEL),4)
+ CFLAGS_inv_mpu_core.o      	+= -Idrivers/iio -DINV_KERNEL_3_10
+ CFLAGS_inv_mpu_i2c.o            += -Idrivers/iio -DINV_KERNEL_3_10
+ CFLAGS_inv_mpu_spi.o       	+= -Idrivers/iio -DINV_KERNEL_3_10
++CFLAGS_inv_mpu_hid.o		+= -Idrivers/iio -DINV_KERNEL_3_10
+ CFLAGS_inv_mpu_ring.o      	+= -Idrivers/iio -DINV_KERNEL_3_10
+ CFLAGS_inv_mpu_trigger.o   	+= -Idrivers/iio -DINV_KERNEL_3_10
+ CFLAGS_inv_mpu_common.o    	+= -Idrivers/iio -DINV_KERNEL_3_10
+@@ -30,6 +32,7 @@ CFLAGS_dmpDefaultMPU6050.o	+= -Idrivers/iio -DINV_KERNEL_3_10
+ else
+ CFLAGS_inv_mpu_i2c.o       += -Idrivers/staging/iio
+ CFLAGS_inv_mpu_spi.o       += -Idrivers/staging/iio
++CFLAGS_inv_mpu_hid.o       += -Idrivers/staging/iio
+ CFLAGS_inv_mpu_core.o      += -Idrivers/staging/iio
+ CFLAGS_inv_mpu_ring.o      += -Idrivers/staging/iio
+ CFLAGS_inv_mpu_trigger.o   += -Idrivers/staging/iio
+diff --git a/drivers/staging/iio/imu/inv_mpu/inv_mpu_core.c b/drivers/staging/iio/imu/inv_mpu/inv_mpu_core.c
+index bba1def5bae8..58dcb08236ec 100644
+--- a/drivers/staging/iio/imu/inv_mpu/inv_mpu_core.c
++++ b/drivers/staging/iio/imu/inv_mpu/inv_mpu_core.c
+@@ -1047,7 +1047,10 @@ static ssize_t inv_temperature_show(struct device *dev,
+ 		pr_err("Could not read temperature register.\n");
+ 		return result;
+ 	}
+-	temp = (signed short)(be16_to_cpup((short *)&data[0]));
++	if (st->use_hid)
++		temp = st->hid_temperature;
++	else
++		temp = (signed short)(be16_to_cpup((short *)&data[0]));
+ 	switch (st->chip_type) {
+ 	case INV_MPU3050:
+ 		cur_scale = scale[0];
+@@ -1069,7 +1072,10 @@ static ssize_t inv_temperature_show(struct device *dev,
+ 
+ 	INV_I2C_INC_TEMPREAD(1);
+ 
+-	return sprintf(buf, "%ld %lld\n", scale_t, get_time_ns());
++	if (st->use_hid)
++		return sprintf(buf, "%ld %lld\n", scale_t, st->hid_timestamp);
++	else
++		return sprintf(buf, "%ld %lld\n", scale_t, get_time_ns());
+ }
+ 
+ /**
+diff --git a/drivers/staging/iio/imu/inv_mpu/inv_mpu_hid.c b/drivers/staging/iio/imu/inv_mpu/inv_mpu_hid.c
+new file mode 100644
+index 000000000000..02bfca825f79
+--- /dev/null
++++ b/drivers/staging/iio/imu/inv_mpu/inv_mpu_hid.c
+@@ -0,0 +1,304 @@
++/*
++* Copyright (C) 2012 Invensense, Inc.
++*
++* This software is licensed under the terms of the GNU General Public
++* License version 2, as published by the Free Software Foundation, and
++* may be copied, distributed, and modified under those terms.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++* GNU General Public License for more details.
++*
++*/
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/delay.h>
++#include <linux/kfifo.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++#include <linux/of_gpio.h>
++#include <linux/of.h>
++
++#include "inv_mpu_iio.h"
++
++static int inv_hid_read(struct inv_mpu_iio_s *st, u8 reg, int len, u8 *data)
++{
++	return 0;
++}
++
++static int inv_hid_single_write(struct inv_mpu_iio_s *st, u8 reg, u8 data)
++{
++	return 0;
++}
++
++static int inv_hid_secondary_read(struct inv_mpu_iio_s *st, u8 reg, int len, u8 *data)
++{
++	return 0;
++}
++
++static int inv_hid_secondary_write(struct inv_mpu_iio_s *st, u8 reg, u8 data)
++{
++	return 0;
++}
++
++static int mpu_hid_memory_write(struct inv_mpu_iio_s *st, u8 mpu_addr, u16 mem_addr,
++			u32 len, u8 const *data)
++{
++	return 0;
++}
++
++static int mpu_hid_memory_read(struct inv_mpu_iio_s *st, u8 mpu_addr, u16 mem_addr,
++			u32 len, u8 *data)
++{
++	return 0;
++}
++
++static struct mpu_platform_data mpu_data = {
++	.int_config  = 0x00,
++	.level_shifter = 0,
++	.orientation = {
++			1,  0,  0,
++			0,  1,  0,
++			0,  0,  1,
++	},
++};
++
++/**
++ *  inv_mpu_probe() - probe function.
++ */
++static int inv_mpu_probe(struct platform_device *pdev)
++{
++	struct inv_mpu_iio_s *st;
++	struct iio_dev *indio_dev;
++	int result = -ENOMEM;
++
++#ifdef INV_KERNEL_3_10
++	indio_dev = iio_device_alloc(sizeof(*st));
++#else
++	indio_dev = iio_allocate_device(sizeof(*st));
++#endif
++	if (!indio_dev) {
++		pr_err("memory allocation failed\n");
++		goto out_no_free;
++	}
++	st = iio_priv(indio_dev);
++	st->plat_data = mpu_data;
++	st->dev = &pdev->dev;
++	indio_dev->dev.parent = &pdev->dev;
++	indio_dev->name = "mpu6500";
++	platform_set_drvdata(pdev, indio_dev);
++	st->use_hid = 1;
++
++	st->plat_read = inv_hid_read;
++	st->plat_single_write = inv_hid_single_write;
++	st->secondary_read = inv_hid_secondary_read;
++	st->secondary_write = inv_hid_secondary_write;
++	st->memory_read = mpu_hid_memory_read;
++	st->memory_write = mpu_hid_memory_write;
++
++	/* power is turned on inside check chip type*/
++	result = inv_check_chip_type(st, indio_dev->name);
++	if (result)
++		goto out_free;
++
++	result = st->init_config(indio_dev);
++	if (result) {
++		dev_err(&pdev->dev, "Could not initialize device.\n");
++		goto out_free;
++	}
++	result = st->set_power_state(st, false);
++	if (result) {
++		dev_err(&pdev->dev, "%s could not be turned off.\n", st->hw->name);
++		goto out_free;
++	}
++
++	inv_set_iio_info(st, indio_dev);
++
++	result = inv_mpu_configure_ring(indio_dev);
++	if (result) {
++		dev_err(&pdev->dev, "configure ring buffer fail\n");
++		goto out_free;
++	}
++
++	result = inv_mpu_probe_trigger(indio_dev);
++	if (result) {
++		dev_err(&pdev->dev, "trigger probe fail\n");
++		goto out_unreg_ring;
++	}
++
++	result = iio_device_register(indio_dev);
++	if (result) {
++		dev_err(&pdev->dev, "IIO device register fail\n");
++		goto out_remove_trigger;
++	}
++
++	if (INV_MPU6050 == st->chip_type ||
++		INV_MPU6500 == st->chip_type) {
++		result = inv_create_dmp_sysfs(indio_dev);
++		if (result) {
++			dev_err(&pdev->dev, "create dmp sysfs failed\n");
++			goto out_unreg_iio;
++		}
++	}
++
++	INIT_KFIFO(st->timestamps);
++	spin_lock_init(&st->time_stamp_lock);
++	dev_info(&pdev->dev, "%s is ready to go!\n",
++					indio_dev->name);
++
++	return 0;
++out_unreg_iio:
++	iio_device_unregister(indio_dev);
++out_remove_trigger:
++	if (indio_dev->modes & INDIO_BUFFER_TRIGGERED)
++		inv_mpu_remove_trigger(indio_dev);
++out_unreg_ring:
++	inv_mpu_unconfigure_ring(indio_dev);
++out_free:
++#ifdef INV_KERNEL_3_10
++	iio_device_free(indio_dev);
++#else
++	iio_free_device(indio_dev);
++#endif
++out_no_free:
++	dev_err(&pdev->dev, "%s failed %d\n", __func__, result);
++
++	return -EIO;
++}
++
++/**
++ *  inv_mpu_remove() - remove function.
++ */
++static int inv_mpu_remove(struct platform_device *pdev)
++{
++	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++	struct inv_mpu_iio_s *st = iio_priv(indio_dev);
++
++	kfifo_free(&st->timestamps);
++	iio_device_unregister(indio_dev);
++	if (indio_dev->modes & INDIO_BUFFER_TRIGGERED)
++		inv_mpu_remove_trigger(indio_dev);
++	inv_mpu_unconfigure_ring(indio_dev);
++#ifdef INV_KERNEL_3_10
++	iio_device_free(indio_dev);
++#else
++	iio_free_device(indio_dev);
++#endif
++
++	dev_info(&pdev->dev, "inv-mpu-iio module removed.\n");
++
++	return 0;
++}
++
++static void inv_mpu_shutdown(struct platform_device *pdev)
++{
++	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++	struct inv_mpu_iio_s *st = iio_priv(indio_dev);
++	struct inv_reg_map_s *reg;
++	int result;
++
++	reg = &st->reg;
++	dev_dbg(&pdev->dev, "Shutting down %s...\n", st->hw->name);
++
++	/* reset to make sure previous state are not there */
++	result = inv_plat_single_write(st, reg->pwr_mgmt_1, BIT_H_RESET);
++	if (result)
++		dev_err(&pdev->dev, "Failed to reset %s\n",
++			st->hw->name);
++	msleep(POWER_UP_TIME);
++	/* turn off power to ensure gyro engine is off */
++	result = st->set_power_state(st, false);
++	if (result)
++		dev_err(&pdev->dev, "Failed to turn off %s\n",
++			st->hw->name);
++}
++
++#ifdef CONFIG_PM
++static int inv_mpu_resume(struct device *dev)
++{
++	struct inv_mpu_iio_s *st =
++			iio_priv(platform_get_drvdata(to_platform_device(dev)));
++	pr_debug("%s inv_mpu_resume\n", st->hw->name);
++	return st->set_power_state(st, true);
++}
++
++static int inv_mpu_suspend(struct device *dev)
++{
++	struct iio_dev *indio_dev = platform_get_drvdata(to_platform_device(dev));
++	struct inv_mpu_iio_s *st = iio_priv(indio_dev);
++	int result;
++
++	pr_debug("%s inv_mpu_suspend\n", st->hw->name);
++	mutex_lock(&indio_dev->mlock);
++	result = 0;
++	if ((!st->chip_config.dmp_on) ||
++		(!st->chip_config.enable) ||
++		(!st->chip_config.dmp_event_int_on))
++		result = st->set_power_state(st, false);
++	mutex_unlock(&indio_dev->mlock);
++
++	return result;
++}
++
++static const struct dev_pm_ops inv_mpu_pmops = {
++	SET_SYSTEM_SLEEP_PM_OPS(inv_mpu_suspend, inv_mpu_resume)
++};
++
++#define INV_MPU_PMOPS (&inv_mpu_pmops)
++#else
++#define INV_MPU_PMOPS NULL
++#endif /* CONFIG_PM */
++
++/* device id table is used to identify what device can be
++ * supported by this driver
++ */
++static const struct platform_device_id inv_mpu_id[] = {
++	{"itg3500", INV_ITG3500},
++	{"mpu3050", INV_MPU3050},
++	{"mpu6050", INV_MPU6050},
++	{"mpu9150", INV_MPU9150},
++	{"mpu6500", INV_MPU6500},
++	{"mpu9250", INV_MPU9250},
++	{"mpu6xxx", INV_MPU6XXX},
++	{"mpu6515", INV_MPU6515},
++	{}
++};
++
++MODULE_DEVICE_TABLE(platform, inv_mpu_id);
++
++static const struct of_device_id inv_mpu_of_match[] = {
++	{ .compatible = "inv-hid,itg3500", },
++	{ .compatible = "inv-hid,mpu3050", },
++	{ .compatible = "inv-hid,mpu6050", },
++	{ .compatible = "inv-hid,mpu9150", },
++	{ .compatible = "inv-hid,mpu6500", },
++	{ .compatible = "inv-hid,mpu9250", },
++	{ .compatible = "inv-hid,mpu6xxx", },
++	{ .compatible = "inv-hid,mpu9350", },
++	{ .compatible = "inv-hid,mpu6515", },
++	{}
++};
++
++MODULE_DEVICE_TABLE(of, inv_mpu_of_match);
++
++static struct platform_driver inv_mpu_platform_driver = {
++	.driver = {
++		.owner = THIS_MODULE,
++		.name	= "inv_mpu_iio_hid",
++		.pm	= INV_MPU_PMOPS,
++		.of_match_table = of_match_ptr(inv_mpu_of_match),
++	},
++	.probe		= inv_mpu_probe,
++	.remove		= inv_mpu_remove,
++	.id_table = inv_mpu_id,
++	.shutdown = inv_mpu_shutdown,
++};
++
++module_platform_driver(inv_mpu_platform_driver);
++
++MODULE_AUTHOR("lyx <lyx@rock-chips.com>");
++MODULE_DESCRIPTION("Invensense device driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("inv-mpu-iio-hid");
+diff --git a/drivers/staging/iio/imu/inv_mpu/inv_mpu_iio.h b/drivers/staging/iio/imu/inv_mpu/inv_mpu_iio.h
+index 41b163b02ebf..0722c6397ab0 100644
+--- a/drivers/staging/iio/imu/inv_mpu/inv_mpu_iio.h
++++ b/drivers/staging/iio/imu/inv_mpu/inv_mpu_iio.h
+@@ -362,6 +362,9 @@ struct inv_mpu_iio_s {
+ 	const short *compass_st_upper;
+ 	const short *compass_st_lower;
+ 	short irq;
++	signed short hid_temperature;
++	u64 hid_timestamp;
++	int use_hid;
+ 	int accel_bias[3];
+ 	int gyro_bias[3];
+ 	short raw_gyro[3];
+diff --git a/drivers/staging/iio/imu/inv_mpu/inv_mpu_misc.c b/drivers/staging/iio/imu/inv_mpu/inv_mpu_misc.c
+index 60bcbba9f87e..93cdba6acdf1 100644
+--- a/drivers/staging/iio/imu/inv_mpu/inv_mpu_misc.c
++++ b/drivers/staging/iio/imu/inv_mpu/inv_mpu_misc.c
+@@ -340,23 +340,24 @@ int inv_get_silicon_rev_mpu6500(struct inv_mpu_iio_s *st)
+ 	int result;
+ 	u8 whoami, sw_rev;
+ 
+-	result = inv_plat_read(st, REG_WHOAMI, 1, &whoami);
+-	if (result)
+-		return result;
+-	if (whoami != MPU6500_ID && whoami != MPU9250_ID &&
+-			whoami != MPU6515_ID)
+-		return -EINVAL;
+-
+-	/*memory read need more time after power up */
+-	msleep(POWER_UP_TIME);
+-	result = mpu_memory_read(st, st->i2c_addr,
+-			MPU6500_MEM_REV_ADDR, 1, &sw_rev);
+-	sw_rev &= INV_MPU_REV_MASK;
+-	if (result)
+-		return result;
+-	if (sw_rev != 0)
+-		return -EINVAL;
++	if (!st->use_hid) {
++		result = inv_plat_read(st, REG_WHOAMI, 1, &whoami);
++		if (result)
++			return result;
++		if (whoami != MPU6500_ID && whoami != MPU9250_ID &&
++				whoami != MPU6515_ID)
++			return -EINVAL;
+ 
++		/*memory read need more time after power up */
++		msleep(POWER_UP_TIME);
++		result = mpu_memory_read(st, st->i2c_addr,
++				MPU6500_MEM_REV_ADDR, 1, &sw_rev);
++		sw_rev &= INV_MPU_REV_MASK;
++		if (result)
++			return result;
++		if (sw_rev != 0)
++			return -EINVAL;
++	}
+ 	/* these values are place holders and not real values */
+ 	chip_info->product_id = MPU6500_PRODUCT_REVISION;
+ 	chip_info->product_revision = MPU6500_PRODUCT_REVISION;
+diff --git a/drivers/staging/iio/imu/inv_mpu/inv_mpu_ring.c b/drivers/staging/iio/imu/inv_mpu/inv_mpu_ring.c
+index 4ea592e1da5d..7ddb67f5aa96 100644
+--- a/drivers/staging/iio/imu/inv_mpu/inv_mpu_ring.c
++++ b/drivers/staging/iio/imu/inv_mpu/inv_mpu_ring.c
+@@ -50,6 +50,7 @@
+ #endif
+ 
+ #include "inv_mpu_iio.h"
++#include "../../../../hid/hid-rkvr.h"
+ 
+ /**
+  *  reset_fifo_mpu3050() - Reset FIFO related registers
+@@ -547,9 +548,9 @@ static irqreturn_t inv_irq_handler(int irq, void *dev_id)
+ 
+ 	catch_up = 0;
+ 	while ((time_since_last_irq > st->irq_dur_ns * 2) &&
+-	       (catch_up < MAX_CATCH_UP) &&
+-	       (!st->chip_config.lpa_mode) &&
+-	       (!st->chip_config.dmp_on)) {
++		(catch_up < MAX_CATCH_UP) &&
++		(!st->chip_config.lpa_mode) &&
++		(!st->chip_config.dmp_on)) {
+ 		st->last_isr_time += st->irq_dur_ns;
+ 		kfifo_in(&st->timestamps,
+ 			 &st->last_isr_time, 1);
+@@ -1053,7 +1054,8 @@ irqreturn_t inv_read_fifo(int irq, void *dev_id)
+ void inv_mpu_unconfigure_ring(struct iio_dev *indio_dev)
+ {
+ 	struct inv_mpu_iio_s *st = iio_priv(indio_dev);
+-	free_irq(st->irq, st);
++	if (!st->use_hid)
++		free_irq(st->irq, st);
+ 	iio_kfifo_free(indio_dev->buffer);
+ };
+ 
+@@ -1074,22 +1076,22 @@ static void inv_scan_query(struct iio_dev *indio_dev)
+ 	int result;
+ 
+ 	if (iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_GYRO_X) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_GYRO_Y) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_GYRO_Z))
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_GYRO_Y) ||
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_GYRO_Z))
+ 		st->chip_config.gyro_fifo_enable = 1;
+ 	else
+ 		st->chip_config.gyro_fifo_enable = 0;
+ 
+ 	if (iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_ACCL_X) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_ACCL_Y) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_ACCL_Z))
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_ACCL_Y) ||
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_ACCL_Z))
+ 		st->chip_config.accl_fifo_enable = 1;
+ 	else
+ 		st->chip_config.accl_fifo_enable = 0;
+ 
+ 	if (iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_MAGN_X) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_MAGN_Y) ||
+-	    iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_MAGN_Z))
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_MAGN_Y) ||
++		iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_MAGN_Z))
+ 		st->chip_config.compass_fifo_enable = 1;
+ 	else
+ 		st->chip_config.compass_fifo_enable = 0;
+@@ -1119,10 +1121,10 @@ static int inv_check_quaternion(struct iio_dev *indio_dev)
+ 
+ 	if (st->chip_config.dmp_on) {
+ 		if (
+-		  iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_R) ||
+-		  iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_X) ||
+-		  iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_Y) ||
+-		  iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_Z))
++			iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_R) ||
++			iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_X) ||
++			iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_Y) ||
++			iio_scan_mask_query(indio_dev, ring, INV_MPU_SCAN_QUAT_Z))
+ 			st->chip_config.quaternion_on = 1;
+ 		else
+ 			st->chip_config.quaternion_on = 0;
+@@ -1195,6 +1197,76 @@ static const struct iio_buffer_setup_ops inv_mpu_ring_setup_ops = {
+ 	.predisable = &inv_predisable,
+ };
+ 
++#ifdef CONFIG_HID_RKVR
++/* Callback handler to send event */
++static int inv_proc_event(char *raw_data, size_t raw_len, void *priv)
++{
++	struct inv_mpu_iio_s *st = (struct inv_mpu_iio_s *)priv;
++	struct iio_dev *indio_dev = iio_priv_to_dev(st);
++	short g[THREE_AXIS], a[THREE_AXIS];
++	int ind;
++	u8 buf[64];
++	u64 *tmp;
++	int i;
++	char *p;
++	struct inv_chip_config_s *conf;
++
++	conf = &st->chip_config;
++	ind = 0;
++
++#ifdef DUMP_HEX
++{
++	int hex_index;
++	char hex[raw_len * 3 + (8 - 3)];
++
++	for (hex_index = 0; hex_index < raw_len; hex_index++)
++		sprintf(&hex[hex_index * 3], "%02X ", raw_data[hex_index]);
++	hex[hex_index * 3] = '\n';
++	hex[hex_index * 3 + 1] = '\0';
++	pr_info("in:%s\n", hex);
++}
++#endif
++	p = raw_data + 6;
++	st->hid_temperature = (p[1] << 8) | p[0];
++	p = raw_data + 8;
++
++	if (conf->quaternion_on)
++		ind += BYTES_FOR_DMP;
++
++	if (conf->accl_fifo_enable) {
++		for (i = 0; i < ARRAY_SIZE(a); i++) {
++			a[i] = (p[1] << 8) | p[0];
++			p += 2;
++		}
++		memcpy(&buf[ind], a, sizeof(a));
++		ind += BYTES_PER_SENSOR;
++	}
++
++	if (conf->gyro_fifo_enable) {
++		for (i = 0; i < ARRAY_SIZE(g); i++) {
++			g[i] = (p[1] << 8) | p[0];
++			p += 2;
++		}
++		memcpy(&buf[ind], g, sizeof(g));
++		ind += BYTES_PER_SENSOR;
++	}
++
++	tmp = (u64 *)buf;
++	st->hid_timestamp = get_time_ns();
++	tmp[DIV_ROUND_UP(ind, 8)] = st->hid_timestamp;
++
++	if (ind > 0) {
++#ifdef INV_KERNEL_3_10
++		iio_push_to_buffers(indio_dev, buf);
++#else
++		iio_push_to_buffer(indio_dev->buffer, buf, st->hid_timestamp);
++#endif
++	}
++
++	return 0;
++}
++#endif
++
+ int inv_mpu_configure_ring(struct iio_dev *indio_dev)
+ {
+ 	int ret;
+@@ -1208,19 +1280,26 @@ int inv_mpu_configure_ring(struct iio_dev *indio_dev)
+ 	/* setup ring buffer */
+ 	ring->scan_timestamp = true;
+ 	indio_dev->setup_ops = &inv_mpu_ring_setup_ops;
+-	/*scan count double count timestamp. should subtract 1. but
+-	number of channels still includes timestamp*/
+-	if (INV_MPU3050 == st->chip_type)
+-		ret = request_threaded_irq(st->irq, inv_irq_handler,
+-			inv_read_fifo_mpu3050,
+-			IRQF_TRIGGER_RISING | IRQF_SHARED, "inv_irq", st);
+-	else
+-		ret = request_threaded_irq(st->irq, inv_irq_handler,
+-			inv_read_fifo,
+-			IRQF_TRIGGER_RISING | IRQF_SHARED, "inv_irq", st);
+-	if (ret)
+-		goto error_iio_sw_rb_free;
+ 
++	if (st->use_hid) {
++#ifdef CONFIG_HID_RKVR
++		pr_info("register event callback\n");
++		rkvr_sensor_register_callback(inv_proc_event, st);
++#endif
++	} else {
++		/*scan count double count timestamp. should subtract 1. but
++		number of channels still includes timestamp*/
++		if (INV_MPU3050 == st->chip_type)
++			ret = request_threaded_irq(st->irq, inv_irq_handler,
++				inv_read_fifo_mpu3050,
++				IRQF_TRIGGER_RISING | IRQF_SHARED, "inv_irq", st);
++		else
++			ret = request_threaded_irq(st->irq, inv_irq_handler,
++				inv_read_fifo,
++				IRQF_TRIGGER_RISING | IRQF_SHARED, "inv_irq", st);
++		if (ret)
++			goto error_iio_sw_rb_free;
++	}
+ 	indio_dev->modes |= INDIO_BUFFER_TRIGGERED;
+ 	return 0;
+ error_iio_sw_rb_free:
+-- 
+2.35.3
+

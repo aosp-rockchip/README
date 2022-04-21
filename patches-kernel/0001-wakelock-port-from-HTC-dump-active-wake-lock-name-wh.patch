@@ -1,0 +1,163 @@
+From 4431b3de6dbeab386c5460168f08e1eff51f771e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Sat, 23 Apr 2011 09:08:19 +0800
+Subject: [PATCH] wakelock: port from HTC, dump active wake lock name when
+ unable to suspend
+
+---
+ include/linux/wakelock.h |  2 ++
+ kernel/power/process.c   |  2 ++
+ kernel/power/wakelock.c  | 41 ++++++++++++++++++++++++----------------
+ 3 files changed, 29 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/wakelock.h b/include/linux/wakelock.h
+index a096d24ada1d..492aa649629a 100755
+--- a/include/linux/wakelock.h
++++ b/include/linux/wakelock.h
+@@ -72,6 +72,7 @@ int wake_lock_active(struct wake_lock *lock);
+  * number of jiffies until all active wake locks time out.
+  */
+ long has_wake_lock(int type);
++void print_active_wake_locks(int type);
+ 
+ #else
+ 
+@@ -84,6 +85,7 @@ static inline void wake_unlock(struct wake_lock *lock) {}
+ 
+ static inline int wake_lock_active(struct wake_lock *lock) { return 0; }
+ static inline long has_wake_lock(int type) { return 0; }
++static inline void print_active_wake_locks(int type) {}
+ 
+ #endif
+ 
+diff --git a/kernel/power/process.c b/kernel/power/process.c
+index 2cdba2e1c3ba..97d0af323b60 100644
+--- a/kernel/power/process.c
++++ b/kernel/power/process.c
+@@ -91,6 +91,8 @@ static int try_to_freeze_tasks(bool sig_only)
+ 				elapsed_csecs / 100, elapsed_csecs % 100, todo);
+ 		if(!wakeup)
+ 			show_state();
++		else
++			print_active_wake_locks(WAKE_LOCK_SUSPEND);
+ 		read_lock(&tasklist_lock);
+ 		do_each_thread(g, p) {
+ 			task_lock(p);
+diff --git a/kernel/power/wakelock.c b/kernel/power/wakelock.c
+index ca48bb8d316b..f94c306b64f6 100644
+--- a/kernel/power/wakelock.c
++++ b/kernel/power/wakelock.c
+@@ -30,8 +30,9 @@ enum {
+ 	DEBUG_SUSPEND = 1U << 2,
+ 	DEBUG_EXPIRE = 1U << 3,
+ 	DEBUG_WAKE_LOCK = 1U << 4,
++	DEBUG_FORBID_SUSPEND = 1U << 5,
+ };
+-static int debug_mask = DEBUG_EXIT_SUSPEND | DEBUG_WAKEUP;
++static int debug_mask = DEBUG_EXIT_SUSPEND | DEBUG_WAKEUP | DEBUG_FORBID_SUSPEND;
+ module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
+ 
+ #define WAKE_LOCK_TYPE_MASK              (0x0f)
+@@ -206,28 +207,33 @@ static void expire_wake_lock(struct wake_lock *lock)
+ }
+ 
+ /* Caller must acquire the list_lock spinlock */
+-static void print_active_locks(int type)
++static void print_active_locks_locked(int type)
+ {
+ 	struct wake_lock *lock;
+-	bool print_expired = true;
+ 
+ 	BUG_ON(type >= WAKE_LOCK_TYPE_COUNT);
+ 	list_for_each_entry(lock, &active_wake_locks[type], link) {
+ 		if (lock->flags & WAKE_LOCK_AUTO_EXPIRE) {
+ 			long timeout = lock->expires - jiffies;
+-			if (timeout > 0)
+-				pr_info("active wake lock %s, time left %ld\n",
+-					lock->name, timeout);
+-			else if (print_expired)
++			if (timeout <= 0)
+ 				pr_info("wake lock %s, expired\n", lock->name);
+-		} else {
++			else
++				pr_info("active wake lock %s, time left %ld.%03lu\n",
++					lock->name, timeout / HZ,
++					(timeout % HZ) * MSEC_PER_SEC / HZ);
++		} else
+ 			pr_info("active wake lock %s\n", lock->name);
+-			if (!debug_mask & DEBUG_EXPIRE)
+-				print_expired = false;
+-		}
+ 	}
+ }
+ 
++void print_active_wake_locks(int type)
++{
++	unsigned long irqflags;
++	spin_lock_irqsave(&list_lock, irqflags);
++	print_active_locks_locked(type);
++	spin_unlock_irqrestore(&list_lock, irqflags);
++}
++
+ static long has_wake_lock_locked(int type)
+ {
+ 	struct wake_lock *lock, *n;
+@@ -253,8 +259,6 @@ long has_wake_lock(int type)
+ 	unsigned long irqflags;
+ 	spin_lock_irqsave(&list_lock, irqflags);
+ 	ret = has_wake_lock_locked(type);
+-	if (ret && (debug_mask & DEBUG_SUSPEND) && type == WAKE_LOCK_SUSPEND)
+-		print_active_locks(type);
+ 	spin_unlock_irqrestore(&list_lock, irqflags);
+ 	return ret;
+ }
+@@ -265,8 +269,10 @@ static void suspend(struct work_struct *work)
+ 	int entry_event_num;
+ 
+ 	if (has_wake_lock(WAKE_LOCK_SUSPEND)) {
+-		if (debug_mask & DEBUG_SUSPEND)
++		if (debug_mask & DEBUG_SUSPEND || debug_mask & DEBUG_FORBID_SUSPEND)
+ 			pr_info("suspend: abort suspend\n");
++		if (debug_mask & DEBUG_FORBID_SUSPEND)
++			print_active_wake_locks(WAKE_LOCK_SUSPEND);
+ 		return;
+ 	}
+ 
+@@ -301,7 +307,7 @@ static void expire_wake_locks(unsigned long data)
+ 		pr_info("expire_wake_locks: start\n");
+ 	spin_lock_irqsave(&list_lock, irqflags);
+ 	if (debug_mask & DEBUG_SUSPEND)
+-		print_active_locks(WAKE_LOCK_SUSPEND);
++		print_active_locks_locked(WAKE_LOCK_SUSPEND);
+ 	has_lock = has_wake_lock_locked(WAKE_LOCK_SUSPEND);
+ 	if (debug_mask & DEBUG_EXPIRE)
+ 		pr_info("expire_wake_locks: done, has_lock %ld\n", has_lock);
+@@ -319,6 +325,8 @@ static int power_suspend_late(struct device *dev)
+ #endif
+ 	if (debug_mask & DEBUG_SUSPEND)
+ 		pr_info("power_suspend_late return %d\n", ret);
++	if (ret && (debug_mask & DEBUG_FORBID_SUSPEND))
++		print_active_wake_locks(WAKE_LOCK_SUSPEND);
+ 	return ret;
+ }
+ 
+@@ -341,6 +349,7 @@ void wake_lock_init(struct wake_lock *lock, int type, const char *name)
+ 	if (name)
+ 		lock->name = name;
+ 	BUG_ON(!lock->name);
++	BUG_ON(lock->flags & WAKE_LOCK_INITIALIZED);
+ 
+ 	if (debug_mask & DEBUG_WAKE_LOCK)
+ 		pr_info("wake_lock_init name=%s\n", lock->name);
+@@ -507,7 +516,7 @@ void wake_unlock(struct wake_lock *lock)
+ 		}
+ 		if (lock == &main_wake_lock) {
+ 			if (debug_mask & DEBUG_SUSPEND)
+-				print_active_locks(WAKE_LOCK_SUSPEND);
++				print_active_locks_locked(WAKE_LOCK_SUSPEND);
+ #ifdef CONFIG_WAKELOCK_STAT
+ 			update_sleep_wait_stats_locked(0);
+ #endif
+-- 
+2.35.3
+

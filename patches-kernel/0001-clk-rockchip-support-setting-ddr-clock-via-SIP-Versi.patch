@@ -1,0 +1,244 @@
+From 764e893ee82321938fc6f4349e9e7caf06a04410 Mon Sep 17 00:00:00 2001
+From: Tang Yun ping <typ@rock-chips.com>
+Date: Thu, 4 May 2017 20:49:58 +0800
+Subject: [PATCH] clk: rockchip: support setting ddr clock via SIP Version 2
+ APIs
+
+1. Add support setting ddr clock via SIP Version 2 APIs
+2. RK3288 using SIP Vision 2.
+
+Change-Id: I935e43b1885a96650dc86e3eb6d79de6795062a9
+Signed-off-by: Tang Yun ping <typ@rock-chips.com>
+---
+ drivers/clk/rockchip/clk-ddr.c    | 159 ++++++++++++++++++++++++++++++
+ drivers/clk/rockchip/clk-rk3288.c |   2 +-
+ drivers/clk/rockchip/clk.h        |   1 +
+ 3 files changed, 161 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/rockchip/clk-ddr.c b/drivers/clk/rockchip/clk-ddr.c
+index 9892c982d194..78dc1b2b955f 100644
+--- a/drivers/clk/rockchip/clk-ddr.c
++++ b/drivers/clk/rockchip/clk-ddr.c
+@@ -13,14 +13,18 @@
+  * GNU General Public License for more details.
+  */
+ 
++#include <drm/drmP.h>
++#include <dt-bindings/display/rk_fb.h>
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
++#include <linux/rockchip/rockchip_sip.h>
+ #include <linux/slab.h>
+ #include <soc/rockchip/rockchip_sip.h>
+ #include <soc/rockchip/scpi.h>
++#include <uapi/drm/drm_mode.h>
+ 
+ #include "clk.h"
+ 
+@@ -40,6 +44,53 @@ struct rockchip_ddrclk {
+ 
+ #define to_rockchip_ddrclk_hw(hw) container_of(hw, struct rockchip_ddrclk, hw)
+ 
++static int rk_drm_get_lcdc_type(void)
++{
++	struct drm_device *drm;
++	u32 lcdc_type = 0;
++
++	drm = drm_device_get_by_name("rockchip");
++	if (drm) {
++		struct drm_connector *conn;
++
++		mutex_lock(&drm->mode_config.mutex);
++		drm_for_each_connector(conn, drm) {
++			if (conn->encoder) {
++				lcdc_type = conn->connector_type;
++				break;
++			}
++		}
++		mutex_unlock(&drm->mode_config.mutex);
++	}
++
++	switch (lcdc_type) {
++	case DRM_MODE_CONNECTOR_LVDS:
++		lcdc_type = SCREEN_LVDS;
++		break;
++	case DRM_MODE_CONNECTOR_DisplayPort:
++		lcdc_type = SCREEN_DP;
++		break;
++	case DRM_MODE_CONNECTOR_HDMIA:
++	case DRM_MODE_CONNECTOR_HDMIB:
++		lcdc_type = SCREEN_HDMI;
++		break;
++	case DRM_MODE_CONNECTOR_TV:
++		lcdc_type = SCREEN_TVOUT;
++		break;
++	case DRM_MODE_CONNECTOR_eDP:
++		lcdc_type = SCREEN_EDP;
++		break;
++	case DRM_MODE_CONNECTOR_DSI:
++		lcdc_type = SCREEN_MIPI;
++		break;
++	default:
++		lcdc_type = SCREEN_NULL;
++		break;
++	}
++
++	return lcdc_type;
++}
++
+ static int rockchip_ddrclk_sip_set_rate(struct clk_hw *hw, unsigned long drate,
+ 					unsigned long prate)
+ {
+@@ -151,6 +202,111 @@ static const struct clk_ops rockchip_ddrclk_scpi_ops = {
+ 	.get_parent = rockchip_ddrclk_get_parent,
+ };
+ 
++struct set_rate_params {
++	u32 hz;
++	/*
++	 * 1: need to wait flag1
++	 * 0: never wait flag1
++	 */
++	u32 wait_flag1;
++	/*
++	 * 1: need to wait flag1
++	 * 0: never wait flag1
++	 */
++	u32 wait_flag0;
++	/* these parameters, not use in RK322xh */
++	u32 lcdc_type;
++	u32 vop;
++	/* if need, add parameter after */
++};
++
++struct round_rate_params {
++	u32 hz;
++	/* if need, add parameter after */
++};
++
++struct rockchip_ddrclk_data {
++	u32 inited_flag;
++	void __iomem *share_memory;
++};
++
++static struct rockchip_ddrclk_data ddr_data;
++
++static void rockchip_ddrclk_data_init(void)
++{
++	struct arm_smccc_res res;
++
++	res = sip_smc_request_share_mem(1, SHARE_PAGE_TYPE_DDR);
++
++	if (!res.a0) {
++		ddr_data.share_memory =  (void __iomem *)res.a1;
++		ddr_data.inited_flag = 1;
++	}
++}
++
++static int rockchip_ddrclk_sip_set_rate_v2(struct clk_hw *hw,
++					   unsigned long drate,
++					   unsigned long prate)
++{
++	struct set_rate_params *p;
++	struct arm_smccc_res res;
++
++	if (!ddr_data.inited_flag)
++		rockchip_ddrclk_data_init();
++
++	p = (struct set_rate_params *)ddr_data.share_memory;
++
++	p->hz = drate;
++	p->lcdc_type = rk_drm_get_lcdc_type();
++
++	res = sip_smc_dram(SHARE_PAGE_TYPE_DDR, 0,
++			   ROCKCHIP_SIP_CONFIG_DRAM_SET_RATE);
++
++	return res.a0;
++}
++
++static unsigned long rockchip_ddrclk_sip_recalc_rate_v2
++			(struct clk_hw *hw, unsigned long parent_rate)
++{
++	struct arm_smccc_res res;
++
++	res = sip_smc_dram(SHARE_PAGE_TYPE_DDR, 0,
++			   ROCKCHIP_SIP_CONFIG_DRAM_GET_RATE);
++	if (!res.a0)
++		return res.a1;
++	else
++		return 0;
++}
++
++static long rockchip_ddrclk_sip_round_rate_v2(struct clk_hw *hw,
++					      unsigned long rate,
++					      unsigned long *prate)
++{
++	struct round_rate_params *p;
++	struct arm_smccc_res res;
++
++	if (!ddr_data.inited_flag)
++		rockchip_ddrclk_data_init();
++
++	p = (struct round_rate_params *)ddr_data.share_memory;
++
++	p->hz = rate;
++
++	res = sip_smc_dram(SHARE_PAGE_TYPE_DDR, 0,
++			   ROCKCHIP_SIP_CONFIG_DRAM_ROUND_RATE);
++	if (!res.a0)
++		return res.a1;
++	else
++		return 0;
++}
++
++static const struct clk_ops rockchip_ddrclk_sip_ops_v2 = {
++	.recalc_rate = rockchip_ddrclk_sip_recalc_rate_v2,
++	.set_rate = rockchip_ddrclk_sip_set_rate_v2,
++	.round_rate = rockchip_ddrclk_sip_round_rate_v2,
++	.get_parent = rockchip_ddrclk_get_parent,
++};
++
+ struct clk *rockchip_clk_register_ddrclk(const char *name, int flags,
+ 					 const char *const *parent_names,
+ 					 u8 num_parents, int mux_offset,
+@@ -182,6 +338,9 @@ struct clk *rockchip_clk_register_ddrclk(const char *name, int flags,
+ 	case ROCKCHIP_DDRCLK_SCPI:
+ 		init.ops = &rockchip_ddrclk_scpi_ops;
+ 		break;
++	case ROCKCHIP_DDRCLK_SIP_V2:
++		init.ops = &rockchip_ddrclk_sip_ops_v2;
++		break;
+ 	default:
+ 		pr_err("%s: unsupported ddrclk type %d\n", __func__, ddr_flag);
+ 		kfree(ddrclk);
+diff --git a/drivers/clk/rockchip/clk-rk3288.c b/drivers/clk/rockchip/clk-rk3288.c
+index d89b1706121e..7140c84d81ec 100644
+--- a/drivers/clk/rockchip/clk-rk3288.c
++++ b/drivers/clk/rockchip/clk-rk3288.c
+@@ -310,7 +310,7 @@ static struct rockchip_clk_branch rk3288_clk_branches[] __initdata = {
+ 			RK3288_CLKGATE_CON(0), 9, GFLAGS),
+ 	COMPOSITE_DDRCLK(SCLK_DDRCLK, "sclk_ddrc", mux_ddrphy_p, 0,
+ 			 RK3288_CLKSEL_CON(26), 2, 1, 0, 0,
+-			 ROCKCHIP_DDRCLK_SIP),
++			 ROCKCHIP_DDRCLK_SIP_V2),
+ 	COMPOSITE_NOGATE(0, "ddrphy", mux_ddrphy_p, CLK_IGNORE_UNUSED,
+ 			RK3288_CLKSEL_CON(26), 2, 1, MFLAGS, 0, 2,
+ 					DFLAGS | CLK_DIVIDER_POWER_OF_TWO),
+diff --git a/drivers/clk/rockchip/clk.h b/drivers/clk/rockchip/clk.h
+index a0f8ccb54b50..d76c9e9e07a4 100644
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -313,6 +313,7 @@ struct clk *rockchip_clk_register_mmc(const char *name,
+  */
+ #define ROCKCHIP_DDRCLK_SIP		0x01
+ #define ROCKCHIP_DDRCLK_SCPI		0x02
++#define ROCKCHIP_DDRCLK_SIP_V2		0x03
+ 
+ struct clk *rockchip_clk_register_ddrclk(const char *name, int flags,
+ 					 const char *const *parent_names,
+-- 
+2.35.3
+

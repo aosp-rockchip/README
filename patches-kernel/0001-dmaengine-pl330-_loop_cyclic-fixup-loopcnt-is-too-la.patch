@@ -1,0 +1,119 @@
+From 8ea3f97aab1b68b5aa1aece7eb83bef6d08b3c84 Mon Sep 17 00:00:00 2001
+From: Sugar Zhang <sugar.zhang@rock-chips.com>
+Date: Fri, 24 Aug 2018 16:16:10 +0800
+Subject: [PATCH] dmaengine: pl330: _loop_cyclic: fixup loopcnt is too large
+
+This patch fixup dma transfer data lost if loop cnt is larger
+than 256.
+
+Change-Id: Id49302cdcc1ac871d03070ce07eaa7653e54408c
+Signed-off-by: Sugar Zhang <sugar.zhang@rock-chips.com>
+---
+ drivers/dma/pl330.c | 67 +++++++++++++++++++++++++++++++--------------
+ 1 file changed, 46 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/dma/pl330.c b/drivers/dma/pl330.c
+index 5893c11dd858..8746c24d3cd7 100644
+--- a/drivers/dma/pl330.c
++++ b/drivers/dma/pl330.c
+@@ -1341,19 +1341,14 @@ static inline int _loop(struct pl330_dmac *pl330, unsigned dry_run, u8 buf[],
+ 	return off;
+ }
+ 
+-/* Returns bytes consumed */
+-static inline int _loop_cyclic(struct pl330_dmac *pl330, unsigned dry_run,
+-		u8 buf[], unsigned long bursts, const struct _xfer_spec *pxs, int ev)
++static int _period(struct pl330_dmac *pl330, unsigned int dry_run, u8 buf[],
++		   unsigned long bursts, const struct _xfer_spec *pxs, int ev)
+ {
+-	int cyc, off;
+-	unsigned lcnt0, lcnt1, ljmp0, ljmp1, ljmpfe;
++	unsigned int lcnt1, ljmp1;
++	int cyc, off = 0;
+ 	struct _arg_LPEND lpend;
+ 	struct pl330_xfer *x = &pxs->desc->px;
+ 
+-	off = 0;
+-	ljmpfe = off;
+-	lcnt0 = pxs->desc->num_periods;
+-
+ 	if (bursts > 256) {
+ 		lcnt1 = 256;
+ 		cyc = bursts / 256;
+@@ -1362,18 +1357,6 @@ static inline int _loop_cyclic(struct pl330_dmac *pl330, unsigned dry_run,
+ 		cyc = 1;
+ 	}
+ 
+-	/* forever loop */
+-	off += _emit_MOV(dry_run, &buf[off], SAR, x->src_addr);
+-	off += _emit_MOV(dry_run, &buf[off], DAR, x->dst_addr);
+-#ifdef CONFIG_ARCH_ROCKCHIP
+-	if (!(pl330->quirks & PL330_QUIRK_BROKEN_NO_FLUSHP))
+-		off += _emit_FLUSHP(dry_run, &buf[off],
+-					pxs->desc->peri);
+-#endif
+-	/* loop0 */
+-	off += _emit_LP(dry_run, &buf[off], 0,  lcnt0);
+-	ljmp0 = off;
+-
+ 	/* loop1 */
+ 	off += _emit_LP(dry_run, &buf[off], 1, lcnt1);
+ 	ljmp1 = off;
+@@ -1424,12 +1407,54 @@ static inline int _loop_cyclic(struct pl330_dmac *pl330, unsigned dry_run,
+ 
+ 	off += _emit_SEV(dry_run, &buf[off], ev);
+ 
++	return off;
++}
++
++/* Returns bytes consumed */
++static inline int _loop_cyclic(struct pl330_dmac *pl330, unsigned int dry_run,
++		u8 buf[], unsigned long bursts, const struct _xfer_spec *pxs, int ev)
++{
++	int off, periods, residue, i;
++	unsigned int lcnt0, ljmp0, ljmpfe;
++	struct _arg_LPEND lpend;
++	struct pl330_xfer *x = &pxs->desc->px;
++
++	off = 0;
++	ljmpfe = off;
++	lcnt0 = pxs->desc->num_periods;
++	periods = 1;
++
++	while (lcnt0 > 256) {
++		periods++;
++		lcnt0 = pxs->desc->num_periods / periods;
++	}
++
++	residue = pxs->desc->num_periods % periods;
++
++	/* forever loop */
++	off += _emit_MOV(dry_run, &buf[off], SAR, x->src_addr);
++	off += _emit_MOV(dry_run, &buf[off], DAR, x->dst_addr);
++#ifdef CONFIG_ARCH_ROCKCHIP
++	if (!(pl330->quirks & PL330_QUIRK_BROKEN_NO_FLUSHP))
++		off += _emit_FLUSHP(dry_run, &buf[off],
++					pxs->desc->peri);
++#endif
++	/* loop0 */
++	off += _emit_LP(dry_run, &buf[off], 0,  lcnt0);
++	ljmp0 = off;
++
++	for (i = 0; i < periods; i++)
++		off += _period(pl330, dry_run, &buf[off], bursts, pxs, ev);
++
+ 	lpend.cond = ALWAYS;
+ 	lpend.forever = false;
+ 	lpend.loop = 0;
+ 	lpend.bjump = off - ljmp0;
+ 	off += _emit_LPEND(dry_run, &buf[off], &lpend);
+ 
++	for (i = 0; i < residue; i++)
++		off += _period(pl330, dry_run, &buf[off], bursts, pxs, ev);
++
+ 	lpend.cond = ALWAYS;
+ 	lpend.forever = true;
+ 	lpend.loop = 1;
+-- 
+2.35.3
+

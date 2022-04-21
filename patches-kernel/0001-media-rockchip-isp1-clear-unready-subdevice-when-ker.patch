@@ -1,0 +1,157 @@
+From deb72b1b1504cfe87ea7f45e70674e6d24cb7ccb Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Sat, 20 Apr 2019 16:03:22 +0800
+Subject: [PATCH] media: rockchip: isp1: clear unready subdevice when kernel
+ boot complete
+
+Change-Id: I497719e6e8f2ef25a9d6402c16733bf4318d06d7
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp1/dev.c | 20 +++++++++
+ drivers/media/platform/rockchip/isp1/dev.h |  1 +
+ drivers/media/v4l2-core/v4l2-async.c       | 52 ++++++++++++++++++++++
+ include/media/v4l2-async.h                 |  8 ++++
+ 4 files changed, 81 insertions(+)
+
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 7ece69cee2d6..e416101805cb 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -76,6 +76,9 @@ static char rkisp1_version[RKISP_VERNO_LEN];
+ module_param_string(version, rkisp1_version, RKISP_VERNO_LEN, 0444);
+ MODULE_PARM_DESC(version, "version number");
+ 
++static DEFINE_MUTEX(rkisp1_dev_mutex);
++static LIST_HEAD(rkisp1_device_list);
++
+ /**************************** pipeline operations *****************************/
+ 
+ static int __isp_pipeline_prepare(struct rkisp1_pipeline *p,
+@@ -1081,6 +1084,10 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 		writel(0, isp_dev->base_addr + CIF_ISP_CSI0_MASK2);
+ 		writel(0, isp_dev->base_addr + CIF_ISP_CSI0_MASK3);
+ 	}
++
++	mutex_lock(&rkisp1_dev_mutex);
++	list_add_tail(&isp_dev->list, &rkisp1_device_list);
++	mutex_unlock(&rkisp1_dev_mutex);
+ 	return 0;
+ 
+ err_runtime_disable:
+@@ -1131,6 +1138,19 @@ static int __maybe_unused rkisp1_runtime_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++static int __init rkisp1_clr_unready_dev(void)
++{
++	struct rkisp1_device *isp_dev;
++
++	mutex_lock(&rkisp1_dev_mutex);
++	list_for_each_entry(isp_dev, &rkisp1_device_list, list)
++		v4l2_async_notifier_clr_unready_dev(&isp_dev->notifier);
++	mutex_unlock(&rkisp1_dev_mutex);
++
++	return 0;
++}
++late_initcall_sync(rkisp1_clr_unready_dev);
++
+ static const struct dev_pm_ops rkisp1_plat_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+ 				pm_runtime_force_resume)
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index 9f075f2a532d..1ae376cb9fa2 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -119,6 +119,7 @@ struct rkisp1_sensor_info {
+  * @params_vdev: ISP input parameters device
+  */
+ struct rkisp1_device {
++	struct list_head list;
+ 	struct regmap *grf;
+ 	void __iomem *base_addr;
+ 	int irq;
+diff --git a/drivers/media/v4l2-core/v4l2-async.c b/drivers/media/v4l2-core/v4l2-async.c
+index 2b08d03b251d..eff72288481a 100644
+--- a/drivers/media/v4l2-core/v4l2-async.c
++++ b/drivers/media/v4l2-core/v4l2-async.c
+@@ -456,6 +456,58 @@ int v4l2_async_notifier_register(struct v4l2_device *v4l2_dev,
+ }
+ EXPORT_SYMBOL(v4l2_async_notifier_register);
+ 
++static int __v4l2_async_notifier_clr_unready_dev(
++	struct v4l2_async_notifier *notifier)
++{
++	struct v4l2_subdev *sd, *tmp;
++	int clr_num = 0;
++
++	list_for_each_entry_safe(sd, tmp, &notifier->done, async_list) {
++		struct v4l2_async_notifier *subdev_notifier =
++			v4l2_async_find_subdev_notifier(sd);
++
++		if (subdev_notifier)
++			clr_num += __v4l2_async_notifier_clr_unready_dev(
++					subdev_notifier);
++	}
++
++	list_for_each_entry_safe(sd, tmp, &notifier->waiting, async_list) {
++		list_del_init(&sd->async_list);
++		sd->asd = NULL;
++		sd->dev = NULL;
++		clr_num++;
++	}
++
++	return clr_num;
++}
++
++int v4l2_async_notifier_clr_unready_dev(struct v4l2_async_notifier *notifier)
++{
++	int ret = 0;
++	int clr_num = 0;
++
++	mutex_lock(&list_lock);
++
++	while (notifier->parent)
++		notifier = notifier->parent;
++
++	if (!notifier->v4l2_dev)
++		goto out;
++
++	clr_num = __v4l2_async_notifier_clr_unready_dev(notifier);
++	dev_info(notifier->v4l2_dev->dev,
++		 "clear unready subdev num: %d\n", clr_num);
++
++	if (clr_num > 0)
++		ret = v4l2_async_notifier_try_complete(notifier);
++
++out:
++	mutex_unlock(&list_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(v4l2_async_notifier_clr_unready_dev);
++
+ int v4l2_async_subdev_notifier_register(struct v4l2_subdev *sd,
+ 					struct v4l2_async_notifier *notifier)
+ {
+diff --git a/include/media/v4l2-async.h b/include/media/v4l2-async.h
+index 1592d323c577..77a90109d076 100644
+--- a/include/media/v4l2-async.h
++++ b/include/media/v4l2-async.h
+@@ -163,6 +163,14 @@ int v4l2_async_notifier_register(struct v4l2_device *v4l2_dev,
+ int v4l2_async_subdev_notifier_register(struct v4l2_subdev *sd,
+ 					struct v4l2_async_notifier *notifier);
+ 
++/**
++ * v4l2_async_notifier_clr_unready_dev - remove unready subdevice
++ *
++ * @notifier: pointer to &struct v4l2_async_notifier
++ */
++
++int v4l2_async_notifier_clr_unready_dev(struct v4l2_async_notifier *notifier);
++
+ /**
+  * v4l2_async_notifier_unregister - unregisters a subdevice asynchronous notifier
+  *
+-- 
+2.35.3
+

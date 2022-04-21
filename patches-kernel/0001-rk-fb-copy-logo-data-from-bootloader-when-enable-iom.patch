@@ -1,0 +1,364 @@
+From febb029be15f6dfff7401d55aeda88d1e3c514a4 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Tue, 13 May 2014 15:16:56 +0800
+Subject: [PATCH] rk fb: copy logo data from bootloader when enable iommu
+
+---
+ drivers/video/rockchip/lcdc/rk3188_lcdc.h |   2 +-
+ drivers/video/rockchip/lcdc/rk3288_lcdc.c | 105 ++++++++++++++++++++--
+ drivers/video/rockchip/lcdc/rk3288_lcdc.h |   7 +-
+ drivers/video/rockchip/rk_fb.c            |  54 ++++++++---
+ include/linux/rk_fb.h                     |   4 +-
+ 5 files changed, 151 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/video/rockchip/lcdc/rk3188_lcdc.h b/drivers/video/rockchip/lcdc/rk3188_lcdc.h
+index 9be04a60a53d..27c8c9289d4b 100755
+--- a/drivers/video/rockchip/lcdc/rk3188_lcdc.h
++++ b/drivers/video/rockchip/lcdc/rk3188_lcdc.h
+@@ -375,7 +375,7 @@ static inline u32 lcdc_read_bit(struct lcdc_device *lcdc_dev,u32 offset,u32 msk)
+ {
+        u32 _v = readl_relaxed(lcdc_dev->regs+offset); 
+        _v &= msk;
+-       return (_v >> msk);   
++       return (_v?1:0);   
+ }
+ 
+ static inline void  lcdc_set_bit(struct lcdc_device *lcdc_dev,u32 offset,u32 msk) 
+diff --git a/drivers/video/rockchip/lcdc/rk3288_lcdc.c b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+index a757ccdabcfd..d9dc627a0b96 100755
+--- a/drivers/video/rockchip/lcdc/rk3288_lcdc.c
++++ b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+@@ -197,6 +197,97 @@ static int rk3288_lcdc_reg_dump(struct rk_lcdc_driver *dev_drv)
+ 
+ }
+ 
++#define WIN_EN(id)		\
++static int win##id##_enable(struct lcdc_device *lcdc_dev, int en)	\
++{ \
++	u32 msk, val;							\
++	spin_lock(&lcdc_dev->reg_lock);					\
++	msk =  m_WIN##id##_EN;						\
++	val  =  v_WIN##id##_EN(en);					\
++	lcdc_msk_reg(lcdc_dev, WIN##id##_CTRL0, msk, val);		\
++	lcdc_cfg_done(lcdc_dev);					\
++	val = lcdc_read_bit(lcdc_dev, WIN##id##_CTRL0, msk);		\
++	while (val !=  (!!en))	{					\
++		val = lcdc_read_bit(lcdc_dev, WIN##id##_CTRL0, msk);	\
++	}								\
++	spin_unlock(&lcdc_dev->reg_lock);				\
++	return 0;							\
++}
++
++WIN_EN(0);
++WIN_EN(1);
++WIN_EN(2);
++WIN_EN(3);
++/*enable/disable win directly*/
++static int rk3288_lcdc_win_direct_en
++		(struct rk_lcdc_driver *drv, int win_id , int en)
++{
++	struct lcdc_device *lcdc_dev = container_of(drv,
++					struct lcdc_device, driver);
++	if (win_id == 0)
++		win0_enable(lcdc_dev, en);
++	else if (win_id == 1)
++		win1_enable(lcdc_dev, en);
++	else if (win_id == 2)
++		win2_enable(lcdc_dev, en);
++	else if (win_id == 3)
++		win3_enable(lcdc_dev, en);
++	else
++		dev_err(lcdc_dev->dev, "invalid win number:%d\n", win_id);
++	return 0;
++		
++}
++
++#define SET_WIN_ADDR(id) \
++static int set_win##id##_addr(struct lcdc_device *lcdc_dev, u32 addr) \
++{							\
++	u32 msk, val;					\
++	spin_lock(&lcdc_dev->reg_lock);			\
++	lcdc_writel(lcdc_dev,WIN##id##_YRGB_MST,addr);	\
++	msk =  m_WIN##id##_EN;				\
++	val  =  v_WIN0_EN(1);				\
++	lcdc_msk_reg(lcdc_dev, WIN##id##_CTRL0, msk,val);	\
++	lcdc_cfg_done(lcdc_dev);			\
++	spin_unlock(&lcdc_dev->reg_lock);		\
++	return 0;					\
++}
++
++SET_WIN_ADDR(0);
++SET_WIN_ADDR(1);
++int rk3288_lcdc_direct_set_win_addr
++		(struct rk_lcdc_driver *dev_drv, int win_id, u32 addr)
++{
++	struct lcdc_device *lcdc_dev = container_of(dev_drv,
++				struct lcdc_device, driver);
++	if (win_id == 0)
++		set_win0_addr(lcdc_dev, addr);
++	else
++		set_win1_addr(lcdc_dev, addr);
++	
++	return 0;
++}
++
++static void lcdc_read_reg_defalut_cfg(struct lcdc_device *lcdc_dev)
++{
++	int reg = 0;
++	u32 val = 0;
++	struct rk_lcdc_win *win0 = lcdc_dev->driver.win[0];
++
++	spin_lock(&lcdc_dev->reg_lock);
++	for (reg = 0; reg < 0x1a0; reg+= 4) {
++		val = lcdc_readl(lcdc_dev, reg);
++		switch (reg) {
++			case WIN0_ACT_INFO:
++				win0->area[0].xact = (val & m_WIN0_ACT_WIDTH)+1;
++				win0->area[0].yact = ((val & m_WIN0_ACT_HEIGHT)>>16)+1;
++			default:
++				break;
++		}
++	}
++	spin_unlock(&lcdc_dev->reg_lock);
++	
++}
++
+ /********do basic init*********/
+ static int rk3288_lcdc_pre_init(struct rk_lcdc_driver *dev_drv)
+ {
+@@ -224,10 +315,7 @@ static int rk3288_lcdc_pre_init(struct rk_lcdc_driver *dev_drv)
+ 	rk3288_lcdc_clk_enable(lcdc_dev);
+ 
+ 	/*backup reg config at uboot*/
+-	for (i = 0; i < 0x1a0;) {
+-		lcdc_readl(lcdc_dev,i);
+-		i += 4;
+-	}
++	lcdc_read_reg_defalut_cfg(lcdc_dev);
+ #ifndef CONFIG_RK_FPGA
+ 	if (lcdc_dev->pwr18 == true) {
+ 		v = 0x00010001;	/*bit14: 1,1.8v;0,3.3v*/
+@@ -254,8 +342,9 @@ static int rk3288_lcdc_pre_init(struct rk_lcdc_driver *dev_drv)
+ 	mask =  m_AUTO_GATING_EN;
+ 	val  =  v_AUTO_GATING_EN(0);
+ 	lcdc_msk_reg(lcdc_dev, SYS_CTRL, mask,val);
+-	
+ 	lcdc_cfg_done(lcdc_dev);
++	if (dev_drv->iommu_enabled) /*disable win0 to workaround iommu pagefault*/
++		win0_enable(lcdc_dev, 0);
+ 	lcdc_dev->pre_init = true;
+ 
+ 
+@@ -1247,8 +1336,8 @@ static int win0_display(struct lcdc_device *lcdc_dev,
+ 	u32 uv_addr;
+ 	y_addr = win->area[0].smem_start+win->area[0].y_offset;/*win->smem_start + win->y_offset;*/
+ 	uv_addr = win->area[0].cbr_start + win->area[0].c_offset;
+-	DBG(2, "lcdc%d>>%s:y_addr:0x%x>>uv_addr:0x%x\n",
+-	    lcdc_dev->id, __func__, y_addr, uv_addr);
++	DBG(2, "lcdc%d>>%s:y_addr:0x%x>>uv_addr:0x%x>>offset:%d\n",
++	    lcdc_dev->id, __func__, y_addr, uv_addr,win->area[0].y_offset);
+ 	spin_lock(&lcdc_dev->reg_lock);
+ 	if (likely(lcdc_dev->clk_on)) {
+ 		win->area[0].y_addr = y_addr;
+@@ -3183,9 +3272,11 @@ static struct rk_lcdc_win lcdc_win[] = {
+ 
+ static struct rk_lcdc_drv_ops lcdc_drv_ops = {
+ 	.open 			= rk3288_lcdc_open,
++	.win_direct_en		= rk3288_lcdc_win_direct_en,
+ 	.load_screen 		= rk3288_load_screen,
+ 	.set_par 		= rk3288_lcdc_set_par,
+ 	.pan_display 		= rk3288_lcdc_pan_display,
++	.direct_set_addr 	= rk3288_lcdc_direct_set_win_addr,
+ 	.lcdc_reg_update	= rk3288_lcdc_reg_update,
+ 	.blank 			= rk3288_lcdc_blank,
+ 	.ioctl 			= rk3288_lcdc_ioctl,
+diff --git a/drivers/video/rockchip/lcdc/rk3288_lcdc.h b/drivers/video/rockchip/lcdc/rk3288_lcdc.h
+index ff55e286dfa2..ca9af3e101c1 100755
+--- a/drivers/video/rockchip/lcdc/rk3288_lcdc.h
++++ b/drivers/video/rockchip/lcdc/rk3288_lcdc.h
+@@ -1368,9 +1368,12 @@ static inline u32 lcdc_readl(struct lcdc_device *lcdc_dev,u32 offset)
+ 
+ static inline u32 lcdc_read_bit(struct lcdc_device *lcdc_dev,u32 offset,u32 msk) 
+ {
+-       u32 _v = readl_relaxed(lcdc_dev->regs+offset); 
++	u32 *_pv = (u32*)lcdc_dev->regsbak;
++	u32 _v = readl_relaxed(lcdc_dev->regs+offset); 
++	_pv += (offset >> 2);
++	*_pv = _v;
+        _v &= msk;
+-       return (_v >> msk);   
++       return (_v?1:0);   
+ }
+ 
+ static inline void  lcdc_set_bit(struct lcdc_device *lcdc_dev,u32 offset,u32 msk) 
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index b60386f27ad9..dc4d7d088fcf 100755
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -52,6 +52,7 @@
+ #include <linux/rockchip/iovmm.h>
+ #include <linux/rockchip/sysmmu.h>
+ #include <linux/dma-buf.h>
++#include <linux/highmem.h>
+ #endif
+ 
+ 
+@@ -1186,6 +1187,29 @@ void rk_fd_fence_wait(struct rk_lcdc_driver *dev_drv,
+ 		printk("error waiting on fence\n");
+ }
+ 
++static int rk_fb_copy_from_loader(struct fb_info *info)
++{
++	struct rk_lcdc_driver *dev_drv = (struct rk_lcdc_driver *)info->par;
++	void *dst = info->screen_base;
++	u32 dsp_addr[4];
++	u32 src;
++	u32 i;
++	struct rk_lcdc_win *win = dev_drv->win[0];
++	u32 size = (win->area[0].xact) * (win->area[0].yact) << 2;
++	dev_drv->ops->get_dsp_addr(dev_drv, dsp_addr);
++	src = dsp_addr[0];
++	dev_info(info->dev, "copy fb data %d x %d  from  dst_addr:%08x\n", 
++		win->area[0].xact, win->area[0].yact, src);
++        for (i = 0; i < size; i += PAGE_SIZE) {
++                void *page = phys_to_page(i + src);
++                void *from_virt = kmap(page);
++                void *to_virt = dst + i;
++                memcpy(to_virt, from_virt, PAGE_SIZE);
++        }
++       return 0;
++}	
++
++
+ #ifdef CONFIG_ROCKCHIP_IOMMU
+ static int g_last_addr[4];
+ int g_last_timeout;
+@@ -1213,7 +1237,7 @@ int rk_fb_sysmmu_fault_handler(struct device *dev,
+ 		g_last_addr[2],
+ 		g_last_addr[3]);
+ 	printk("last freed buffer:\n");
+-	for (i = 0; freed_addr[i] != 0xfefefefe; i++)
++	for (i = 0; (freed_addr[i] != 0xfefefefe) && freed_addr[i]; i++)
+ 		printk("%d:0x%08x\n",i, freed_addr[i]);
+ 	printk("last timeout:%d\n", g_last_timeout);
+ 	dev_drv->ops->get_disp_info(dev_drv, buf,0) ;
+@@ -1552,7 +1576,7 @@ static int rk_fb_set_win_buffer(struct fb_info *info,
+     	struct fb_fix_screeninfo *fix = &info->fix;
+     	struct rk_lcdc_driver * dev_drv = (struct rk_lcdc_driver * )info->par;
+ 	struct rk_screen *screen = dev_drv->cur_screen;
+-
++	struct fb_info *fbi = rk_fb->fb[0];
+ 	int i,ion_fd,acq_fence_fd;
+ 	u32 xvir,yvir;
+ 	u32 xoffset,yoffset;
+@@ -1570,9 +1594,9 @@ static int rk_fb_set_win_buffer(struct fb_info *info,
+ 	u8  is_pic_yuv=0;
+ 	u8  ppixel_a=0,global_a=0;
+ 	ion_phys_addr_t phy_addr;
+-
+ 	reg_win_data->reg_area_data[0].smem_start = -1;
+ 	reg_win_data->area_num = 0;
++	fbi = rk_fb->fb[reg_win_data->win_id];
+ 	if(win_par->area_par[0].phy_addr == 0){
+ 		for(i=0;i<RK_WIN_MAX_AREA;i++){	
+ 			ion_fd = win_par->area_par[i].ion_fd;
+@@ -1584,6 +1608,7 @@ static int rk_fb_set_win_buffer(struct fb_info *info,
+ 					/*return -EINVAL;*/
+ 					break;
+ 				}
++				fbi->screen_base = ion_map_kernel(rk_fb->ion_client,hdl);
+ 				reg_win_data->area_num++;
+ 				reg_win_data->reg_area_data[i].ion_handle = hdl;
+ 				#ifndef CONFIG_ROCKCHIP_IOMMU
+@@ -1609,6 +1634,7 @@ static int rk_fb_set_win_buffer(struct fb_info *info,
+ 		reg_win_data->reg_area_data[0].smem_start = 
+ 		win_par->area_par[0].phy_addr;
+ 		reg_win_data->area_num = 1;
++		fbi->screen_base = phys_to_virt(win_par->area_par[0].phy_addr);
+ 	}	
+ 
+ 	if(reg_win_data->area_num == 0){
+@@ -2155,9 +2181,11 @@ static ssize_t rk_fb_read(struct fb_info *info, char __user *buf,
+ 		win = dev_drv->win[win_id];
+ 
+ 	if (win->format == RGB565)
+-		total_size = win->area[0].xact*win->area[0].yact<<1; /*only read the current frame buffer*/
+-	else
+-		total_size = win->area[0].xact*win->area[0].yact<<2;
++		total_size = win->area[0].y_vir_stride * win->area[0].yact << 1; /*only read the current frame buffer*/
++	else if( win->format == YUV420) {
++		total_size = (win->area[0].y_vir_stride * win->area[0].yact * 6);
++	} else
++		total_size = win->area[0].y_vir_stride * win->area[0].yact << 2;
+ 
+ 
+ 	if (p >= total_size)
+@@ -3166,6 +3194,7 @@ bool is_prmry_rk_lcdc_registered(void)
+ 
+ 
+ }
++
+ int rk_fb_register(struct rk_lcdc_driver *dev_drv,
+ 				struct rk_lcdc_win *win, int id)
+ {
+@@ -3224,7 +3253,7 @@ int rk_fb_register(struct rk_lcdc_driver *dev_drv,
+ 		}
+ 		rkfb_create_sysfs(fbi);
+ 		rk_fb->fb[rk_fb->num_fb] = fbi;
+-		dev_info(&fb_pdev->dev, "rockchip framebuffer registerd:%s\n",
++		dev_info(fbi->dev, "rockchip framebuffer registerd:%s\n",
+ 					fbi->fix.id);
+ 		rk_fb->num_fb++;
+ 
+@@ -3269,7 +3298,7 @@ if (dev_drv->prop == PRMRY) {
+ 	struct fb_info *main_fbi = rk_fb->fb[0];
+ 	main_fbi->fbops->fb_open(main_fbi, 1);
+ #if defined(CONFIG_ROCKCHIP_IOMMU)
+-	if (dev_drv->iommu_enabled) {/* only alloc memory for main fb*/	
++	if (dev_drv->iommu_enabled) {
+ 		mmu_dev = rockchip_get_sysmmu_device_by_compatible(dev_drv->mmu_dts_name);
+ 		if (mmu_dev) {
+ 			platform_set_sysmmu(mmu_dev, dev_drv->dev);
+@@ -3281,9 +3310,14 @@ if (dev_drv->prop == PRMRY) {
+ 			dev_err(dev_drv->dev, "failed to get rockchip iommu device\n");
+ 	}
+ #endif
+-	rk_fb_alloc_buffer(main_fbi, 0);
+-	if(support_uboot_display())
++	rk_fb_alloc_buffer(main_fbi, 0); /* only alloc memory for main fb*/	
++	if(support_uboot_display()) {
++		if (dev_drv->iommu_enabled) {
++			rk_fb_copy_from_loader(main_fbi);
++			dev_drv->ops->direct_set_addr(dev_drv,0, main_fbi->fix.smem_start);
++		}
+ 		return 0;
++	}
+ 	main_fbi->fbops->fb_set_par(main_fbi);
+ #if  defined(CONFIG_LOGO_LINUX_BMP)
+ 	if (fb_prewine_bmp_logo(main_fbi, FB_ROTATE_UR)) {
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index e0655cfa4262..a7b23af7517f 100755
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -351,6 +351,7 @@ struct rk_fb_trsm_ops {
+ 
+ struct rk_lcdc_drv_ops {
+ 	int (*open) (struct rk_lcdc_driver * dev_drv, int layer_id, bool open);
++	int (*win_direct_en)(struct rk_lcdc_driver *dev_drv, int win_id, int en);
+ 	int (*init_lcdc) (struct rk_lcdc_driver * dev_drv);
+ 	int (*ioctl) (struct rk_lcdc_driver * dev_drv, unsigned int cmd,
+ 		      unsigned long arg, int layer_id);
+@@ -360,8 +361,9 @@ struct rk_lcdc_drv_ops {
+ 		      int blank_mode);
+ 	int (*set_par) (struct rk_lcdc_driver * dev_drv, int layer_id);
+ 	int (*pan_display) (struct rk_lcdc_driver * dev_drv, int layer_id);
++	int (*direct_set_addr)(struct rk_lcdc_driver *drv, int win_id, u32 addr);
+ 	int (*lcdc_reg_update) (struct rk_lcdc_driver * dev_drv);
+-	 ssize_t(*get_disp_info) (struct rk_lcdc_driver * dev_drv, char *buf,
++	ssize_t(*get_disp_info) (struct rk_lcdc_driver * dev_drv, char *buf,
+ 				  int layer_id);
+ 	int (*load_screen) (struct rk_lcdc_driver * dev_drv, bool initscreen);
+ 	int (*get_win_state) (struct rk_lcdc_driver * dev_drv, int layer_id);
+-- 
+2.35.3
+

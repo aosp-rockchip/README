@@ -1,0 +1,135 @@
+From 4f7530f62bbdb063d033f689d57b4688694a9b76 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 26 Feb 2020 11:38:36 +0800
+Subject: [PATCH] media: rockchip: ispp: support fec function
+
+Change-Id: I4148e905c39e06ad5662dd410014ec0c7c38792b
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/stream.c | 46 ++++++++++++++++++-
+ drivers/media/platform/rockchip/ispp/stream.h |  9 ++++
+ 2 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index c301819d6019..8fc7e6a837fd 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -498,6 +498,9 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 
+ 	rkispp_clear_bits(base + RKISPP_CTRL_QUICK, GLB_FEC2SCL_EN);
+ 	if (dev->module_en[ISPP_FEC]) {
++		pic_size = (fmt & FMT_YUV422) ? width * height * 2 :
++			width * height * 3 >> 1;
++		addr_offs = width * height;
+ 		buf = &vdev->nr_buf.pic_wr;
+ 		buf->size = pic_size;
+ 		ret = rkispp_allow_buffer(dev, buf);
+@@ -558,7 +561,10 @@ static int config_fec(struct rkispp_device *dev)
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+ 	void __iomem *base = dev->base_addr;
++	struct rkispp_dummy_buffer *buf;
+ 	u32 width, height, fmt, mult = 1;
++	u32 i, mesh_size;
++	int ret;
+ 
+ 	vdev = &dev->stream_vdev;
+ 	if (!dev->module_en[ISPP_FEC])
+@@ -590,6 +596,35 @@ static int config_fec(struct rkispp_device *dev)
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_FEC_RD_UV_BASE_SHD;
+ 	}
+ 
++	mesh_size = cal_fec_mesh(width, height, 0);
++	buf = &vdev->fec_buf.mesh_xint;
++	buf->size = ALIGN(mesh_size * 2, 8);
++	ret = rkispp_allow_buffer(dev, buf);
++	if (ret < 0)
++		goto err;
++	writel(buf->dma_addr, base + RKISPP_FEC_MESH_XINT_BASE);
++
++	buf = &vdev->fec_buf.mesh_yint;
++	buf->size = ALIGN(mesh_size * 2, 8);
++	ret = rkispp_allow_buffer(dev, buf);
++	if (ret < 0)
++		goto err;
++	writel(buf->dma_addr, base + RKISPP_FEC_MESH_YINT_BASE);
++
++	buf = &vdev->fec_buf.mesh_xfra;
++	buf->size = ALIGN(mesh_size, 8);
++	ret = rkispp_allow_buffer(dev, buf);
++	if (ret < 0)
++		goto err;
++	writel(buf->dma_addr, base + RKISPP_FEC_MESH_XFRA_BASE);
++
++	buf = &vdev->fec_buf.mesh_yfra;
++	buf->size = ALIGN(mesh_size, 8);
++	ret = rkispp_allow_buffer(dev, buf);
++	if (ret < 0)
++		goto err;
++	writel(buf->dma_addr, base + RKISPP_FEC_MESH_YFRA_BASE);
++
+ 	rkispp_set_bits(base + RKISPP_FEC_CTRL, FMT_RD_MASK, fmt);
+ 	writel(ALIGN(width * mult, 16) >> 2, base + RKISPP_FEC_RD_VIR_STRIDE);
+ 	writel(height << 16 | width, base + RKISPP_FEC_PIC_SIZE);
+@@ -600,6 +635,13 @@ static int config_fec(struct rkispp_device *dev)
+ 		 readl(base + RKISPP_FEC_CTRL),
+ 		 readl(base + RKISPP_FEC_CORE_CTRL));
+ 	return 0;
++err:
++	for (i = 0; i < sizeof(vdev->fec_buf) /
++	     sizeof(struct rkispp_dummy_buffer); i++)
++		rkispp_free_buffer(dev, &vdev->fec_buf.mesh_xint + i);
++	v4l2_err(&dev->v4l2_dev,
++		 "%s Failed to allocate buffer\n", __func__);
++	return ret;
+ }
+ 
+ static int config_modules(struct rkispp_device *dev)
+@@ -916,6 +958,9 @@ static void rkispp_destroy_dummy_buf(struct rkispp_stream *stream)
+ 		for (i = 0; i < sizeof(vdev->nr_buf) /
+ 		     sizeof(struct rkispp_dummy_buffer); i++)
+ 			rkispp_free_buffer(dev, &vdev->nr_buf.pic_cur + i);
++		for (i = 0; i < sizeof(vdev->fec_buf) /
++		     sizeof(struct rkispp_dummy_buffer); i++)
++			rkispp_free_buffer(dev, &vdev->fec_buf.mesh_xint + i);
+ 	}
+ }
+ 
+@@ -1358,7 +1403,6 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 	}
+ 
+ 	if (mis_val & SHP_INT &&
+-	    dev->inp == INP_DDR &&
+ 	    dev->module_en[ISPP_FEC])
+ 		writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 575b3e8347f5..8a7fd6939c4f 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -91,6 +91,14 @@ struct in_nr_buf {
+ 	struct rkispp_dummy_buffer tmp_yuv;
+ };
+ 
++/* fec internal using buf */
++struct in_fec_buf {
++	struct rkispp_dummy_buffer mesh_xint;
++	struct rkispp_dummy_buffer mesh_yint;
++	struct rkispp_dummy_buffer mesh_xfra;
++	struct rkispp_dummy_buffer mesh_yfra;
++};
++
+ /* struct rkispp_stream - ISPP stream video device
+  * id: stream video identify
+  * buf_queue: queued buffer list
+@@ -134,6 +142,7 @@ struct rkispp_stream_vdev {
+ 	struct rkispp_stream stream[STREAM_MAX];
+ 	struct in_tnr_buf tnr_buf;
+ 	struct in_nr_buf nr_buf;
++	struct in_fec_buf fec_buf;
+ 	atomic_t refcnt;
+ };
+ 
+-- 
+2.35.3
+

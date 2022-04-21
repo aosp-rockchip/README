@@ -1,0 +1,187 @@
+From 3739a5c60538bba737291e4d5cd902453c942f30 Mon Sep 17 00:00:00 2001
+From: Simon Xue <xxm@rock-chips.com>
+Date: Fri, 12 Jun 2020 16:39:39 +0800
+Subject: [PATCH] ANDROID: GKI: iommu: fix system crash
+
+'commit e24979f0e7bf ("ANDROID: GKI: iommu: Snapshot of vendor changes")'
+would cause system crash, the main reason is __iommu_unmap need to do
+iommu_pgsize for "iova and size", otherwise iommu page table
+may overflow
+
+Fixes: e24979f0e7bf ("ANDROID: GKI: iommu: Snapshot of vendor changes")
+Change-Id: I4712a2956ecaa74751b2b46dc32715d78e66c68b
+Signed-off-by: Simon Xue <xxm@rock-chips.com>
+---
+ arch/arm64/mm/dma-mapping.c | 66 +++++++++++++++++++++++++++++--------
+ drivers/iommu/dma-iommu.c   |  5 ++-
+ drivers/iommu/iommu.c       |  6 ++--
+ 3 files changed, 58 insertions(+), 19 deletions(-)
+
+diff --git a/arch/arm64/mm/dma-mapping.c b/arch/arm64/mm/dma-mapping.c
+index b182b6766f43..f309ad38fa94 100644
+--- a/arch/arm64/mm/dma-mapping.c
++++ b/arch/arm64/mm/dma-mapping.c
+@@ -850,7 +850,8 @@ static void __iommu_sync_single_for_cpu(struct device *dev,
+ 
+ 	if (!domain || iommu_is_iova_coherent(domain, dev_addr))
+ 		return;
+-
++	if (is_device_dma_coherent(dev))
++		return;
+ 	phys = iommu_iova_to_phys(domain, dev_addr);
+ 	__dma_unmap_area(phys_to_virt(phys), size, dir);
+ }
+@@ -864,7 +865,8 @@ static void __iommu_sync_single_for_device(struct device *dev,
+ 
+ 	if (!domain || iommu_is_iova_coherent(domain, dev_addr))
+ 		return;
+-
++	if (is_device_dma_coherent(dev))
++		return;
+ 	phys = iommu_iova_to_phys(domain, dev_addr);
+ 	__dma_map_area(phys_to_virt(phys), size, dir);
+ }
+@@ -906,7 +908,8 @@ static void __iommu_sync_sg_for_cpu(struct device *dev,
+ 
+ 	if (!domain || iommu_is_iova_coherent(domain, iova))
+ 		return;
+-
++	if (is_device_dma_coherent(dev))
++		return;
+ 	for_each_sg(sgl, sg, nelems, i)
+ 		__dma_unmap_area(sg_virt(sg), sg->length, dir);
+ }
+@@ -922,7 +925,8 @@ static void __iommu_sync_sg_for_device(struct device *dev,
+ 
+ 	if (!domain || iommu_is_iova_coherent(domain, iova))
+ 		return;
+-
++	if (is_device_dma_coherent(dev))
++		return;
+ 	for_each_sg(sgl, sg, nelems, i)
+ 		__dma_map_area(sg_virt(sg), sg->length, dir);
+ }
+@@ -931,18 +935,13 @@ static int __iommu_map_sg_attrs(struct device *dev, struct scatterlist *sgl,
+ 				int nelems, enum dma_data_direction dir,
+ 				unsigned long attrs)
+ {
+-	bool coherent = is_dma_coherent(dev, attrs);
+-	int ret;
+-
+-	ret =  iommu_dma_map_sg(dev, sgl, nelems,
+-				dma_info_to_prot(dir, coherent, attrs));
+-	if (!ret)
+-		return ret;
++	bool coherent = is_device_dma_coherent(dev);
+ 
+ 	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) == 0)
+ 		__iommu_sync_sg_for_device(dev, sgl, nelems, dir);
+ 
+-	return ret;
++	return iommu_dma_map_sg(dev, sgl, nelems,
++				dma_info_to_prot(dir, coherent, attrs));
+ }
+ 
+ static void __iommu_unmap_sg_attrs(struct device *dev,
+@@ -980,10 +979,48 @@ static int __init __iommu_dma_init(void)
+ }
+ arch_initcall(__iommu_dma_init);
+ 
++static void __iommu_setup_dma_ops(struct device *dev, u64 dma_base, u64 size,
++				  const struct iommu_ops *ops)
++{
++	struct iommu_domain *domain;
++
++	if (!ops)
++		return;
++
++	/*
++	 * The IOMMU core code allocates the default DMA domain, which the
++	 * underlying IOMMU driver needs to support via the dma-iommu layer.
++	 */
++	domain = iommu_get_domain_for_dev(dev);
++
++	if (!domain)
++		goto out_err;
++
++	if (domain->type == IOMMU_DOMAIN_DMA) {
++		if (iommu_dma_init_domain(domain, dma_base, size, dev))
++			goto out_err;
++
++		dev->dma_ops = &iommu_dma_ops;
++	}
++
++	return;
++
++out_err:
++	 pr_warn("Failed to set up IOMMU for device %s; retaining platform DMA ops\n",
++		 dev_name(dev));
++}
++
+ void arch_teardown_dma_ops(struct device *dev)
+ {
+ 	dev->dma_ops = NULL;
+ }
++
++#else
++
++static void __iommu_setup_dma_ops(struct device *dev, u64 dma_base, u64 size,
++				  const struct iommu_ops *iommu)
++{ }
++
+ #endif  /* CONFIG_IOMMU_DMA */
+ 
+ static void arm_iommu_setup_dma_ops(struct device *dev, u64 dma_base, u64 size);
+@@ -999,7 +1036,10 @@ void arch_setup_dma_ops(struct device *dev, u64 dma_base, u64 size,
+ 	}
+ 
+ 	dev->archdata.dma_coherent = coherent;
+-	arm_iommu_setup_dma_ops(dev, dma_base, size);
++	if (of_parse_phandle(dev->of_node, "qcom,iommu-group", 0))
++		arm_iommu_setup_dma_ops(dev, dma_base, size);
++	else
++		__iommu_setup_dma_ops(dev, dma_base, size, iommu);
+ 
+ #ifdef CONFIG_XEN
+ 	if (xen_initial_domain()) {
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index a3659e67346d..bc63b4daaa4f 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -519,9 +519,8 @@ static struct page **__iommu_dma_alloc_pages(unsigned int count,
+ 			unsigned int order = __fls(order_mask);
+ 
+ 			order_size = 1U << order;
+-			page = alloc_pages(order ?
+-					   (gfp | __GFP_NORETRY) &
+-						~__GFP_RECLAIM : gfp, order);
++			page = alloc_pages((order_mask - order_size) ?
++					   gfp | __GFP_NORETRY : gfp, order);
+ 			if (!page)
+ 				continue;
+ 			if (!order)
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index 06a11978af03..8f3c832a7016 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -1681,14 +1681,14 @@ static size_t __iommu_unmap(struct iommu_domain *domain,
+ 	 * or we hit an area that isn't mapped.
+ 	 */
+ 	while (unmapped < size) {
+-		size_t left = size - unmapped;
++		size_t pgsize = iommu_pgsize(domain->pgsize_bitmap, iova, size - unmapped);
+ 
+-		unmapped_page = ops->unmap(domain, iova, left);
++		unmapped_page = ops->unmap(domain, iova, pgsize);
+ 		if (!unmapped_page)
+ 			break;
+ 
+ 		if (sync && ops->iotlb_range_add)
+-			ops->iotlb_range_add(domain, iova, left);
++			ops->iotlb_range_add(domain, iova, pgsize);
+ 
+ 		pr_debug("unmapped: iova 0x%lx size 0x%zx\n",
+ 			 iova, unmapped_page);
+-- 
+2.35.3
+

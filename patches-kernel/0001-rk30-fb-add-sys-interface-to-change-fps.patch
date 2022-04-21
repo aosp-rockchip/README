@@ -1,0 +1,311 @@
+From c7ba9040456c0260d4efdbb57c3548ab82bba73b Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Mon, 30 Apr 2012 16:44:48 +0800
+Subject: [PATCH] rk30 fb:add sys interface to change fps
+
+	the path is  sys/class/graphics/fbx/fps`
+---
+ drivers/video/rockchip/chips/rk30_lcdc.c | 59 +++++++++++++++++++++---
+ drivers/video/rockchip/rk_fb.c           |  1 +
+ drivers/video/rockchip/rkfb_sysfs.c      | 41 ++++++++++++++++
+ include/linux/rk_fb.h                    |  1 +
+ include/linux/rk_screen.h                | 55 +++++++++++-----------
+ 5 files changed, 123 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index b18a10f0df13..9ce62be385bf 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -101,6 +101,8 @@ static int rk30_load_screen(struct rk_lcdc_device_driver *dev_drv, bool initscre
+ 	int ret = -EINVAL;
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	rk_screen *screen = lcdc_dev->screen;
++	u64 ft;
++	int fps;
+ 	u16 face;
+ 	u16 mcu_total, mcu_rwstart, mcu_csstart, mcu_rwend, mcu_csend;
+ 	u16 right_margin = screen->right_margin;
+@@ -204,7 +206,13 @@ static int rk30_load_screen(struct rk_lcdc_device_driver *dev_drv, bool initscre
+ 	}
+     	lcdc_dev->driver.pixclock = lcdc_dev->pixclock = div_u64(1000000000000llu, clk_get_rate(lcdc_dev->dclk));
+ 	clk_enable(lcdc_dev->dclk);
+-    	printk("%s: dclk:%lu ",lcdc_dev->driver.name,clk_get_rate(lcdc_dev->dclk));
++	
++	ft = (u64)(screen->upper_margin + screen->lower_margin + screen->y_res +screen->vsync_len)*
++		(screen->left_margin + screen->right_margin + screen->x_res + screen->hsync_len)*
++		(dev_drv->pixclock);       // one frame time ,(pico seconds)
++	fps = div64_u64(1000000000000llu,ft);
++	screen->ft = 1000/fps;
++    	printk("%s: dclk:%lu>>fps:%d ",lcdc_dev->driver.name,clk_get_rate(lcdc_dev->dclk),fps);
+     	if(initscreen)
+     	{
+         	if(screen->lcdc_aclk)
+@@ -312,7 +320,7 @@ static  int win0_display(struct rk30_lcdc_device *lcdc_dev,struct layer_par *par
+ 		LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);
+ 	}
+ 	spin_unlock(&lcdc_dev->reg_lock);
+-	
++
+ 	return 0;
+ 	
+ }
+@@ -570,7 +578,7 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 	spin_lock_irqsave(&dev_drv->cpl_lock,flags);
+ 	init_completion(&dev_drv->frame_done);
+ 	spin_unlock_irqrestore(&dev_drv->cpl_lock,flags);
+-	timeout = wait_for_completion_interruptible_timeout(&dev_drv->frame_done,msecs_to_jiffies(25));
++	timeout = wait_for_completion_interruptible_timeout(&dev_drv->frame_done,msecs_to_jiffies(dev_drv->screen->ft+5));
+ 	if(!timeout)
+ 	{
+ 		printk(KERN_ERR "wait for new frame start time out!\n");
+@@ -634,7 +642,7 @@ swap:1 win0 on the top of win1
+ set  : 1 set overlay 
+         0 get overlay state
+ ************************************/
+-static int rk30_ovl_mgr(struct rk_lcdc_device_driver *dev_drv,int swap,bool set)
++static int rk30_lcdc_ovl_mgr(struct rk_lcdc_device_driver *dev_drv,int swap,bool set)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	int ovl;
+@@ -660,12 +668,48 @@ static int rk30_ovl_mgr(struct rk_lcdc_device_driver *dev_drv,int swap,bool set)
+ 
+ 	return ovl;
+ }
+-static int rk30_get_disp_info(struct rk_lcdc_device_driver *dev_drv,int layer_id)
++static int rk30_lcdc_get_disp_info(struct rk_lcdc_device_driver *dev_drv,int layer_id)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	return 0;
+ }
+ 
++
++/*******************************************
++lcdc fps manager,set or get lcdc fps
++set:0 get
++     1 set
++********************************************/
++static int rk30_lcdc_fps_mgr(struct rk_lcdc_device_driver *dev_drv,int fps,bool set)
++{
++	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
++	rk_screen * screen = dev_drv->screen;
++	u64 ft = 0;
++	u32 dotclk;
++	int ret;
++
++	if(set)
++	{
++		ft = div_u64(1000000000000llu,fps);
++		dev_drv->pixclock = div_u64(ft,(screen->upper_margin + screen->lower_margin + screen->y_res +screen->vsync_len)*
++				(screen->left_margin + screen->right_margin + screen->x_res + screen->hsync_len));
++		dotclk = div_u64(1000000000000llu,dev_drv->pixclock);
++		ret = clk_set_rate(lcdc_dev->dclk, dotclk);
++		if(ret)
++		{
++	        	printk(KERN_ERR ">>>>>> set lcdc%d dclk failed\n",lcdc_dev->id);
++		}
++	    	dev_drv->pixclock = lcdc_dev->pixclock = div_u64(1000000000000llu, clk_get_rate(lcdc_dev->dclk));
++			
++	}
++	
++	ft = (u64)(screen->upper_margin + screen->lower_margin + screen->y_res +screen->vsync_len)*
++	(screen->left_margin + screen->right_margin + screen->x_res + screen->hsync_len)*
++	(dev_drv->pixclock);       // one frame time ,(pico seconds)
++	fps = div64_u64(1000000000000llu,ft);
++	screen->ft = 1000/fps ;  //one frame time in ms
++	return fps;
++}
+ int rk30_lcdc_early_suspend(struct rk_lcdc_device_driver *dev_drv)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+@@ -730,8 +774,9 @@ static struct rk_lcdc_device_driver lcdc_driver = {
+ 	.pan_display            = rk30_lcdc_pan_display,
+ 	.load_screen		= rk30_load_screen,
+ 	.get_layer_state	= rk30_lcdc_get_layer_state,
+-	.ovl_mgr		= rk30_ovl_mgr,
+-	.get_disp_info		= rk30_get_disp_info,
++	.ovl_mgr		= rk30_lcdc_ovl_mgr,
++	.get_disp_info		= rk30_lcdc_get_disp_info,
++	.fps_mgr		= rk30_lcdc_fps_mgr,
+ };
+ #ifdef CONFIG_PM
+ static int rk30_lcdc_suspend(struct platform_device *pdev, pm_message_t state)
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 8a9a78bd531a..05d57ec1f143 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -778,6 +778,7 @@ static int init_lcdc_device_driver(struct rk_lcdc_device_driver *dev_drv,
+ 	dev_drv->get_layer_state= def_drv->get_layer_state;
+ 	dev_drv->get_disp_info  = def_drv->get_disp_info;
+ 	dev_drv->ovl_mgr	= def_drv->ovl_mgr;
++	dev_drv->fps_mgr	= def_drv->fps_mgr;
+ 	init_layer_par(dev_drv);
+ 	init_completion(&dev_drv->frame_done);
+ 	spin_lock_init(&dev_drv->cpl_lock);
+diff --git a/drivers/video/rockchip/rkfb_sysfs.c b/drivers/video/rockchip/rkfb_sysfs.c
+index 17f8fafa746a..fd3edf96aa4d 100644
+--- a/drivers/video/rockchip/rkfb_sysfs.c
++++ b/drivers/video/rockchip/rkfb_sysfs.c
+@@ -152,6 +152,46 @@ static ssize_t set_overlay(struct device *dev,struct device_attribute *attr,
+ 	return count;
+ }
+ 
++
++static ssize_t show_fps(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_lcdc_device_driver * dev_drv = 
++		(struct rk_lcdc_device_driver * )fbi->par;
++	int fps;
++	fps =  dev_drv->fps_mgr(dev_drv,0,0);
++	if(fps < 0)
++	{
++		return fps;
++	}
++
++	return snprintf(buf, PAGE_SIZE, "fps:%d\n",fps);
++	
++}
++
++static ssize_t set_fps(struct device *dev,struct device_attribute *attr,
++	const char *buf, size_t count)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_lcdc_device_driver * dev_drv = 
++		(struct rk_lcdc_device_driver * )fbi->par;
++	int fps;
++	int ret;
++	ret = kstrtoint(buf, 0, &fps);
++	if(ret)
++	{
++		return ret;
++	}
++	ret = dev_drv->fps_mgr(dev_drv,fps,1);
++	if(ret < 0)
++	{
++		return ret;
++	}
++
++	return count;
++}
++
+ static struct device_attribute rkfb_attrs[] = {
+ 	__ATTR(phys_addr, S_IRUGO, show_phys, NULL),
+ 	__ATTR(virt_addr, S_IRUGO, show_virt, NULL),
+@@ -159,6 +199,7 @@ static struct device_attribute rkfb_attrs[] = {
+ 	__ATTR(screen_info, S_IRUGO, show_screen_info, NULL),
+ 	__ATTR(enable, S_IRUGO | S_IWUSR, show_fb_state, set_fb_state),
+ 	__ATTR(overlay, S_IRUGO | S_IWUSR, show_overlay, set_overlay),
++	__ATTR(fps, S_IRUGO | S_IWUSR, show_fps, set_fps),
+ };
+ 
+ int rkfb_create_sysfs(struct fb_info *fbi)
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index bc909f9ee470..1cee768e66a4 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -212,6 +212,7 @@ struct rk_lcdc_device_driver{
+ 	int (*load_screen)(struct rk_lcdc_device_driver *dev_drv, bool initscreen);
+ 	int (*get_layer_state)(struct rk_lcdc_device_driver *dev_drv,int layer_id);
+ 	int (*ovl_mgr)(struct rk_lcdc_device_driver *dev_drv,int swap,bool set);  //overlay manager
++	int (*fps_mgr)(struct rk_lcdc_device_driver *dev_drv,int fps,bool set);
+ 	
+ };
+ 
+diff --git a/include/linux/rk_screen.h b/include/linux/rk_screen.h
+index d6ebe7bcfea2..efa47e53cde0 100644
+--- a/include/linux/rk_screen.h
++++ b/include/linux/rk_screen.h
+@@ -92,19 +92,19 @@ struct rk29lcd_info {
+ 
+ /* Screen description */
+ typedef struct rk29fb_screen {
+-    /* screen type & hardware connect format & out face */
+-    u16 type;
+-    u16 hw_format;
+-    u16 face;
++	/* screen type & hardware connect format & out face */
++	u16 type;
++	u16 hw_format;
++	u16 face;
+ 
+ 	/* Screen size */
+ 	u16 x_res;
+ 	u16 y_res;
+-    u16 width;
+-    u16 height;
++	u16 width;
++	u16 height;
+ 
+-    u32 mode;
+-    /* Timing */
++	u32 mode;
++	/* Timing */
+ 	u32 pixclock;
+ 	u16 left_margin;
+ 	u16 right_margin;
+@@ -112,6 +112,7 @@ typedef struct rk29fb_screen {
+ 	u16 upper_margin;
+ 	u16 lower_margin;
+ 	u16 vsync_len;
++	u8  ft;	//the time need to display one frame,in ms
+ #ifdef CONFIG_HDMI_DUAL_DISP
+     /* Scaler mode Timing */
+ 	u32 s_pixclock;
+@@ -125,34 +126,34 @@ typedef struct rk29fb_screen {
+ 	u16 s_vsync_st;
+ #endif
+ 	u8 hdmi_resolution;
+-    /* mcu need */
++	    /* mcu need */
+ 	u8 mcu_wrperiod;
+-    u8 mcu_usefmk;
+-    u8 mcu_frmrate;
++	u8 mcu_usefmk;
++	u8 mcu_frmrate;
+ 
+-	/* Pin polarity */
++		/* Pin polarity */
+ 	u8 pin_hsync;
+ 	u8 pin_vsync;
+ 	u8 pin_den;
+ 	u8 pin_dclk;
+-    u32 lcdc_aclk;
++	u32 lcdc_aclk;
+ 	u8 pin_dispon;
+ 
+ 	/* Swap rule */
+-    u8 swap_rb;
+-    u8 swap_rg;
+-    u8 swap_gb;
+-    u8 swap_delta;
+-    u8 swap_dumy;
+-
+-    /* Operation function*/
+-    int (*init)(void);
+-    int (*standby)(u8 enable);
+-    int (*refresh)(u8 arg);
+-    int (*scandir)(u16 dir);
+-    int (*disparea)(u8 area);
+-    int (*sscreen_get)(struct rk29fb_screen *screen, u8 resolution);
+-    int (*sscreen_set)(struct rk29fb_screen *screen, bool type);// 1: use scaler 0:bypass
++	u8 swap_rb;
++	u8 swap_rg;
++	u8 swap_gb;
++	u8 swap_delta;
++	u8 swap_dumy;
++
++	/* Operation function*/
++	int (*init)(void);
++	int (*standby)(u8 enable);
++	int (*refresh)(u8 arg);
++	int (*scandir)(u16 dir);
++	int (*disparea)(u8 area);
++	int (*sscreen_get)(struct rk29fb_screen *screen, u8 resolution);
++	int (*sscreen_set)(struct rk29fb_screen *screen, bool type);// 1: use scaler 0:bypass
+ } rk_screen;
+ 
+ extern void set_lcd_info(struct rk29fb_screen *screen, struct rk29lcd_info *lcd_info);
+-- 
+2.35.3
+

@@ -1,0 +1,116 @@
+From 00691037a5c07cac5a1dd63f6ba071f28c81c012 Mon Sep 17 00:00:00 2001
+From: chenjh <chenjh@rock-chips.com>
+Date: Sat, 27 May 2017 11:34:18 +0800
+Subject: [PATCH] fiq debugger: rockchip: fix crash because of invalid sp_el0
+
+(1) use cpu id from bl31 delivers;
+(2) sp_el0 should point to kernel address in EL1 mode.
+
+On ARM64, kernel uses sp_el0 to store current_thread_info(),
+we see a problem: when fiq occurs, cpu is EL1 mode but sp_el0
+point to userspace address. At this moment, if we read
+'current_thread_info()->cpu' or other, it leads an error.
+
+We find above situation happens when save/restore cpu context
+between system mode and user mode under heavy load.
+Like 'ret_fast_syscall()', kernel restore context of user mode,
+but fiq occurs before the instruction 'eret', so this causes the
+above situation.
+
+Assembly code:
+
+ffffff80080826c8 <ret_fast_syscall>:
+
+...skipping...
+
+ffffff80080826fc:       d503201f        nop
+ffffff8008082700:       d5384100        mrs     x0, sp_el0
+ffffff8008082704:       f9400c00        ldr     x0, [x0,#24]
+ffffff8008082708:       d5182000        msr     ttbr0_el1, x0
+ffffff800808270c:       d5033fdf        isb
+ffffff8008082710:       f9407ff7        ldr     x23, [sp,#248]
+ffffff8008082714:       d5184117        msr     sp_el0, x23
+ffffff8008082718:       d503201f        nop
+ffffff800808271c:       d503201f        nop
+ffffff8008082720:       d5184035        msr     elr_el1, x21
+ffffff8008082724:       d5184016        msr     spsr_el1, x22
+ffffff8008082728:       a94007e0        ldp     x0, x1, [sp]
+ffffff800808272c:       a9410fe2        ldp     x2, x3, [sp,#16]
+ffffff8008082730:       a94217e4        ldp     x4, x5, [sp,#32]
+ffffff8008082734:       a9431fe6        ldp     x6, x7, [sp,#48]
+ffffff8008082738:       a94427e8        ldp     x8, x9, [sp,#64]
+ffffff800808273c:       a9452fea        ldp     x10, x11, [sp,#80]
+ffffff8008082740:       a94637ec        ldp     x12, x13, [sp,#96]
+ffffff8008082744:       a9473fee        ldp     x14, x15, [sp,#112]
+ffffff8008082748:       a94847f0        ldp     x16, x17, [sp,#128]
+ffffff800808274c:       a9494ff2        ldp     x18, x19, [sp,#144]
+ffffff8008082750:       a94a57f4        ldp     x20, x21, [sp,#160]
+ffffff8008082754:       a94b5ff6        ldp     x22, x23, [sp,#176]
+ffffff8008082758:       a94c67f8        ldp     x24, x25, [sp,#192]
+ffffff800808275c:       a94d6ffa        ldp     x26, x27, [sp,#208]
+ffffff8008082760:       a94e77fc        ldp     x28, x29, [sp,#224]
+ffffff8008082764:       f9407bfe        ldr     x30, [sp,#240]
+ffffff8008082768:       9104c3ff        add     sp, sp, #0x130
+ffffff800808276c:       d69f03e0        eret
+
+Change-Id: I071e899f8a407764e166ca0403199c9d87d6ce78
+Signed-off-by: chenjh <chenjh@rock-chips.com>
+---
+ .../android/fiq_debugger/fiq_debugger.c       | 24 +++++++++++--------
+ 1 file changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/staging/android/fiq_debugger/fiq_debugger.c b/drivers/staging/android/fiq_debugger/fiq_debugger.c
+index 7615f2130ecd..ee3cd6c24dc5 100644
+--- a/drivers/staging/android/fiq_debugger/fiq_debugger.c
++++ b/drivers/staging/android/fiq_debugger/fiq_debugger.c
+@@ -583,7 +583,13 @@ static bool fiq_debugger_fiq_exec(struct fiq_debugger_state *state,
+ 			void *svc_sp)
+ {
+ 	bool signal_helper = false;
++	unsigned long va_start;
+ 
++#ifdef CONFIG_ARM64
++	va_start = VA_START;
++#else
++	va_start = PAGE_OFFSET;
++#endif
+ 	if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
+ 		fiq_debugger_help(state);
+ 	} else if (!strcmp(cmd, "pc")) {
+@@ -593,11 +599,14 @@ static bool fiq_debugger_fiq_exec(struct fiq_debugger_state *state,
+ 	} else if (!strcmp(cmd, "allregs")) {
+ 		fiq_debugger_dump_allregs(&state->output, regs);
+ 	} else if (!strcmp(cmd, "bt")) {
+-		if (!user_mode((struct pt_regs *)regs))
++		if (user_mode((struct pt_regs *)regs) ||
++		    ((unsigned long)svc_sp < va_start) ||
++		    ((unsigned long)svc_sp > -256UL))
++			fiq_debugger_printf(&state->output, "User mode\n");
++		else
+ 			fiq_debugger_dump_stacktrace(&state->output, regs,
+ 						     100, svc_sp);
+-		else
+-			fiq_debugger_printf(&state->output, "User mode\n");
++
+ 	} else if (!strncmp(cmd, "reset", 5)) {
+ 		cmd += 5;
+ 		while (*cmd == ' ')
+@@ -1022,13 +1031,8 @@ void fiq_debugger_fiq(void *regs, u32 cpu)
+ 	if (!state)
+ 		return;
+ 
+-	if (!user_mode((struct pt_regs *)regs))
+-		need_irq = fiq_debugger_handle_uart_interrupt(state,
+-						smp_processor_id(),
+-						regs, current_thread_info());
+-	else
+-		need_irq = fiq_debugger_handle_uart_interrupt(state, cpu,
+-						regs, current_thread_info());
++	need_irq = fiq_debugger_handle_uart_interrupt(state, cpu, regs,
++						      current_thread_info());
+ 	if (need_irq)
+ 		fiq_debugger_force_irq(state);
+ }
+-- 
+2.35.3
+

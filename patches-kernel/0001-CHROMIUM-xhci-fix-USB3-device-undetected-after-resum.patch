@@ -1,0 +1,116 @@
+From 12b5fa422aa349d8e50b8811c526de1ade4f12e1 Mon Sep 17 00:00:00 2001
+From: William wu <wulf@rock-chips.com>
+Date: Mon, 21 Nov 2016 14:06:19 +0800
+Subject: [PATCH] CHROMIUM: xhci: fix USB3 device undetected after resume
+
+Some xHC controllers (e.g. Rockchip rk3399) integrated in
+DWC3 IP, will be powered down in S3, and reinitialized after
+resume.
+
+However, if a USB3 device is plugged before system enter S3,
+the device will be disconnected after resume because of xHC
+lose power. And the device can't be detected again even if
+we reinitialize xHC. In this case, CCS and CSC is '0' and
+can't reflect the current state of the port, also the link
+state stays in Rx.Detect.
+
+So try to do warm reset on resume to reset USB3 device to
+the default state, also reset a USB3 link, and re-exchange
+link configuration information.
+
+BUG=chrome-os-partner:58347
+TEST=Plug an USB3 flash drive in rk3399 Kevin board Type-C
+port, then set system enter S3. Wakeup system, check if USB3
+device can be detected after resume.
+
+Change-Id: I90975a48866569f2c2422a244afc618a3e427f57
+Signed-off-by: William wu <wulf@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/412487
+Commit-Ready: Guenter Roeck <groeck@chromium.org>
+Tested-by: Guenter Roeck <groeck@chromium.org>
+Tested-by: Inno Park <ih.yoo.park@samsung.com>
+Reviewed-by: Guenter Roeck <groeck@chromium.org>
+Signed-off-by: Meng Dongyang <daniel.meng@rock-chips.com>
+---
+ drivers/usb/host/xhci-hub.c      | 17 +++++++++++++++++
+ drivers/usb/host/xhci-plat.c     |  3 +++
+ drivers/usb/host/xhci.h          |  1 +
+ include/linux/usb/xhci_pdriver.h |  2 ++
+ 4 files changed, 23 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index e9675e8f0e54..52997fbfc07c 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -1420,6 +1420,23 @@ int xhci_bus_resume(struct usb_hcd *hcd)
+ 			xhci_dbg(xhci, "reset stuck port %d\n", port_index);
+ 			continue;
+ 		}
++
++		/*
++		 * Workaround for missing CCS and CSC on resume if controller
++		 * is powered down in S3 with device plugged in.
++		 */
++		if ((xhci->quirks & XHCI_WARM_RESET_ON_RESUME) &&
++		    (hcd->speed >= HCD_USB3) &&
++		    !(temp & (PORT_CSC | PORT_CONNECT))) {
++			/* clear wakeup/change bits, and do a warm port reset */
++			temp &= ~(PORT_RWC_BITS | PORT_CEC | PORT_WAKE_BITS);
++			temp |= PORT_WR;
++			writel(temp, port_array[port_index]);
++			/* flush write */
++			readl(port_array[port_index]);
++			continue;
++		}
++
+ 		if (DEV_SUPERSPEED_ANY(temp))
+ 			temp &= ~(PORT_RWC_BITS | PORT_CEC | PORT_WAKE_BITS);
+ 		else
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index cf809492d389..2418740b6fac 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -54,6 +54,9 @@ static void xhci_plat_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 	 */
+ 	if (pdata && pdata->xhci_slow_suspend)
+ 		xhci->quirks |= XHCI_SLOW_SUSPEND;
++
++	if (pdata && pdata->usb3_warm_reset_on_resume)
++		xhci->quirks |= XHCI_WARM_RESET_ON_RESUME;
+ }
+ 
+ /* called during probe() after chip reset completes */
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 7c413e2376b8..068b6571c64b 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1636,6 +1636,7 @@ struct xhci_hcd {
+ #define XHCI_PME_STUCK_QUIRK	(1 << 20)
+ #define XHCI_DIS_AUTOSUSPEND	(1 << 21)
+ #define XHCI_MISSING_CAS	(1 << 24)
++#define XHCI_WARM_RESET_ON_RESUME	(1 << 25)
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+ 	/* There are two roothubs to keep track of bus suspend info for */
+diff --git a/include/linux/usb/xhci_pdriver.h b/include/linux/usb/xhci_pdriver.h
+index cd03e02f5c9a..5df42af8a404 100644
+--- a/include/linux/usb/xhci_pdriver.h
++++ b/include/linux/usb/xhci_pdriver.h
+@@ -23,12 +23,14 @@
+  *			after the Run/Stop (R/S) bit is cleared to '0'.
+  * @usb3_disable_autosuspend: determines if this xhci platform supports
+  *			USB3 autosuspend capability
++ * @usb3_warm_reset_on_resume:	determines if it need warm reset on resume.
+  *
+  */
+ struct usb_xhci_pdata {
+ 	unsigned	usb3_lpm_capable:1;
+ 	unsigned	xhci_slow_suspend:1;
+ 	unsigned	usb3_disable_autosuspend:1;
++	unsigned	usb3_warm_reset_on_resume:1;
+ };
+ 
+ #endif /* __USB_CORE_XHCI_PDRIVER_H */
+-- 
+2.35.3
+

@@ -1,0 +1,132 @@
+From bac84643034b9dd6a10984a3b3455fb0531fccd8 Mon Sep 17 00:00:00 2001
+From: Simon Xue <xxm@rock-chips.com>
+Date: Thu, 17 Oct 2019 15:44:57 +0800
+Subject: [PATCH] PCI: rockchip: support remove dma_trx_obj
+
+When PCIe link broken, remove pcie dev and reprobe may repair the link,
+also need to remove the dma_trx_obj
+
+Change-Id: If0a243d7c39bef5763c22fa53d5e7a6d515412f5
+Signed-off-by: Simon Xue <xxm@rock-chips.com>
+---
+ drivers/pci/controller/pcie-rockchip-host.c | 13 +++++++++--
+ drivers/pci/controller/rockchip-pcie-dma.c  | 26 +++++++++++++++++++++
+ drivers/pci/controller/rockchip-pcie-dma.h  |  6 +++++
+ 3 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-rockchip-host.c b/drivers/pci/controller/pcie-rockchip-host.c
+index 55c52ec60860..41cdcb8e3af3 100644
+--- a/drivers/pci/controller/pcie-rockchip-host.c
++++ b/drivers/pci/controller/pcie-rockchip-host.c
+@@ -1280,8 +1280,11 @@ static int rockchip_pcie_remove(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct rockchip_pcie *rockchip = dev_get_drvdata(dev);
+ 
+-	pci_stop_root_bus(rockchip->root_bus);
+-	pci_remove_root_bus(rockchip->root_bus);
++	if (rockchip->root_bus) {
++		pci_stop_root_bus(rockchip->root_bus);
++		pci_remove_root_bus(rockchip->root_bus);
++	}
++
+ 	pci_unmap_iospace(rockchip->io);
+ 	irq_domain_remove(rockchip->irq_domain);
+ 
+@@ -1289,6 +1292,12 @@ static int rockchip_pcie_remove(struct platform_device *pdev)
+ 
+ 	rockchip_pcie_disable_clocks(rockchip);
+ 
++	if (rockchip->dma_trx_enabled)
++		rk_pcie_dma_obj_remove(rockchip->dma_obj);
++
++	if (rockchip->deferred)
++		sysfs_remove_group(&pdev->dev.kobj, &pcie_attr_group);
++
+ 	if (!IS_ERR(rockchip->vpcie12v))
+ 		regulator_disable(rockchip->vpcie12v);
+ 	if (!IS_ERR(rockchip->vpcie3v3))
+diff --git a/drivers/pci/controller/rockchip-pcie-dma.c b/drivers/pci/controller/rockchip-pcie-dma.c
+index 41438ab89ab1..e09f8143bdea 100644
+--- a/drivers/pci/controller/rockchip-pcie-dma.c
++++ b/drivers/pci/controller/rockchip-pcie-dma.c
+@@ -524,6 +524,11 @@ static const struct file_operations rk_pcie_misc_fops = {
+ 	.poll		= rk_pcie_misc_poll,
+ };
+ 
++static void rk_pcie_delete_misc(struct dma_trx_obj *obj)
++{
++	misc_deregister(&obj->pcie_dev->dev);
++}
++
+ static int rk_pcie_add_misc(struct dma_trx_obj *obj)
+ {
+ 	int ret;
+@@ -545,6 +550,7 @@ static int rk_pcie_add_misc(struct dma_trx_obj *obj)
+ 	}
+ 
+ 	pcie_dev->obj = obj;
++	obj->pcie_dev = pcie_dev;
+ 
+ 	pr_info("register misc device pcie-dev\n");
+ 
+@@ -577,6 +583,11 @@ static void *rk_pcie_map_kernel(phys_addr_t start, size_t len)
+ 	return vaddr;
+ }
+ 
++static void rk_pcie_unmap_kernel(void *vaddr)
++{
++	vunmap(vaddr);
++}
++
+ static void rk_pcie_dma_table_free(struct dma_trx_obj *obj, int num)
+ {
+ 	int i;
+@@ -752,3 +763,18 @@ struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev)
+ 	return obj;
+ }
+ EXPORT_SYMBOL_GPL(rk_pcie_dma_obj_probe);
++
++void rk_pcie_dma_obj_remove(struct dma_trx_obj *obj)
++{
++	hrtimer_cancel(&obj->scan_timer);
++	destroy_hrtimer_on_stack(&obj->scan_timer);
++	rk_pcie_delete_misc(obj);
++	rk_pcie_unmap_kernel(obj->mem_base);
++	rk_pcie_dma_table_free(obj, PCIE_DMA_TABLE_NUM);
++	destroy_workqueue(obj->dma_trx_wq);
++
++#ifdef CONFIG_DEBUG_FS
++	debugfs_remove_recursive(obj->pcie_root);
++#endif
++}
++EXPORT_SYMBOL_GPL(rk_pcie_dma_obj_remove);
+diff --git a/drivers/pci/controller/rockchip-pcie-dma.h b/drivers/pci/controller/rockchip-pcie-dma.h
+index 90888328fd01..8a0797d083e8 100644
+--- a/drivers/pci/controller/rockchip-pcie-dma.h
++++ b/drivers/pci/controller/rockchip-pcie-dma.h
+@@ -174,6 +174,7 @@ struct dma_trx_obj {
+ 	struct mutex			count_mutex;
+ 	unsigned long			irq_num;
+ 	struct dentry			*pcie_root;
++	struct pcie_misc_dev		*pcie_dev;
+ };
+ 
+ #ifdef CONFIG_PCIE_DW_ROCKCHIP
+@@ -194,9 +195,14 @@ static inline void rk_pcie_start_dma_3399(struct dma_trx_obj *obj)
+ 
+ #ifdef CONFIG_ROCKCHIP_PCIE_DMA_OBJ
+ struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev);
++void rk_pcie_dma_obj_remove(struct dma_trx_obj *obj);
+ #else
+ static inline struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev)
+ {
+ 	return NULL;
+ }
++
++static inline void rk_pcie_dma_obj_remove(struct dma_trx_obj *obj)
++{
++}
+ #endif
+-- 
+2.35.3
+

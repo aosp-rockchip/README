@@ -1,0 +1,167 @@
+From 1b5128e3dda2564a30f98aa1b95635cefeaa7749 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Wed, 25 Jul 2012 14:08:28 +0800
+Subject: [PATCH] rk: add console write by thread support
+
+---
+ arch/arm/common/fiq_debugger.c      |  7 +++
+ arch/arm/include/asm/fiq_debugger.h |  4 ++
+ arch/arm/plat-rk/Kconfig            |  7 +++
+ arch/arm/plat-rk/rk_fiq_debugger.c  | 69 +++++++++++++++++++++++++++++
+ 4 files changed, 87 insertions(+)
+
+diff --git a/arch/arm/common/fiq_debugger.c b/arch/arm/common/fiq_debugger.c
+index 9617d374df4b..114c98e4d0ba 100644
+--- a/arch/arm/common/fiq_debugger.c
++++ b/arch/arm/common/fiq_debugger.c
+@@ -1086,6 +1086,13 @@ static void debug_console_write(struct console *co,
+ 	if (!state->console_enable && !state->syslog_dumping)
+ 		return;
+ 
++#ifdef CONFIG_RK_CONSOLE_THREAD
++	if (state->pdata->console_write) {
++		state->pdata->console_write(state->pdev, s, count);
++		return;
++	}
++#endif
++
+ 	debug_uart_enable(state);
+ 	while (count--) {
+ 		if (*s == '\n')
+diff --git a/arch/arm/include/asm/fiq_debugger.h b/arch/arm/include/asm/fiq_debugger.h
+index 4d274883ba6a..38a82f1ee354 100644
+--- a/arch/arm/include/asm/fiq_debugger.h
++++ b/arch/arm/include/asm/fiq_debugger.h
+@@ -59,6 +59,10 @@ struct fiq_debugger_pdata {
+ 
+ 	void (*force_irq)(struct platform_device *pdev, unsigned int irq);
+ 	void (*force_irq_ack)(struct platform_device *pdev, unsigned int irq);
++
++#ifdef CONFIG_RK_CONSOLE_THREAD
++	void (*console_write)(struct platform_device *pdev, const char *s, unsigned int count);
++#endif
+ };
+ 
+ #endif
+diff --git a/arch/arm/plat-rk/Kconfig b/arch/arm/plat-rk/Kconfig
+index 58e73499aea2..c14ce225ac5d 100644
+--- a/arch/arm/plat-rk/Kconfig
++++ b/arch/arm/plat-rk/Kconfig
+@@ -146,6 +146,13 @@ config RK_DEBUG_UART
+ 	help
+ 	  Select a UART for debugging. -1 disable.
+ 
++config RK_CONSOLE_THREAD
++	bool "Console write by thread"
++	depends on FIQ_DEBUGGER_CONSOLE
++	default y
++	help
++	  Normal kernel printk will write out to UART by "kconsole" kthread
++
+ config RK_SRAM_DMA
+ 	bool "Sound DMA buffer in internal SRAM"
+ 	depends on ARCH_RK30
+diff --git a/arch/arm/plat-rk/rk_fiq_debugger.c b/arch/arm/plat-rk/rk_fiq_debugger.c
+index 7461f06676a9..55f409914a00 100644
+--- a/arch/arm/plat-rk/rk_fiq_debugger.c
++++ b/arch/arm/plat-rk/rk_fiq_debugger.c
+@@ -27,6 +27,8 @@
+ #include <linux/slab.h>
+ #include <linux/stacktrace.h>
+ #include <linux/uaccess.h>
++#include <linux/kfifo.h>
++#include <linux/kthread.h>
+ #include <asm/fiq_debugger.h>
+ #include <asm/hardware/gic.h>
+ #include <plat/rk_fiq_debugger.h>
+@@ -36,6 +38,9 @@ struct rk_fiq_debugger {
+ 	struct fiq_debugger_pdata pdata;
+ 	void __iomem *debug_port_base;
+ 	bool break_seen;
++#ifdef CONFIG_RK_CONSOLE_THREAD
++	struct task_struct *console_task;
++#endif
+ };
+ 
+ static inline void rk_fiq_write(struct rk_fiq_debugger *t,
+@@ -122,6 +127,61 @@ static void debug_flush(struct platform_device *pdev)
+ 		cpu_relax();
+ }
+ 
++#ifdef CONFIG_RK_CONSOLE_THREAD
++static DEFINE_KFIFO(fifo, unsigned char, SZ_64K);
++
++static int console_thread(void *data)
++{
++	struct platform_device *pdev = data;
++	struct rk_fiq_debugger *t;
++	unsigned char c;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	while (1) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		schedule();
++		if (kthread_should_stop())
++			break;
++		set_current_state(TASK_RUNNING);
++		while (kfifo_get(&fifo, &c))
++			debug_putc(pdev, c);
++		debug_flush(pdev);
++	}
++
++	return 0;
++}
++
++static void console_write(struct platform_device *pdev, const char *s, unsigned int count)
++{
++	unsigned char c, r = '\r';
++	static bool oops = false;
++	struct rk_fiq_debugger *t;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	if (oops_in_progress || oops) {
++		while (kfifo_get(&fifo, &c))
++			debug_putc(pdev, c);
++		while (count--) {
++			if (*s == '\n') {
++				debug_putc(pdev, r);
++			}
++			debug_putc(pdev, *s++);
++		}
++		debug_flush(pdev);
++		oops = true;
++		return;
++	}
++
++	while (count--) {
++		if (*s == '\n') {
++			kfifo_put(&fifo, &r);
++		}
++		kfifo_put(&fifo, s++);
++	}
++	wake_up_process(t->console_task);
++}
++#endif
++
+ static void fiq_enable(struct platform_device *pdev, unsigned int irq, bool on)
+ {
+ 	if (on)
+@@ -199,6 +259,15 @@ void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeu
+ 		res_count++;
+ 	}
+ 
++#ifdef CONFIG_RK_CONSOLE_THREAD
++	t->console_task = kthread_create(console_thread, pdev, "kconsole");
++	if (!IS_ERR(t->console_task)) {
++		struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
++		t->pdata.console_write = console_write;
++		sched_setscheduler_nocheck(t->console_task, SCHED_FIFO, &param);
++	}
++#endif
++
+ 	pdev->name = "fiq_debugger";
+ 	pdev->id = rk_fiq_debugger_id++;
+ 	pdev->dev.platform_data = &t->pdata;
+-- 
+2.35.3
+

@@ -1,0 +1,382 @@
+From a810fcbdfca72cd166c98d72a44299e0810dce48 Mon Sep 17 00:00:00 2001
+From: Jianqun Xu <jay.xu@rock-chips.com>
+Date: Thu, 26 Nov 2015 10:18:00 +0800
+Subject: [PATCH] staging: ion: add ion map iommu APIs
+
+If with the defination of RK_IOMMU, rockchip-ion support
+iommu APIs.
+
+Change-Id: I2e63fb0822c0e296c88676302fa31359c6821af1
+Signed-off-by: Jianqun Xu <jay.xu@rock-chips.com>
+---
+ drivers/staging/android/ion/ion.c      | 269 +++++++++++++++++++++++++
+ drivers/staging/android/ion/ion_priv.h |  38 ++++
+ 2 files changed, 307 insertions(+)
+
+diff --git a/drivers/staging/android/ion/ion.c b/drivers/staging/android/ion/ion.c
+index 92d62d1ce8cd..f81822a2503f 100644
+--- a/drivers/staging/android/ion/ion.c
++++ b/drivers/staging/android/ion/ion.c
+@@ -115,6 +115,10 @@ struct ion_handle {
+ 	int id;
+ };
+ 
++#ifdef CONFIG_RK_IOMMU
++static void ion_iommu_force_unmap(struct ion_buffer *buffer);
++#endif
++
+ bool ion_buffer_fault_user_mappings(struct ion_buffer *buffer)
+ {
+ 	return (buffer->flags & ION_FLAG_CACHED) &&
+@@ -272,6 +276,9 @@ void ion_buffer_destroy(struct ion_buffer *buffer)
+ 	if (WARN_ON(buffer->kmap_cnt > 0))
+ 		buffer->heap->ops->unmap_kernel(buffer->heap, buffer);
+ 	buffer->heap->ops->unmap_dma(buffer->heap, buffer);
++#ifdef CONFIG_RK_IOMMU
++	ion_iommu_force_unmap(buffer);
++#endif
+ 	buffer->heap->ops->free(buffer);
+ 	vfree(buffer->pages);
+ 	kfree(buffer);
+@@ -675,6 +682,265 @@ void ion_unmap_kernel(struct ion_client *client, struct ion_handle *handle)
+ }
+ EXPORT_SYMBOL(ion_unmap_kernel);
+ 
++#ifdef CONFIG_RK_IOMMU
++static void ion_iommu_add(struct ion_buffer *buffer,
++			  struct ion_iommu_map *iommu)
++{
++	struct rb_node **p = &buffer->iommu_maps.rb_node;
++	struct rb_node *parent = NULL;
++	struct ion_iommu_map *entry;
++
++	while (*p) {
++		parent = *p;
++		entry = rb_entry(parent, struct ion_iommu_map, node);
++
++		if (iommu->key < entry->key) {
++			p = &(*p)->rb_left;
++		} else if (iommu->key > entry->key) {
++			p = &(*p)->rb_right;
++		} else {
++			pr_err("%s: buffer %p already has mapping for domainid %lx\n",
++			       __func__,
++			       buffer,
++			       iommu->key);
++		}
++	}
++
++	rb_link_node(&iommu->node, parent, p);
++	rb_insert_color(&iommu->node, &buffer->iommu_maps);
++}
++
++static struct ion_iommu_map *ion_iommu_lookup(
++		struct ion_buffer *buffer,
++		unsigned long key)
++{
++	struct rb_node **p = &buffer->iommu_maps.rb_node;
++	struct rb_node *parent = NULL;
++	struct ion_iommu_map *entry;
++
++	while (*p) {
++		parent = *p;
++		entry = rb_entry(parent, struct ion_iommu_map, node);
++
++		if (key < entry->key)
++			p = &(*p)->rb_left;
++		else if (key > entry->key)
++			p = &(*p)->rb_right;
++		else
++			return entry;
++	}
++
++	return NULL;
++}
++
++static struct ion_iommu_map *__ion_iommu_map(
++		struct ion_buffer *buffer,
++		struct device *iommu_dev, unsigned long *iova)
++{
++	struct ion_iommu_map *data;
++	int ret;
++
++	data = kmalloc(sizeof(*data), GFP_ATOMIC);
++
++	if (!data)
++		return ERR_PTR(-ENOMEM);
++
++	data->buffer = buffer;
++	data->key = (unsigned long)iommu_dev;
++
++	ret = buffer->heap->ops->map_iommu(buffer, iommu_dev, data,
++						buffer->size, buffer->flags);
++	if (ret)
++		goto out;
++
++	kref_init(&data->ref);
++	*iova = data->iova_addr;
++
++	ion_iommu_add(buffer, data);
++
++	return data;
++
++out:
++	kfree(data);
++	return ERR_PTR(ret);
++}
++
++int ion_map_iommu(struct device *iommu_dev, struct ion_client *client,
++		  struct ion_handle *handle, unsigned long *iova,
++		  unsigned long *size)
++{
++	struct ion_buffer *buffer;
++	struct ion_iommu_map *iommu_map;
++	int ret = 0;
++
++	mutex_lock(&client->lock);
++	if (!ion_handle_validate(client, handle)) {
++		pr_err("%s: invalid handle passed to map_kernel.\n",
++		       __func__);
++		mutex_unlock(&client->lock);
++		return -EINVAL;
++	}
++
++	buffer = handle->buffer;
++	mutex_lock(&buffer->lock);
++
++	if (!handle->buffer->heap->ops->map_iommu) {
++		pr_err("%s: map_iommu is not implemented by this heap.\n",
++		       __func__);
++		ret = -ENODEV;
++		goto out;
++	}
++
++	if (buffer->size & ~PAGE_MASK) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	iommu_map = ion_iommu_lookup(buffer, (unsigned long)iommu_dev);
++	if (!iommu_map) {
++		iommu_map = __ion_iommu_map(buffer, iommu_dev, iova);
++		if (IS_ERR(iommu_map))
++			ret = PTR_ERR(iommu_map);
++	} else {
++		if (iommu_map->mapped_size != buffer->size) {
++			pr_err("%s: handle %p is already mapped with length\n"
++			       " %d, trying to map with length %zu\n",
++			       __func__, handle, iommu_map->mapped_size,
++			       buffer->size);
++			ret = -EINVAL;
++		} else {
++			kref_get(&iommu_map->ref);
++			*iova = iommu_map->iova_addr;
++		}
++	}
++	if (!ret)
++		buffer->iommu_map_cnt++;
++
++	*size = buffer->size;
++out:
++	mutex_unlock(&buffer->lock);
++	mutex_unlock(&client->lock);
++	return ret;
++}
++EXPORT_SYMBOL(ion_map_iommu);
++
++static void ion_iommu_release(struct kref *kref)
++{
++	struct ion_iommu_map *map = container_of(
++				kref,
++				struct ion_iommu_map,
++				ref);
++	struct ion_buffer *buffer = map->buffer;
++
++	rb_erase(&map->node, &buffer->iommu_maps);
++	buffer->heap->ops->unmap_iommu((struct device *)map->key, map);
++	kfree(map);
++}
++
++/**
++ * Unmap any outstanding mappings which would otherwise have been leaked.
++ */
++static void ion_iommu_force_unmap(struct ion_buffer *buffer)
++{
++	struct ion_iommu_map *iommu_map;
++	struct rb_node *node;
++	const struct rb_root *rb = &buffer->iommu_maps;
++
++	mutex_lock(&buffer->lock);
++	while ((node = rb_first(rb)) != 0) {
++		iommu_map = rb_entry(node, struct ion_iommu_map, node);
++		/* set ref count to 1 to force release */
++		kref_init(&iommu_map->ref);
++		kref_put(&iommu_map->ref, ion_iommu_release);
++	}
++	mutex_unlock(&buffer->lock);
++}
++
++void ion_unmap_iommu(struct device *iommu_dev, struct ion_client *client,
++		     struct ion_handle *handle)
++{
++	struct ion_iommu_map *iommu_map;
++	struct ion_buffer *buffer;
++
++	mutex_lock(&client->lock);
++	buffer = handle->buffer;
++	mutex_lock(&buffer->lock);
++
++	iommu_map = ion_iommu_lookup(buffer, (unsigned long)iommu_dev);
++	if (!iommu_map) {
++		WARN(1, "%s: (%p) was never mapped for %p\n", __func__,
++		     iommu_dev, buffer);
++		goto out;
++	}
++
++	buffer->iommu_map_cnt--;
++	kref_put(&iommu_map->ref, ion_iommu_release);
++out:
++	mutex_unlock(&buffer->lock);
++	mutex_unlock(&client->lock);
++}
++EXPORT_SYMBOL(ion_unmap_iommu);
++
++static int ion_debug_client_show_buffer_map(struct seq_file *s,
++					    struct ion_buffer *buffer)
++{
++	struct ion_iommu_map *iommu_map;
++	const struct rb_root *rb;
++	struct rb_node *node;
++
++	mutex_lock(&buffer->lock);
++	rb = &buffer->iommu_maps;
++	node = rb_first(rb);
++	while (node) {
++		iommu_map = rb_entry(node, struct ion_iommu_map, node);
++		seq_printf(s, "%16.16s:   0x%08lx   0x%08x   0x%08x %8zuKB %4d\n",
++			   "<iommu>", iommu_map->iova_addr, 0, 0,
++			   (size_t)iommu_map->mapped_size >> 10,
++			   atomic_read(&iommu_map->ref.refcount));
++		node = rb_next(node);
++	}
++
++	mutex_unlock(&buffer->lock);
++	return 0;
++}
++
++static int ion_debug_client_show_buffer(struct seq_file *s, void *unused)
++{
++	struct ion_client *client = s->private;
++	struct rb_node *n;
++
++	seq_puts(s, "----------------------------------------------------\n");
++	seq_printf(s, "%16.s: %12.s %12.s %12.s %10.s %4.s %4.s %4.s\n",
++		   "heap_name", "VA", "PA", "IBUF", "size", "HC", "IBR", "IHR");
++	mutex_lock(&client->lock);
++	for (n = rb_first(&client->handles); n; n = rb_next(n)) {
++		struct ion_handle *handle = rb_entry(n, struct ion_handle,
++						     node);
++		struct ion_buffer *buffer = handle->buffer;
++		ion_phys_addr_t pa = 0;
++		size_t len = buffer->size;
++
++		mutex_lock(&buffer->lock);
++		if (buffer->heap->ops->phys)
++			buffer->heap->ops->phys(buffer->heap,
++						buffer, &pa, &len);
++
++		seq_printf(s, "%16.16s:   0x%08lx   0x%08lx   0x%08lx %8zuKB %4d %4d %4d\n",
++			   buffer->heap->name, (unsigned long)buffer->vaddr, pa,
++			   (unsigned long)buffer, len >> 10,
++			   buffer->handle_count,
++			   atomic_read(&buffer->ref.refcount),
++			   atomic_read(&handle->ref.refcount));
++
++		mutex_unlock(&buffer->lock);
++		ion_debug_client_show_buffer_map(s, buffer);
++	}
++
++	mutex_unlock(&client->lock);
++	return 0;
++}
++#endif
++
+ static int ion_debug_client_show(struct seq_file *s, void *unused)
+ {
+ 	struct ion_client *client = s->private;
+@@ -701,6 +967,9 @@ static int ion_debug_client_show(struct seq_file *s, void *unused)
+ 			continue;
+ 		seq_printf(s, "%16.16s: %16zu\n", names[i], sizes[i]);
+ 	}
++#ifdef CONFIG_RK_IOMMU
++	ion_debug_client_show_buffer(s, unused);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/drivers/staging/android/ion/ion_priv.h b/drivers/staging/android/ion/ion_priv.h
+index 0239883bffb7..df1cc860c3a0 100644
+--- a/drivers/staging/android/ion/ion_priv.h
++++ b/drivers/staging/android/ion/ion_priv.h
+@@ -31,6 +31,31 @@
+ 
+ struct ion_buffer *ion_handle_buffer(struct ion_handle *handle);
+ 
++#ifdef CONFIG_RK_IOMMU
++/**
++ * struct ion_iommu_map - represents a mapping of an ion buffer to an iommu
++ * @iova_addr - iommu virtual address
++ * @node - rb node to exist in the buffer's tree of iommu mappings
++ * @key - contains the iommu device info
++ * @ref - for reference counting this mapping
++ * @mapped_size - size of the iova space mapped
++ *		(may not be the same as the buffer size)
++ *
++ * Represents a mapping of one ion buffer to a particular iommu domain
++ * and address range. There may exist other mappings of this buffer in
++ * different domains or address ranges. All mappings will have the same
++ * cacheability and security.
++ */
++struct ion_iommu_map {
++	unsigned long iova_addr;
++	struct rb_node node;
++	unsigned long key;
++	struct ion_buffer *buffer;
++	struct kref ref;
++	int mapped_size;
++};
++#endif
++
+ /**
+  * struct ion_buffer - metadata for a particular buffer
+  * @ref:		reference count
+@@ -84,6 +109,10 @@ struct ion_buffer {
+ 	int handle_count;
+ 	char task_comm[TASK_COMM_LEN];
+ 	pid_t pid;
++#ifdef CONFIG_RK_IOMMU
++	unsigned int iommu_map_cnt;
++	struct rb_root iommu_maps;
++#endif
+ };
+ void ion_buffer_destroy(struct ion_buffer *buffer);
+ 
+@@ -121,6 +150,15 @@ struct ion_heap_ops {
+ 	int (*map_user)(struct ion_heap *mapper, struct ion_buffer *buffer,
+ 			struct vm_area_struct *vma);
+ 	int (*shrink)(struct ion_heap *heap, gfp_t gfp_mask, int nr_to_scan);
++#ifdef CONFIG_RK_IOMMU
++	int (*map_iommu)(struct ion_buffer *buffer,
++			 struct device *iommu_dev,
++			 struct ion_iommu_map *map_data,
++			 unsigned long iova_length,
++			 unsigned long flags);
++	void (*unmap_iommu)(struct device *iommu_dev,
++			    struct ion_iommu_map *data);
++#endif
+ };
+ 
+ /**
+-- 
+2.35.3
+

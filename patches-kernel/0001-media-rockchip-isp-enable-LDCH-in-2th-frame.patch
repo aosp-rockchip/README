@@ -1,0 +1,113 @@
+From cb3d3f5e4c5c0095e5fde27ea414cd133fad491e Mon Sep 17 00:00:00 2001
+From: Xu Hongfei <xuhf@rock-chips.com>
+Date: Mon, 2 Nov 2020 19:31:34 +0800
+Subject: [PATCH] media: rockchip: isp: enable LDCH in 2th frame
+
+LDCH will compete with LSC/3DLUT for the DDR bus,
+which may cause LDCH to read the map table exception.
+so isp enable LDCH in 2th frame.
+
+Signed-off-by: Xu Hongfei <xuhf@rock-chips.com>
+Change-Id: If84139362ee9ca8de43714915f4387923cf21000
+---
+ .../media/platform/rockchip/isp/isp_params.h  |  1 +
+ .../platform/rockchip/isp/isp_params_v2x.c    | 28 ++++++++++++++++---
+ .../platform/rockchip/isp/isp_params_v2x.h    |  7 +++++
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/isp_params.h b/drivers/media/platform/rockchip/isp/isp_params.h
+index 7bf19c0aa65e..9a6cc0b95ce0 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params.h
++++ b/drivers/media/platform/rockchip/isp/isp_params.h
+@@ -50,6 +50,7 @@ struct rkisp_isp_params_vdev {
+ 	struct v4l2_format vdev_fmt;
+ 	bool streamon;
+ 	bool first_params;
++	bool first_cfg_params;
+ 	bool hdrtmo_en;
+ 
+ 	enum v4l2_quantization quantization;
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index 4df76f06358f..36d20677baff 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -4,7 +4,7 @@
+ #include <media/v4l2-common.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/videobuf2-core.h>
+-#include <media/videobuf2-vmalloc.h>	/* for ISP params */
++#include <media/videobuf2-vmalloc.h>   /* for ISP params */
+ #include <linux/rk-preisp.h>
+ #include "dev.h"
+ #include "regs.h"
+@@ -3959,9 +3959,14 @@ void __isp_isr_other_config(struct rkisp_isp_params_vdev *params_vdev,
+ 			ops->ldch_config(params_vdev,
+ 				&new_params->others.ldch_cfg);
+ 
+-		if (module_en_update & ISP2X_MODULE_LDCH)
+-			ops->ldch_enable(params_vdev,
+-				!!(module_ens & ISP2X_MODULE_LDCH));
++		if (module_en_update & ISP2X_MODULE_LDCH) {
++			if (params_vdev->first_cfg_params &&
++			    !!(module_ens & ISP2X_MODULE_LDCH))
++				priv_val->delay_en_ldch = true;
++			else
++				ops->ldch_enable(params_vdev,
++						!!(module_ens & ISP2X_MODULE_LDCH));
++		}
+ 	}
+ 
+ 	if ((module_en_update & ISP2X_MODULE_GAIN) ||
+@@ -4198,9 +4203,13 @@ rkisp_params_first_cfg_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 	priv_val->tmo_en = 0;
+ 	priv_val->lsc_en = 0;
+ 	priv_val->mge_en = 0;
++	priv_val->delay_en_ldch = false;
++	params_vdev->first_cfg_params = true;
+ 	__isp_isr_other_config(params_vdev, params_vdev->isp2x_params, RKISP_PARAMS_ALL);
+ 	__isp_isr_meas_config(params_vdev, params_vdev->isp2x_params, RKISP_PARAMS_ALL);
+ 	__preisp_isr_update_hdrae_para(params_vdev, params_vdev->isp2x_params);
++	params_vdev->first_cfg_params = false;
++
+ 	params_vdev->cur_hdrtmo = params_vdev->isp2x_params->others.hdrtmo_cfg;
+ 	params_vdev->cur_hdrmge = params_vdev->isp2x_params->others.hdrmge_cfg;
+ 	params_vdev->last_hdrtmo = params_vdev->cur_hdrtmo;
+@@ -4436,6 +4445,17 @@ rkisp_params_isr_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 
+ 		params_vdev->rdbk_times--;
+ 		if (IS_HDR_RDBK(dev->csi_dev.rd_mode) && !params_vdev->rdbk_times) {
++			struct rkisp_isp_params_val_v2x *priv_val =
++				(struct rkisp_isp_params_val_v2x *)params_vdev->priv_val;
++
++			if (priv_val->delay_en_ldch) {
++				struct rkisp_isp_params_v2x_ops *ops =
++					(struct rkisp_isp_params_v2x_ops *)params_vdev->priv_ops;
++
++				ops->ldch_enable(params_vdev, true);
++				priv_val->delay_en_ldch = false;
++			}
++
+ 			rkisp_params_cfg_v2x(params_vdev, cur_frame_id, 0, RKISP_PARAMS_SHD);
+ 			return;
+ 		}
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.h b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+index ad86bc505b46..d34aceee3f83 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.h
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+@@ -334,6 +334,13 @@ struct rkisp_isp_params_val_v2x {
+ 	u8 tmo_en;
+ 	u8 lsc_en;
+ 	u8 mge_en;
++
++	/*
++	 * LDCH will compete with LSC/3DLUT for the DDR bus,
++	 * which may cause LDCH to read the map table exception.
++	 * so enable LDCH in 2th frame.
++	 */
++	bool delay_en_ldch;
+ };
+ 
+ int rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev);
+-- 
+2.35.3
+

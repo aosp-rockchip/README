@@ -1,0 +1,464 @@
+From 75c2080503aa64c97163e1b5535cc47affc5824e Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Sat, 3 Nov 2018 17:14:17 +0800
+Subject: [PATCH] drivers/input/touchscreen: remove unused ts_lib driver
+
+Change-Id: Ief30bdafe5d47365d548f1a9d64d59422571542a
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ drivers/input/touchscreen/ts_lib/Makefile   |   2 -
+ drivers/input/touchscreen/ts_lib/dejitter.c | 137 -------------------
+ drivers/input/touchscreen/ts_lib/tslib.c    |  71 ----------
+ drivers/input/touchscreen/ts_lib/tslib.h    |  62 ---------
+ drivers/input/touchscreen/ts_lib/variance.c | 138 --------------------
+ 5 files changed, 410 deletions(-)
+ delete mode 100644 drivers/input/touchscreen/ts_lib/Makefile
+ delete mode 100755 drivers/input/touchscreen/ts_lib/dejitter.c
+ delete mode 100755 drivers/input/touchscreen/ts_lib/tslib.c
+ delete mode 100755 drivers/input/touchscreen/ts_lib/tslib.h
+ delete mode 100755 drivers/input/touchscreen/ts_lib/variance.c
+
+diff --git a/drivers/input/touchscreen/ts_lib/Makefile b/drivers/input/touchscreen/ts_lib/Makefile
+deleted file mode 100644
+index 3a8139a048b8..000000000000
+--- a/drivers/input/touchscreen/ts_lib/Makefile
++++ /dev/null
+@@ -1,2 +0,0 @@
+-# SPDX-License-Identifier: GPL-2.0
+-obj-y	+= tslib.o variance.o dejitter.o
+\ No newline at end of file
+diff --git a/drivers/input/touchscreen/ts_lib/dejitter.c b/drivers/input/touchscreen/ts_lib/dejitter.c
+deleted file mode 100755
+index e8f5387d216e..000000000000
+--- a/drivers/input/touchscreen/ts_lib/dejitter.c
++++ /dev/null
+@@ -1,137 +0,0 @@
+-/*
+- *  tslib/dejitter.c
+- *
+- *  Copyright (C) 2001 Russell King.
+- *
+- * This file is placed under the LGPL.  Please see the file
+- * COPYING for more details.
+- *
+- *
+- * Problem: some touchscreens read the X/Y values from ADC with a
+- * great level of noise in their lowest bits. This produces "jitter"
+- * in touchscreen output, e.g. even if we hold the stylus still,
+- * we get a great deal of X/Y coordinate pairs that are close enough
+- * but not equal. Also if we try to draw a straight line in a painter
+- * program, we'll get a line full of spikes.
+- *
+- * Solution: we apply a smoothing filter on the last several values
+- * thus excluding spikes from output. If we detect a substantial change
+- * in coordinates, we reset the backlog of pen positions, thus avoiding
+- * smoothing coordinates that are not supposed to be smoothed. This
+- * supposes all noise has been filtered by the lower-level filter,
+- * e.g. by the "variance" module.
+- */
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/interrupt.h>
+-#include <linux/kernel.h>
+-#include <linux/slab.h>
+-#include <linux/fcntl.h>
+-#include <linux/delay.h>
+-#include <linux/device.h>
+-//#include <asm/typedef.h>
+-#include <mach/iomux.h>
+-#include <asm/uaccess.h>
+-#include <asm/types.h>
+-#include <asm/io.h>
+-#include <asm/delay.h>
+-#include "tslib.h"
+-
+-//#define DEBUG
+-/**
+- * This filter works as follows: we keep track of latest N samples,
+- * and average them with certain weights. The oldest samples have the
+- * least weight and the most recent samples have the most weight.
+- * This helps remove the jitter and at the same time doesn't influence
+- * responsivity because for each input sample we generate one output
+- * sample; pen movement becomes just somehow more smooth.
+- */
+-
+-/* To keep things simple (avoiding division) we ensure that
+- * SUM(weight) = power-of-two. Also we must know how to approximate
+- * measurements when we have less than NR_SAMPHISTLEN samples.
+- */
+-static const unsigned char weight [NR_SAMPHISTLEN - 1][NR_SAMPHISTLEN + 1] =
+-{
+-	/* The last element is pow2(SUM(0..3)) */
+-	{ 5, 3, 0, 0, 3 },	/* When we have 2 samples ... */
+-	{ 8, 5, 3, 0, 4 },	/* When we have 3 samples ... */
+-	{ 6, 4, 3, 3, 4 },	/* When we have 4 samples ... */
+-};
+-
+-static void average (struct tslib_dejitter *djt, struct ts_sample *samp)
+-{
+-	const unsigned char *w;
+-	int sn = djt->head;
+-	int i, x = 0, y = 0;
+-	//unsigned int p = 0;
+-
+-        w = weight [djt->nr - 2];
+-
+-	for (i = 0; i < djt->nr; i++) {
+-		x += djt->hist [sn].x * w [i];
+-		y += djt->hist [sn].y * w [i];
+-		//p += djt->hist [sn].p * w [i];
+-		sn = (sn - 1) & (NR_SAMPHISTLEN - 1);
+-	}
+-
+-	samp->x = x >> w [NR_SAMPHISTLEN];
+-	samp->y = y >> w [NR_SAMPHISTLEN];
+-	//samp->pressure = p >> w [NR_SAMPHISTLEN];
+-#ifdef DEBUG
+-	printk("DEJITTER----------------> %d %d %d\n",
+-		samp->x, samp->y, samp->pressure);
+-#endif
+-}
+-
+-int dejitter_read(struct tslib_info *info, struct ts_sample *samp, int nr)
+-{
+-	struct tslib_dejitter *djt = info->djt;
+-	struct ts_sample *s;
+-	int count = 0, ret;
+-
+-	ret = variance_read(info, samp, nr);
+-	for (s = samp; ret > 0; s++, ret--) {
+-		if (s->pressure == 0) {
+-			/*
+-			 * Pen was released. Reset the state and
+-			 * forget all history events.
+-			 */
+-			djt->nr = 0;
+-			samp [count++] = *s;
+-			continue;
+-		}
+-
+-        /* If the pen moves too fast, reset the backlog. */
+-		if (djt->nr) {
+-			int prev = (djt->head - 1) & (NR_SAMPHISTLEN - 1);
+-			if (sqr(s->x - djt->hist [prev].x) +
+-			    sqr(s->y - djt->hist [prev].y) > djt->delta) {
+-#ifdef DEBUG
+-				printk("DEJITTER: pen movement exceeds threshold\n");
+-#endif
+-				djt->nr = 0;
+-			}
+-		}
+-
+-		djt->hist[djt->head].x = s->x;
+-		djt->hist[djt->head].y = s->y;
+-		djt->hist[djt->head].p = s->pressure;
+-		if (djt->nr < NR_SAMPHISTLEN)
+-			djt->nr++;
+-
+-		/* We'll pass through the very first sample since
+-		 * we can't average it (no history yet).
+-		 */
+-		if (djt->nr == 1)
+-			samp [count] = *s;
+-		else {
+-			average (djt, samp + count);
+-		}
+-		count++;
+-
+-		djt->head = (djt->head + 1) & (NR_SAMPHISTLEN - 1);
+-	}
+-
+-	return count;
+-}
+diff --git a/drivers/input/touchscreen/ts_lib/tslib.c b/drivers/input/touchscreen/ts_lib/tslib.c
+deleted file mode 100755
+index f5910237c484..000000000000
+--- a/drivers/input/touchscreen/ts_lib/tslib.c
++++ /dev/null
+@@ -1,71 +0,0 @@
+-/*
+- * tslib/tslib.c
+- *
+- * This file is placed under the LGPL.  Please see the file
+- * COPYING for more details.
+- *
+- */
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/interrupt.h>
+-#include <linux/kernel.h>
+-#include <linux/slab.h>
+-#include <linux/fcntl.h>
+-#include <linux/delay.h>
+-#include <linux/device.h>
+-//#include <asm/typedef.h>
+-#include <mach/iomux.h>
+-#include <asm/uaccess.h>
+-#include <asm/types.h>
+-#include <asm/io.h>
+-#include <asm/delay.h>
+-#include "tslib.h"
+-
+-struct tslib_info *g_tslib_inf = NULL;
+-
+-int sqr(int x)
+-{
+-	return x * x;
+-}
+-
+-int tslib_init(struct tslib_info *info, void *raw_read)
+-{
+-	struct tslib_info *tslib_inf = info;
+-	struct tslib_variance *var = NULL;
+-	struct tslib_dejitter *djt = NULL;
+-
+-	if(raw_read == NULL)
+-		return -1;
+-	
+-	memset(tslib_inf, 0, sizeof(struct tslib_info));
+-
+-	var = kmalloc(sizeof(struct tslib_variance), GFP_KERNEL);
+-	if (var == NULL)
+-		goto failed1;
+-	memset(var, 0, sizeof(struct tslib_variance));
+-
+-	djt = kmalloc(sizeof(struct tslib_dejitter), GFP_KERNEL);
+-	if (djt == NULL)
+-		goto failed2;
+-
+-	memset(djt, 0, sizeof(struct tslib_dejitter));
+-
+-	var->flags = 0;
+-	var->delta = sqr(VARIANCE_DELTA);
+-
+-	djt->head = 0;
+-	djt->delta = sqr(DEJITTER_DELTA);
+-
+-	tslib_inf->raw_read = raw_read;
+-	tslib_inf->var = var;
+-	tslib_inf->djt = djt;
+-
+-	g_tslib_inf = tslib_inf;
+-
+-	return 0;
+-	
+-failed2:
+-	kfree(var);
+-failed1:
+-	return -1;
+-}
+diff --git a/drivers/input/touchscreen/ts_lib/tslib.h b/drivers/input/touchscreen/ts_lib/tslib.h
+deleted file mode 100755
+index 0cdf99516c00..000000000000
+--- a/drivers/input/touchscreen/ts_lib/tslib.h
++++ /dev/null
+@@ -1,62 +0,0 @@
+-#ifndef _TSLIB_H_
+-#define _TSLIB_H_
+-/*
+- *  tslib/tslib.h
+- *
+- *  Copyright (C) 2001 Russell King.
+- *
+- * This file is placed under the LGPL.
+- *
+- *
+- * Touch screen library interface definitions.
+- */
+-
+-#define NR_SAMPHISTLEN	4
+-
+-#define VARIANCE_DELTA   10
+-#define DEJITTER_DELTA   100
+-
+-struct ts_sample {
+-	int		x;
+-	int		y;
+-	unsigned int	pressure;
+-};
+-
+-struct tslib_variance {
+-	int delta;
+-    struct ts_sample last;
+-    struct ts_sample noise;
+-	unsigned int flags;
+-};
+-
+-struct ts_hist {
+-	int x;
+-	int y;
+-	unsigned int p;
+-};
+-
+-struct tslib_dejitter {
+-	int delta;
+-	int x;
+-	int y;
+-	int down;
+-	int nr;
+-	int head;
+-	struct ts_hist hist[NR_SAMPHISTLEN];
+-};
+-
+-struct tslib_info {
+-	int (*raw_read)(struct tslib_info *info, struct ts_sample *samp, int nr);
+-	struct tslib_variance *var;
+-	struct tslib_dejitter *djt;
+-};
+-
+-int sqr(int x);
+-
+-int tslib_init(struct tslib_info *info, void *raw_read);
+-void variance_clear(struct tslib_info *info);
+-int variance_read(struct tslib_info *info, struct ts_sample *samp, int nr);
+-int dejitter_read(struct tslib_info *info, struct ts_sample *samp, int nr);
+-
+-
+-#endif /* _TSLIB_H_ */
+diff --git a/drivers/input/touchscreen/ts_lib/variance.c b/drivers/input/touchscreen/ts_lib/variance.c
+deleted file mode 100755
+index 504d81cebbee..000000000000
+--- a/drivers/input/touchscreen/ts_lib/variance.c
++++ /dev/null
+@@ -1,138 +0,0 @@
+-/*
+- *  tslib/variance.c
+- *
+- *  Copyright (C) 2001 Russell King.
+- *
+- * This file is placed under the LGPL.  Please see the file
+- * COPYING for more details.
+- *
+- *
+- * Variance filter for touchscreen values.
+- *
+- * Problem: some touchscreens are sampled very roughly, thus even if
+- * you hold the pen still, the samples can differ, sometimes substantially.
+- * The worst happens when electric noise during sampling causes the result
+- * to be substantially different from the real pen position; this causes
+- * the mouse cursor to suddenly "jump" and then return back.
+- *
+- * Solution: delay sampled data by one timeslot. If we see that the last
+- * sample read differs too much, we mark it as "suspicious". If next sample
+- * read is close to the sample before the "suspicious", the suspicious sample
+- * is dropped, otherwise we consider that a quick pen movement is in progress
+- * and pass through both the "suspicious" sample and the sample after it.
+- */
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/interrupt.h>
+-#include <linux/kernel.h>
+-#include <linux/slab.h>
+-#include <linux/fcntl.h>
+-#include <linux/delay.h>
+-#include <linux/device.h>
+-//#include <asm/typedef.h>
+-#include <mach/iomux.h>
+-#include <asm/uaccess.h>
+-#include <asm/types.h>
+-#include <asm/io.h>
+-#include <asm/delay.h>
+-#include "tslib.h"
+-
+-//#define DEBUG
+-
+-#define VAR_PENDOWN			0x00000001
+-#define VAR_LASTVALID		0x00000002
+-#define VAR_NOISEVALID		0x00000004
+-#define VAR_SUBMITNOISE		0x00000008
+-void variance_clear(struct tslib_info *info)
+-{
+-	struct ts_sample cur;
+-	struct tslib_variance *var = info->var;
+-	
+-	cur.pressure = 0;
+-
+-	/* Flush the queue immediately when the pen is just
+-	 * released, otherwise the previous layer will
+-	 * get the pen up notification too late. This 
+-	 * will happen if info->next->ops->read() blocks.
+-	 */
+-	if (var->flags & VAR_PENDOWN) {
+-		var->flags |= VAR_SUBMITNOISE;
+-		var->noise = cur;
+-	}
+-	/* Reset the state machine on pen up events. */
+-	var->flags &= ~(VAR_PENDOWN | VAR_NOISEVALID | VAR_LASTVALID);
+-	var->noise = cur;
+-	var->last = cur;
+-
+-	return;
+-}
+-int variance_read(struct tslib_info *info, struct ts_sample *samp, int nr)
+-{
+-	struct tslib_variance *var = info->var;
+-	struct ts_sample cur;
+-	int count = 0, dist;
+-
+-	while (count < nr) {
+-		if (var->flags & VAR_SUBMITNOISE) {
+-			cur = var->noise;
+-			var->flags &= ~VAR_SUBMITNOISE;
+-		} else {
+-			if (info->raw_read(info, &cur, 1) < 1)
+-				return count;
+-		}
+-
+-		if (cur.pressure == 0) {
+-			/* Flush the queue immediately when the pen is just
+-			 * released, otherwise the previous layer will
+-			 * get the pen up notification too late. This 
+-			 * will happen if info->next->ops->read() blocks.
+-			 */
+-			if (var->flags & VAR_PENDOWN) {
+-				var->flags |= VAR_SUBMITNOISE;
+-				var->noise = cur;
+-			}
+-			/* Reset the state machine on pen up events. */
+-			var->flags &= ~(VAR_PENDOWN | VAR_NOISEVALID | VAR_LASTVALID);
+-			goto acceptsample;
+-		} else
+-			var->flags |= VAR_PENDOWN;
+-
+-		if (!(var->flags & VAR_LASTVALID)) {
+-			var->last = cur;
+-			var->flags |= VAR_LASTVALID;
+-			continue;
+-		}
+-
+-		if (var->flags & VAR_PENDOWN) {
+-			/* Compute the distance between last sample and current */
+-			dist = sqr(cur.x - var->last.x) +
+-			       sqr(cur.y - var->last.y);
+-
+-			if (dist > var->delta) {
+-				/* Do we suspect the previous sample was a noise? */
+-				if (var->flags & VAR_NOISEVALID) {
+-					/* Two "noises": it's just a quick pen movement */
+-					samp [count++] = var->last = var->noise;
+-					var->flags = (var->flags & ~VAR_NOISEVALID) |
+-						VAR_SUBMITNOISE;
+-				} else
+-					var->flags |= VAR_NOISEVALID;
+-
+-				/* The pen jumped too far, maybe it's a noise ... */
+-				var->noise = cur;
+-				continue;
+-			} else
+-				var->flags &= ~VAR_NOISEVALID;
+-		}
+-
+-acceptsample:
+-#ifdef DEBUG
+-		printk("VARIANCE----------------> %d %d %d\n",
+-			var->last.x, var->last.y, var->last.pressure);
+-#endif
+-		samp [count++] = var->last;
+-		var->last = cur;
+-	}
+-
+-	return count;
+-}
+-- 
+2.35.3
+

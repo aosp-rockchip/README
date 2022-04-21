@@ -1,0 +1,205 @@
+From eff09450e6a434dda13134ac95dfd2c1d300e7d8 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Tue, 20 Oct 2020 10:13:16 +0800
+Subject: [PATCH] media: rockchip: ispp: using common dummy buf to save memory
+
+Change-Id: Ic2cf3e6cfcced849380e15e198943f7ee994bcdb
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/common.c | 38 +++++++++++++++++++
+ drivers/media/platform/rockchip/ispp/common.h |  2 +
+ drivers/media/platform/rockchip/ispp/dev.c    |  1 +
+ drivers/media/platform/rockchip/ispp/hw.h     |  1 +
+ drivers/media/platform/rockchip/ispp/stream.c | 30 ++++-----------
+ drivers/media/platform/rockchip/ispp/stream.h |  2 -
+ 6 files changed, 49 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index d567609c930f..e14b7014e6ca 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -310,3 +310,41 @@ void rkispp_soft_reset(struct rkispp_device *ispp)
+ 	if (domain)
+ 		iommu_attach_device(domain, hw->dev);
+ }
++
++int rkispp_alloc_common_dummy_buf(struct rkispp_device *dev)
++{
++	struct rkispp_hw_dev *hw = dev->hw_dev;
++	struct rkispp_subdev *sdev = &dev->ispp_sdev;
++	struct rkispp_dummy_buffer *dummy_buf = &hw->dummy_buf;
++	u32 w = hw->max_in.w ? hw->max_in.w : sdev->out_fmt.width;
++	u32 h =  hw->max_in.h ? hw->max_in.h : sdev->out_fmt.height;
++	u32 size =  w * h * 2;
++	int ret = 0;
++
++	mutex_lock(&hw->dev_lock);
++	if (dummy_buf->mem_priv) {
++		if (dummy_buf->size >= size)
++			goto end;
++		rkispp_free_buffer(dev, &dev->hw_dev->dummy_buf);
++	}
++	dummy_buf->size = w * h * 2;
++	ret = rkispp_allow_buffer(dev, dummy_buf);
++	if (ret < 0)
++		v4l2_err(&dev->v4l2_dev,
++			 "failed to alloc common dummy buf:%d\n", ret);
++	else
++		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
++			 "alloc common dummy buf:0x%x size:%d\n",
++			 (u32)dummy_buf->dma_addr, dummy_buf->size);
++
++end:
++	mutex_unlock(&hw->dev_lock);
++	return ret;
++}
++
++void rkispp_free_common_dummy_buf(struct rkispp_device *dev)
++{
++	mutex_lock(&dev->hw_dev->dev_lock);
++	rkispp_free_buffer(dev, &dev->hw_dev->dummy_buf);
++	mutex_unlock(&dev->hw_dev->dev_lock);
++}
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index f395efa7fd54..cec14cd77bf6 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -114,4 +114,6 @@ void rkispp_free_buffer(struct rkispp_device *dev,
+ int rkispp_attach_hw(struct rkispp_device *ispp);
+ int rkispp_event_handle(struct rkispp_device *ispp, u32 cmd, void *arg);
+ void rkispp_soft_reset(struct rkispp_device *ispp);
++int rkispp_alloc_common_dummy_buf(struct rkispp_device *dev);
++void rkispp_free_common_dummy_buf(struct rkispp_device *dev);
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 79c9eea661ea..43fc2fea8956 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -305,6 +305,7 @@ static int __maybe_unused rkispp_runtime_suspend(struct device *dev)
+ 
+ 	if (atomic_dec_return(&ispp_dev->hw_dev->power_cnt))
+ 		return 0;
++	rkispp_free_common_dummy_buf(ispp_dev);
+ 	return pm_runtime_put_sync(ispp_dev->hw_dev->dev);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+index b7e319944cd5..c3ef66e2ee73 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.h
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -31,6 +31,7 @@ struct rkispp_hw_dev {
+ 	struct clk *clks[ISPP_MAX_BUS_CLK];
+ 	struct rkispp_device *ispp[DEV_MAX];
+ 	struct rkispp_isp_buf_pool pool[RKISPP_BUF_POOL_MAX];
++	struct rkispp_dummy_buffer dummy_buf;
+ 	struct max_input max_in;
+ 	struct list_head list;
+ 	int clk_rate_tbl_num;
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index ff9283e5ed42..23810de6ee8d 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -299,7 +299,7 @@ static void update_mi(struct rkispp_stream *stream)
+ 
+ 	if (stream->type == STREAM_OUTPUT &&
+ 	    !stream->curr_buf) {
+-		dummy_buf = &stream->dummy_buf;
++		dummy_buf = &dev->hw_dev->dummy_buf;
+ 		set_y_addr(stream, dummy_buf->dma_addr);
+ 		set_uv_addr(stream, dummy_buf->dma_addr);
+ 	}
+@@ -662,7 +662,7 @@ static int nr_init_buf(struct rkispp_device *dev, u32 size)
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_dummy_buffer *buf;
+-	int i, ret, cnt = 1;
++	int i, ret, cnt = 0;
+ 
+ 	if (vdev->module_ens & ISPP_MODULE_FEC)
+ 		cnt = RKISPP_BUF_MAX;
+@@ -675,11 +675,6 @@ static int nr_init_buf(struct rkispp_device *dev, u32 size)
+ 		list_add_tail(&buf->list, &vdev->nr.list_wr);
+ 	}
+ 
+-	if (vdev->module_ens & ISPP_MODULE_FEC)
+-		vdev->nr.cur_wr = get_list_buf(&vdev->nr.list_wr, false);
+-	else
+-		get_list_buf(&vdev->nr.list_wr, false);
+-
+ 	buf = &vdev->nr.buf.tmp_yuv;
+ 	buf->size = size >> 2;
+ 	ret = rkispp_allow_buffer(dev, buf);
+@@ -790,7 +785,7 @@ static int config_nr_shp(struct rkispp_device *dev)
+ 	} else {
+ 		stream = &vdev->stream[STREAM_MB];
+ 		if (!stream->streaming) {
+-			val = vdev->nr.buf.wr[0].dma_addr;
++			val = hw->dummy_buf.dma_addr;
+ 			rkispp_write(dev, RKISPP_SHARP_WR_Y_BASE, val);
+ 			rkispp_write(dev, RKISPP_SHARP_WR_UV_BASE, val);
+ 			rkispp_write(dev, RKISPP_SHARP_WR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
+@@ -1102,9 +1097,8 @@ static int is_stopped_mb(struct rkispp_stream *stream)
+ 		rkispp_clear_bits(dev, RKISPP_FEC_CTRL, FMT_FBC << 4);
+ 		rkispp_set_bits(dev, RKISPP_FEC_CORE_CTRL,
+ 				0, SW_FEC2DDR_DIS);
+-	} else if (vdev->module_ens &
+-		   (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
+-		val = dev->stream_vdev.nr.buf.wr[0].dma_addr;
++	} else if (vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
++		val = dev->hw_dev->dummy_buf.dma_addr;
+ 		rkispp_write(dev, RKISPP_SHARP_WR_Y_BASE, val);
+ 		rkispp_write(dev, RKISPP_SHARP_WR_UV_BASE, val);
+ 		rkispp_set_bits(dev, RKISPP_SHARP_CTRL, SW_SHP_WR_FORMAT_MASK, FMT_FBC);
+@@ -1361,27 +1355,17 @@ static void rkispp_buf_queue(struct vb2_buffer *vb)
+ 
+ static int rkispp_create_dummy_buf(struct rkispp_stream *stream)
+ {
+-	struct rkispp_dummy_buffer *buf = &stream->dummy_buf;
+ 	struct rkispp_device *dev = stream->isppdev;
+ 
+ 	if (stream->type != STREAM_OUTPUT)
+ 		return 0;
+-
+-	buf->size = max3(stream->out_fmt.plane_fmt[0].bytesperline *
+-			 stream->out_fmt.height,
+-			 stream->out_fmt.plane_fmt[1].sizeimage,
+-			 stream->out_fmt.plane_fmt[2].sizeimage);
+-	return rkispp_allow_buffer(dev, buf);
++	return rkispp_alloc_common_dummy_buf(dev);
+ }
+ 
+ static void rkispp_destroy_dummy_buf(struct rkispp_stream *stream)
+ {
+-	struct rkispp_dummy_buffer *buf = &stream->dummy_buf;
+ 	struct rkispp_device *dev = stream->isppdev;
+-	struct rkispp_stream_vdev *vdev;
+-
+-	vdev = &dev->stream_vdev;
+-	rkispp_free_buffer(dev, buf);
++	struct rkispp_stream_vdev *vdev= &dev->stream_vdev;
+ 
+ 	if (atomic_read(&vdev->refcnt) == 1) {
+ 		vdev->irq_ends = 0;
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 12063dcfff4b..8fde7f833f45 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -134,7 +134,6 @@ struct in_fec_buf {
+  * buf_queue: queued buffer list
+  * curr_buf: the buffer used for current frame
+  * next_buf: the buffer used for next frame
+- * dummy_buf: dummy space to store dropped data
+  * done: wait frame end event queue
+  * vbq_lock: lock to protect buf_queue
+  * out_cap_fmt: the output of ispp
+@@ -152,7 +151,6 @@ struct rkispp_stream {
+ 	struct list_head buf_queue;
+ 	struct rkispp_buffer *curr_buf;
+ 	struct rkispp_buffer *next_buf;
+-	struct rkispp_dummy_buffer dummy_buf;
+ 	wait_queue_head_t done;
+ 	spinlock_t vbq_lock;
+ 
+-- 
+2.35.3
+

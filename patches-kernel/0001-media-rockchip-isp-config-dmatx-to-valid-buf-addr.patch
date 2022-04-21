@@ -1,0 +1,530 @@
+From 0be314b3906b5a3515eaa65505a7fba16654ac65 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 23 Dec 2020 16:10:49 +0800
+Subject: [PATCH] media: rockchip: isp: config dmatx to valid buf addr
+
+Change-Id: I6e74e3a8e7d298c5620f6e4fab47c615f0b6b30c
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  |  16 +++
+ drivers/media/platform/rockchip/isp/capture.h |   2 -
+ .../media/platform/rockchip/isp/capture_v1x.c |  32 +----
+ .../media/platform/rockchip/isp/capture_v20.c |  66 +++++-----
+ .../media/platform/rockchip/isp/capture_v21.c |  36 +----
+ .../media/platform/rockchip/isp/capture_v2x.h |   1 +
+ drivers/media/platform/rockchip/isp/common.c  | 123 ++++++++++++++++++
+ drivers/media/platform/rockchip/isp/common.h  |   3 +
+ drivers/media/platform/rockchip/isp/hw.h      |   2 +-
+ 9 files changed, 190 insertions(+), 91 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 2a21c5fd24e9..db969c1d46e0 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -683,6 +683,8 @@ static void free_bridge_buf(struct rkisp_bridge_device *dev)
+ 		for (j = 0; j < GROUP_BUF_MAX; j++)
+ 			rkisp_free_buffer(dev->ispdev, &buf->dummy[j]);
+ 	}
++
++	rkisp_free_common_dummy_buf(dev->ispdev);
+ }
+ 
+ static int init_buf(struct rkisp_bridge_device *dev, u32 pic_size, u32 gain_size)
+@@ -699,6 +701,7 @@ static int init_buf(struct rkisp_bridge_device *dev, u32 pic_size, u32 gain_size
+ 	v4l2_dbg(1, rkisp_debug, &dev->ispdev->v4l2_dev,
+ 		 "%s pic size:%d gain size:%d\n",
+ 		 __func__, pic_size, gain_size);
++
+ 	INIT_LIST_HEAD(&hw->list);
+ 	for (i = 0; i < dev->buf_num; i++) {
+ 		buf = &hw->bufs[i];
+@@ -717,6 +720,18 @@ static int init_buf(struct rkisp_bridge_device *dev, u32 pic_size, u32 gain_size
+ 			goto err;
+ 	}
+ 
++	for (i = 0; i < hw->dev_num; i++) {
++		struct rkisp_device *isp = hw->isp[i];
++
++		if (!(isp->isp_inp & INP_CSI))
++			continue;
++		ret = rkisp_alloc_common_dummy_buf(isp);
++		if (ret < 0)
++			goto err;
++		else
++			break;
++	}
++
+ 	hw->cur_buf = list_first_entry(&hw->list, struct rkisp_ispp_buf, list);
+ 	list_del(&hw->cur_buf->list);
+ 	buf = to_bridge_buf(hw->cur_buf);
+@@ -852,6 +867,7 @@ static int bridge_start(struct rkisp_bridge_device *dev)
+ 	dev->ops->config(dev);
+ 
+ 	if (!dev->ispdev->hw_dev->is_mi_update) {
++		rkisp_config_dmatx_valid_buf(dev->ispdev);
+ 		force_cfg_update(dev->ispdev);
+ 
+ 		if (!(dev->work_mode & ISP_ISPP_QUICK))
+diff --git a/drivers/media/platform/rockchip/isp/capture.h b/drivers/media/platform/rockchip/isp/capture.h
+index c326457bd48e..1b0d17fd86ee 100644
+--- a/drivers/media/platform/rockchip/isp/capture.h
++++ b/drivers/media/platform/rockchip/isp/capture.h
+@@ -191,7 +191,6 @@ struct streams_ops {
+  *
+  * @vbq_lock: lock to protect buf_queue
+  * @buf_queue: queued buffer list
+- * @dummy_buf: dummy space to store dropped data
+  *
+  * rkisp use shadowsock registers, so it need two buffer at a time
+  * @curr_buf: the buffer used for current frame
+@@ -213,7 +212,6 @@ struct rkisp_stream {
+ 	struct stream_config *config;
+ 	spinlock_t vbq_lock;
+ 	struct list_head buf_queue;
+-	struct rkisp_dummy_buffer dummy_buf;
+ 	struct rkisp_buffer *curr_buf;
+ 	struct rkisp_buffer *next_buf;
+ 	bool streaming;
+diff --git a/drivers/media/platform/rockchip/isp/capture_v1x.c b/drivers/media/platform/rockchip/isp/capture_v1x.c
+index 00d05f05661b..3da62b03e318 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v1x.c
++++ b/drivers/media/platform/rockchip/isp/capture_v1x.c
+@@ -329,7 +329,7 @@ static void sp_disable_mi(struct rkisp_stream *stream)
+ /* Update buffer info to memory interface, it's called in interrupt */
+ static void update_mi(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
++	struct rkisp_dummy_buffer *dummy_buf = &stream->ispdev->hw_dev->dummy_buf;
+ 	void __iomem *base = stream->ispdev->base_addr;
+ 
+ 	/* The dummy space allocated by dma_alloc_coherent is used, we can
+@@ -342,7 +342,7 @@ static void update_mi(struct rkisp_stream *stream)
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CB]);
+ 		mi_set_cr_addr(stream,
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CR]);
+-	} else {
++	} else if (dummy_buf->mem_priv) {
+ 		mi_set_y_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cb_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cr_addr(stream, dummy_buf->dma_addr);
+@@ -649,38 +649,14 @@ static void rkisp_buf_queue(struct vb2_buffer *vb)
+ 
+ static int rkisp_create_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+-	struct rkisp_device *dev = stream->ispdev;
+-	u32 size = max3(stream->out_fmt.plane_fmt[0].bytesperline *
+-			stream->out_fmt.height,
+-			stream->out_fmt.plane_fmt[1].sizeimage,
+-			stream->out_fmt.plane_fmt[2].sizeimage);
+-
+-	if (dummy_buf->mem_priv) {
+-		if (dummy_buf->size >= size)
+-			return 0;
+-		rkisp_free_buffer(dev, dummy_buf);
+-	}
+-
+-	dummy_buf->size = size;
+-	if (rkisp_alloc_buffer(dev, dummy_buf) < 0) {
+-		v4l2_err(&dev->v4l2_dev,
+-			 "Failed to allocate the memory for dummy buffer\n");
+-		return -ENOMEM;
+-	}
+-
+-	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+-		 "stream:%d dummy buf:0x%x\n",
+-		 stream->id, (u32)dummy_buf->dma_addr);
+-	return 0;
++	return rkisp_alloc_common_dummy_buf(stream->ispdev);
+ }
+ 
+ static void rkisp_destroy_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 
+-	rkisp_free_buffer(dev, dummy_buf);
++	rkisp_free_common_dummy_buf(dev);
+ }
+ 
+ static void destroy_buf_queue(struct rkisp_stream *stream,
+diff --git a/drivers/media/platform/rockchip/isp/capture_v20.c b/drivers/media/platform/rockchip/isp/capture_v20.c
+index 08f74ee6ece6..eb9d4e282cd6 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v20.c
++++ b/drivers/media/platform/rockchip/isp/capture_v20.c
+@@ -523,6 +523,31 @@ void hdr_qbuf(struct list_head *q,
+ 		list_add_tail(&buf->queue, q);
+ }
+ 
++void rkisp_config_dmatx_valid_buf(struct rkisp_device *dev)
++{
++	struct rkisp_hw_dev *hw = dev->hw_dev;
++	struct rkisp_stream *stream;
++	struct rkisp_device *isp;
++	u32 i, j;
++
++	if (!hw->dummy_buf.mem_priv)
++		return;
++	/* dmatx buf update by mi force or oneself frame end,
++	 * for async dmatx enable need to update to valid buf first.
++	 */
++	for (i = 0; i < hw->dev_num; i++) {
++		isp = hw->isp[i];
++		if (!(isp->isp_inp & INP_CSI))
++			continue;
++		for (j = RKISP_STREAM_DMATX0; j < RKISP_MAX_STREAM; j++) {
++			stream = &isp->cap_dev.stream[j];
++			if (!stream->linked || stream->u.dmatx.is_config)
++				continue;
++			mi_set_y_addr(stream, hw->dummy_buf.dma_addr);
++		}
++	}
++}
++
+ /* configure dual-crop unit */
+ static int rkisp_stream_config_dcrop(struct rkisp_stream *stream, bool async)
+ {
+@@ -1039,8 +1064,8 @@ static void update_dmatx_v2(struct rkisp_stream *stream)
+ 			else
+ 				hdr_qbuf(&dev->hdr.q_tx[index], buf);
+ 		}
+-		if (!buf && stream->dummy_buf.mem_priv)
+-			buf = &stream->dummy_buf;
++		if (!buf && dev->hw_dev->dummy_buf.mem_priv)
++			buf = &dev->hw_dev->dummy_buf;
+ 		if (buf)
+ 			mi_set_y_addr(stream, buf->dma_addr);
+ 	}
+@@ -1054,7 +1079,7 @@ static void update_dmatx_v2(struct rkisp_stream *stream)
+ /* Update buffer info to memory interface, it's called in interrupt */
+ static void update_mi(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
++	struct rkisp_dummy_buffer *dummy_buf = &stream->ispdev->hw_dev->dummy_buf;
+ 	void __iomem *base = stream->ispdev->base_addr;
+ 
+ 	/* The dummy space allocated by dma_alloc_coherent is used, we can
+@@ -1067,7 +1092,7 @@ static void update_mi(struct rkisp_stream *stream)
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CB]);
+ 		mi_set_cr_addr(stream,
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CR]);
+-	} else {
++	} else if (dummy_buf->mem_priv) {
+ 		mi_set_y_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cb_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cr_addr(stream, dummy_buf->dma_addr);
+@@ -1102,7 +1127,11 @@ static void sp_stop_mi(struct rkisp_stream *stream)
+ 
+ static void dmatx_stop_mi(struct rkisp_stream *stream)
+ {
++	struct rkisp_hw_dev *hw = stream->ispdev->hw_dev;
++
+ 	raw_wr_disable(stream);
++	if (hw->dummy_buf.mem_priv)
++		mi_set_y_addr(stream, hw->dummy_buf.dma_addr);
+ 	stream->u.dmatx.is_config = false;
+ }
+ 
+@@ -1510,6 +1539,7 @@ static int rkisp_start(struct rkisp_stream *stream)
+ 	 */
+ 	if (is_update && !dev->br_dev.en) {
+ 		rkisp_stats_first_ddr_config(&dev->stats_vdev);
++		rkisp_config_dmatx_valid_buf(dev);
+ 		force_cfg_update(dev);
+ 		mi_frame_end(stream);
+ 		hdr_update_dmatx_buf(dev);
+@@ -1620,39 +1650,15 @@ static void rkisp_buf_queue(struct vb2_buffer *vb)
+ 
+ static int rkisp_create_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+-	struct rkisp_device *dev = stream->ispdev;
+-	u32 size = max3(stream->out_fmt.plane_fmt[0].bytesperline *
+-			stream->out_fmt.height,
+-			stream->out_fmt.plane_fmt[1].sizeimage,
+-			stream->out_fmt.plane_fmt[2].sizeimage);
+-
+-	if (dummy_buf->mem_priv) {
+-		if (dummy_buf->size >= size)
+-			return 0;
+-		rkisp_free_buffer(dev, dummy_buf);
+-	}
+-
+-	dummy_buf->size = size;
+-	if (rkisp_alloc_buffer(dev, dummy_buf) < 0) {
+-		v4l2_err(&dev->v4l2_dev,
+-			 "Failed to allocate the memory for dummy buffer\n");
+-		return -ENOMEM;
+-	}
+-
+-	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+-		 "stream:%d dummy buf:0x%x\n",
+-		 stream->id, (u32)dummy_buf->dma_addr);
+-	return 0;
++	return rkisp_alloc_common_dummy_buf(stream->ispdev);
+ }
+ 
+ static void rkisp_destroy_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 
+-	rkisp_free_buffer(dev, dummy_buf);
+ 	hdr_destroy_buf(dev);
++	rkisp_free_common_dummy_buf(dev);
+ }
+ 
+ static void destroy_buf_queue(struct rkisp_stream *stream,
+diff --git a/drivers/media/platform/rockchip/isp/capture_v21.c b/drivers/media/platform/rockchip/isp/capture_v21.c
+index 9ddce99d65c7..9e2f34990dbb 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v21.c
++++ b/drivers/media/platform/rockchip/isp/capture_v21.c
+@@ -500,8 +500,8 @@ static void update_dmatx_v2(struct rkisp_stream *stream)
+ 			else
+ 				hdr_qbuf(&dev->hdr.q_tx[index], buf);
+ 		}
+-		if (!buf && stream->dummy_buf.mem_priv)
+-			buf = &stream->dummy_buf;
++		if (!buf && dev->hw_dev->dummy_buf.mem_priv)
++			buf = &dev->hw_dev->dummy_buf;
+ 		if (buf)
+ 			mi_set_y_addr(stream, buf->dma_addr);
+ 	}
+@@ -515,7 +515,7 @@ static void update_dmatx_v2(struct rkisp_stream *stream)
+ /* Update buffer info to memory interface, it's called in interrupt */
+ static void update_mi(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
++	struct rkisp_dummy_buffer *dummy_buf = &stream->ispdev->hw_dev->dummy_buf;
+ 	void __iomem *base = stream->ispdev->base_addr;
+ 
+ 	/* The dummy space allocated by dma_alloc_coherent is used, we can
+@@ -528,7 +528,7 @@ static void update_mi(struct rkisp_stream *stream)
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CB]);
+ 		mi_set_cr_addr(stream,
+ 			stream->next_buf->buff_addr[RKISP_PLANE_CR]);
+-	} else {
++	} else if (dummy_buf->mem_priv) {
+ 		mi_set_y_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cb_addr(stream, dummy_buf->dma_addr);
+ 		mi_set_cr_addr(stream, dummy_buf->dma_addr);
+@@ -1007,39 +1007,15 @@ static void rkisp_buf_queue(struct vb2_buffer *vb)
+ 
+ static int rkisp_create_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+-	struct rkisp_device *dev = stream->ispdev;
+-	u32 size = max3(stream->out_fmt.plane_fmt[0].bytesperline *
+-			stream->out_fmt.height,
+-			stream->out_fmt.plane_fmt[1].sizeimage,
+-			stream->out_fmt.plane_fmt[2].sizeimage);
+-
+-	if (dummy_buf->mem_priv) {
+-		if (dummy_buf->size >= size)
+-			return 0;
+-		rkisp_free_buffer(dev, dummy_buf);
+-	}
+-
+-	dummy_buf->size = size;
+-	if (rkisp_alloc_buffer(dev, dummy_buf) < 0) {
+-		v4l2_err(&dev->v4l2_dev,
+-			 "Failed to allocate the memory for dummy buffer\n");
+-		return -ENOMEM;
+-	}
+-
+-	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+-		 "stream:%d dummy buf:0x%x\n",
+-		 stream->id, (u32)dummy_buf->dma_addr);
+-	return 0;
++	return rkisp_alloc_common_dummy_buf(stream->ispdev);
+ }
+ 
+ static void rkisp_destroy_dummy_buf(struct rkisp_stream *stream)
+ {
+-	struct rkisp_dummy_buffer *dummy_buf = &stream->dummy_buf;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 
+-	rkisp_free_buffer(dev, dummy_buf);
+ 	hdr_destroy_buf(dev);
++	rkisp_free_common_dummy_buf(dev);
+ }
+ 
+ static void destroy_buf_queue(struct rkisp_stream *stream,
+diff --git a/drivers/media/platform/rockchip/isp/capture_v2x.h b/drivers/media/platform/rockchip/isp/capture_v2x.h
+index b9b7d1966eed..ceba63018e24 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v2x.h
++++ b/drivers/media/platform/rockchip/isp/capture_v2x.h
+@@ -15,6 +15,7 @@ int hdr_config_dmatx(struct rkisp_device *dev);
+ int hdr_update_dmatx_buf(struct rkisp_device *dev);
+ void hdr_stop_dmatx(struct rkisp_device *dev);
+ void hdr_destroy_buf(struct rkisp_device *dev);
++void rkisp_config_dmatx_valid_buf(struct rkisp_device *dev);
+ 
+ int rkisp_register_stream_v20(struct rkisp_device *dev);
+ void rkisp_unregister_stream_v20(struct rkisp_device *dev);
+diff --git a/drivers/media/platform/rockchip/isp/common.c b/drivers/media/platform/rockchip/isp/common.c
+index 62e18557e07a..d20dc7694bda 100644
+--- a/drivers/media/platform/rockchip/isp/common.c
++++ b/drivers/media/platform/rockchip/isp/common.c
+@@ -174,3 +174,126 @@ int rkisp_attach_hw(struct rkisp_device *isp)
+ 
+ 	return 0;
+ }
++
++static int rkisp_alloc_page_dummy_buf(struct rkisp_device *dev, u32 size)
++{
++	struct rkisp_hw_dev *hw = dev->hw_dev;
++	struct rkisp_dummy_buffer *dummy_buf = &hw->dummy_buf;
++	u32 i, n_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
++	struct page *page = NULL, **pages = NULL;
++	struct sg_table *sg = NULL;
++	int ret = -ENOMEM;
++
++	page = alloc_pages(GFP_KERNEL, 0);
++	if (!page)
++		goto err;
++
++	pages = kvmalloc_array(n_pages, sizeof(struct page *), GFP_KERNEL);
++	if (!pages)
++		goto free_page;
++	for (i = 0; i < n_pages; i++)
++		pages[i] = page;
++
++	sg = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
++	if (!sg)
++		goto free_pages;
++	ret = sg_alloc_table_from_pages(sg, pages, n_pages, 0,
++					n_pages << PAGE_SHIFT, GFP_KERNEL);
++	if (ret)
++		goto free_sg;
++
++	ret = dma_map_sg(hw->dev, sg->sgl, sg->nents, DMA_BIDIRECTIONAL);
++	dummy_buf->dma_addr = sg_dma_address(sg->sgl);
++	dummy_buf->mem_priv = sg;
++	dummy_buf->pages = pages;
++	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
++		 "%s buf:0x%x map cnt:%d\n", __func__,
++		 (u32)dummy_buf->dma_addr, ret);
++	return 0;
++free_sg:
++	kfree(sg);
++free_pages:
++	kvfree(pages);
++free_page:
++	__free_pages(page, 0);
++err:
++	return ret;
++}
++
++static void rkisp_free_page_dummy_buf(struct rkisp_device *dev)
++{
++	struct rkisp_dummy_buffer *dummy_buf = &dev->hw_dev->dummy_buf;
++	struct sg_table *sg = dummy_buf->mem_priv;
++
++	if (!sg)
++		return;
++	dma_unmap_sg(dev->hw_dev->dev, sg->sgl, sg->nents, DMA_BIDIRECTIONAL);
++	sg_free_table(sg);
++	kfree(sg);
++	__free_pages(dummy_buf->pages[0], 0);
++	kvfree(dummy_buf->pages);
++	dummy_buf->mem_priv = NULL;
++	dummy_buf->pages = NULL;
++}
++
++int rkisp_alloc_common_dummy_buf(struct rkisp_device *dev)
++{
++	struct rkisp_hw_dev *hw = dev->hw_dev;
++	struct rkisp_dummy_buffer *dummy_buf = &hw->dummy_buf;
++	struct rkisp_stream *stream;
++	struct rkisp_device *isp;
++	u32 i, j, size = 0;
++	int ret = 0;
++
++	mutex_lock(&hw->dev_lock);
++	if (dummy_buf->mem_priv)
++		goto end;
++
++	for (i = 0; i < hw->dev_num; i++) {
++		isp = hw->isp[i];
++		for (j = 0; j < RKISP_MAX_STREAM; j++) {
++			stream = &isp->cap_dev.stream[j];
++			if (!stream->linked)
++				continue;
++			size = max(size,
++				   stream->out_fmt.plane_fmt[0].bytesperline *
++				   stream->out_fmt.height);
++		}
++	}
++	if (size == 0)
++		goto end;
++
++	if (hw->is_mmu) {
++		ret = rkisp_alloc_page_dummy_buf(dev, size);
++		goto end;
++	}
++
++	dummy_buf->size = size;
++	ret = rkisp_alloc_buffer(dev, dummy_buf);
++	if (!ret)
++		v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
++			 "%s buf:0x%x size:%d\n", __func__,
++			 (u32)dummy_buf->dma_addr, dummy_buf->size);
++end:
++	if (ret < 0)
++		v4l2_err(&dev->v4l2_dev, "%s failed:%d\n", __func__, ret);
++	mutex_unlock(&hw->dev_lock);
++	return ret;
++}
++
++void rkisp_free_common_dummy_buf(struct rkisp_device *dev)
++{
++	struct rkisp_hw_dev *hw = dev->hw_dev;
++
++	mutex_lock(&hw->dev_lock);
++	if (atomic_read(&hw->refcnt) ||
++	    atomic_read(&dev->cap_dev.refcnt) > 1)
++		goto end;
++
++	if (hw->is_mmu)
++		rkisp_free_page_dummy_buf(dev);
++	else
++		rkisp_free_buffer(dev, &hw->dummy_buf);
++end:
++	mutex_unlock(&hw->dev_lock);
++}
+diff --git a/drivers/media/platform/rockchip/isp/common.h b/drivers/media/platform/rockchip/isp/common.h
+index f9ac8674ab8b..898dc8afb9f3 100644
+--- a/drivers/media/platform/rockchip/isp/common.h
++++ b/drivers/media/platform/rockchip/isp/common.h
+@@ -119,6 +119,7 @@ struct rkisp_dummy_buffer {
+ 	struct list_head queue;
+ 	struct dma_buf *dbuf;
+ 	dma_addr_t dma_addr;
++	struct page **pages;
+ 	void *mem_priv;
+ 	void *vaddr;
+ 	u32 size;
+@@ -164,4 +165,6 @@ void rkisp_update_regs(struct rkisp_device *dev, u32 start, u32 end);
+ int rkisp_alloc_buffer(struct rkisp_device *dev, struct rkisp_dummy_buffer *buf);
+ void rkisp_free_buffer(struct rkisp_device *dev, struct rkisp_dummy_buffer *buf);
+ int rkisp_attach_hw(struct rkisp_device *isp);
++int rkisp_alloc_common_dummy_buf(struct rkisp_device *dev);
++void rkisp_free_common_dummy_buf(struct rkisp_device *dev);
+ #endif /* _RKISP_COMMON_H */
+diff --git a/drivers/media/platform/rockchip/isp/hw.h b/drivers/media/platform/rockchip/isp/hw.h
+index 10879320f4e4..9e6c6550c47a 100644
+--- a/drivers/media/platform/rockchip/isp/hw.h
++++ b/drivers/media/platform/rockchip/isp/hw.h
+@@ -52,7 +52,7 @@ struct rkisp_hw_dev {
+ 	struct rkisp_ispp_buf *cur_buf;
+ 	struct rkisp_ispp_buf *nxt_buf;
+ 	struct list_head list;
+-
++	struct rkisp_dummy_buffer dummy_buf;
+ 	const struct vb2_mem_ops *mem_ops;
+ 
+ 	bool is_mmu;
+-- 
+2.35.3
+

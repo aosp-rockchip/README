@@ -1,0 +1,675 @@
+From e7dff10919fdbcc35a0ce309448051b334a40922 Mon Sep 17 00:00:00 2001
+From: hjc <hjc@rock-chips.com>
+Date: Wed, 30 Jul 2014 11:55:11 +0800
+Subject: [PATCH] rk3036 hdmi: add support HDCP function
+
+---
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdcp.c  | 118 +++++++--
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdcp.h  |   5 +
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdmi.c  |   2 +-
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdmi.h  |   1 +
+ .../hdmi/chips/rk3036/rk3036_hdmi_hdcp.c      | 234 ++++++++++++++----
+ drivers/video/rockchip/hdmi/rk_hdmi_task.c    |   3 +-
+ 6 files changed, 294 insertions(+), 69 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.c
+index 5d7d419deee5..2b5ee65dc58a 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.c
+@@ -5,6 +5,8 @@
+ #include <linux/miscdevice.h>
+ #include <linux/workqueue.h>
+ #include <linux/firmware.h>
++#include <linux/timer.h>
++#include <linux/jiffies.h>
+ #include "rk3036_hdmi.h"
+ #include "rk3036_hdcp.h"
+ 
+@@ -12,6 +14,11 @@ struct hdcp *hdcp = NULL;
+ 
+ static void hdcp_work_queue(struct work_struct *work);
+ 
++#define AUTH_TIMEOUT (2*HZ)
++static struct timer_list auth_timer;
++static int timer_state = 0;
++extern int is_1b_03_test(void);
++
+ /*-----------------------------------------------------------------------------
+  * Function: hdcp_submit_work
+  *-----------------------------------------------------------------------------
+@@ -59,6 +66,25 @@ static void hdcp_cancel_work(struct delayed_work **work)
+ 	}
+ }
+ 
++/*-----------------------------------------------------------------------------
++ * Function: auth_timer_func
++ *-----------------------------------------------------------------------------
++ */
++static void auth_timer_func(unsigned long data)
++{
++	printk(KERN_INFO "hdcp auth 2 second timeout\n");
++        if(hdcp->auth_state == 0) {
++                mod_timer(&auth_timer, jiffies + AUTH_TIMEOUT);
++                if ((hdcp->hdcp_state != HDCP_DISABLED) &&
++                        (hdcp->hdcp_state != HDCP_ENABLE_PENDING)) {
++			if (is_1b_03_test())
++				return;
++
++                        hdcp_submit_work(HDCP_FAIL_EVENT, 0);
++                }
++        }
++}
++
+ /*-----------------------------------------------------------------------------
+  * Function: hdcp_wq_authentication_failure
+  *-----------------------------------------------------------------------------
+@@ -70,12 +96,15 @@ static void hdcp_wq_authentication_failure(void)
+ 	}
+ 
+ 	rk3036_hdcp_disable();
++/*
+ 	rk3036_hdmi_control_output(false);
++ */
++        rk3036_set_colorbar(1);
+ 	
+ 	hdcp_cancel_work(&hdcp->pending_wq_event);
+ 	
+ 	if (hdcp->retry_cnt && (hdcp->hdmi_state != HDMI_STOPPED)) {
+-		if (hdcp->retry_cnt < HDCP_INFINITE_REAUTH) {
++		if (hdcp->retry_cnt <= HDCP_INFINITE_REAUTH) {
+ 			hdcp->retry_cnt--;
+ 			printk(KERN_INFO "HDCP: authentication failed - "
+ 					 "retrying, attempts=%d\n",
+@@ -86,12 +115,27 @@ static void hdcp_wq_authentication_failure(void)
+ 
+ 		hdcp->hdcp_state = HDCP_AUTHENTICATION_START;
+ 
++		if (hdcp->auth_state == 1 && timer_state == 0) {
++			DBG("add auth timer\n");
++			hdcp->auth_state = 0;
++			hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
++			auth_timer.expires = jiffies + AUTH_TIMEOUT;
++			add_timer(&auth_timer);
++			timer_state = 1;
++		}
++
+ 		hdcp->pending_wq_event = hdcp_submit_work(HDCP_AUTH_REATT_EVENT,
+ 							 HDCP_REAUTH_DELAY);
+ 	} else {
+ 		printk(KERN_INFO "HDCP: authentication failed - "
+ 				 "HDCP disabled\n");
+ 		hdcp->hdcp_state = HDCP_ENABLE_PENDING;
++
++		if (timer_state == 1) {
++			DBG("delete auth timer\n");
++			del_timer_sync(&auth_timer);
++			timer_state = 0;
++		}
+ 	}
+ 
+ }
+@@ -114,11 +158,11 @@ static void hdcp_wq_start_authentication(void)
+ 		DBG("HDCP: authentication failed");
+ 		hdcp_wq_authentication_failure();
+ 	} else {
+-		hdcp->hdcp_state = HDCP_WAIT_KSV_LIST;
+-//		hdcp->hdcp_state = HDCP_LINK_INTEGRITY_CHECK;
++//		hdcp->hdcp_state = HDCP_WAIT_KSV_LIST;
++		hdcp->hdcp_state = HDCP_LINK_INTEGRITY_CHECK;
+ 	}
+ }
+-
++#if 0
+ /*-----------------------------------------------------------------------------
+  * Function: hdcp_wq_check_bksv
+  *-----------------------------------------------------------------------------
+@@ -148,14 +192,23 @@ static void hdcp_wq_check_bksv(void)
+ 			hdcp->retry_cnt = hdcp->retry_times;
+ 	}
+ }
+-
++#endif
+ /*-----------------------------------------------------------------------------
+  * Function: hdcp_wq_authentication_sucess
+  *-----------------------------------------------------------------------------
+  */
+ static void hdcp_wq_authentication_sucess(void)
+ {
+-	rk3036_hdmi_control_output(true);
++	hdcp->auth_state = 1;
++	if (timer_state == 1) {
++		DBG("delete auth timer\n");
++		timer_state = 0;
++		del_timer_sync(&auth_timer);
++	}
++/*
++	rk616_hdmi_control_output(true);
++ */
++        rk3036_set_colorbar(0);
+ 	printk(KERN_INFO "HDCP: authentication pass");
+ }
+ 
+@@ -171,11 +224,11 @@ static void hdcp_wq_disable(int event)
+ 	rk3036_hdcp_disable();
+ 	if(event == HDCP_DISABLE_CTL) {
+ 		hdcp->hdcp_state = HDCP_DISABLED;
+-		if(hdcp->hdmi_state == HDMI_STARTED)
+-			rk3036_hdmi_control_output(true);
+-	}
+-	else if(event == HDCP_STOP_FRAME_EVENT)
++		if (hdcp->hdmi_state == HDMI_STARTED)
++			rk3036_set_colorbar(0);
++	} else if (event == HDCP_STOP_FRAME_EVENT) {
+ 		hdcp->hdcp_state = HDCP_ENABLE_PENDING;
++	}
+ }
+ 
+ /*-----------------------------------------------------------------------------
+@@ -221,10 +274,13 @@ static void hdcp_work_queue(struct work_struct *work)
+ 		case HDCP_DISABLED:
+ 			/* HDCP enable control or re-authentication event */
+ 			if (event == HDCP_ENABLE_CTL) {
+-				if(hdcp->retry_times == 0)
++/*
++				if (hdcp->retry_times == 0)
+ 					hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
+ 				else
+ 					hdcp->retry_cnt = hdcp->retry_times;
++*/
++				hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
+ 				if (hdcp->hdmi_state == HDMI_STARTED)
+ 					hdcp_wq_start_authentication();
+ 				else
+@@ -245,7 +301,7 @@ static void hdcp_work_queue(struct work_struct *work)
+ 				hdcp_wq_start_authentication();
+ 	
+ 			break;
+-		
++#if 0
+ 		case HDCP_WAIT_KSV_LIST:
+ 			/* KSV failure */
+ 			if (event == HDCP_FAIL_EVENT) {
+@@ -257,9 +313,9 @@ static void hdcp_work_queue(struct work_struct *work)
+ 			else if (event == HDCP_KSV_LIST_RDY_EVENT)
+ 				hdcp_wq_check_bksv();
+ 			break;
+-		
++#endif
+ 		case HDCP_LINK_INTEGRITY_CHECK:
+-			/* Ri failure */
++			/* authentication failure */
+ 			if (event == HDCP_FAIL_EVENT) {
+ 				printk(KERN_INFO "HDCP: Ri check failure\n");
+ 				hdcp_wq_authentication_failure();
+@@ -294,6 +350,15 @@ static void hdcp_start_frame_cb(void)
+ 	if (hdcp->pending_wq_event)
+ 		hdcp_cancel_work(&hdcp->pending_wq_event);
+ 
++	if (timer_state == 0) {
++		DBG("add auth timer\n");
++		auth_timer.expires = jiffies + AUTH_TIMEOUT;
++		add_timer(&auth_timer);
++		timer_state = 1;
++	}
++
++	hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
++
+ 	hdcp->pending_start = hdcp_submit_work(HDCP_START_FRAME_EVENT,
+ 							HDCP_ENABLE_DELAY);
+ }
+@@ -317,8 +382,10 @@ static void hdcp_irq_cb(int status)
+ 			hdcp_submit_work(HDCP_FAIL_EVENT, 0);
+ 		}
+ 	}
++/*
+ 	else if(interrupt1 & (m_INT_BKSV_READY | m_INT_BKSV_UPDATE))
+ 		hdcp_submit_work(HDCP_KSV_LIST_RDY_EVENT, 0);
++ */
+ 	else if(interrupt1 & m_INT_AUTH_SUCCESS)
+ 		hdcp_submit_work(HDCP_AUTH_PASS_EVENT, 0);
+ }
+@@ -330,7 +397,7 @@ static void hdcp_irq_cb(int status)
+ static int hdcp_power_on_cb(void)
+ {
+ 	DBG("%s", __FUNCTION__);
+-//	return rk3036_hdcp_load_key2mem(hdcp->keys);
++	return rk3036_hdcp_load_key2mem(hdcp->keys);
+ 	return HDCP_OK;
+ }
+ 
+@@ -341,9 +408,16 @@ static int hdcp_power_on_cb(void)
+ static void hdcp_power_off_cb(void)
+ {
+ 	DBG("%s", __FUNCTION__);
++	if (timer_state == 1) {
++		DBG("delete auth timer\n");
++		timer_state = 0;
++		del_timer_sync(&auth_timer);
++	}
++	hdcp->auth_state = 0;
++
+ 	if(!hdcp->enable)
+ 		return;
+-	
++	rk3036_hdcp_stop_authentication();
+ 	hdcp_cancel_work(&hdcp->pending_start);
+ 	hdcp_cancel_work(&hdcp->pending_wq_event);
+ 	init_completion(&hdcp->complete);
+@@ -353,7 +427,9 @@ static void hdcp_power_off_cb(void)
+ 							msecs_to_jiffies(5000));
+ }
+ 
+-// Load HDCP key to external HDCP memory
++/*
++ * Load HDCP key to external HDCP memory
++ */
+ static void hdcp_load_keys_cb(const struct firmware *fw, void *context)
+ {
+ 	if (!fw) {
+@@ -526,7 +602,10 @@ static int __init rk3036_hdcp_init(void)
+ 										hdcp_irq_cb,
+ 										hdcp_power_on_cb,
+ 										hdcp_power_off_cb);
+-										
++
++	init_timer(&auth_timer);
++	auth_timer.data = 0;
++	auth_timer.function = auth_timer_func;
+ 	DBG("%s success %u", __FUNCTION__, jiffies_to_msecs(jiffies));
+ 	return 0;
+ 	
+@@ -559,5 +638,6 @@ static void __exit rk3036_hdcp_exit(void)
+ 	kfree(hdcp);
+ }
+ 
+-module_init(rk3036_hdcp_init);
++/* module_init(rk3036_hdcp_init); */
++late_initcall_sync(rk3036_hdcp_init);
+ module_exit(rk3036_hdcp_exit);
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.h
+index c465f54d079d..89ede9526169 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdcp.h
+@@ -9,6 +9,8 @@
+ #define HDCP_OK			0
+ #define HDCP_KEY_ERR	1
+ #define HDCP_KSV_ERR	2
++#define HDCP_KEY_VALID		3
++#define HDCP_KEY_INVALID	4
+ 
+ /* Delays */
+ #define HDCP_ENABLE_DELAY	300
+@@ -171,6 +173,7 @@ struct hdcp {
+ 	struct delayed_work *pending_start;
+ 	struct delayed_work *pending_wq_event;
+ 	int retry_cnt;
++	int auth_state;
+ };
+ 
+ extern struct hdcp *hdcp;
+@@ -187,4 +190,6 @@ extern int	rk3036_hdcp_start_authentication(void);
+ extern int	rk3036_hdcp_check_bksv(void);
+ extern int	rk3036_hdcp_load_key2mem(struct hdcp_keys *key);
+ extern void rk3036_hdcp_interrupt(char *status1, char *status2);
++extern void rk3036_set_colorbar(int enable);
++extern int rk3036_hdcp_stop_authentication(void);
+ #endif /* __rk3036_HDCP_H__ */
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+index 7405323ed6d3..bff045fcd476 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+@@ -25,7 +25,7 @@
+ #include "rk3036_hdmi.h"
+ #include "rk3036_hdmi_hw.h"
+ 
+-static struct rk_hdmi_device *hdmi_dev;
++struct rk_hdmi_device *hdmi_dev;
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ static int rk3036_hdmi_reg_show(struct seq_file *s, void *v)
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
+index afdec401392e..b54b1495aacd 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
+@@ -19,6 +19,7 @@ extern int rk3036_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
+ 					      void (*hdcp_irq_cb)(int status),
+ 					      int (*hdcp_power_on_cb)(void),
+ 					      void (*hdcp_power_off_cb)(void));
++extern struct rk_hdmi_device *hdmi_dev;
+ 
+ struct rk_hdmi_device {
+ 	int clk_on;
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hdcp.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hdcp.c
+index 1177f9439d32..cc7905c51a6c 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hdcp.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hdcp.c
+@@ -2,47 +2,112 @@
+ #include "rk3036_hdmi.h"
+ #include "rk3036_hdmi_hw.h"
+ #include "rk3036_hdcp.h"
++int is_1b_03_test(void)
++{
++	int reg_value;
++	int reg_val_1;
++	hdmi_readl(hdmi_dev, 0x58, &reg_value);
++	hdmi_readl(hdmi_dev, 0xc3, &reg_val_1);
+ 
+-#define HDCPWrReg	HDMIWrReg
+-#define HDCPRdReg	HDMIRdReg
+-#define HDCPMskReg(temp,addr,Msk,val) 	do{ \
+-						HDMIRdReg(addr,&temp); \
+-						HDMIWrReg(addr, ((val)&(Msk))|(temp&(~Msk))); \
+-					}while(0)
+-	
++	if (reg_value != 0) {
++		if ((reg_val_1 & 0x40) == 0)
++			return 1;
++	}
++	return 0;
++}
++
++void rk3036_set_colorbar(int enable)
++{
++        static int display_mask = 0;
++        int reg_value;
++        if (enable) {
++                if (!display_mask) {
++                        if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2)) {
++	                        hdmi_readl(hdmi_dev, SYS_CTRL, &reg_value);
++                                hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);  
++        	                hdmi_writel(hdmi_dev, HDMI_COLORBAR, 0x00);
++                                hdmi_writel(hdmi_dev, SYS_CTRL, reg_value);
++                        } else {
++        	                hdmi_writel(hdmi_dev, HDMI_COLORBAR, 0x00);
++                        }
++
++                        display_mask = 1;
++                }
++        } else {
++                if (display_mask) {
++
++                        if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2)) {
++	                        hdmi_readl(hdmi_dev, SYS_CTRL, &reg_value);
++                                hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);  
++                                hdmi_writel(hdmi_dev, HDMI_COLORBAR, 0x10);
++                                hdmi_writel(hdmi_dev, SYS_CTRL, reg_value);
++                        } else {
++                                hdmi_writel(hdmi_dev, HDMI_COLORBAR, 0x10);
++                        }
++
++                        display_mask = 0;
++                }
++        }
++}
+ void rk3036_hdcp_disable(void)
+ {
+-	char temp;
+-	
++	int reg_value;
++	if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2)) {
++		hdmi_readl(hdmi_dev, SYS_CTRL, &reg_value);
++		hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);
++	}
++
+ 	// Diable HDCP Interrupt
+-	HDCPWrReg(HDCP_INT_MASK1, 0x00);
++	hdmi_writel(hdmi_dev, HDCP_INT_MASK1, 0x00);
+ 	// Stop and Reset HDCP
+-	HDCPMskReg(temp, HDCP_CTRL1, m_ENCRYPT_ENABLE | m_AUTH_STOP | m_HDCP_RESET, 
+-		v_ENCRYPT_ENABLE(0) | v_AUTH_STOP(1) | v_HDCP_RESET(1) );
++	hdmi_msk_reg(hdmi_dev, HDCP_CTRL1, m_AUTH_START | m_AUTH_STOP | m_HDCP_RESET,
++		v_AUTH_START(0) | v_AUTH_STOP(1) | v_HDCP_RESET(1) );
++
++	if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2))
++		hdmi_writel(hdmi_dev, SYS_CTRL, reg_value);
++
+ }
+ 
+-int	rk3036_hdcp_load_key2mem(struct hdcp_keys *key)
++int rk3036_hdcp_key_check(struct hdcp_keys *key)
++{
++	int i = 0;
++       	
++	DBG("HDCP: check hdcp key\n");
++	//check 40 private key 
++	for(i = 0; i < HDCP_PRIVATE_KEY_SIZE; i++){
++		if(key->DeviceKey[i] != 0x00)
++			return HDCP_KEY_VALID;
++	}
++	//check aksv
++   	for(i = 0; i < 5; i++){
++		if(key->KSV[i] != 0x00)
++			return HDCP_KEY_VALID;
++	}
++
++	return HDCP_KEY_INVALID;		
++}
++int rk3036_hdcp_load_key2mem(struct hdcp_keys *key)
+ {
+ 	int i;
+ 	DBG("HDCP: rk3036_hdcp_load_key2mem start");
+ 	// Write 40 private key
+ 	for(i = 0; i < HDCP_PRIVATE_KEY_SIZE; i++)
+-		HDCPWrReg(HDCP_KEY_FIFO, key->DeviceKey[i]);
++		hdmi_writel(hdmi_dev, HDCP_KEY_FIFO, key->DeviceKey[i]);
+ 	
+ 	// Write 1st aksv
+ 	for(i = 0; i < 5; i++)
+-		HDCPWrReg(HDCP_KEY_FIFO, key->KSV[i]);
++		hdmi_writel(hdmi_dev, HDCP_KEY_FIFO, key->KSV[i]);
+ 		
+ 	// Write 2nd aksv
+ 	for(i = 0; i < 5; i++)
+-		HDCPWrReg(HDCP_KEY_FIFO, key->KSV[i]);
++		hdmi_writel(hdmi_dev, HDCP_KEY_FIFO, key->KSV[i]);
+ 	DBG("HDCP: rk3036_hdcp_load_key2mem end");
+ 	return HDCP_OK;
+ }
+ 
+-int	rk3036_hdcp_start_authentication(void)
++int rk3036_hdcp_start_authentication(void)
+ {
+-	char temp;
++	int temp;
+ 	int retry = 0;
+ 
+ 	if(hdcp->keys == NULL) {
+@@ -50,37 +115,64 @@ int	rk3036_hdcp_start_authentication(void)
+ 		return HDCP_KEY_ERR;
+ 	}
+ 	
+-	// Select TMDS CLK to configure regs
+-	HDCPMskReg(temp, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_TMDS);
+-	
+-	HDCPRdReg(HDCP_KEY_STATUS,&temp);
++	if(rk3036_hdcp_key_check(hdcp->keys) == HDCP_KEY_INVALID){
++		printk(KERN_ERR "loaded HDCP key is incorrect\n");
++		return HDCP_KEY_ERR;
++	}	
++
++        if (hdmi_dev->driver.tmdsclk > (HDMI_SYS_FREG_CLK << 2)) {
++        	// Select TMDS CLK to configure regs
++		hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_TMDS);
++        } else {
++		hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);
++        }
++
++	hdmi_writel(hdmi_dev, HDCP_TIMER_100MS,0x28);
++	hdmi_readl(hdmi_dev, HDCP_KEY_STATUS,&temp);
+ 	while( ( temp & m_KEY_READY) == 0 ) {
+-		if(retry > 10) {
++		if(retry > 1000) {
+ 			printk(KERN_ERR "HDCP: loaded key error\n");
+ 			return HDCP_KEY_ERR;
+ 		}
+ 		rk3036_hdcp_load_key2mem(hdcp->keys);
+ 		msleep(1);
+-		HDCPRdReg(HDCP_KEY_STATUS,&temp);
++		hdmi_readl(hdmi_dev, HDCP_KEY_STATUS,&temp);
++                retry++;
+ 	}
+-	
++
+ 	// Config DDC bus clock: ddc_clk = reg_clk/4*(reg 0x4c 0x4b)
+-	DBG("TMDS frequency %d", hdmi->tmdsclk);
+-	retry = hdmi->tmdsclk/(HDCP_DDC_CLK*4);
+-	HDCPWrReg(DDC_CLK_L, retry & 0xFF);
+-	HDCPWrReg(DDC_CLK_H, (retry >> 8) & 0xFF);
+-	
+-	HDCPWrReg(HDCP_CTRL2, 0x00);
+-	
++        retry = hdmi_dev->hclk_rate/(HDCP_DDC_CLK << 2);
++        hdmi_writel(hdmi_dev, DDC_CLK_L, retry & 0xFF);
++        hdmi_writel(hdmi_dev, DDC_CLK_H, (retry >> 8) & 0xFF);
++ 
++	hdmi_writel(hdmi_dev, HDCP_CTRL2, 0x67);
++
+ 	//Enable interrupt
+-	HDCPWrReg(HDCP_INT_MASK1, m_INT_HDCP_ERR | m_INT_BKSV_READY | m_INT_BKSV_UPDATE | m_INT_AUTH_SUCCESS | m_INT_AUTH_READY);
+-//	HDCPWrReg(HDCP_INT_MASK2, 0xFF);
++	hdmi_writel(hdmi_dev, HDCP_INT_MASK1, m_INT_HDCP_ERR | m_INT_BKSV_READY | m_INT_BKSV_UPDATE | m_INT_AUTH_SUCCESS | m_INT_AUTH_READY);
++	 hdmi_writel(hdmi_dev, HDCP_INT_MASK2, 0x00);
++
+ 	//Start authentication
+-	HDCPMskReg(temp, HDCP_CTRL1, m_AUTH_START | m_ENCRYPT_ENABLE | m_ADVANED_ENABLE, v_AUTH_START(1) | v_ENCRYPT_ENABLE(1) | v_ADVANED_ENABLE(0));
+-	
++	hdmi_msk_reg(hdmi_dev, HDCP_CTRL1, m_AUTH_START | m_ENCRYPT_ENABLE | m_ADVANED_ENABLE | m_AUTH_STOP | m_HDCP_RESET,
++		v_AUTH_START(1) | v_ENCRYPT_ENABLE(1) | v_ADVANED_ENABLE(0) | v_AUTH_STOP(0) | v_HDCP_RESET(0));
++
++        if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2)) {
++		hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_TMDS);
++        }
+ 	return HDCP_OK;
+ }
+ 
++int rk3036_hdcp_stop_authentication(void)
++{
++        hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);  
++        hdmi_writel(hdmi_dev, DDC_CLK_L, 0x1c);
++	hdmi_writel(hdmi_dev, DDC_CLK_H, 0x00);
++	hdmi_writel(hdmi_dev, HDCP_CTRL2, 0x08);
++	hdmi_writel(hdmi_dev, HDCP_INT_MASK2, 0x06);
++	hdmi_writel(hdmi_dev, HDCP_CTRL1, 0x02);
++        return 0;
++	//hdmi_writel(HDCP_CTRL1, 0x0a);
++}
++#if 0
+ int	rk3036_hdcp_check_bksv(void)
+ {
+ 	int i, j;
+@@ -88,7 +180,7 @@ int	rk3036_hdcp_check_bksv(void)
+ 	char *invalidkey;
+ 	
+ 	for(i = 0; i < 5; i++) {
+-		HDCPRdReg(HDCP_KSV_BYTE0 + (4 - i),&temp);
++		hdmi_readl(HDCP_KSV_BYTE0 + (4 - i), &temp);
+ 		bksv[i] = temp & 0xFF;
+ 	}
+ 	DBG("bksv is 0x%02x%02x%02x%02x%02x", bksv[0], bksv[1], bksv[2], bksv[3], bksv[4]);
+@@ -113,31 +205,77 @@ int	rk3036_hdcp_check_bksv(void)
+ 		invalidkey = hdcp->invalidkeys + i *5;
+ 		if(memcmp(bksv, invalidkey, 5) == 0) {
+ 			printk(KERN_ERR "HDCP: BKSV was revocated!!!\n");
+-			HDCPMskReg(temp, HDCP_CTRL1, m_BKSV_INVALID | m_ENCRYPT_ENABLE, v_BKSV_INVALID(1) | v_ENCRYPT_ENABLE(1));
++			hdmi_msk_reg(HDCP_CTRL1, m_BKSV_INVALID | m_ENCRYPT_ENABLE, v_BKSV_INVALID(1) | v_ENCRYPT_ENABLE(1));
+ 			return HDCP_KSV_ERR;
+ 		}
+ 	}
+-	HDCPMskReg(temp, HDCP_CTRL1, m_BKSV_VALID | m_ENCRYPT_ENABLE, v_BKSV_VALID(1) | v_ENCRYPT_ENABLE(1));
++	hdmi_msk_reg(HDCP_CTRL1, m_BKSV_VALID | m_ENCRYPT_ENABLE, v_BKSV_VALID(1) | v_ENCRYPT_ENABLE(1));
+ 	return HDCP_OK;
+ }
++#endif
++
++int rk3036_hdcp_error(int value)
++{
++        if (value & 0x80) {
++                printk("Timed out waiting for downstream repeater\n");
+ 
++        } else if (value & 0x40) {
++                printk("Too many devices connected to repeater tree\n");
++
++        } else if (value & 0x20) {
++                printk("SHA-1 hash check of BKSV list failed\n");
++
++        } else if (value & 0x10) {
++                printk("SHA-1 hash check of BKSV list failed\n");
++
++        } else if (value & 0x08) {
++                printk("DDC channels no acknowledge\n");
++
++        } else if (value & 0x04) {
++                printk("Pj mismatch\n");
++
++        } else if (value & 0x02) {
++                printk("Ri mismatch\n");
++
++        } else if (value & 0x01) {
++                printk("Bksv is wrong\n");
++
++        } else {
++                return 0;
++        }
++        return 1;
++}
+ void rk3036_hdcp_interrupt(char *status1, char *status2)
+ {
+-	char interrupt1 = 0;
+-	char interrupt2 = 0;
+-	char temp =0;
+-	HDCPRdReg(HDCP_INT_STATUS1,&interrupt1);
+-	HDCPRdReg(HDCP_INT_STATUS2,&interrupt2);
++	int interrupt1 = 0;
++	int interrupt2 = 0;
++	int temp =0;
++
++	hdmi_readl(hdmi_dev, HDCP_INT_STATUS1,&interrupt1);
++	hdmi_readl(hdmi_dev, HDCP_INT_STATUS2,&interrupt2);
++
++	if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2))
++               hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_SYS);
++
+ 	if(interrupt1) {
+-		HDCPWrReg(HDCP_INT_STATUS1, interrupt1);
++		hdmi_writel(hdmi_dev, HDCP_INT_STATUS1, interrupt1);
+ 		if(interrupt1 & m_INT_HDCP_ERR){
+-			HDCPRdReg(HDCP_ERROR,&temp);
+-			printk(KERN_INFO "HDCP: Error 0x%02x\n", temp);
++			hdmi_readl(hdmi_dev, HDCP_ERROR,&temp);
++			printk(KERN_INFO "HDCP: Error reg 0x65 = 0x%02x\n", temp);
++                        rk3036_hdcp_error(temp); 
++			hdmi_writel(hdmi_dev, HDCP_ERROR, temp);
+ 		}
+ 	}
+ 	if(interrupt2)
+-		HDCPWrReg(HDCP_INT_STATUS2, interrupt2);
++		hdmi_writel(hdmi_dev, HDCP_INT_STATUS2, interrupt2);
+ 	
+ 	*status1 = interrupt1;
+ 	*status2 = interrupt2;
++
++	if (hdmi_dev->driver.tmdsclk <= (HDMI_SYS_FREG_CLK << 2))
++		hdmi_msk_reg(hdmi_dev, SYS_CTRL, m_REG_CLK_SOURCE, v_REG_CLK_SOURCE_TMDS);
++/*
++	hdmi_readl(HDCP_ERROR, &temp);
++	DBG("HDCP: Error reg 0x65 = 0x%02x\n", temp);
++*/
+ }
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_task.c b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+index 94d8260e6c03..2a2317b57075 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_task.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+@@ -268,8 +268,9 @@ void hdmi_work(struct work_struct *work)
+ 			if (hdmi->display != HDMI_ENABLE) {
+ 				hdmi->control_output(hdmi, HDMI_ENABLE);
+ 				hdmi->display = HDMI_ENABLE;
+-				if (hdmi->hdcp_cb)
++				if (hdmi->hdcp_cb) {
+ 					hdmi->hdcp_cb();
++				}
+ 			}
+ 
+ 			if (hdmi->wait == 1) {
+-- 
+2.35.3
+

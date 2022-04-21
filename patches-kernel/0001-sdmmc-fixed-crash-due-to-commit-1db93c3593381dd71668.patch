@@ -1,0 +1,147 @@
+From 318034e9149cd66058dd9d6a11cde39c4aa79a9c Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Mon, 8 Jul 2013 16:54:05 +0800
+Subject: [PATCH] sdmmc: fixed crash due to commit
+ '1db93c3593381dd716685e01856c7680113363c5'
+
+---
+ drivers/mmc/card/block.c | 50 +++++++++++++++++++++++++++++++++++++++-
+ drivers/mmc/card/queue.c | 46 +++++++++++++++++++++++++++++++++---
+ 2 files changed, 92 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index d7db8a7fd321..aa0b48116ba8 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -1477,7 +1477,44 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *req)
+ static int
+ mmc_blk_set_blksize(struct mmc_blk_data *md, struct mmc_card *card);
+ 
+-static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
++static int sdmmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
++{
++	int ret;
++	struct mmc_blk_data *md = mq->data;
++	struct mmc_card *card = md->queue.card;
++
++#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
++       if (mmc_bus_needs_resume(card->host)) {
++               mmc_resume_bus(card->host);
++               mmc_blk_set_blksize(md, card);
++       }
++#endif
++	mmc_claim_host(card->host);
++
++	ret = mmc_blk_part_switch(card, md);
++	if (ret) {
++		ret = 0;
++		goto out;
++	}
++
++	if (req && req->cmd_flags & REQ_DISCARD) {
++		if (req->cmd_flags & REQ_SECURE)
++			ret = mmc_blk_issue_secdiscard_rq(mq, req);
++		else
++			ret = mmc_blk_issue_discard_rq(mq, req);
++	} else if (req && req->cmd_flags & REQ_FLUSH) {
++		ret = mmc_blk_issue_flush(mq, req);
++	} else {
++		ret = mmc_blk_issue_rw_rq(mq, req);
++	}
++
++out:
++	mmc_release_host(card->host);
++	return ret;
++
++}
++
++static int emmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ {
+ 	int ret;
+ 	struct mmc_blk_data *md = mq->data;
+@@ -1517,6 +1554,17 @@ static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ 	return ret;
+ }
+ 
++static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
++{
++	struct mmc_blk_data *md = mq->data;
++	struct mmc_card *card = md->queue.card;
++
++	if(HOST_IS_EMMC(card->host))
++		return emmc_blk_issue_rq(mq, req);
++	else
++		return sdmmc_blk_issue_rq(mq, req);
++}
++
+ static inline int mmc_blk_readonly(struct mmc_card *card)
+ {
+ 	return mmc_card_readonly(card) ||
+diff --git a/drivers/mmc/card/queue.c b/drivers/mmc/card/queue.c
+index 45fb362e3f01..9088d26b7d51 100644
+--- a/drivers/mmc/card/queue.c
++++ b/drivers/mmc/card/queue.c
+@@ -41,8 +41,45 @@ static int mmc_prep_request(struct request_queue *q, struct request *req)
+ 
+ 	return BLKPREP_OK;
+ }
++static int sdmmc_queue_thread(void *d)
++{
++	struct mmc_queue *mq = d;
++	struct request_queue *q = mq->queue;
++
++	current->flags |= PF_MEMALLOC;
++
++	down(&mq->thread_sem);
++	do {
++		struct request *req = NULL;
++
++		spin_lock_irq(q->queue_lock);
++		set_current_state(TASK_INTERRUPTIBLE);
++		req = blk_fetch_request(q);
++		mq->mqrq_cur->req = req;
++		mq->mqrq_prev->req = NULL;
++		spin_unlock_irq(q->queue_lock);
++
++		if (!req) {
++			if (kthread_should_stop()) {
++				set_current_state(TASK_RUNNING);
++				break;
++			}
++			up(&mq->thread_sem);
++			schedule();
++			down(&mq->thread_sem);
++			continue;
++		}
++		set_current_state(TASK_RUNNING);
++
++		mq->issue_fn(mq, req);
++	} while (1);
++	up(&mq->thread_sem);
++
++	return 0;
++}
++
+ 
+-static int mmc_queue_thread(void *d)
++static int emmc_queue_thread(void *d)
+ {
+ 	struct mmc_queue *mq = d;
+ 	struct request_queue *q = mq->queue;
+@@ -257,8 +294,11 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
+ 
+ 	sema_init(&mq->thread_sem, 1);
+ 
+-	mq->thread = kthread_run(mmc_queue_thread, mq, "mmcqd/%d%s",
+-		host->index, subname ? subname : "");
++	if(HOST_IS_EMMC(card->host))
++		mq->thread = kthread_run(emmc_queue_thread, mq, "emmcqd");
++	else
++		mq->thread = kthread_run(sdmmc_queue_thread, mq, "mmcqd/%d%s",
++			host->index, subname ? subname : "");
+ 
+ 	if (IS_ERR(mq->thread)) {
+ 		ret = PTR_ERR(mq->thread);
+-- 
+2.35.3
+

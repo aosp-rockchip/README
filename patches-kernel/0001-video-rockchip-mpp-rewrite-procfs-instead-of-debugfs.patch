@@ -1,0 +1,966 @@
+From 0206e47f0f2ab7425e3e3e8c5df8dd7f4afbff9a Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Thu, 27 Aug 2020 16:02:19 +0800
+Subject: [PATCH] video: rockchip: mpp: rewrite procfs instead of debugfs
+
+debugfs might be disabled in some simple system.
+location:
+    /sys/kernel/debug/mpp_service/
+to -->
+    /proc/mpp_service/
+
+Change-Id: I4e463d9be9ee1b0f229394ee61580a343ccc870c
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c  | 45 +++++++++++++++++++
+ drivers/video/rockchip/mpp/mpp_common.h  | 19 ++++++--
+ drivers/video/rockchip/mpp/mpp_iep2.c    | 43 +++++++++---------
+ drivers/video/rockchip/mpp/mpp_rkvdec.c  | 55 ++++++++++++------------
+ drivers/video/rockchip/mpp/mpp_rkvenc.c  | 48 +++++++++++----------
+ drivers/video/rockchip/mpp/mpp_service.c | 29 +++++++------
+ drivers/video/rockchip/mpp/mpp_vdpu1.c   | 42 +++++++++---------
+ drivers/video/rockchip/mpp/mpp_vdpu2.c   | 43 +++++++++---------
+ drivers/video/rockchip/mpp/mpp_vepu1.c   | 43 +++++++++---------
+ drivers/video/rockchip/mpp/mpp_vepu2.c   | 43 +++++++++---------
+ 10 files changed, 240 insertions(+), 170 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 7c373371ed2e..d44f1ac720ab 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -16,11 +16,13 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_irq.h>
++#include <linux/proc_fs.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/poll.h>
+ #include <linux/regmap.h>
+ #include <linux/rwsem.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/nospec.h>
+@@ -1855,6 +1857,49 @@ int mpp_clk_set_rate(struct mpp_clk_info *clk_info,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PROC_FS
++static int fops_show_u32(struct seq_file *file, void *v)
++{
++	u32 *val = file->private;
++
++	seq_printf(file, "%d\n", *val);
++
++	return 0;
++}
++
++static int fops_open_u32(struct inode *inode, struct file *file)
++{
++	return single_open(file, fops_show_u32, PDE_DATA(inode));
++}
++
++static ssize_t fops_write_u32(struct file *file, const char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	int rc;
++	struct seq_file *priv = file->private_data;
++
++	rc = kstrtou32_from_user(buf, count, 0, priv->private);
++	if (rc)
++		return rc;
++
++	return count;
++}
++
++static const struct file_operations procfs_fops_u32 = {
++	.open = fops_open_u32,
++	.read = seq_read,
++	.release = single_release,
++	.write = fops_write_u32,
++};
++
++struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data)
++{
++	return proc_create_data(name, mode, parent, &procfs_fops_u32, data);
++}
++#endif
++
+ int px30_workaround_combo_init(struct mpp_dev *mpp)
+ {
+ 	struct mpp_rk_iommu *iommu = NULL, *loop = NULL, *n;
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index d1aa2c572cc1..b21bd38219d2 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -182,7 +182,7 @@ struct reg_offset_info {
+ struct mpp_clk_info {
+ 	struct clk *clk;
+ 
+-	/* debug rate, from debugfs */
++	/* debug rate, from debug */
+ 	u32 debug_rate_hz;
+ 	/* normal rate, from dtsi */
+ 	u32 normal_rate_hz;
+@@ -351,8 +351,8 @@ struct mpp_service {
+ 	dev_t dev_id;
+ 	struct cdev mpp_cdev;
+ 	struct device *child_dev;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+ 	unsigned long hw_support;
+ 	atomic_t shutdown_request;
+@@ -598,6 +598,19 @@ static inline int mpp_reset_up_write(struct mpp_reset_group *group)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PROC_FS
++struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data);
++#else
++static inline struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data)
++{
++	return 0;
++}
++#endif
++
+ /* workaround according hardware */
+ int px30_workaround_combo_init(struct mpp_dev *mpp);
+ int px30_workaround_combo_switch_grf(struct mpp_dev *mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_iep2.c b/drivers/video/rockchip/mpp/mpp_iep2.c
+index 864ebd504f1b..a06c91fd2b1e 100644
+--- a/drivers/video/rockchip/mpp/mpp_iep2.c
++++ b/drivers/video/rockchip/mpp/mpp_iep2.c
+@@ -18,8 +18,8 @@
+ #include <linux/dma-buf.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
+ #include <linux/pm_runtime.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "rockchip_iep2_regs.h"
+@@ -216,10 +216,9 @@ struct iep2_dev {
+ 	struct mpp_clk_info aclk_info;
+ 	struct mpp_clk_info hclk_info;
+ 	struct mpp_clk_info sclk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ 	struct reset_control *rst_s;
+@@ -749,41 +748,43 @@ static int iep2_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int iep2_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int iep2_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	debugfs_remove_recursive(iep->debugfs);
++	if (iep->procfs) {
++		proc_remove(iep->procfs);
++		iep->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int iep2_debugfs_init(struct mpp_dev *mpp)
++static int iep2_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	iep->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(iep->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		iep->debugfs = NULL;
++	iep->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(iep->procfs)) {
++		mpp_err("failed on mkdir\n");
++		iep->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   iep->debugfs, &iep->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   iep->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      iep->procfs, &iep->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      iep->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int iep2_debugfs_remove(struct mpp_dev *mpp)
++static inline int iep2_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int iep2_debugfs_init(struct mpp_dev *mpp)
++static inline int iep2_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -973,7 +974,7 @@ static int iep2_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = IEP2_SESSION_MAX_BUFFERS;
+-	iep2_debugfs_init(mpp);
++	iep2_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -988,7 +989,7 @@ static int iep2_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&iep->mpp);
+-	iep2_debugfs_remove(&iep->mpp);
++	iep2_procfs_remove(&iep->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index a3e7e5fea53d..704b4a8179b7 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -22,10 +22,10 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ #include <linux/thermal.h>
+ #include <linux/notifier.h>
++#include <linux/proc_fs.h>
+ #include <linux/rockchip/rockchip_sip.h>
+ #include <linux/regulator/consumer.h>
+ 
+@@ -160,10 +160,9 @@ struct rkvdec_dev {
+ 	struct mpp_clk_info core_clk_info;
+ 	struct mpp_clk_info cabac_clk_info;
+ 	struct mpp_clk_info hevc_cabac_clk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ 	struct reset_control *rst_niu_a;
+@@ -1106,47 +1105,49 @@ static int rkvdec_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int rkvdec_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int rkvdec_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+-	debugfs_remove_recursive(dec->debugfs);
++	if (dec->procfs) {
++		proc_remove(dec->procfs);
++		dec->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int rkvdec_debugfs_init(struct mpp_dev *mpp)
++static int rkvdec_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+-	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(dec->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		dec->debugfs = NULL;
++	dec->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(dec->procfs)) {
++		mpp_err("failed on open procfs\n");
++		dec->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("clk_core", 0644,
+-			   dec->debugfs, &dec->core_clk_info.debug_rate_hz);
+-	debugfs_create_u32("clk_cabac", 0644,
+-			   dec->debugfs, &dec->cabac_clk_info.debug_rate_hz);
+-	debugfs_create_u32("clk_hevc_cabac", 0644,
+-			   dec->debugfs, &dec->hevc_cabac_clk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   dec->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      dec->procfs, &dec->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("clk_core", 0644,
++			      dec->procfs, &dec->core_clk_info.debug_rate_hz);
++	mpp_procfs_create_u32("clk_cabac", 0644,
++			      dec->procfs, &dec->cabac_clk_info.debug_rate_hz);
++	mpp_procfs_create_u32("clk_hevc_cabac", 0644,
++			      dec->procfs, &dec->hevc_cabac_clk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      dec->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int rkvdec_debugfs_remove(struct mpp_dev *mpp)
++static inline int rkvdec_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int rkvdec_debugfs_init(struct mpp_dev *mpp)
++static inline int rkvdec_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -1766,7 +1767,7 @@ static int rkvdec_probe(struct platform_device *pdev)
+ 
+ 	dec->state = RKVDEC_STATE_NORMAL;
+ 	mpp->session_max_buffers = RKVDEC_SESSION_MAX_BUFFERS;
+-	rkvdec_debugfs_init(mpp);
++	rkvdec_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -1779,7 +1780,7 @@ static int rkvdec_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&dec->mpp);
+-	rkvdec_debugfs_remove(&dec->mpp);
++	rkvdec_procfs_remove(&dec->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 8823f9b9be39..5829a158868c 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -15,6 +15,7 @@
+ #include <linux/devfreq_cooling.h>
+ #include <linux/iopoll.h>
+ #include <linux/interrupt.h>
++#include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+ #include <linux/of_platform.h>
+@@ -22,7 +23,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+-#include <linux/debugfs.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ #include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+@@ -166,10 +167,9 @@ struct rkvenc_dev {
+ 	struct mpp_clk_info hclk_info;
+ 	struct mpp_clk_info core_clk_info;
+ 	u32 default_max_load;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ 	struct reset_control *rst_core;
+@@ -600,43 +600,45 @@ static int rkvenc_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int rkvenc_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int rkvenc_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 
+-	debugfs_remove_recursive(enc->debugfs);
++	if (enc->procfs) {
++		proc_remove(enc->procfs);
++		enc->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int rkvenc_debugfs_init(struct mpp_dev *mpp)
++static int rkvenc_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 
+-	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(enc->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		enc->debugfs = NULL;
++	enc->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(enc->procfs)) {
++		mpp_err("failed on open procfs\n");
++		enc->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("clk_core", 0644,
+-			   enc->debugfs, &enc->core_clk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   enc->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      enc->procfs, &enc->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("clk_core", 0644,
++			      enc->procfs, &enc->core_clk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      enc->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int rkvenc_debugfs_remove(struct mpp_dev *mpp)
++static inline int rkvenc_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int rkvenc_debugfs_init(struct mpp_dev *mpp)
++static inline int rkvenc_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -1131,7 +1133,7 @@ static int rkvenc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = RKVENC_SESSION_MAX_BUFFERS;
+-	rkvenc_debugfs_init(mpp);
++	rkvenc_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -1149,7 +1151,7 @@ static int rkvenc_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&enc->mpp);
+-	rkvenc_debugfs_remove(&enc->mpp);
++	rkvenc_procfs_remove(&enc->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_service.c b/drivers/video/rockchip/mpp/mpp_service.c
+index 46c96b43194b..e2102b240de3 100644
+--- a/drivers/video/rockchip/mpp/mpp_service.c
++++ b/drivers/video/rockchip/mpp/mpp_service.c
+@@ -12,9 +12,9 @@
+ 
+ #include <linux/completion.h>
+ #include <linux/delay.h>
+-#include <linux/debugfs.h>
+ #include <linux/module.h>
+ #include <linux/of_platform.h>
++#include <linux/proc_fs.h>
+ #include <linux/slab.h>
+ #include <linux/mfd/syscon.h>
+ 
+@@ -140,31 +140,34 @@ static int mpp_remove_service(struct mpp_service *srv)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int mpp_debugfs_remove(struct mpp_service *srv)
++#ifdef CONFIG_PROC_FS
++static int mpp_procfs_remove(struct mpp_service *srv)
+ {
+-	debugfs_remove_recursive(srv->debugfs);
++	if (srv->procfs) {
++		proc_remove(srv->procfs);
++		srv->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int mpp_debugfs_init(struct mpp_service *srv)
++static int mpp_procfs_init(struct mpp_service *srv)
+ {
+-	srv->debugfs = debugfs_create_dir(MPP_SERVICE_NAME, NULL);
+-	if (IS_ERR_OR_NULL(srv->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		srv->debugfs = NULL;
++	srv->procfs = proc_mkdir(MPP_SERVICE_NAME, NULL);
++	if (IS_ERR_OR_NULL(srv->procfs)) {
++		mpp_err("failed on mkdir /proc/%s\n", MPP_SERVICE_NAME);
++		srv->procfs = NULL;
+ 	}
+ 
+ 	return 0;
+ }
+ #else
+-static inline int mpp_debugfs_remove(struct mpp_service *srv)
++static inline int mpp_procfs_remove(struct mpp_service *srv)
+ {
+ 	return 0;
+ }
+ 
+-static inline int mpp_debugfs_init(struct mpp_service *srv)
++static inline int mpp_procfs_init(struct mpp_service *srv)
+ {
+ 	return 0;
+ }
+@@ -239,7 +242,7 @@ static int mpp_service_probe(struct platform_device *pdev)
+ 		dev_err(dev, "register %s device\n", MPP_SERVICE_NAME);
+ 		goto fail_register;
+ 	}
+-	mpp_debugfs_init(srv);
++	mpp_procfs_init(srv);
+ 
+ 	/* register sub drivers */
+ 	MPP_REGISTER_DRIVER(srv, RKVDEC, rkvdec);
+@@ -275,7 +278,7 @@ static int mpp_service_remove(struct platform_device *pdev)
+ 
+ 	mpp_remove_service(srv);
+ 	class_destroy(srv->cls);
+-	mpp_debugfs_remove(srv);
++	mpp_procfs_remove(srv);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu1.c b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+index 8587c050be05..6dd1867c7b08 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+@@ -19,7 +19,7 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_debug.h"
+@@ -118,8 +118,8 @@ struct vdpu_dev {
+ 
+ 	struct mpp_clk_info aclk_info;
+ 	struct mpp_clk_info hclk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -488,41 +488,43 @@ static int vdpu_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int vdpu_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int vdpu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	debugfs_remove_recursive(dec->debugfs);
++	if (dec->procfs) {
++		proc_remove(dec->procfs);
++		dec->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int vdpu_debugfs_init(struct mpp_dev *mpp)
++static int vdpu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(dec->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		dec->debugfs = NULL;
++	dec->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(dec->procfs)) {
++		mpp_err("failed on open procfs\n");
++		dec->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   dec->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      dec->procfs, &dec->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      dec->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int vdpu_debugfs_remove(struct mpp_dev *mpp)
++static inline int vdpu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int vdpu_debugfs_init(struct mpp_dev *mpp)
++static inline int vdpu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -826,7 +828,7 @@ static int vdpu_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = VDPU1_SESSION_MAX_BUFFERS;
+-	vdpu_debugfs_init(mpp);
++	vdpu_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -839,7 +841,7 @@ static int vdpu_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&dec->mpp);
+-	vdpu_debugfs_remove(&dec->mpp);
++	vdpu_procfs_remove(&dec->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu2.c b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+index 7c51573231ad..d4246f20a20a 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+@@ -19,7 +19,7 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_debug.h"
+@@ -102,10 +102,9 @@ struct vdpu_dev {
+ 
+ 	struct mpp_clk_info aclk_info;
+ 	struct mpp_clk_info hclk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ };
+@@ -441,41 +440,43 @@ static int vdpu_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int vdpu_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int vdpu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	debugfs_remove_recursive(dec->debugfs);
++	if (dec->procfs) {
++		proc_remove(dec->procfs);
++		dec->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int vdpu_debugfs_init(struct mpp_dev *mpp)
++static int vdpu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(dec->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		dec->debugfs = NULL;
++	dec->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(dec->procfs)) {
++		mpp_err("failed on open procfs\n");
++		dec->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   dec->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      dec->procfs, &dec->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      dec->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int vdpu_debugfs_remove(struct mpp_dev *mpp)
++static inline int vdpu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int vdpu_debugfs_init(struct mpp_dev *mpp)
++static inline int vdpu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -724,7 +725,7 @@ static int vdpu_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = VDPU2_SESSION_MAX_BUFFERS;
+-	vdpu_debugfs_init(mpp);
++	vdpu_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -737,7 +738,7 @@ static int vdpu_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&dec->mpp);
+-	vdpu_debugfs_remove(&dec->mpp);
++	vdpu_procfs_remove(&dec->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu1.c b/drivers/video/rockchip/mpp/mpp_vepu1.c
+index de3bcfd258a4..b24329994d4f 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu1.c
+@@ -18,7 +18,7 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_debug.h"
+@@ -86,10 +86,9 @@ struct vepu_dev {
+ 
+ 	struct mpp_clk_info aclk_info;
+ 	struct mpp_clk_info hclk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ };
+@@ -395,41 +394,43 @@ static int vepu_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int vepu_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int vepu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	debugfs_remove_recursive(enc->debugfs);
++	if (enc->procfs) {
++		proc_remove(enc->procfs);
++		enc->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int vepu_debugfs_init(struct mpp_dev *mpp)
++static int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(enc->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		enc->debugfs = NULL;
++	enc->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(enc->procfs)) {
++		mpp_err("failed on open procfs\n");
++		enc->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   enc->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      enc->procfs, &enc->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      enc->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int vepu_debugfs_remove(struct mpp_dev *mpp)
++static inline int vepu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int vepu_debugfs_init(struct mpp_dev *mpp)
++static inline int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -596,7 +597,7 @@ static int vepu_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = VEPU1_SESSION_MAX_BUFFERS;
+-	vepu_debugfs_init(mpp);
++	vepu_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -609,7 +610,7 @@ static int vepu_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&enc->mpp);
+-	vepu_debugfs_remove(&enc->mpp);
++	vepu_procfs_remove(&enc->mpp);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index 72e942a0f046..47434fdd2c4d 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -18,7 +18,7 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+-#include <linux/debugfs.h>
++#include <linux/proc_fs.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_debug.h"
+@@ -95,10 +95,9 @@ struct vepu_dev {
+ 
+ 	struct mpp_clk_info aclk_info;
+ 	struct mpp_clk_info hclk_info;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *debugfs;
++#ifdef CONFIG_PROC_FS
++	struct proc_dir_entry *procfs;
+ #endif
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ };
+@@ -407,41 +406,43 @@ static int vepu_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
+-static int vepu_debugfs_remove(struct mpp_dev *mpp)
++#ifdef CONFIG_PROC_FS
++static int vepu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	debugfs_remove_recursive(enc->debugfs);
++	if (enc->procfs) {
++		proc_remove(enc->procfs);
++		enc->procfs = NULL;
++	}
+ 
+ 	return 0;
+ }
+ 
+-static int vepu_debugfs_init(struct mpp_dev *mpp)
++static int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+-					  mpp->srv->debugfs);
+-	if (IS_ERR_OR_NULL(enc->debugfs)) {
+-		mpp_err("failed on open debugfs\n");
+-		enc->debugfs = NULL;
++	enc->procfs = proc_mkdir(mpp->dev->of_node->name, mpp->srv->procfs);
++	if (IS_ERR_OR_NULL(enc->procfs)) {
++		mpp_err("failed on open procfs\n");
++		enc->procfs = NULL;
+ 		return -EIO;
+ 	}
+-	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+-	debugfs_create_u32("session_buffers", 0644,
+-			   enc->debugfs, &mpp->session_max_buffers);
++	mpp_procfs_create_u32("aclk", 0644,
++			      enc->procfs, &enc->aclk_info.debug_rate_hz);
++	mpp_procfs_create_u32("session_buffers", 0644,
++			      enc->procfs, &mpp->session_max_buffers);
+ 
+ 	return 0;
+ }
+ #else
+-static inline int vepu_debugfs_remove(struct mpp_dev *mpp)
++static inline int vepu_procfs_remove(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+ 
+-static inline int vepu_debugfs_init(struct mpp_dev *mpp)
++static inline int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
+@@ -636,7 +637,7 @@ static int vepu_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mpp->session_max_buffers = VEPU2_SESSION_MAX_BUFFERS;
+-	vepu_debugfs_init(mpp);
++	vepu_procfs_init(mpp);
+ 	dev_info(dev, "probing finish\n");
+ 
+ 	return 0;
+@@ -649,7 +650,7 @@ static int vepu_remove(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "remove device\n");
+ 	mpp_dev_remove(&enc->mpp);
+-	vepu_debugfs_remove(&enc->mpp);
++	vepu_procfs_remove(&enc->mpp);
+ 
+ 	return 0;
+ }
+-- 
+2.35.3
+

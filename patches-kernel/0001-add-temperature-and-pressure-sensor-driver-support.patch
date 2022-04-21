@@ -1,0 +1,1064 @@
+From 61e52f56cb10261cbba44c409f8202c2a35e8aad Mon Sep 17 00:00:00 2001
+From: luowei <lw@rock-chips.com>
+Date: Wed, 27 Feb 2013 10:33:18 +0800
+Subject: [PATCH] add temperature and pressure sensor driver support
+
+---
+ drivers/input/sensors/Kconfig                 |   2 +
+ drivers/input/sensors/Makefile                |   2 +
+ drivers/input/sensors/pressure/Kconfig        |  14 +
+ drivers/input/sensors/pressure/Makefile       |   6 +
+ drivers/input/sensors/pressure/pr_ms5607.c    | 300 +++++++++++++++++
+ drivers/input/sensors/sensor-dev.c            | 214 +++++++++++-
+ drivers/input/sensors/temperature/Kconfig     |  15 +-
+ drivers/input/sensors/temperature/Makefile    |   7 +-
+ .../input/sensors/temperature/tmp_ms5607.c    | 317 ++++++++++++++++++
+ include/linux/sensor-dev.h                    |  19 +-
+ 10 files changed, 883 insertions(+), 13 deletions(-)
+ create mode 100755 drivers/input/sensors/pressure/Kconfig
+ create mode 100755 drivers/input/sensors/pressure/Makefile
+ create mode 100755 drivers/input/sensors/pressure/pr_ms5607.c
+ create mode 100755 drivers/input/sensors/temperature/tmp_ms5607.c
+
+diff --git a/drivers/input/sensors/Kconfig b/drivers/input/sensors/Kconfig
+index 25fea663108c..813330bfb316 100755
+--- a/drivers/input/sensors/Kconfig
++++ b/drivers/input/sensors/Kconfig
+@@ -15,5 +15,7 @@ source "drivers/input/sensors/gyro/Kconfig"
+ source "drivers/input/sensors/lsensor/Kconfig"
+ source "drivers/input/sensors/psensor/Kconfig"
+ source "drivers/input/sensors/temperature/Kconfig"
++source "drivers/input/sensors/pressure/Kconfig"
++
+ 
+ endif
+diff --git a/drivers/input/sensors/Makefile b/drivers/input/sensors/Makefile
+index 65d9b20b1a44..1b23c47bea21 100755
+--- a/drivers/input/sensors/Makefile
++++ b/drivers/input/sensors/Makefile
+@@ -4,6 +4,8 @@ obj-$(CONFIG_COMPASS_DEVICE)			+= compass/
+ obj-$(CONFIG_GYROSCOPE_DEVICE)			+= gyro/
+ obj-$(CONFIG_LIGHT_DEVICE)				+= lsensor/
+ obj-$(CONFIG_PROXIMITY_DEVICE)			+= psensor/
++obj-$(CONFIG_TEMPERATURE_DEVICE)		+= temperature/
++obj-$(CONFIG_PRESSURE_DEVICE)			+= pressure/
+ 
+ 
+ obj-$(CONFIG_SENSOR_DEVICE)				+= sensor-i2c.o
+diff --git a/drivers/input/sensors/pressure/Kconfig b/drivers/input/sensors/pressure/Kconfig
+new file mode 100755
+index 000000000000..c172f6dd84ab
+--- /dev/null
++++ b/drivers/input/sensors/pressure/Kconfig
+@@ -0,0 +1,14 @@
++#
++# pressure sensor drivers configuration
++#
++
++menuconfig PRESSURE_DEVICE
++	bool "pressure sensor device support"
++	default n
++
++if PRESSURE_DEVICE
++ config PR_MS5607
++ bool "pressure sensor ms5607"
++ default n
++ 
++endif
+diff --git a/drivers/input/sensors/pressure/Makefile b/drivers/input/sensors/pressure/Makefile
+new file mode 100755
+index 000000000000..837fafa7d960
+--- /dev/null
++++ b/drivers/input/sensors/pressure/Makefile
+@@ -0,0 +1,6 @@
++#
++# pressure sensor drivers configuration
++#
++
++obj-$(CONFIG_PR_MS5607) 		+= pr_ms5607.o
++
+diff --git a/drivers/input/sensors/pressure/pr_ms5607.c b/drivers/input/sensors/pressure/pr_ms5607.c
+new file mode 100755
+index 000000000000..000f411d0375
+--- /dev/null
++++ b/drivers/input/sensors/pressure/pr_ms5607.c
+@@ -0,0 +1,300 @@
++/* drivers/input/sensors/pressure/ms5607.c
++ *
++ * Copyright (C) 2012-2015 ROCKCHIP.
++ * Author: luowei <lw@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <mach/gpio.h>
++#include <mach/board.h> 
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++#if 0
++#define SENSOR_DEBUG_TYPE SENSOR_TYPE_PRESSURE
++#define DBG(x...) if(sensor->pdata->type == SENSOR_DEBUG_TYPE) printk(x)
++#else
++#define DBG(x...)
++#endif
++
++#define CMD_RESET   0x1E  // ADC reset command 
++#define CMD_ADC_READ 0x00  // ADC read command 
++#define CMD_ADC_CONV 0x40  // ADC conversion command 
++#define CMD_ADC_D1   0x00    // ADC D1 conversion 
++#define CMD_ADC_D2   0x10    // ADC D2 conversion 
++#define CMD_ADC_256  0x00    // ADC OSR=256 
++#define CMD_ADC_512  0x02    // ADC OSR=512 
++#define CMD_ADC_1024 0x04    // ADC OSR=1024 
++#define CMD_ADC_2048 0x06    // ADC OSR=2048 
++#define CMD_ADC_4096 0x08    // ADC OSR=4096 
++#define CMD_PROM_RD  0xA0  // Prom read command 
++
++
++/****************operate according to sensor chip:start************/
++
++static int C[8] = {0};
++int g_ms5607_temp;
++int g_ms5607_pr_status;
++
++#if defined(CONFIG_TMP_MS5607)
++extern int g_ms5607_temp_status;
++#else
++static int g_ms5607_temp_status = SENSOR_OFF;
++#endif
++
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	int result = 0;
++	int i = 0;
++	char prom[16];
++
++	if((enable) && (g_ms5607_temp_status == SENSOR_OFF))
++	{
++		result = sensor_write_reg_normal(client, CMD_RESET);
++		if(result)		
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++
++		//Read PROM (128 bit of calibration words)  
++		memset(prom, 0, 16);
++		prom[0]= CMD_PROM_RD;//CMD_PROM_RD;   
++		for(i=0; i<8; i++)
++		{
++			prom[i*2]= CMD_PROM_RD + i*2;
++			result = sensor_rx_data(client, &prom[i*2], 2);
++			if(result)
++			{
++				printk("%s:line=%d,error\n",__func__,__LINE__);
++				return result;
++			}
++		}
++
++		for (i=0;i<8;i++) 
++		{
++			C[i] = prom[2*i] << 8 | prom[2*i + 1];
++			DBG("prom[%d]=0x%x,prom[%d]=0x%x",2*i,prom[2*i],(2*i + 1),prom[2*i + 1]);
++			DBG("\nC[%d]=%d,",i+1,C[i]);
++		} 
++
++	}
++	
++	g_ms5607_pr_status = enable;
++	
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{	
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++	int result = 0;
++	
++	result = sensor->ops->active(client,0,0);
++	if(result)
++	{
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return result;
++	}
++	
++	sensor->status_cur = SENSOR_OFF;
++	g_ms5607_pr_status = sensor->status_cur;
++	
++	//Reset
++	//result = sensor_write_reg_normal(client, CMD_RESET);
++	//if(result)		
++        //printk("%s:line=%d,error\n",__func__,__LINE__);	
++    
++	return result;
++}
++
++
++static int pressure_report_value(struct input_dev *input, int data)
++{
++	//get pressure, high and temperature from register data
++
++	input_report_abs(input, ABS_PRESSURE, data);
++	input_sync(input);
++	
++	return 0;
++}
++
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++    
++	int result = 0;
++	char buffer[3];	
++	char index = 0;
++	unsigned int  D1=0, D2=0;
++
++	int T2 = 0;
++	long long OFF = 0;	// offset at actual temperature 
++	long long SENS = 0;	// sensitivity at actual temperature 
++	int dT = 0;		// difference between actual and measured temperature
++	long long OFF2 = 0;
++	long long SENS2 = 0;
++	int P = 0;		// compensated pressure value 
++
++
++	memset(buffer, 0, 3);
++	if(sensor->ops->read_len < 3)	//sensor->ops->read_len = 3
++	{
++		printk("%s:lenth is error,len=%d\n",__func__,sensor->ops->read_len);
++		return -1;
++	}
++
++	//D1 conversion
++	sensor_write_reg_normal(client,  CMD_ADC_CONV + CMD_ADC_D1 + CMD_ADC_4096);
++	msleep(10);
++
++	memset(buffer, 0, 3);
++	buffer[0] = CMD_ADC_READ;
++	result = sensor_rx_data(client, &buffer[0], 3);
++	if(result)
++	{
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return result;
++	}
++
++	D1 = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
++	DBG("\nD1=%d :buffer[0]=0x%x,buffer[1]=0x%x,buffer2]=0x%x\n",D1,buffer[0],buffer[1],buffer[2]);
++
++	//D2 conversion
++	sensor_write_reg_normal(client,  CMD_ADC_CONV + CMD_ADC_D2 + CMD_ADC_4096);
++	msleep(10);
++
++	memset(buffer, 0, 3);
++	buffer[0] = CMD_ADC_READ;
++	result = sensor_rx_data(client, &buffer[0], 3);
++	if(result)
++	{
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return result;
++	}
++
++	D2 = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
++	DBG("D2=%d:buffer[0]=0x%x,buffer[1]=0x%x,buffer2]=0x%x\n",D2,buffer[0],buffer[1],buffer[2]);
++
++	dT = D2 - ((unsigned int)C[5] << 8);
++
++	g_ms5607_temp = (int)(2000 + ((long long)dT * C[6] >> 23));
++
++	OFF = ((unsigned long long)C[2] << 17) + (C[4] * (long long)dT >> 6);
++
++	SENS = ((long long)C[1] << 16) + (C[3] * (long long)dT >> 7);
++
++	/*calcualte 2nd order pressure and temperature (BP5607 2nd order algorithm)*/
++	if (g_ms5607_temp < -4000 || g_ms5607_temp > 8500)
++	{
++		printk("%s:temperature is error\n",__func__);
++		return -1;
++	}
++
++	if (g_ms5607_temp < 2000)
++	{
++		int tmp;
++		tmp = (g_ms5607_temp - 2000) * (g_ms5607_temp - 2000);
++
++		T2 = (int)((long long)(dT * dT) >> 31);
++		OFF2 = (((long long)tmp * 61)*((long long)tmp * 61)) >> 4;
++		SENS2 = (long long)((tmp*tmp) << 1);
++
++		if (g_ms5607_temp < -1500)
++		{
++			tmp = (g_ms5607_temp + 1500) * (g_ms5607_temp + 1500);
++			OFF2 += 15 * tmp;
++			SENS2 += 8 * tmp;
++		}
++	}
++	else
++	{
++		T2=0;
++		OFF2 = 0;
++		SENS2 = 0;
++	}
++
++	g_ms5607_temp -= T2;
++	OFF -= OFF2;
++	SENS -= SENS2;    
++	P = (int)((((D1 * SENS) >> 21) - OFF) >> 15);
++
++	index = pressure_report_value(sensor->input_dev, P);
++
++	DBG("%s:pressure=%d,temperature=%d\n",__func__,P,g_ms5607_temp);
++	
++	return result;
++}
++
++struct sensor_operate pressure_ms5607_ops = {
++	.name				= "pr_ms5607",
++	.type				= SENSOR_TYPE_PRESSURE,	//sensor type and it should be correct
++	.id_i2c				= PRESSURE_ID_MS5607,	//i2c id number
++	.read_reg			= SENSOR_UNKNOW_DATA,	//read data
++	.read_len			= 3,			//data length
++	.id_reg				= SENSOR_UNKNOW_DATA,	//read device id from this register
++	.id_data 			= SENSOR_UNKNOW_DATA,	//device id
++	.precision			= 24,			//8 bits
++	.ctrl_reg 			= SENSOR_UNKNOW_DATA,	//enable or disable 
++	.int_status_reg 		= SENSOR_UNKNOW_DATA,	//intterupt status register
++	.range				= {100,65535},		//range
++	.brightness			= {10,255},     	//brightness
++	.trig				= IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_SHARED,		
++	.active				= sensor_active,	
++	.init				= sensor_init,
++	.report				= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++
++//function name should not be changed
++static struct sensor_operate *pressure_get_ops(void)
++{
++	return &pressure_ms5607_ops;
++}
++
++
++static int __init pressure_ms5607_init(void)
++{
++	struct sensor_operate *ops = pressure_get_ops();
++	int result = 0;
++	int type = ops->type;
++	result = sensor_register_slave(type, NULL, NULL, pressure_get_ops);
++	printk("%s\n",__func__);
++	return result;
++}
++
++static void __exit pressure_ms5607_exit(void)
++{
++	struct sensor_operate *ops = pressure_get_ops();
++	int type = ops->type;
++	sensor_unregister_slave(type, NULL, NULL, pressure_get_ops);
++}
++
++
++module_init(pressure_ms5607_init);
++module_exit(pressure_ms5607_exit);
++
+diff --git a/drivers/input/sensors/sensor-dev.c b/drivers/input/sensors/sensor-dev.c
+index 10e43614724d..c172a17c0147 100755
+--- a/drivers/input/sensors/sensor-dev.c
++++ b/drivers/input/sensors/sensor-dev.c
+@@ -43,7 +43,7 @@
+ #define DBG(x...)
+ #endif
+ 
+-#define SENSOR_VERSION_AND_TIME  "sensor-dev.c v1.0 2013-2-18"
++#define SENSOR_VERSION_AND_TIME  "sensor-dev.c v1.1 add pressure and temperature support 2013-2-27"
+ 
+ 
+ struct sensor_private_data *g_sensor[SENSOR_NUM_TYPES];
+@@ -306,6 +306,8 @@ static int sensor_irq_init(struct i2c_client *client)
+ 		if((sensor->pdata->type == SENSOR_TYPE_GYROSCOPE) || (sensor->pdata->type == SENSOR_TYPE_ACCEL))
+ 		disable_irq_nosync(client->irq);//disable irq
+ 		if(((sensor->pdata->type == SENSOR_TYPE_LIGHT) || (sensor->pdata->type == SENSOR_TYPE_PROXIMITY))&& (!(sensor->ops->trig & IRQF_SHARED)))	
++		disable_irq_nosync(client->irq);//disable irq	
++		if(((sensor->pdata->type == SENSOR_TYPE_TEMPERATURE) || (sensor->pdata->type == SENSOR_TYPE_PRESSURE))&& (!(sensor->ops->trig & IRQF_SHARED)))		
+ 		disable_irq_nosync(client->irq);//disable irq
+ 		printk("%s:use irq=%d\n",__func__,irq);
+ 	}
+@@ -961,16 +963,186 @@ static int temperature_dev_release(struct inode *inode, struct file *file)
+ static long temperature_dev_ioctl(struct file *file,
+ 			  unsigned int cmd, unsigned long arg)
+ {
+-	//struct sensor_private_data *sensor = g_sensor[SENSOR_TYPE_TEMPERATURE];
+-	//struct i2c_client *client = sensor->client;
+-	//void __user *argp = (void __user *)arg;
++	struct sensor_private_data *sensor = g_sensor[SENSOR_TYPE_TEMPERATURE];
++	struct i2c_client *client = sensor->client;
++	unsigned int *argp = (unsigned int *)arg;	
+ 	int result = 0;
++
++	switch(cmd)
++	{
++		case TEMPERATURE_IOCTL_GET_ENABLED:
++			*argp = sensor->status_cur;
++			break;
++		case TEMPERATURE_IOCTL_ENABLE:		
++			DBG("%s:LIGHTSENSOR_IOCTL_ENABLE start\n", __func__);
++			mutex_lock(&sensor->operation_mutex);	 
++			if(*(unsigned int *)argp)
++			{
++				if(sensor->status_cur == SENSOR_OFF)
++				{
++					if ( (result = sensor->ops->active(client, SENSOR_ON, 0) ) < 0 ) {
++					mutex_unlock(&sensor->operation_mutex);
++					printk("%s:fail to active sensor,ret=%d\n",__func__,result);	     
++					goto error;	      
++					}	
++					if(sensor->pdata->irq_enable)
++					{
++						if(!(sensor->ops->trig & IRQF_SHARED))
++						{
++							DBG("%s:enable irq,irq=%d\n",__func__,client->irq);
++							enable_irq(client->irq);	//enable irq
++						}
++					}	
++					else
++					{
++						PREPARE_DELAYED_WORK(&sensor->delaywork, sensor_delaywork_func);
++						schedule_delayed_work(&sensor->delaywork, msecs_to_jiffies(sensor->pdata->poll_delay_ms));
++					}
++					
++					sensor->status_cur = SENSOR_ON;
++				}	
++			}
++			else
++			{
++				if(sensor->status_cur == SENSOR_ON)
++				{
++					if ( (result = sensor->ops->active(client, SENSOR_OFF, 0) ) < 0 ) {
++					mutex_unlock(&sensor->operation_mutex); 	     
++					goto error;
++					}
++					
++					if(sensor->pdata->irq_enable)
++					{				
++						if(!(sensor->ops->trig & IRQF_SHARED))
++						{
++							DBG("%s:disable irq,irq=%d\n",__func__,client->irq);
++							disable_irq_nosync(client->irq);//disable irq
++						}
++					}
++					else
++					cancel_delayed_work_sync(&sensor->delaywork);	
++					
++					sensor->status_cur = SENSOR_OFF;
++				}
++			}
++			mutex_unlock(&sensor->operation_mutex);
++			DBG("%s:LIGHTSENSOR_IOCTL_ENABLE OK\n", __func__);
++			break;
++		
++		default:
++			break;
++	}
+ 	
++error:
++	return result;
++}
++
++
++static int pressure_dev_open(struct inode *inode, struct file *file)
++{
++	//struct sensor_private_data *sensor = g_sensor[SENSOR_TYPE_PRESSURE];
++	//struct i2c_client *client = sensor->client;
++
++	int result = 0;
++
+ 
+ 	return result;
+ }
+ 
+ 
++static int pressure_dev_release(struct inode *inode, struct file *file)
++{
++	//struct sensor_private_data *sensor = g_sensor[SENSOR_TYPE_PRESSURE];
++	//struct i2c_client *client = sensor->client;
++
++	int result = 0;
++
++
++	return result;
++}
++
++
++/* ioctl - I/O control */
++static long pressure_dev_ioctl(struct file *file,
++			  unsigned int cmd, unsigned long arg)
++{
++	struct sensor_private_data *sensor = g_sensor[SENSOR_TYPE_PRESSURE];
++	struct i2c_client *client = sensor->client;
++	unsigned int *argp = (unsigned int *)arg;	
++	int result = 0;
++
++	switch(cmd)
++	{
++		case PRESSURE_IOCTL_GET_ENABLED:
++			*argp = sensor->status_cur;
++			break;
++		case PRESSURE_IOCTL_ENABLE:		
++			DBG("%s:LIGHTSENSOR_IOCTL_ENABLE start\n", __func__);
++			mutex_lock(&sensor->operation_mutex);	 
++			if(*(unsigned int *)argp)
++			{
++				if(sensor->status_cur == SENSOR_OFF)
++				{
++					if ( (result = sensor->ops->active(client, SENSOR_ON, 0) ) < 0 ) {
++					mutex_unlock(&sensor->operation_mutex);
++					printk("%s:fail to active sensor,ret=%d\n",__func__,result);	     
++					goto error;	      
++					}	
++					if(sensor->pdata->irq_enable)
++					{
++						if(!(sensor->ops->trig & IRQF_SHARED))
++						{
++							DBG("%s:enable irq,irq=%d\n",__func__,client->irq);
++							enable_irq(client->irq);	//enable irq
++						}
++					}	
++					else
++					{
++						PREPARE_DELAYED_WORK(&sensor->delaywork, sensor_delaywork_func);
++						schedule_delayed_work(&sensor->delaywork, msecs_to_jiffies(sensor->pdata->poll_delay_ms));
++					}
++					
++					sensor->status_cur = SENSOR_ON;
++				}	
++			}
++			else
++			{
++				if(sensor->status_cur == SENSOR_ON)
++				{
++					if ( (result = sensor->ops->active(client, SENSOR_OFF, 0) ) < 0 ) {
++					mutex_unlock(&sensor->operation_mutex); 	     
++					goto error;
++					}
++					
++					if(sensor->pdata->irq_enable)
++					{				
++						if(!(sensor->ops->trig & IRQF_SHARED))
++						{
++							DBG("%s:disable irq,irq=%d\n",__func__,client->irq);
++							disable_irq_nosync(client->irq);//disable irq
++						}
++					}
++					else
++					cancel_delayed_work_sync(&sensor->delaywork);	
++					
++					sensor->status_cur = SENSOR_OFF;
++				}
++			}
++			mutex_unlock(&sensor->operation_mutex);
++			DBG("%s:LIGHTSENSOR_IOCTL_ENABLE OK\n", __func__);
++			break;
++		
++		default:
++			break;
++	}
++	
++error:
++	return result;
++}
++
++
++
++
+ static int sensor_misc_device_register(struct sensor_private_data *sensor, int type)
+ {
+ 	int result = 0;
+@@ -1095,6 +1267,26 @@ static int sensor_misc_device_register(struct sensor_private_data *sensor, int t
+ 				
+ 			break;
+ 
++		case SENSOR_TYPE_PRESSURE:
++			if(!sensor->ops->misc_dev)
++			{
++				sensor->fops.owner = THIS_MODULE;
++				sensor->fops.unlocked_ioctl = pressure_dev_ioctl;
++				sensor->fops.open = pressure_dev_open;
++				sensor->fops.release = pressure_dev_release;
++
++				sensor->miscdev.minor = MISC_DYNAMIC_MINOR;
++				sensor->miscdev.name = "pressure";
++				sensor->miscdev.fops = &sensor->fops;
++			}	
++			else
++			{
++				memcpy(&sensor->miscdev, sensor->ops->misc_dev, sizeof(*sensor->ops->misc_dev));
++
++			}
++				
++			break;
++
+ 		default:
+ 			printk("%s:unknow sensor type=%d\n",__func__,type);
+ 			result = -1;
+@@ -1299,6 +1491,11 @@ int sensor_probe(struct i2c_client *client, const struct i2c_device_id *devid)
+ 			set_bit(EV_ABS, sensor->input_dev->evbit);		
+ 			input_set_abs_params(sensor->input_dev, ABS_THROTTLE, sensor->ops->range[0], sensor->ops->range[1], 0, 0);
+ 			break;
++		case SENSOR_TYPE_PRESSURE:				
++			sensor->input_dev->name = "pressure";
++			set_bit(EV_ABS, sensor->input_dev->evbit);		
++			input_set_abs_params(sensor->input_dev, ABS_PRESSURE, sensor->ops->range[0], sensor->ops->range[1], 0, 0);
++			break;
+ 		default:
+ 			printk("%s:unknow sensor type=%d\n",__func__,type);
+ 			break;
+@@ -1426,8 +1623,15 @@ static const struct i2c_device_id sensor_id[] = {
+ 	{"proximity_al3006", PROXIMITY_ID_AL3006},	
+ 	{"ps_stk3171", PROXIMITY_ID_STK3171},
+ 	{"ps_ap321xx", PROXIMITY_ID_AP321XX},
++	
+ 	/*temperature*/
+-	{"temperature", TEMPERATURE_ID_ALL},
++	{"temperature", TEMPERATURE_ID_ALL},	
++	{"tmp_ms5607", TEMPERATURE_ID_MS5607},
++
++	/*pressure*/
++	{"pressure", PRESSURE_ID_ALL},
++	{"pr_ms5607", PRESSURE_ID_MS5607},
++	
+ 	{},
+ };
+ 
+diff --git a/drivers/input/sensors/temperature/Kconfig b/drivers/input/sensors/temperature/Kconfig
+index 65e61499a54e..cbb615b5424f 100755
+--- a/drivers/input/sensors/temperature/Kconfig
++++ b/drivers/input/sensors/temperature/Kconfig
+@@ -1,7 +1,14 @@
+ #
+-# temperature sensor drivers configuration
++# temperature sensor drivers configuration
+ #
+ 
+-menuconfig TEMPERATURE_DEVICE
+-	bool "temperature sensor device support"
+-	default n	
+\ No newline at end of file
++menuconfig TEMPERATURE_DEVICE
++	bool "temperature sensor device support"
++	default n
++
++if TEMPERATURE_DEVICE
++ config TMP_MS5607
++ bool "temperature sensor ms5607"
++ default n
++ 
++endif
+diff --git a/drivers/input/sensors/temperature/Makefile b/drivers/input/sensors/temperature/Makefile
+index 5dba77d01e64..2f9f5efaa2f4 100755
+--- a/drivers/input/sensors/temperature/Makefile
++++ b/drivers/input/sensors/temperature/Makefile
+@@ -1,3 +1,6 @@
+ #
+-# temperature sensor drivers configuration
+-#
+\ No newline at end of file
++# temperature sensor drivers configuration
++#
++
++obj-$(CONFIG_TMP_MS5607) 		+= tmp_ms5607.o
++
+diff --git a/drivers/input/sensors/temperature/tmp_ms5607.c b/drivers/input/sensors/temperature/tmp_ms5607.c
+new file mode 100755
+index 000000000000..8fa565977950
+--- /dev/null
++++ b/drivers/input/sensors/temperature/tmp_ms5607.c
+@@ -0,0 +1,317 @@
++/* drivers/input/sensors/temperature/tmp_ms5607.c
++ *
++ * Copyright (C) 2012-2015 ROCKCHIP.
++ * Author: luowei <lw@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <mach/gpio.h>
++#include <mach/board.h> 
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++#if 0
++#define SENSOR_DEBUG_TYPE SENSOR_TYPE_TEMPERATURE
++#define DBG(x...) if(sensor->pdata->type == SENSOR_DEBUG_TYPE) printk(x)
++#else
++#define DBG(x...)
++#endif
++
++#define CMD_RESET   0x1E  // ADC reset command 
++#define CMD_ADC_READ 0x00  // ADC read command 
++#define CMD_ADC_CONV 0x40  // ADC conversion command 
++#define CMD_ADC_D1   0x00    // ADC D1 conversion 
++#define CMD_ADC_D2   0x10    // ADC D2 conversion 
++#define CMD_ADC_256  0x00    // ADC OSR=256 
++#define CMD_ADC_512  0x02    // ADC OSR=512 
++#define CMD_ADC_1024 0x04    // ADC OSR=1024 
++#define CMD_ADC_2048 0x06    // ADC OSR=2048 
++#define CMD_ADC_4096 0x08    // ADC OSR=4096 
++#define CMD_PROM_RD  0xA0  // Prom read command 
++
++#if defined(CONFIG_PR_MS5607)
++extern int g_ms5607_temp;
++extern int g_ms5607_pr_status;
++#else
++static int g_ms5607_temp = 0;
++static int g_ms5607_pr_status = SENSOR_OFF;
++#endif
++
++int g_ms5607_temp_status;
++static int C[8] = {0};
++
++/****************operate according to sensor chip:start************/
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	int result = 0;
++	int i = 0;
++	char prom[16];
++	
++	if((enable)&&(g_ms5607_pr_status == SENSOR_OFF))
++	{
++		result = sensor_write_reg_normal(client, CMD_RESET);
++		if(result)		
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++
++		//Read PROM (128 bit of calibration words)  
++		memset(prom, 0, 16);
++		prom[0]= CMD_PROM_RD;//CMD_PROM_RD;   
++		for(i=0; i<8; i++)
++		{
++			prom[i*2]= CMD_PROM_RD + i*2;
++			result = sensor_rx_data(client, &prom[i*2], 2);
++			if(result)
++			{
++				printk("%s:line=%d,error\n",__func__,__LINE__);
++				return result;
++			}
++		}
++
++		for (i=0;i<8;i++) 
++		{
++			C[i] = prom[2*i] << 8 | prom[2*i + 1];
++			DBG("prom[%d]=0x%x,prom[%d]=0x%x",2*i,prom[2*i],(2*i + 1),prom[2*i + 1]);
++			DBG("\nC[%d]=%d,",i+1,C[i]);
++		} 
++
++	}
++
++	g_ms5607_temp_status = enable;
++	
++	return result;
++}
++
++
++
++static int sensor_init(struct i2c_client *client)
++{	
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++	int result = 0;
++	
++	result = sensor->ops->active(client,0,0);
++	if(result)
++	{
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return result;
++	}
++	
++	sensor->status_cur = SENSOR_OFF;
++	g_ms5607_temp_status = sensor->status_cur;
++	//Reset
++	//result = sensor_write_reg_normal(client, CMD_RESET);
++	//if(result)		
++	//printk("%s:line=%d,error\n",__func__,__LINE__); 
++    
++	return result;
++}
++
++
++
++static int temperature_report_value(struct input_dev *input, int data)
++{
++	//get temperature, high and temperature from register data
++
++	input_report_abs(input, ABS_THROTTLE, data);
++	input_sync(input);
++	
++	return 0;
++}
++
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++    
++	int result = 0;
++	char buffer[3]; 
++	char index = 0;
++	unsigned int  D1=0, D2=0;
++
++	int T2 = 0;
++	long long OFF = 0;	// offset at actual temperature 
++	long long SENS = 0;	// sensitivity at actual temperature 
++	int dT = 0;		// difference between actual and measured temperature
++	long long OFF2 = 0;
++	long long SENS2 = 0;
++	int P = 0;		// compensated pressure value 
++
++
++	memset(buffer, 0, 3);
++	if(sensor->ops->read_len < 3)	//sensor->ops->read_len = 3
++	{
++		printk("%s:lenth is error,len=%d\n",__func__,sensor->ops->read_len);
++		return -1;
++	}
++
++	if(g_ms5607_pr_status == 	SENSOR_OFF)
++	{
++
++		//D1 conversion
++		sensor_write_reg_normal(client,  CMD_ADC_CONV + CMD_ADC_D1 + CMD_ADC_4096);
++		msleep(10);
++
++		memset(buffer, 0, 3);
++		buffer[0] = CMD_ADC_READ;
++		result = sensor_rx_data(client, &buffer[0], 3);
++		if(result)
++		{
++			printk("%s:line=%d,error\n",__func__,__LINE__);
++			return result;
++		}
++
++		D1 = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
++		DBG("\nD1=%d :buffer[0]=0x%x,buffer[1]=0x%x,buffer2]=0x%x\n",D1,buffer[0],buffer[1],buffer[2]);
++
++		//D2 conversion
++		sensor_write_reg_normal(client,  CMD_ADC_CONV + CMD_ADC_D2 + CMD_ADC_4096);
++		msleep(10);
++
++		memset(buffer, 0, 3);
++		buffer[0] = CMD_ADC_READ;
++		result = sensor_rx_data(client, &buffer[0], 3);
++		if(result)
++		{
++			printk("%s:line=%d,error\n",__func__,__LINE__);
++			return result;
++		}
++
++		D2 = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
++		DBG("D2=%d:buffer[0]=0x%x,buffer[1]=0x%x,buffer2]=0x%x\n",D2,buffer[0],buffer[1],buffer[2]);
++
++		dT = D2 - ((unsigned int)C[5] << 8);
++
++		g_ms5607_temp = (int)(2000 + ((long long)dT * C[6] >> 23));
++
++		OFF = ((unsigned long long)C[2] << 17) + (C[4] * (long long)dT >> 6);
++
++		SENS = ((long long)C[1] << 16) + (C[3] * (long long)dT >> 7);
++
++		/*calcualte 2nd order pressure and temperature (BP5607 2nd order algorithm)*/
++		if (g_ms5607_temp < -4000 || g_ms5607_temp > 8500)
++		{
++			printk("%s:temperature is error\n",__func__);
++			return -1;
++		}
++
++		if (g_ms5607_temp < 2000)
++		{
++			int tmp;
++			tmp = (g_ms5607_temp - 2000) * (g_ms5607_temp - 2000);
++
++			T2 = (int)((long long)(dT * dT) >> 31);
++			OFF2 = (((long long)tmp * 61)*((long long)tmp * 61)) >> 4;
++			SENS2 = (long long)((tmp*tmp) << 1);
++
++			if (g_ms5607_temp < -1500)
++			{
++				tmp = (g_ms5607_temp + 1500) * (g_ms5607_temp + 1500);
++				OFF2 += 15 * tmp;
++				SENS2 += 8 * tmp;
++			}
++		}
++		else
++		{
++			T2=0;
++			OFF2 = 0;
++			SENS2 = 0;
++		}
++
++		g_ms5607_temp -= T2;
++		OFF -= OFF2;
++		SENS -= SENS2;	  
++		P = (int)((((D1 * SENS) >> 21) - OFF) >> 15);
++
++		index = temperature_report_value(sensor->input_dev, g_ms5607_temp);
++		
++		DBG("%s:pressure=%d,temperature=%d\n",__func__,P,g_ms5607_temp);
++	
++	}
++	else
++	{	
++		index = temperature_report_value(sensor->input_dev, g_ms5607_temp);
++		
++		#if defined(CONFIG_PR_MS5607)
++		DBG("%s:pressure=%d,temperature=%d\n",__func__,P,g_ms5607_temp);
++		#else	
++		printk("%s:errror,need pr_ms5607\n",__func__);
++		#endif
++	}
++	
++	
++	return result;
++}
++
++
++struct sensor_operate temperature_ms5607_ops = {
++	.name				= "tmp_ms5607",
++	.type				= SENSOR_TYPE_TEMPERATURE,	//sensor type and it should be correct
++	.id_i2c				= TEMPERATURE_ID_MS5607,	//i2c id number
++	.read_reg			= SENSOR_UNKNOW_DATA,	//read data
++	.read_len			= 3,			//data length
++	.id_reg				= SENSOR_UNKNOW_DATA,	//read device id from this register
++	.id_data 			= SENSOR_UNKNOW_DATA,	//device id
++	.precision			= 24,			//8 bits
++	.ctrl_reg 			= SENSOR_UNKNOW_DATA,	//enable or disable 
++	.int_status_reg 		= SENSOR_UNKNOW_DATA,	//intterupt status register
++	.range				= {100,65535},		//range
++	.trig				= IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_SHARED,		
++	.active				= sensor_active,	
++	.init				= sensor_init,
++	.report				= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++
++//function name should not be changed
++static struct sensor_operate *temperature_get_ops(void)
++{
++	return &temperature_ms5607_ops;
++}
++
++
++static int __init temperature_ms5607_init(void)
++{
++	struct sensor_operate *ops = temperature_get_ops();
++	int result = 0;
++	int type = ops->type;
++	result = sensor_register_slave(type, NULL, NULL, temperature_get_ops);
++	DBG("%s\n",__func__);
++	return result;
++}
++
++static void __exit temperature_ms5607_exit(void)
++{
++	struct sensor_operate *ops = temperature_get_ops();
++	int type = ops->type;
++	sensor_unregister_slave(type, NULL, NULL, temperature_get_ops);
++}
++
++
++module_init(temperature_ms5607_init);
++module_exit(temperature_ms5607_exit);
++
+diff --git a/include/linux/sensor-dev.h b/include/linux/sensor-dev.h
+index 24c568e2d3c8..980069ae7f23 100755
+--- a/include/linux/sensor-dev.h
++++ b/include/linux/sensor-dev.h
+@@ -32,7 +32,7 @@ enum sensor_type {
+ 	SENSOR_TYPE_LIGHT,	
+ 	SENSOR_TYPE_PROXIMITY,
+ 	SENSOR_TYPE_TEMPERATURE,	
+-	//SENSOR_TYPE_PRESSURE,
++	SENSOR_TYPE_PRESSURE,
+ 	SENSOR_NUM_TYPES
+ };
+ 
+@@ -87,10 +87,13 @@ enum sensor_id {
+ 	PROXIMITY_ID_AL3006,
+ 	PROXIMITY_ID_STK3171,
+ 	PROXIMITY_ID_AP321XX,
+-	TEMPERATURE_ID_ALL,
++	
++	TEMPERATURE_ID_ALL,	
++	TEMPERATURE_ID_MS5607,
+ 
+ 	PRESSURE_ID_ALL,
+ 	PRESSURE_ID_BMA085,
++	PRESSURE_ID_MS5607,
+ 	SENSOR_NUM_ID,
+ };
+ 
+@@ -190,6 +193,18 @@ extern int sensor_unregister_slave(int type,struct i2c_client *client,
+ #define PSENSOR_IOCTL_DISABLE       		_IOW(PSENSOR_IOCTL_MAGIC, 3, int *)
+ 
+ 
++#define PRESSURE_IOCTL_MAGIC 'r'
++#define PRESSURE_IOCTL_GET_ENABLED 		_IOR(PRESSURE_IOCTL_MAGIC, 1, int *)
++#define PRESSURE_IOCTL_ENABLE 			_IOW(PRESSURE_IOCTL_MAGIC, 2, int *)
++#define PRESSURE_IOCTL_DISABLE       		_IOW(PRESSURE_IOCTL_MAGIC, 3, int *)
++#define PRESSURE_IOCTL_SET_DELAY       		_IOW(PRESSURE_IOCTL_MAGIC, 4, int *)
++
++
++#define TEMPERATURE_IOCTL_MAGIC 't'
++#define TEMPERATURE_IOCTL_GET_ENABLED 		_IOR(TEMPERATURE_IOCTL_MAGIC, 1, int *)
++#define TEMPERATURE_IOCTL_ENABLE 		_IOW(TEMPERATURE_IOCTL_MAGIC, 2, int *)
++#define TEMPERATURE_IOCTL_DISABLE       	_IOW(TEMPERATURE_IOCTL_MAGIC, 3, int *)
++#define TEMPERATURE_IOCTL_SET_DELAY       	_IOW(TEMPERATURE_IOCTL_MAGIC, 4, int *)
+ 
+ 
+ extern int sensor_rx_data(struct i2c_client *client, char *rxData, int length);
+-- 
+2.35.3
+

@@ -1,0 +1,328 @@
+From 0b8c593910625ec39e6a01ea5aa17c2c64259c03 Mon Sep 17 00:00:00 2001
+From: Jeffy Chen <jeffy.chen@rock-chips.com>
+Date: Wed, 10 Jan 2018 17:23:41 +0100
+Subject: [PATCH] BACKPORT: drm/bridge: analogix: Do not use device's drvdata
+
+The driver that instantiates the bridge should own the drvdata, as all
+driver model callbacks (probe, remove, shutdown, PM ops, etc.) are also
+owned by its driver struct. Moreover, storing two different pointer
+types in driver data depending on driver initialization status is barely
+a good practice and in fact has led to many bugs in this driver.
+
+Let's clean up this mess and change Analogix entry points to simply
+accept some opaque struct pointer, adjusting their users at the same
+time to avoid breaking the compilation.
+
+Change-Id: Ie06ce63a5daae532df69d2447b0673b91032d61c
+Signed-off-by: Tomasz Figa <tfiga@chromium.org>
+Signed-off-by: Jeffy Chen <jeffy.chen@rock-chips.com>
+Signed-off-by: Thierry Escande <thierry.escande@collabora.com>
+Reviewed-by: Andrzej Hajda <a.hajda@samsung.com>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Acked-by: Jingoo Han <jingoohan1@gmail.com>
+Acked-by: Archit Taneja <architt@codeaurora.org>
+Signed-off-by: Heiko Stuebner <heiko@sntech.de>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180110162348.22765-2-thierry.escande@collabora.com
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+(cherry-picked from 6b2d8fd98d051f8697c45f96249dca73842a2362)
+---
+ .../drm/bridge/analogix/analogix_dp_core.c    | 49 ++++++++-----------
+ .../gpu/drm/rockchip/analogix_dp-rockchip.c   | 42 ++++++++++------
+ include/drm/bridge/analogix_dp.h              | 13 +++--
+ 3 files changed, 56 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/analogix/analogix_dp_core.c b/drivers/gpu/drm/bridge/analogix/analogix_dp_core.c
+index 877d07054823..907846f88d14 100644
+--- a/drivers/gpu/drm/bridge/analogix/analogix_dp_core.c
++++ b/drivers/gpu/drm/bridge/analogix/analogix_dp_core.c
+@@ -1179,8 +1179,9 @@ static ssize_t analogix_dpaux_transfer(struct drm_dp_aux *aux,
+ 	return analogix_dp_transfer(dp, msg);
+ }
+ 
+-int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+-		     struct analogix_dp_plat_data *plat_data)
++struct analogix_dp_device *
++analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
++		 struct analogix_dp_plat_data *plat_data)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct analogix_dp_device *dp;
+@@ -1189,14 +1190,12 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 
+ 	if (!plat_data) {
+ 		dev_err(dev, "Invalided input plat_data\n");
+-		return -EINVAL;
++		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 	dp = devm_kzalloc(dev, sizeof(struct analogix_dp_device), GFP_KERNEL);
+ 	if (!dp)
+-		return -ENOMEM;
+-
+-	dev_set_drvdata(dev, dp);
++		return ERR_PTR(-ENOMEM);
+ 
+ 	dp->dev = &pdev->dev;
+ 	dp->dpms_mode = DRM_MODE_DPMS_OFF;
+@@ -1210,7 +1209,7 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 
+ 	ret = analogix_dp_dt_parse_pdata(dp);
+ 	if (ret)
+-		return ret;
++		return ERR_PTR(ret);
+ 
+ 	dp->phy = devm_phy_get(dp->dev, "dp");
+ 	if (IS_ERR(dp->phy)) {
+@@ -1224,14 +1223,14 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 			if (ret == -ENOSYS || ret == -ENODEV)
+ 				dp->phy = NULL;
+ 			else
+-				return ret;
++				return ERR_PTR(ret);
+ 		}
+ 	}
+ 
+ 	dp->clock = devm_clk_get(&pdev->dev, "dp");
+ 	if (IS_ERR(dp->clock)) {
+ 		dev_err(&pdev->dev, "failed to get clock\n");
+-		return PTR_ERR(dp->clock);
++		return ERR_CAST(dp->clock);
+ 	}
+ 
+ 	clk_prepare_enable(dp->clock);
+@@ -1240,7 +1239,7 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 
+ 	dp->reg_base = devm_ioremap_resource(&pdev->dev, res);
+ 	if (IS_ERR(dp->reg_base))
+-		return PTR_ERR(dp->reg_base);
++		return ERR_CAST(dp->reg_base);
+ 
+ 	dp->force_hpd = of_property_read_bool(dev->of_node, "force-hpd");
+ 
+@@ -1252,19 +1251,19 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 	if (IS_ERR(dp->hpd_gpio)) {
+ 		ret = PTR_ERR(dp->hpd_gpio);
+ 		dev_err(dev, "failed to request hpd GPIO: %d\n", ret);
+-		return ret;
++		return ERR_PTR(ret);
+ 	}
+ 
+ 	dp->irq = platform_get_irq(pdev, 0);
+ 	if (dp->irq == -ENXIO) {
+ 		dev_err(&pdev->dev, "failed to get irq\n");
+-		return -ENODEV;
++		return ERR_PTR(-ENODEV);
+ 	}
+ 
+ 	if (dp->plat_data->panel) {
+ 		if (drm_panel_prepare(dp->plat_data->panel)) {
+ 			DRM_ERROR("failed to setup the panel\n");
+-			return -EBUSY;
++			return ERR_PTR(-EBUSY);
+ 		}
+ 	}
+ 
+@@ -1278,7 +1277,7 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 						"analogix-hpd", dp);
+ 		if (ret) {
+ 			dev_err(dev, "failed to request hpd IRQ: %d\n", ret);
+-			return ret;
++			return ERR_PTR(ret);
+ 		}
+ 	}
+ 
+@@ -1288,7 +1287,7 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 					0, "analogix-dp", dp);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to request host irq\n");
+-		return ret;
++		return ERR_PTR(ret);
+ 	}
+ 	disable_irq(dp->irq);
+ 
+@@ -1301,7 +1300,7 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 
+ 	ret = drm_dp_aux_register(&dp->aux);
+ 	if (ret)
+-		return ret;
++		return ERR_PTR(ret);
+ 
+ 	pm_runtime_enable(dev);
+ 	pm_runtime_get_sync(dp->dev);
+@@ -1314,21 +1313,18 @@ int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+ 		goto err_disable_pm_runtime;
+ 	}
+ 
+-	return 0;
++	return dp;
+ 
+ err_disable_pm_runtime:
+ 	pm_runtime_put(dp->dev);
+ 	pm_runtime_disable(dev);
+ 
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(analogix_dp_bind);
+ 
+-void analogix_dp_unbind(struct device *dev, struct device *master,
+-			void *data)
++void analogix_dp_unbind(struct analogix_dp_device *dp)
+ {
+-	struct analogix_dp_device *dp = dev_get_drvdata(dev);
+-
+ 	analogix_dp_bridge_disable(dp->bridge);
+ 	dp->connector.funcs->destroy(&dp->connector);
+ 	dp->encoder->funcs->destroy(dp->encoder);
+@@ -1342,16 +1338,14 @@ void analogix_dp_unbind(struct device *dev, struct device *master,
+ 
+ 	drm_dp_aux_unregister(&dp->aux);
+ 	pm_runtime_put(dp->dev);
+-	pm_runtime_disable(dev);
++	pm_runtime_disable(dp->dev);
+ 	clk_disable_unprepare(dp->clock);
+ }
+ EXPORT_SYMBOL_GPL(analogix_dp_unbind);
+ 
+ #ifdef CONFIG_PM
+-int analogix_dp_suspend(struct device *dev)
++int analogix_dp_suspend(struct analogix_dp_device *dp)
+ {
+-	struct analogix_dp_device *dp = dev_get_drvdata(dev);
+-
+ 	clk_disable_unprepare(dp->clock);
+ 
+ 	if (dp->plat_data->panel) {
+@@ -1363,9 +1357,8 @@ int analogix_dp_suspend(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(analogix_dp_suspend);
+ 
+-int analogix_dp_resume(struct device *dev)
++int analogix_dp_resume(struct analogix_dp_device *dp)
+ {
+-	struct analogix_dp_device *dp = dev_get_drvdata(dev);
+ 	int ret;
+ 
+ 	ret = clk_prepare_enable(dp->clock);
+diff --git a/drivers/gpu/drm/rockchip/analogix_dp-rockchip.c b/drivers/gpu/drm/rockchip/analogix_dp-rockchip.c
+index 00abf3eced17..a8312cf0871c 100644
+--- a/drivers/gpu/drm/rockchip/analogix_dp-rockchip.c
++++ b/drivers/gpu/drm/rockchip/analogix_dp-rockchip.c
+@@ -66,6 +66,7 @@ struct rockchip_dp_device {
+ 
+ 	const struct rockchip_dp_chip_data *data;
+ 
++	struct analogix_dp_device *adp;
+ 	struct analogix_dp_plat_data plat_data;
+ };
+ 
+@@ -376,12 +377,6 @@ static int rockchip_dp_bind(struct device *dev, struct device *master,
+ 	}
+ 
+ 	dp->plat_data.panel = panel;
+-	/*
+-	 * Just like the probe function said, we don't need the
+-	 * device drvrate anymore, we should leave the charge to
+-	 * analogix dp driver, set the device drvdata to NULL.
+-	 */
+-	dev_set_drvdata(dev, NULL);
+ 
+ 	dp_data = of_device_get_match_data(dev);
+ 	if (!dp_data)
+@@ -408,13 +403,19 @@ static int rockchip_dp_bind(struct device *dev, struct device *master,
+ 	dp->plat_data.power_off = rockchip_dp_powerdown;
+ 	dp->plat_data.get_modes = rockchip_dp_get_modes;
+ 
+-	return analogix_dp_bind(dev, dp->drm_dev, &dp->plat_data);
++	dp->adp = analogix_dp_bind(dev, dp->drm_dev, &dp->plat_data);
++	if (IS_ERR(dp->adp))
++		return PTR_ERR(dp->adp);
++
++	return 0;
+ }
+ 
+ static void rockchip_dp_unbind(struct device *dev, struct device *master,
+ 			       void *data)
+ {
+-	return analogix_dp_unbind(dev, master, data);
++	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
++
++	analogix_dp_unbind(dp->adp);
+ }
+ 
+ static const struct component_ops rockchip_dp_component_ops = {
+@@ -433,11 +434,6 @@ static int rockchip_dp_probe(struct platform_device *pdev)
+ 
+ 	dp->dev = dev;
+ 
+-	/*
+-	 * We just use the drvdata until driver run into component
+-	 * add function, and then we would set drvdata to null, so
+-	 * that analogix dp driver could take charge of the drvdata.
+-	 */
+ 	platform_set_drvdata(pdev, dp);
+ 
+ 	return component_add(dev, &rockchip_dp_component_ops);
+@@ -450,10 +446,26 @@ static int rockchip_dp_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int rockchip_dp_suspend(struct device *dev)
++{
++	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
++
++	return analogix_dp_suspend(dp->adp);
++}
++
++static int rockchip_dp_resume(struct device *dev)
++{
++	struct rockchip_dp_device *dp = dev_get_drvdata(dev);
++
++	return analogix_dp_resume(dp->adp);
++}
++#endif
++
+ static const struct dev_pm_ops rockchip_dp_pm_ops = {
+ #ifdef CONFIG_PM_SLEEP
+-	.suspend_late = analogix_dp_suspend,
+-	.resume_early = analogix_dp_resume,
++	.suspend = rockchip_dp_suspend,
++	.resume_early = rockchip_dp_resume,
+ #endif
+ };
+ 
+diff --git a/include/drm/bridge/analogix_dp.h b/include/drm/bridge/analogix_dp.h
+index d51a694eb9ee..05c73743c6da 100644
+--- a/include/drm/bridge/analogix_dp.h
++++ b/include/drm/bridge/analogix_dp.h
+@@ -13,6 +13,8 @@
+ 
+ #include <drm/drm_crtc.h>
+ 
++struct analogix_dp_device;
++
+ enum analogix_dp_devtype {
+ 	EXYNOS_DP,
+ 	ROCKCHIP_DP,
+@@ -39,11 +41,12 @@ struct analogix_dp_plat_data {
+ 			 struct drm_connector *);
+ };
+ 
+-int analogix_dp_resume(struct device *dev);
+-int analogix_dp_suspend(struct device *dev);
++int analogix_dp_resume(struct analogix_dp_device *dp);
++int analogix_dp_suspend(struct analogix_dp_device *dp);
+ 
+-int analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
+-		     struct analogix_dp_plat_data *plat_data);
+-void analogix_dp_unbind(struct device *dev, struct device *master, void *data);
++struct analogix_dp_device *
++analogix_dp_bind(struct device *dev, struct drm_device *drm_dev,
++		 struct analogix_dp_plat_data *plat_data);
++void analogix_dp_unbind(struct analogix_dp_device *dp);
+ 
+ #endif /* _ANALOGIX_DP_H_ */
+-- 
+2.35.3
+

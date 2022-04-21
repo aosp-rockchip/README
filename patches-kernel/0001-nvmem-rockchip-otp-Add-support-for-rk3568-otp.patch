@@ -1,0 +1,143 @@
+From 92b14c36c7308a72afe75dfa7e3ac91c93d6adca Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Thu, 12 Nov 2020 16:24:14 +0800
+Subject: [PATCH] nvmem: rockchip-otp: Add support for rk3568-otp
+
+This adds the necessary data for handling efuse on the rk3568.
+
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+Change-Id: Ia74d77b68a6303223eaccdc08e882851a917f50f
+---
+ .../bindings/nvmem/rockchip-otp.txt           |  1 +
+ drivers/nvmem/rockchip-otp.c                  | 82 +++++++++++++++++++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/nvmem/rockchip-otp.txt b/Documentation/devicetree/bindings/nvmem/rockchip-otp.txt
+index 5fec29725aa4..f4cdd4380b79 100644
+--- a/Documentation/devicetree/bindings/nvmem/rockchip-otp.txt
++++ b/Documentation/devicetree/bindings/nvmem/rockchip-otp.txt
+@@ -4,6 +4,7 @@ Required properties:
+ - compatible: Should be one of the following.
+   - "rockchip,px30-otp" - for PX30 SoCs.
+   - "rockchip,rk3308-otp" - for RK3308 SoCs.
++  - "rockchip,rk3568-otp" - for RK3568 SoCs.
+   - "rockchip,rv1126-otp" - for RV1126 SoCs.
+ - reg: Must contain an entry with the physical base address and length
+   for each entry in reg-names.
+diff --git a/drivers/nvmem/rockchip-otp.c b/drivers/nvmem/rockchip-otp.c
+index ec09bac0c0f1..9b5c02195f4d 100644
+--- a/drivers/nvmem/rockchip-otp.c
++++ b/drivers/nvmem/rockchip-otp.c
+@@ -54,6 +54,7 @@
+ 
+ #define OTPC_TIMEOUT			10000
+ #define OTPC_TIMEOUT_PROG		100000
++#define RK3568_NBYTES			2
+ 
+ #define RV1126_OTP_NVM_CEB		0x00
+ #define RV1126_OTP_NVM_RSTB		0x04
+@@ -249,6 +250,72 @@ static int px30_otp_read(void *context, unsigned int offset, void *val,
+ 	return ret;
+ }
+ 
++static int rk3568_otp_read(void *context, unsigned int offset, void *val,
++			   size_t bytes)
++{
++	struct rockchip_otp *otp = context;
++	unsigned int addr_start, addr_end, addr_offset, addr_len;
++	u32 out_value;
++	u8 *buf;
++	int ret = 0, i = 0;
++
++	addr_start = rounddown(offset, RK3568_NBYTES) / RK3568_NBYTES;
++	addr_end = roundup(offset + bytes, RK3568_NBYTES) / RK3568_NBYTES;
++	addr_offset = offset % RK3568_NBYTES;
++	addr_len = addr_end - addr_start;
++
++	buf = kzalloc(array3_size(addr_len, RK3568_NBYTES, sizeof(*buf)),
++		      GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	ret = clk_bulk_prepare_enable(otp->num_clks, otp->clks);
++	if (ret < 0) {
++		dev_err(otp->dev, "failed to prepare/enable clks\n");
++		goto out;
++	}
++
++	ret = rockchip_otp_reset(otp);
++	if (ret) {
++		dev_err(otp->dev, "failed to reset otp phy\n");
++		goto disable_clks;
++	}
++
++	ret = px30_otp_ecc_enable(otp, false);
++	if (ret < 0) {
++		dev_err(otp->dev, "rockchip_otp_ecc_enable err\n");
++		goto disable_clks;
++	}
++
++	writel(OTPC_USE_USER | OTPC_USE_USER_MASK, otp->base + OTPC_USER_CTRL);
++	udelay(5);
++	while (addr_len--) {
++		writel(addr_start++ | OTPC_USER_ADDR_MASK,
++		       otp->base + OTPC_USER_ADDR);
++		writel(OTPC_USER_FSM_ENABLE | OTPC_USER_FSM_ENABLE_MASK,
++		       otp->base + OTPC_USER_ENABLE);
++		ret = px30_otp_wait_status(otp, OTPC_USER_DONE);
++		if (ret < 0) {
++			dev_err(otp->dev, "timeout during read setup\n");
++			goto read_end;
++		}
++		out_value = readl(otp->base + OTPC_USER_Q);
++		memcpy(&buf[i], &out_value, RK3568_NBYTES);
++		i += RK3568_NBYTES;
++	}
++
++	memcpy(val, buf + addr_offset, bytes);
++
++read_end:
++	writel(0x0 | OTPC_USE_USER_MASK, otp->base + OTPC_USER_CTRL);
++disable_clks:
++	clk_bulk_disable_unprepare(otp->num_clks, otp->clks);
++out:
++	kfree(buf);
++
++	return ret;
++}
++
+ static int rv1126_otp_init(struct rockchip_otp *otp)
+ {
+ 	u32 status = 0;
+@@ -429,6 +496,17 @@ static const struct rockchip_data px30_data = {
+ 	.reg_read = px30_otp_read,
+ };
+ 
++static const char * const rk3568_otp_clocks[] = {
++	"usr", "sbpi", "apb", "phy",
++};
++
++static const struct rockchip_data rk3568_data = {
++	.size = 0x80,
++	.clocks = rk3568_otp_clocks,
++	.num_clks = ARRAY_SIZE(rk3568_otp_clocks),
++	.reg_read = rk3568_otp_read,
++};
++
+ static const char * const rv1126_otp_clocks[] = {
+ 	"otp", "apb_pclk",
+ };
+@@ -451,6 +529,10 @@ static const struct of_device_id rockchip_otp_match[] = {
+ 		.compatible = "rockchip,rk3308-otp",
+ 		.data = (void *)&px30_data,
+ 	},
++	{
++		.compatible = "rockchip,rk3568-otp",
++		.data = (void *)&rk3568_data,
++	},
+ 	{
+ 		.compatible = "rockchip,rv1126-otp",
+ 		.data = (void *)&rv1126_data,
+-- 
+2.35.3
+

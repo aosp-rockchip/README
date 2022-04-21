@@ -1,0 +1,577 @@
+From c3ff5f81cae69d06ad6bc4b17f090f585b6822ce Mon Sep 17 00:00:00 2001
+From: cym <cym@rock-chips.com>
+Date: Thu, 30 Sep 2010 17:56:16 +0800
+Subject: [PATCH] =?UTF-8?q?=E4=BF=AE=E6=94=B9=E4=B8=8D=E8=83=BD=E9=87=8D?=
+ =?UTF-8?q?=E5=90=AF=EF=BC=88reboot=EF=BC=89=E7=9A=84BUG,reboot=E5=89=8Ddd?=
+ =?UTF-8?q?r=E9=99=8D=E9=A2=91=E5=88=B0136M=EF=BC=8Carm=E9=99=8D=E9=A2=912?=
+ =?UTF-8?q?4M=EF=BC=8C=E5=85=B3=E9=97=ADdsp=EF=BC=8C=E5=85=B3=E9=97=ADlcdc?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ arch/arm/mach-rk2818/clock.c                  | 112 ++++++++
+ arch/arm/mach-rk2818/ddr.c                    | 244 ++++++++++++------
+ arch/arm/mach-rk2818/include/mach/scu.h       |   5 +-
+ .../staging/rk2818/rk2818_dsp/rk2818_dsp.c    |  47 ++++
+ .../rk2818/rk2818_power/rk2818_power.c        |  23 +-
+ 5 files changed, 356 insertions(+), 75 deletions(-)
+
+diff --git a/arch/arm/mach-rk2818/clock.c b/arch/arm/mach-rk2818/clock.c
+index 427846987b74..6305d4881826 100644
+--- a/arch/arm/mach-rk2818/clock.c
++++ b/arch/arm/mach-rk2818/clock.c
+@@ -303,6 +303,8 @@ void __tcmfunc tcm_udelay(unsigned long usecs, unsigned long arm_freq_mhz)
+ 
+ #define ARM_PLL_IDX	0
+ #define DSP_PLL_IDX	1
++#define CODEC_PLL_IDX   2
++
+ 
+ static void scu_hw_pll_wait_lock(int pll_idx, int delay)
+ {
+@@ -584,6 +586,61 @@ static int rockchip_scu_set_dsp_pllclk_hw(const struct rockchip_pll_set *ps)
+ 	return 0;
+ }
+ 
++static int rockchip_scu_set_codec_pllclk_hw(const struct rockchip_pll_set *ps)
++{
++	const int delay = OTHER_PLL_DELAY;
++
++	if (ps->clk_hz == 24 * SCU_CLK_MHZ) {
++//		dsp_pll_clk_slow_mode(1);
++		/* 20100615,HSL@RK,when power down,set pll out=300 M. */
++		scu_writel_force(ps->pll_con, SCU_CPLL_CON);
++		pr_debug("codec power down\n");
++		tcm_udelay(1, 600);
++		scu_writel_force(scu_readl(SCU_CPLL_CON) | PLL_PD, SCU_CPLL_CON);
++	} else {
++		u32 reg_val;
++
++//		dsp_pll_clk_slow_mode(1);
++
++		reg_val = scu_readl(SCU_CPLL_CON);
++		if (reg_val & PLL_PD) {
++			scu_writel_force(reg_val & ~PLL_PD, SCU_CPLL_CON);
++			pr_debug("codec pll power on, set to %d, delay = %d\n", ps->clk_hz, delay);
++			scu_hw_pll_wait_lock(CODEC_PLL_IDX, delay * 2);
++		}
++
++		/* XXX:delay for pll state , for 0.3ms , clkf will lock clkf */
++		/* 鍙兘灞忓箷浼氬€掑姩,濡傛灉涓嶄慨鏀?clkr鍜宑lkf鍒欎笉鐢ㄨ繘鍏low mode . */
++		scu_writel_force(ps->pll_con, SCU_CPLL_CON);
++		scu_hw_pll_wait_lock(CODEC_PLL_IDX, delay);
++
++//		dsp_pll_clk_slow_mode(0);
++	}
++
++	return 0;
++}
++
++#define CODEC_PLL(_clk_hz, nr, nf, od) \
++{							\
++	.clk_hz		= _clk_hz,			\
++	.pll_con	= PLL_SAT | PLL_FAST | PLL_CLKR(nr-1) | PLL_CLKF(nf-1) | PLL_CLKOD(od-1), \
++}
++
++static const struct rockchip_pll_set codec_pll[] = {
++// clk_hz = 24*clkf/(clkr*clkod) clkr clkf clkod
++	CODEC_PLL(600 * SCU_CLK_MHZ, 6, 150, 1),
++	CODEC_PLL(560 * SCU_CLK_MHZ, 6, 140, 1),
++//	CODEC_PLL(500 * SCU_CLK_MHZ, 6, 125, 1),
++//	CODEC_PLL(450 * SCU_CLK_MHZ, 4,  75, 1),
++//	CODEC_PLL(400 * SCU_CLK_MHZ, 6, 100, 1),
++#if MAYCHG_VDD
++	CODEC_PLL(364 * SCU_CLK_MHZ, 6,  91, 1),	// VDD_110 for ddr 364M will crash.
++#endif
++	// pll power down.
++	CODEC_PLL( 136 * SCU_CLK_MHZ, 6,  34*2,2),
++	CODEC_PLL( 24 * SCU_CLK_MHZ, 4,  50, 1),	// POWER down,by the real clk = 300M
++};
++
+ #define DSP_PLL(_clk_hz, nr, nf, od) \
+ {							\
+ 	.clk_hz		= _clk_hz,			\
+@@ -1467,6 +1524,61 @@ void clk_recalculate_root_clocks(void)
+ 	UNLOCK();
+ }
+ 
++
++
++
++static int register_show (void)
++{
++	printk("SCU_APLL_CON     : 0x%08x\n", scu_readl(SCU_APLL_CON));
++	printk("SCU_DPLL_CON     : 0x%08x\n", scu_readl(SCU_DPLL_CON));
++	printk("SCU_CPLL_CON     : 0x%08x\n", scu_readl(SCU_CPLL_CON));
++	printk("SCU_MODE_CON     : 0x%08x\n", scu_readl(SCU_MODE_CON));
++	printk("SCU_PMU_CON      : 0x%08x\n", scu_readl(SCU_PMU_CON));
++	printk("SCU_CLKSEL0_CON  : 0x%08x\n", scu_readl(SCU_CLKSEL0_CON));
++	printk("SCU_CLKSEL1_CON  : 0x%08x\n", scu_readl(SCU_CLKSEL1_CON));
++	printk("SCU_CLKGATE0_CON : 0x%08x\n", scu_readl(SCU_CLKGATE0_CON));
++	printk("SCU_CLKGATE1_CON : 0x%08x\n", scu_readl(SCU_CLKGATE1_CON));
++	printk("SCU_CLKGATE2_CON : 0x%08x\n", scu_readl(SCU_CLKGATE2_CON));
++	printk("SCU_SOFTRST_CON : 0x%08x\n", scu_readl(SCU_SOFTRST_CON));
++	printk("SCU_CHIPCFG_CON : 0x%08x\n", scu_readl(SCU_CHIPCFG_CON));
++	printk("SCU_CPUPD : 0x%08x\n", scu_readl(SCU_CPUPD));
++	printk("SCU_CLKSEL2_CON  : 0x%08x\n", scu_readl(SCU_CLKSEL2_CON));
++}
++
++
++
++static void scu_ddr_early_suspend(void)
++{
++	static const struct rockchip_pll_set arm_tmp_pll =ARM_PLL(192 * SCU_CLK_MHZ, 4, 96, 3,  4, 11, 41, 1);
++	static const struct rockchip_pll_set arm_tmp_pll2 =ARM_PLL( 24 * SCU_CLK_MHZ, 4, 48, 1,  6, 11, 21, 0);
++
++//	register_show();
++
++	rockchip_scu_set_arm_pllclk_hw(&arm_tmp_pll);
++
++	ddr_change_mode(0 );
++
++	scu_writel_force(scu_readl(SCU_CLKGATE0_CON)&~(0x1<<11), SCU_CLKGATE0_CON);
++	scu_writel_force(scu_readl(SCU_CLKGATE1_CON)&~(0x1<<19), SCU_CLKGATE1_CON);
++	scu_writel_force(((scu_readl(SCU_CLKSEL0_CON)&~(0xff<<8))|(0x05<<8)), SCU_CLKSEL0_CON);
++
++	change_ddr_freq(136);
++
++	rockchip_scu_set_arm_pllclk_hw(&arm_tmp_pll2);
++
++//	register_show();
++}
++
++
++void scu_set_clk_for_reboot( void)
++{
++ //       scu_unlock_arm_force(); /* for force change freq. */
++        scu_ddr_early_suspend( );
++        //ddr_change_mode( 1 );
++ //       rockchip_clk_set_arm( 24 ) ; /* for loader , maskrom , AHB 1:1--do it at rk281x_reboot */
++}
++
++
+ /**
+  * clk_preinit - initialize any fields in the struct clk before clk init
+  * @clk: struct clk * to initialize
+diff --git a/arch/arm/mach-rk2818/ddr.c b/arch/arm/mach-rk2818/ddr.c
+index f18fd5512619..83671c539cae 100644
+--- a/arch/arm/mach-rk2818/ddr.c
++++ b/arch/arm/mach-rk2818/ddr.c
+@@ -1736,6 +1736,24 @@ static void __tcmfunc  ddr_change_freq( int freq_MHZ )
+ }
+ void change_ddr_freq(int freq_MHZ)
+ {
++
++#if 0
++		g_intcReg->FIQ_INTEN &= 0x0;
++		g_intcReg->IRQ_INTEN_H &= 0x0;
++		g_intcReg->IRQ_INTEN_L &= 0x0;
++		g_intcReg->IRQ_INTMASK_L &= 0x0;
++		g_intcReg->IRQ_INTMASK_H &= 0x0;	
++#endif
++#if 0	
++	uint32 i;
++	uint32 *p;
++		for(i=0;i<93; i++)
++		{
++			p = (uint32 *)(DDR_REG_BASE + (4*i));
++			printk("DDR Reg[%d]=0x%x\n", i, *p);
++		}
++#endif
++
+         unsigned long flags;
+         local_irq_save(flags);
+         DDR_SAVE_SP;
+@@ -1747,6 +1765,18 @@ void change_ddr_freq(int freq_MHZ)
+ #define change_ddr_freq( mhz )
+ #endif
+ 
++/* change ddr to mode :1:performance , 0:power save*/
++/* 20100909,HSL@RK,exchange performance and power save */
++void ddr_change_mode( int performance )
++{
++        if( performance ){
++                pDDR_Reg->CTRL_REG_63 = 0x0000ffff; 
++         } else {
++                pDDR_Reg->CTRL_REG_63 = 200 ; //  0x64; 
++        }
++}  
++
++
+ /****************************************************************/
+ //������:SDRAM_Init
+ //����:SDRAM��ʼ��
+@@ -1913,87 +1943,157 @@ static void __tcmlocalfunc rk2818_reduce_armfrq(void)
+ }
+ static void __tcmfunc rk281x_reboot( void )
+ {
++	uint32 i;
++	uint32 *p;
+ #define pSCU_Reg	((pSCU_REG)SCU_BASE_ADDR_VA)
+ #define g_intcReg 	((pINTC_REG)(INTC_BASE_ADDR_VA))
+ #if 0
+-		g_intcReg->FIQ_INTEN &= 0x0;
+-		g_intcReg->IRQ_INTEN_H &= 0x0;
+-		g_intcReg->IRQ_INTEN_L &= 0x0;
+-		g_intcReg->IRQ_INTMASK_L &= 0x0;
+-		g_intcReg->IRQ_INTMASK_H &= 0x0;	
++	g_intcReg->FIQ_INTEN &= 0x0;
++	g_intcReg->IRQ_INTEN_H &= 0x0;
++	g_intcReg->IRQ_INTEN_L &= 0x0;
++	g_intcReg->IRQ_INTMASK_L &= 0x0;
++	g_intcReg->IRQ_INTMASK_H &= 0x0;	
+ #endif		
+-		//rk2818_reduce_armfrq();
+-		disable_DDR_Sleep();
+-		printk("start reboot!!!\n");
+-		asm( "MRC p15,0,r0,c1,c0,0\n"
+-				"BIC r0,r0,#(1<<0)	   @disable mmu\n"
+-				"BIC r0,r0,#(1<<13)    @set vector to 0x00000000\n"
+-				"MCR p15,0,r0,c1,c0,0\n"
+-				"mov r1,r1\n"
+-				"mov r1,r1\n" 
+-							
+-
+-				"ldr r2,=0x18018000        @ set dsp power domain on\n"
+-  				"ldr r3,[r2,#0x10]\n"
+-  				"bic r3,r3,#(1<<0)\n"
+-  				"str r3,[r2,#0x10]\n"
+-  
+- 				" ldr r3,[r2,#0x24]     @ enable dsp ahb clk\n"
+-  				"bic r3,r3,#(1<<2)\n"
+-  				"str r3,[r2,#0x24]\n"
+-  
+-  				"ldr r3,[r2,#0x1c]     @ gate 0 ,enable dsp clk\n"
+-  				"bic r3,r3,#(1<<1)\n"
+-  				"str r3,[r2,#0x1c]\n"
+-  
+-  				"ldr r3,[r2,#0x28]     @dsp soft reset , for dsp l2 cache as maskrom stack.\n"
+-  				"ORR r3,r3,#((1<<5))\n"
+-  				"str r3,[r2,#0x28]\n"
+-  				"BIC r3,r3,#((1<<5))\n"
+-  				"str r3,[r2,#0x28]\n"
+-
+-				"ldr r2,=0x18018000      @ enable sram arm dsp clock\n"
+-  				"ldr r3,[r2,#0x1c]\n"
+-  				"bic r3,r3,#(1<<3)\n"
+-  				"bic r3,r3,#(1<<4)\n"
+-  				"str r3,[r2,#0x1c]\n"
+-				
++	//rk2818_reduce_armfrq();
++	//printk("disable DDR sleep!!!\n");
++	//disable_DDR_Sleep();
++	printk("start reboot!!!\n");
++	#if 0
++	for(i=0;i<93; i++)
++	{
++		p = (uint32 *)(DDR_REG_BASE + (4*i));
++		printk("DDR Reg[%d]=0x%x\n", i, *p);
++	}
++	#else
++	//WAIT_ME();
++	#endif
++	asm(    
++		"ldr r6,=0x18018000      @ get scu reg base first.\n"
++                "ldr r7,=0x10002FF8     @load sram for stack.\n"
++                "mov r0,#0\n"
++		"MCR  p15, 0, r0, c7, c7, 0    @flush I-cache & D-cache\n"
++		"MRC p15,0,r0,c1,c0,0\n"
++		"BIC r0,r0,#(1<<2)	@ disable Dcache \n"
++		"BIC r0,r0,#(1<<12)     @ disable Icache \n"
++		"MCR p15,0,r0,c1,c0,0\n"
++			
++		"MRC p15,0,r0,c1,c0,0\n"
++		"BIC r0,r0,#(1<<0)	   @disable mmu\n"
++		"BIC r0,r0,#(1<<13)    @set vector to 0x00000000\n"
++		"MCR p15,0,r0,c1,c0,0\n"
++		"mov r1,r1\n"
++		"mov r1,r1\n" 
++		"mov r1,r1\n"
++
++                "mov sp , r7\n"     // set SP for call other functions at itcm.
++                // print char '0'
++		//"mov r0,#0x30\n"
++		//"bl ddr_put_char\n"
+ 				
+-				 "ldr r2,=0x10040804        @usb soft disconnect.\n"
+-                 		" mov r3,#2\n"
+-               		 "str r3,[r2,#0]\n"
++		//"ldr r2,=0x18018000      @ enable sram arm dsp clock\n"
++		//"mov    r2,r6\n"
++		"ldr r3,[r6,#0x1c]\n"
++		"bic r3,r3,#(1<<3)\n"
++		"bic r3,r3,#(1<<4)\n"
++		"str r3,[r6,#0x1c]\n"
+ 
+ 				
++		// print char 'A'
++		//"mov r0,#0x41\n"
++		//"bl ddr_put_char\n"
++				
++		"ldr r3,[r6,#0x1c]         @ITCM not map to address 0, it is right in linux system\n"
++		"bic r3,r3,#(1<<15)      @maskrom clock enable\n"
++		"bic r3,r3,#(1<<8)       @nandc clock enable\n"
++		"bic r3,r3,#(1<<22)      @spi0 clock enable\n"
++		"bic r3,r3,#(1<<18)      @uart0 clock enable\n"
++		"bic r3,r3,#(1<<6)       @usb clock enable\n"
++		"bic r3,r3,#(1<<7)\n"
++		"bic r3,r3,#(1<<9)       @intc clock enable\n"
++		"bic r3,r3,#(1<<5)       @hif clock enable\n"
++		"str r3,[r6,#0x1c]\n"
++
++                // print char '1'
++		//"mov r0,#0x31\n"
++		//"bl ddr_put_char\n"
++
++		"ldr r2,=0x10040804        @usb soft disconnect.\n"
++       		" mov r3,#2\n"
++	        "str r3,[r2,#0]\n"
++
++	        "ldr r2,=0x100AE00C       @ BCH reset.\n"
++		" mov r3,#1\n"
++		"str r3,[r2,#0]\n"
++                		
++		"ldr r3,[r6,#0x14]       @ARM:AHB=1:1, AHB:APB=2:1\n"
++		"bic r3,r3,#0xF\n"
++		"orr r3,r3,#0x4\n"
++		"str r3,[r6,#0x14]\n"
++
++                // print char 'B'
++		//"mov r0,#0x42\n"
++		//"bl ddr_put_char\n"
++				
++		"ldr r3,[r6,#0x28]      @reset nandc\n"
++		"orr r3,r3,#(1<<3)\n"
++		"orr r3,r3,#(1<<0)\n"
++		"orr r3,r3,#(1<<11)\n"
++		"orr r3,r3,#(1<<12)\n"
++		//"orr r3,r3,#(1<<14)  @reset uart1\n"
++		"orr r3,r3,#(1<<15)\n"
++		"str r3,[r6,#0x28]\n"
++			
++		"mov r0,#1000\n"
++		"bl ddr_pll_delay\n"
++				
++		//"ldr r2,=0x18018000\n"
++		"ldr r3,[r6,#0x28]\n"
++		"bic r3,r3,#(1<<3)\n"
++		"bic r3,r3,#(1<<0)\n"
++		"bic r3,r3,#(1<<11)\n"
++		"bic r3,r3,#(1<<12)\n"
++		"bic r3,r3,#(1<<14)\n"
++		"bic r3,r3,#(1<<15)\n"
++		"str r3,[r6,#0x28]\n"
++
++		"mov r0,#100\n"
++		"bl ddr_pll_delay\n"
++
++	        // print char '2'
++		//"mov r0,#0x32\n"
++		//"bl ddr_put_char\n"
++			
++		//"ldr r2,=0x18018000\n"
++		"ldr r3,[r6,#0x18]      @uart0 use 24MHz clock\n"
++		"bic r3,r3,#(1<<31)\n"
++		"str r3,[r6,#0x18]\n"
++				
++		"ldr r6,=0x18019000        @ DisableRemap\n"
++		"ldr r3,[r6,#0x14]\n"
++		"bic r3,r3,#(1<<0)\n"
++		"bic r3,r3,#(1<<1)\n"
++		"str r3,[r6,#0x14]\n"
+ 
+-               		 "ldr r2,=0x100AE00C       @ BCH reset.\n"
+-                		" mov r3,#1\n"
+-                		"str r3,[r2,#0]\n"
+-
+-				"MRC p15,0,r0,c1,c0,0\n"
+-				"BIC r0,r0,#(1<<2)	@ disable IDcache \n"
+-				"MCR p15,0,r0,c1,c0,0\n"
+-				"mov r0,#0\n"
+-				"MCR  p15, 0, r0, c7, c7, 0    @flush I-cache & D-cache\n"
+-
+-				"ldr r2,=0x18019000        @ DisableRemap\n"
+-  				"ldr r3,[r2,#0x14]\n"
+-  				"bic r3,r3,#(1<<0)\n"
+-  				"bic r3,r3,#(1<<1)\n"
+-  				"str r3,[r2,#0x14]\n"
+-
+-                #if 0
+-				"ldr r2,=0x18009000       @rk2818_reduce_corevoltage\n"
+-				"ldr r3,[r2,#0x24]\n"
+-				"bic r3,#(1<<6)\n"
+-				"str r3,[r2,#0x24]\n"
+-				"ldr r3,[r2,#0x28]\n"
+-				"bic r3,#(1<<6)\n"
+-				"str r3,[r2,#0x28]\n"
+-                #endif
+-				"mov r12,#0\n"
+-				"mov pc ,r12\n"
+-				);
++		"ldr r3,[r6,#0x10]   @hif interface enable\n"
++		"orr r3,r3,#(1<<27)\n"
++		"str r3,[r6,#0x10]\n"
++
++                // print char '3'
++		//"mov r0,#0x33\n"
++		//"bl ddr_put_char\n"
+ 
++#if 0
++		"ldr r2,=0x18009000       @rk2818_reduce_corevoltage\n"
++		"ldr r3,[r2,#0x24]\n"
++		"bic r3,#(1<<6)\n"
++		"str r3,[r2,#0x24]\n"
++		"ldr r3,[r2,#0x28]\n"
++		"bic r3,#(1<<6)\n"
++		"str r3,[r2,#0x28]\n"
++                #endif
++		"mov r12,#0\n"
++		"mov pc ,r12\n"
++		);
+ }
+ 
+ void(*rk2818_reboot)(void )= (void(*)(void ))rk281x_reboot;
+diff --git a/arch/arm/mach-rk2818/include/mach/scu.h b/arch/arm/mach-rk2818/include/mach/scu.h
+index 5fa4ee4485a6..b2485acc1ebd 100644
+--- a/arch/arm/mach-rk2818/include/mach/scu.h
++++ b/arch/arm/mach-rk2818/include/mach/scu.h
+@@ -124,5 +124,8 @@ extern void __tcmfunc ddr_pll_delay( int loops ) ;
+  * for example when arm run at slow mode, call tcm_udelay(usecs, 24)
+  */
+ extern void __tcmfunc tcm_udelay(unsigned long usecs, unsigned long arm_freq_mhz);
+-
++void scu_set_clk_for_reboot( void );
++void ddr_change_mode( int performance );
++void change_ddr_freq(int freq_MHZ);
++extern void kernel_restart(char *cmd);
+ #endif
+diff --git a/drivers/staging/rk2818/rk2818_dsp/rk2818_dsp.c b/drivers/staging/rk2818/rk2818_dsp/rk2818_dsp.c
+index ead1f313858c..1552a46e69c5 100755
+--- a/drivers/staging/rk2818/rk2818_dsp/rk2818_dsp.c
++++ b/drivers/staging/rk2818/rk2818_dsp/rk2818_dsp.c
+@@ -93,6 +93,8 @@ struct rk28dsp_inf {
+ 
+ 	struct clk *clk;
+ 	int clk_enabled;
++
++	int in_suspend;
+ };
+ 
+ #define SCU_BASE_ADDR_VA		RK2818_SCU_BASE
+@@ -164,6 +166,9 @@ static int wq_condition = 1;
+ static DECLARE_WAIT_QUEUE_HEAD(wq2);
+ static int wq2_condition = 0;
+ 
++static DECLARE_WAIT_QUEUE_HEAD(wq3);
++static int wq3_condition = 0;
++
+ static DECLARE_MUTEX(sem);
+ 
+ static int rcv_quit = 0;
+@@ -1172,6 +1177,47 @@ static int dsp_drv_resume(struct platform_device *pdev)
+ #define dsp_drv_resume		NULL
+ #endif /* CONFIG_PM */
+ 
++typedef struct android_early_suspend android_early_suspend_t;
++struct android_early_suspend
++{
++	struct list_head link;
++	int level;
++	void (*suspend)(android_early_suspend_t *h);
++	void (*resume)(android_early_suspend_t *h);
++};
++
++static void dsp_early_suspend(android_early_suspend_t *h)
++{
++	dspprintk(">>>>>> %s : %s\n", __FILE__, __FUNCTION__);
++	if(g_inf)
++	{
++		down(&sem);
++		if(0==g_inf->cur_req) {
++			g_inf->in_suspend = 1;
++		    up(&sem);
++		} else if(2==g_inf->cur_req){	//can not in early suspend
++		        up(&sem);
++			return;
++		} else {
++			g_inf->in_suspend = 1;
++		    wq3_condition = 0;
++		    up(&sem);
++			wait_event(wq3, wq3_condition);
++		}
++                del_timer(&g_inf->dsp_timer);
++		if(DS_SLEEP != g_inf->dsp_status ) {
++		    g_inf->dsp_status = DS_SLEEP;
++		    dsp_powerctl(DPC_SLEEP, 0);
++		    dspprintk("dsp : normal -> sleep \n");
++		}
++	}
++}
++
++static void dsp_drv_shutdown(struct platform_device *pdev)
++{
++        printk("%s:: shutdown dsp\n" , __func__ );
++        dsp_early_suspend( NULL );
++}
+ 
+ static struct platform_driver dsp_driver = {
+ 	.probe		= dsp_drv_probe,
+@@ -1181,6 +1227,7 @@ static struct platform_driver dsp_driver = {
+ 	.driver		= {
+ 		.name	= "rk28-dsp",
+ 	},
++	.shutdown       = dsp_drv_shutdown,
+ };
+ 
+ static int __init rk2818_dsp_init(void)
+diff --git a/drivers/staging/rk2818/rk2818_power/rk2818_power.c b/drivers/staging/rk2818/rk2818_power/rk2818_power.c
+index fffd1f0bd625..c9060f8f962e 100644
+--- a/drivers/staging/rk2818/rk2818_power/rk2818_power.c
++++ b/drivers/staging/rk2818/rk2818_power/rk2818_power.c
+@@ -24,6 +24,7 @@
+ #include <mach/gpio.h>
+ #include <mach/hardware.h>
+ #include <mach/rk2818_iomap.h>
++#include <mach/scu.h>
+ 
+ /***************
+ *	 DEBUG
+@@ -46,14 +47,32 @@ extern void setup_mm_for_reboot(char mode);
+  * boot : 0: normal , 1: loader , 2: maskrom , 3:recovery
+  *
+  */
++void rk2818_soft_restart( void )
++{
++	scu_set_clk_for_reboot( );   // MUST slow down ddr freq
++	rk2818_reboot( );	// normal 
++}
++
++
++
++static void rk_reboot( void)
++{
++	local_irq_disable();
++//	cpu_proc_fin();
++       setup_mm_for_reboot('r');
++	rk2818_soft_restart();
++}
++
++
++
++
+ 
+  int rk2818_restart( int	mode, const char *cmd) 
+ {
+ 		restart_dbg("%s->%s->%d",__FILE__,__FUNCTION__,__LINE__);
+ 		switch ( mode ) {
+ 		case 0:
+-				local_irq_disable();
+-				rk2818_reboot( );	// normal 
++				rk_reboot( );
+ 				break;
+ 		case 1:
+ 				//rk28_usb();
+-- 
+2.35.3
+

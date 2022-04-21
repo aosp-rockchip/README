@@ -1,0 +1,233 @@
+From 68ae37643a2bee37c5721e1051c338b441995c3f Mon Sep 17 00:00:00 2001
+From: Huibin Hong <huibin.hong@rock-chips.com>
+Date: Thu, 24 Jan 2019 19:40:45 +0800
+Subject: [PATCH] serial: 8250: support rx dma mode only
+
+Most SOCS have only 8 or 6 channels, but have more than 16
+peripherals. If those peripherals work together, some
+fails to request dma channel, because there are no enough
+channels. And maybe it's unnecessary to use dma for uart
+tx. It is necessary for uart rx when hardware auto flow
+control is not used.
+
+&uart0 {
+	dma-names = "!tx", "rx";  // disable uart tx with dma
+	status = "okay";
+};
+
+Change-Id: Ia74477514ba57300a4d19a5c2565ae7b5b8ab521
+Signed-off-by: Huibin Hong <huibin.hong@rock-chips.com>
+---
+ drivers/tty/serial/8250/8250_dma.c  | 81 +++++++++++++----------------
+ drivers/tty/serial/8250/8250_port.c | 34 +++++++++++-
+ 2 files changed, 70 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250_dma.c b/drivers/tty/serial/8250/8250_dma.c
+index 3645a4a94a40..08c762131500 100644
+--- a/drivers/tty/serial/8250/8250_dma.c
++++ b/drivers/tty/serial/8250/8250_dma.c
+@@ -295,35 +295,15 @@ int serial8250_request_dma(struct uart_8250_port *p)
+ 	/* 8250 rx dma requires dmaengine driver to support pause/terminate */
+ 	ret = dma_get_slave_caps(dma->rxchan, &caps);
+ 	if (ret)
+-		goto release_rx;
++		goto err_rx;
+ 	if (!caps.cmd_pause || !caps.cmd_terminate ||
+ 	    caps.residue_granularity == DMA_RESIDUE_GRANULARITY_DESCRIPTOR) {
+ 		ret = -EINVAL;
+-		goto release_rx;
++		goto err_rx;
+ 	}
+ 
+ 	dmaengine_slave_config(dma->rxchan, &dma->rxconf);
+ 
+-	/* Get a channel for TX */
+-	dma->txchan = dma_request_slave_channel_compat(mask,
+-						       dma->fn, dma->tx_param,
+-						       p->port.dev, "tx");
+-	if (!dma->txchan) {
+-		ret = -ENODEV;
+-		goto release_rx;
+-	}
+-
+-	/* 8250 tx dma requires dmaengine driver to support terminate */
+-	ret = dma_get_slave_caps(dma->txchan, &caps);
+-	if (ret)
+-		goto err;
+-	if (!caps.cmd_terminate) {
+-		ret = -EINVAL;
+-		goto err;
+-	}
+-
+-	dmaengine_slave_config(dma->txchan, &dma->txconf);
+-
+ 	/* RX buffer */
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 	if (!dma->rx_size)
+@@ -335,32 +315,44 @@ int serial8250_request_dma(struct uart_8250_port *p)
+ 
+ 	dma->rx_buf = dma_alloc_coherent(dma->rxchan->device->dev, dma->rx_size,
+ 					&dma->rx_addr, GFP_KERNEL);
++
+ 	if (!dma->rx_buf) {
+ 		ret = -ENOMEM;
+-		goto err;
++		goto err_rx;
+ 	}
+ 
+-	/* TX buffer */
+-	dma->tx_addr = dma_map_single(dma->txchan->device->dev,
+-					p->port.state->xmit.buf,
+-					UART_XMIT_SIZE,
+-					DMA_TO_DEVICE);
+-	if (dma_mapping_error(dma->txchan->device->dev, dma->tx_addr)) {
+-		dma_free_coherent(dma->rxchan->device->dev, dma->rx_size,
+-				  dma->rx_buf, dma->rx_addr);
+-		ret = -ENOMEM;
+-		goto err;
++	/* Get a channel for TX */
++	dma->txchan = dma_request_slave_channel_compat(mask,
++						       dma->fn, dma->tx_param,
++						       p->port.dev, "tx");
++	if (dma->txchan) {
++		dmaengine_slave_config(dma->txchan, &dma->txconf);
++
++		/* TX buffer */
++		dma->tx_addr = dma_map_single(dma->txchan->device->dev,
++						p->port.state->xmit.buf,
++						UART_XMIT_SIZE,
++						DMA_TO_DEVICE);
++		if (dma_mapping_error(dma->txchan->device->dev, dma->tx_addr)) {
++			dma_free_coherent(dma->rxchan->device->dev,
++					  dma->rx_size, dma->rx_buf,
++					  dma->rx_addr);
++			dma_release_channel(dma->txchan);
++			dma->txchan = NULL;
++		}
++
++		dev_info_ratelimited(p->port.dev, "got rx and tx dma channels\n");
++	} else {
++		dev_info_ratelimited(p->port.dev, "got rx dma channels only\n");
+ 	}
+ 
+-	dev_dbg_ratelimited(p->port.dev, "got both dma channels\n");
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 	/* start dma for rx*/
+ 	serial8250_start_rx_dma(p);
+ #endif
+ 	return 0;
+-err:
+-	dma_release_channel(dma->txchan);
+-release_rx:
++
++err_rx:
+ 	dma_release_channel(dma->rxchan);
+ 	return ret;
+ }
+@@ -383,13 +375,14 @@ void serial8250_release_dma(struct uart_8250_port *p)
+ 	dma->rx_running = 0;
+ #endif
+ 	/* Release TX resources */
+-	dmaengine_terminate_sync(dma->txchan);
+-	dma_unmap_single(dma->txchan->device->dev, dma->tx_addr,
+-			 UART_XMIT_SIZE, DMA_TO_DEVICE);
+-	dma_release_channel(dma->txchan);
+-	dma->txchan = NULL;
+-	dma->tx_running = 0;
+-
++	if (dma->txchan) {
++		dmaengine_terminate_all(dma->txchan);
++		dma_unmap_single(dma->txchan->device->dev, dma->tx_addr,
++				 UART_XMIT_SIZE, DMA_TO_DEVICE);
++		dma_release_channel(dma->txchan);
++		dma->txchan = NULL;
++		dma->tx_running = 0;
++	}
+ 	dev_dbg_ratelimited(p->port.dev, "dma channels released\n");
+ }
+ EXPORT_SYMBOL_GPL(serial8250_release_dma);
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index ef0aa633c5b6..6127b0f86c54 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -1552,8 +1552,13 @@ static inline void __start_tx(struct uart_port *port)
+ {
+ 	struct uart_8250_port *up = up_to_u8250p(port);
+ 
++#ifdef CONFIG_ARCH_ROCKCHIP
++	if (up->dma && up->dma->txchan && !up->dma->tx_dma(up))
++		return;
++#else
+ 	if (up->dma && !up->dma->tx_dma(up))
+ 		return;
++#endif
+ 
+ 	if (!(up->ier & UART_IER_THRI)) {
+ 		up->ier |= UART_IER_THRI;
+@@ -1843,6 +1848,12 @@ EXPORT_SYMBOL_GPL(serial8250_modem_status);
+ 
+ static bool handle_rx_dma(struct uart_8250_port *up, unsigned int iir)
+ {
++#ifdef CONFIG_ARCH_ROCKCHIP
++	if ((iir & 0xf) != UART_IIR_RX_TIMEOUT)
++		return 0;
++	else
++		return up->dma->rx_dma(up);
++#else
+ 	switch (iir & 0x3f) {
+ 	case UART_IIR_RX_TIMEOUT:
+ 		serial8250_rx_dma_flush(up);
+@@ -1851,6 +1862,7 @@ static bool handle_rx_dma(struct uart_8250_port *up, unsigned int iir)
+ 		return true;
+ 	}
+ 	return up->dma->rx_dma(up);
++#endif
+ }
+ 
+ /*
+@@ -1861,6 +1873,7 @@ int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
+ 	unsigned char status;
+ 	unsigned long flags;
+ 	struct uart_8250_port *up = up_to_u8250p(port);
++	int dma_err = -1;
+ 
+ 	if (iir & UART_IIR_NO_INT)
+ 		return 0;
+@@ -1869,14 +1882,33 @@ int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
+ 
+ 	status = serial_port_in(port, UART_LSR);
+ 
++#ifdef CONFIG_ARCH_ROCKCHIP
++	if (status & (UART_LSR_DR | UART_LSR_BI)) {
++		if (up->dma && up->dma->rxchan)
++			dma_err = handle_rx_dma(up, iir);
++
++		if (!up->dma || dma_err)
++			status = serial8250_rx_chars(up, status);
++	}
++#else
+ 	if (status & (UART_LSR_DR | UART_LSR_BI) &&
+ 	    iir & UART_IIR_RDI) {
+ 		if (!up->dma || handle_rx_dma(up, iir))
+ 			status = serial8250_rx_chars(up, status);
+ 	}
++#endif
+ 	serial8250_modem_status(up);
+-	if ((!up->dma || up->dma->tx_err) && (status & UART_LSR_THRE))
++
++#ifdef CONFIG_ARCH_ROCKCHIP
++	if ((!up->dma || (up->dma && (!up->dma->txchan || up->dma->tx_err))) &&
++	    (status & UART_LSR_THRE))
++		serial8250_tx_chars(up);
++#else
++	if ((!up->dma || (up->dma && up->dma->tx_err)) &&
++	    (status & UART_LSR_THRE))
+ 		serial8250_tx_chars(up);
++#endif
++
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 	if (status & UART_LSR_BRK_ERROR_BITS) {
+ 
+-- 
+2.35.3
+

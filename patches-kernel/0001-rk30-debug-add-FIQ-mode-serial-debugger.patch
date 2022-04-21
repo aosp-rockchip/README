@@ -1,0 +1,557 @@
+From 2d332d7295a141921570c0c4402dacaccb5651d5 Mon Sep 17 00:00:00 2001
+From: hhb <hhb@rock-chips.com>
+Date: Tue, 28 Feb 2012 14:29:31 +0800
+Subject: [PATCH] 	rk30: debug: add FIQ mode serial debugger
+
+---
+ arch/arm/common/fiq_debugger.c                |   2 +
+ arch/arm/mach-rk30/Makefile                   |   1 +
+ arch/arm/mach-rk30/common.c                   |   6 +-
+ arch/arm/mach-rk30/devices.c                  |   5 +
+ arch/arm/mach-rk30/fiq.c                      | 120 ++++++++++
+ arch/arm/mach-rk30/include/mach/fiq.h         |  27 +++
+ arch/arm/mach-rk30/include/mach/irqs.h        |   5 +
+ arch/arm/plat-rk/Makefile                     |   1 +
+ .../plat-rk/include/plat/rk_fiq_debugger.h    |  29 +++
+ arch/arm/plat-rk/rk_fiq_debugger.c            | 215 ++++++++++++++++++
+ 10 files changed, 410 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/mach-rk30/fiq.c
+ create mode 100644 arch/arm/mach-rk30/include/mach/fiq.h
+ create mode 100644 arch/arm/plat-rk/include/plat/rk_fiq_debugger.h
+ create mode 100644 arch/arm/plat-rk/rk_fiq_debugger.c
+
+diff --git a/arch/arm/common/fiq_debugger.c b/arch/arm/common/fiq_debugger.c
+index 3ed18ae2ed80..203f08ddfc70 100644
+--- a/arch/arm/common/fiq_debugger.c
++++ b/arch/arm/common/fiq_debugger.c
+@@ -372,6 +372,7 @@ static void dump_irqs(struct fiq_debugger_state *state)
+ 		state->last_irqs[n] = kstat_irqs(n);
+ 	}
+ 
++#ifdef CONFIG_LOCAL_TIMERS
+ 	for (cpu = 0; cpu < NR_CPUS; cpu++) {
+ 
+ 		debug_printf(state, "LOC %d: %10u %11u\n", cpu,
+@@ -381,6 +382,7 @@ static void dump_irqs(struct fiq_debugger_state *state)
+ 		state->last_local_timer_irqs[cpu] =
+ 			__IRQ_STAT(cpu, local_timer_irqs);
+ 	}
++#endif
+ }
+ 
+ struct stacktrace_state {
+diff --git a/arch/arm/mach-rk30/Makefile b/arch/arm/mach-rk30/Makefile
+index 032b9d072e52..3d9fa0f22193 100644
+--- a/arch/arm/mach-rk30/Makefile
++++ b/arch/arm/mach-rk30/Makefile
+@@ -5,6 +5,7 @@ obj-y += io.o
+ obj-y += iomux.o
+ obj-y += reset.o
+ obj-y += timer.o
++obj-$(CONFIG_FIQ) += fiq.o
+ obj-y += ../mach-rk29/early_printk.o
+ ifndef CONFIG_DEBUG_LL
+ obj-y += ../kernel/debug.o
+diff --git a/arch/arm/mach-rk30/common.c b/arch/arm/mach-rk30/common.c
+index 1b4d2bcd3e52..d399887b4bd3 100755
+--- a/arch/arm/mach-rk30/common.c
++++ b/arch/arm/mach-rk30/common.c
+@@ -10,18 +10,22 @@
+ #include <mach/board.h>
+ #include <mach/gpio.h>
+ #include <mach/iomux.h>
++#include <mach/fiq.h>
+ 
+ extern void __init rk29_setup_early_printk(void);
+ 
+ void __init rk30_init_irq(void)
+ {
+ 	gic_init(0, IRQ_LOCALTIMER, RK30_GICD_BASE, RK30_GICC_BASE);
++#ifdef CONFIG_FIQ
++	rk30_fiq_init();
++#endif
+ 	rk30_gpio_init();
+ }
+ 
+ void __init rk30_map_io(void)
+ {
+-        rk30_map_common_io();
++	rk30_map_common_io();
+ 	rk29_setup_early_printk();
+ 	rk29_sram_init();
+ 	rk30_clock_init();
+diff --git a/arch/arm/mach-rk30/devices.c b/arch/arm/mach-rk30/devices.c
+index 980661efa256..4dda764689c0 100755
+--- a/arch/arm/mach-rk30/devices.c
++++ b/arch/arm/mach-rk30/devices.c
+@@ -24,6 +24,8 @@
+ #include <plat/dma-pl330.h>
+ #include <mach/gpio.h>
+ #include <mach/iomux.h>
++#include <plat/rk_fiq_debugger.h>
++
+ static u64 dma_dmamask = DMA_BIT_MASK(32);
+ 
+ #ifdef CONFIG_TSADC_RK30
+@@ -886,6 +888,9 @@ static int __init rk30_init_devices(void)
+ 	platform_device_register(&device_tsadc);
+ #endif
+ 	rk30_init_sdmmc();
++#ifdef CONFIG_FIQ_DEBUGGER
++	rk_serial_debug_init(RK30_UART1_PHYS, IRQ_UART1, IRQ_UART_SIGNAL, -1);
++#endif
+ 
+         return 0;
+ }
+diff --git a/arch/arm/mach-rk30/fiq.c b/arch/arm/mach-rk30/fiq.c
+new file mode 100644
+index 000000000000..48c3b35d8d2d
+--- /dev/null
++++ b/arch/arm/mach-rk30/fiq.c
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (C) 2010 Google, Inc.
++ *
++ * Author:
++ *	Brian Swetland <swetland@google.com>
++ *	Iliyan Malchev <malchev@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++
++#include <asm/hardware/gic.h>
++#include <asm/fiq.h>
++#include <mach/io.h>
++#include <mach/fiq.h>
++
++
++// GIC ICDISR
++#define GIC_DIST_SECURITY	0x080
++
++#define FIRST_SGI_PPI_IRQ	32
++
++static void rk30_fiq_mask(struct irq_data *d)
++{
++	u32 i = 0;
++	void __iomem *base = RK30_GICD_BASE;
++
++	if (d->irq < FIRST_SGI_PPI_IRQ)
++		return;
++	// ICDISR each bit   0 -- Secure   1--Non-Secure
++	// FIQ output from secure , so set bit Non-Secure to mask the fiq
++	base += GIC_DIST_SECURITY + ((d->irq / 32) << 2);
++	i = readl_relaxed(base);
++	i |= 1 << (d->irq % 32);
++	writel_relaxed(i, base);
++	dsb();
++}
++
++static void rk30_fiq_unmask(struct irq_data *d)
++{
++	u32 i = 0;
++	void __iomem *base = RK30_GICD_BASE;
++
++	if (d->irq < FIRST_SGI_PPI_IRQ)
++		return;
++	// ICDISR each bit   0 -- Secure   1--Non-Secure
++	// FIQ output from secure , so set bit Secure to unmask the fiq
++	base += GIC_DIST_SECURITY + ((d->irq / 32) << 2);
++	i = readl_relaxed(base);
++	i &= ~(1 << (d->irq % 32));
++	writel_relaxed(i, base);
++	dsb();
++}
++
++void rk_fiq_enable(int irq)
++{
++	rk30_fiq_unmask(irq_get_irq_data(irq));
++	enable_fiq(irq);
++}
++
++void rk_fiq_disable(int irq)
++{
++	rk30_fiq_mask(irq_get_irq_data(irq));
++	disable_fiq(irq);
++}
++
++void rk_irq_setpending(int irq)
++{
++	writel_relaxed(1<<(irq%32), RK30_GICD_BASE + GIC_DIST_PENDING_SET + (irq/32)*4);
++	dsb();
++}
++
++void rk_irq_clearpending(int irq)
++{
++	writel_relaxed(1<<(irq%32), RK30_GICD_BASE + GIC_DIST_PENDING_CLEAR + (irq/32)*4);
++	dsb();
++}
++
++void rk30_fiq_init(void)
++{
++	void __iomem *base = RK30_GICD_BASE;
++	unsigned int gic_irqs, i;
++
++	// read gic info to know how many irqs in our chip
++	gic_irqs = readl_relaxed(base + GIC_DIST_CTR) & 0x1f;
++	//set all the interrupt to non-secure state
++	for (i = 0; i < (gic_irqs + 1); i++) {
++		/*
++		 * In any system that implements the ARM Security Extensions,
++		 * to support a consistent model for message passing between
++		 * processors, ARM strongly recommends that all processors reserve:
++		 * ID0-ID7 for Non-secure interrupts
++		 * ID8-ID15 for Secure interrupts.
++		 */
++		if (i == 0) {
++			writel_relaxed(0xffff00ff, base + GIC_DIST_SECURITY + (i<<2));
++		} else {
++			writel_relaxed(0xffffffff, base + GIC_DIST_SECURITY + (i<<2));
++		}
++	}
++	dsb();
++
++	writel_relaxed(0x3, base + GIC_DIST_CTRL);
++	writel_relaxed(0x1f, RK30_GICC_BASE + GIC_CPU_CTRL);
++	dsb();
++}
+diff --git a/arch/arm/mach-rk30/include/mach/fiq.h b/arch/arm/mach-rk30/include/mach/fiq.h
+new file mode 100644
+index 000000000000..1eb5eab9f813
+--- /dev/null
++++ b/arch/arm/mach-rk30/include/mach/fiq.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2010 Google, Inc.
++ *
++ * Author:
++ *	Iliyan Malchev <malchev@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __ASM_ARCH_RK30_FIQ_H
++#define __ASM_ARCH_RK30_FIQ_H
++
++/* enable/disable an interrupt that is an FIQ (safe from FIQ context?) */
++void rk_fiq_enable(int n);
++void rk_fiq_disable(int n);
++void rk_irq_setpending(int irq);
++void rk_irq_clearpending(int irq);
++void rk30_fiq_init(void);
++#endif
+diff --git a/arch/arm/mach-rk30/include/mach/irqs.h b/arch/arm/mach-rk30/include/mach/irqs.h
+index 3bff0f7ee9af..0606eeed97e5 100644
+--- a/arch/arm/mach-rk30/include/mach/irqs.h
++++ b/arch/arm/mach-rk30/include/mach/irqs.h
+@@ -1,6 +1,8 @@
+ #ifndef __MACH_IRQS_H
+ #define __MACH_IRQS_H
+ 
++#define FIQ_START 			0
++
+ #define IRQ_LOCALTIMER                  29
+ 
+ #define RK30XX_IRQ(x)                   (x + 32)
+@@ -82,6 +84,9 @@
+ #define IRQ_VIO0_OBSRV_MAINFAULT        RK30XX_IRQ(74)
+ #define IRQ_DMAC_OBSRV_MAINFAULT        RK30XX_IRQ(75)
+ 
++//hhb@rock-chips.com this spi is used for fiq_debugger signal irq
++#define IRQ_UART_SIGNAL			RK30XX_IRQ(80)
++
+ #define NR_GIC_IRQS                     (5 * 32)
+ #define NR_GPIO_IRQS                    (6 * 32)
+ #define NR_BOARD_IRQS                   64
+diff --git a/arch/arm/plat-rk/Makefile b/arch/arm/plat-rk/Makefile
+index 675b57652170..874c3063ce02 100644
+--- a/arch/arm/plat-rk/Makefile
++++ b/arch/arm/plat-rk/Makefile
+@@ -2,5 +2,6 @@ obj-$(CONFIG_RK29_LAST_LOG) += last_log.o
+ obj-$(CONFIG_USB_GADGET) += usb_detect.o
+ obj-$(CONFIG_RK29_VPU) += vpu_service.o
+ obj-$(CONFIG_ARCH_RK30) += dma-pl330.o
++obj-$(CONFIG_FIQ_DEBUGGER) += rk_fiq_debugger.o
+ obj-y += mem_reserve.o
+ obj-y += sram.o
+diff --git a/arch/arm/plat-rk/include/plat/rk_fiq_debugger.h b/arch/arm/plat-rk/include/plat/rk_fiq_debugger.h
+new file mode 100644
+index 000000000000..c1ff163208c3
+--- /dev/null
++++ b/arch/arm/plat-rk/include/plat/rk_fiq_debugger.h
+@@ -0,0 +1,29 @@
++/*
++ * linux/arch/arm/mach-rk30/include/mach/rk30_fiq_debugger.h
++ *
++ * Copyright (C) 2010 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __MACH_RK30_FIQ_DEBUGGER_H
++#define __MACH_RK30_FIQ_DEBUGGER_H
++
++//#ifdef CONFIG_RK30_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_DEBUGGER
++void rk_serial_debug_init(unsigned int base, int irq, int signal, int wakeup_irq);
++#else
++static inline void rk_serial_debug_init(unsigned int base, int irq, int signal, int wakeup_irq)
++{
++}
++#endif
++
++#endif
+diff --git a/arch/arm/plat-rk/rk_fiq_debugger.c b/arch/arm/plat-rk/rk_fiq_debugger.c
+new file mode 100644
+index 000000000000..2105af62c9f8
+--- /dev/null
++++ b/arch/arm/plat-rk/rk_fiq_debugger.c
+@@ -0,0 +1,215 @@
++/*
++ * arch/arm/mach-rk/rk_fiq_debugger.c
++ *
++ * Serial Debugger Interface for Rockchip
++ *
++ * Copyright (C) 2008 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <stdarg.h>
++#include <linux/module.h>
++#include <linux/io.h>
++#include <linux/interrupt.h>
++#include <linux/clk.h>
++#include <linux/platform_device.h>
++#include <linux/irq.h>
++#include <linux/serial_reg.h>
++#include <linux/slab.h>
++#include <linux/stacktrace.h>
++#include <asm/fiq_debugger.h>
++#include <asm/hardware/gic.h>
++#include <plat/rk_fiq_debugger.h>
++#include <mach/system.h>
++#include <mach/fiq.h>
++
++#include <linux/uaccess.h>
++
++struct rk_fiq_debugger {
++	struct fiq_debugger_pdata pdata;
++	void __iomem *debug_port_base;
++	bool break_seen;
++};
++
++static inline void rk_fiq_write(struct rk_fiq_debugger *t,
++	unsigned int val, unsigned int off)
++{
++	__raw_writeb(val, t->debug_port_base + off * 4);
++}
++
++static inline unsigned int rk_fiq_read(struct rk_fiq_debugger *t,
++	unsigned int off)
++{
++	return __raw_readb(t->debug_port_base + off * 4);
++}
++
++static inline unsigned int rk_fiq_read_lsr(struct rk_fiq_debugger *t)
++{
++	unsigned int lsr;
++
++	lsr = rk_fiq_read(t, UART_LSR);
++	if (lsr & UART_LSR_BI)
++		t->break_seen = true;
++
++	return lsr;
++}
++
++static int debug_port_init(struct platform_device *pdev)
++{
++	struct rk_fiq_debugger *t;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	if (rk_fiq_read(t, UART_LSR) & UART_LSR_DR)
++		(void)rk_fiq_read(t, UART_RX);
++	/* enable rx and lsr interrupt */
++	rk_fiq_write(t, UART_IER_RLSI | UART_IER_RDI, UART_IER);
++	/* interrupt on every character */
++	rk_fiq_write(t, 0, UART_IIR);
++
++	return 0;
++}
++
++static int debug_getc(struct platform_device *pdev)
++{
++	unsigned int lsr;
++	struct rk_fiq_debugger *t;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	lsr = rk_fiq_read_lsr(t);
++
++	if (lsr & UART_LSR_BI || t->break_seen) {
++		t->break_seen = false;
++		return FIQ_DEBUGGER_BREAK;
++	}
++
++	if (lsr & UART_LSR_DR)
++		return rk_fiq_read(t, UART_RX);
++
++	return FIQ_DEBUGGER_NO_CHAR;
++}
++
++static void debug_putc(struct platform_device *pdev, unsigned int c)
++{
++	struct rk_fiq_debugger *t;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	while (!(rk_fiq_read_lsr(t) & UART_LSR_THRE))
++		cpu_relax();
++
++	rk_fiq_write(t, c, UART_TX);
++}
++
++static void debug_flush(struct platform_device *pdev)
++{
++	struct rk_fiq_debugger *t;
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++
++	while (!(rk_fiq_read_lsr(t) & UART_LSR_TEMT))
++		cpu_relax();
++}
++
++static void fiq_enable(struct platform_device *pdev, unsigned int irq, bool on)
++{
++	if (on)
++		rk_fiq_enable(irq);
++	else
++		rk_fiq_disable(irq);
++}
++
++static void force_irq(struct platform_device *pdev, unsigned int irq)
++{
++	rk_irq_setpending(irq);
++}
++
++static int rk_fiq_debugger_id;
++
++void rk_serial_debug_init(unsigned int base, int irq, int signal, int wakeup_irq)
++{
++	struct rk_fiq_debugger *t = NULL;
++	struct platform_device *pdev = NULL;
++	struct resource *res = NULL;
++	int res_count = 0;
++
++	t = kzalloc(sizeof(struct rk_fiq_debugger), GFP_KERNEL);
++	if (!t) {
++		pr_err("Failed to allocate for fiq debugger\n");
++		return;
++	}
++
++	t->pdata.uart_init = debug_port_init;
++	t->pdata.uart_getc = debug_getc;
++	t->pdata.uart_putc = debug_putc;
++	t->pdata.uart_flush = debug_flush;
++	t->pdata.fiq_enable = fiq_enable;
++	t->pdata.force_irq = force_irq;
++	t->debug_port_base = ioremap(base, PAGE_SIZE);
++
++	if (!t->debug_port_base) {
++		pr_err("Failed to ioremap for fiq debugger\n");
++		goto out1;
++	}
++
++	res = kzalloc(sizeof(struct resource) * 3, GFP_KERNEL);
++	if (!res) {
++		pr_err("Failed to alloc fiq debugger resources\n");
++		goto out2;
++	}
++
++	pdev = kzalloc(sizeof(struct platform_device), GFP_KERNEL);
++	if (!pdev) {
++		pr_err("Failed to alloc fiq debugger platform device\n");
++		goto out3;
++	};
++
++	if(irq >= 0){
++		res[0].flags = IORESOURCE_IRQ;
++		res[0].start = irq;
++		res[0].end = irq;
++		res[0].name = "fiq";
++		res_count++;
++	}
++
++	if(signal >= 0){
++		res[1].flags = IORESOURCE_IRQ;
++		res[1].start = signal;
++		res[1].end = signal;
++		res[1].name = "signal";
++		res_count++;
++	}
++
++	if (wakeup_irq >= 0) {
++		res[2].flags = IORESOURCE_IRQ;
++		res[2].start = wakeup_irq;
++		res[2].end = wakeup_irq;
++		res[2].name = "wakeup";
++		res_count++;
++	}
++
++	pdev->name = "fiq_debugger";
++	pdev->id = rk_fiq_debugger_id++;
++	pdev->dev.platform_data = &t->pdata;
++	pdev->resource = res;
++	pdev->num_resources = res_count;
++	if (platform_device_register(pdev)) {
++		pr_err("Failed to register fiq debugger\n");
++		goto out4;
++	}
++	return;
++
++out4:
++	kfree(pdev);
++out3:
++	kfree(res);
++out2:
++	iounmap(t->debug_port_base);
++out1:
++	kfree(t);
++}
+-- 
+2.35.3
+

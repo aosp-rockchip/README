@@ -1,0 +1,732 @@
+From 3f90324becf7317fb6e676d1ff2451e114ac3cad Mon Sep 17 00:00:00 2001
+From: xxx <xxx@rock-chips.com>
+Date: Fri, 28 Mar 2014 15:56:00 +0800
+Subject: [PATCH] rkpm sleep support
+
+---
+ arch/arm/mach-rockchip/Makefile           |   2 +-
+ arch/arm/mach-rockchip/pm-pie.c           |  22 ++-
+ arch/arm/mach-rockchip/pm.c               | 209 +++++++++++++---------
+ arch/arm/mach-rockchip/pm.h               |  41 ++++-
+ arch/arm/mach-rockchip/pmu.h              |   2 +-
+ arch/arm/mach-rockchip/sleep.S            | 108 +++++++++++
+ include/dt-bindings/suspend/rockchip-pm.h |  61 ++++---
+ 7 files changed, 322 insertions(+), 123 deletions(-)
+ mode change 100644 => 100755 arch/arm/mach-rockchip/pm-pie.c
+ mode change 100644 => 100755 arch/arm/mach-rockchip/pm.c
+ mode change 100644 => 100755 arch/arm/mach-rockchip/pm.h
+ mode change 100644 => 100755 arch/arm/mach-rockchip/pmu.h
+ create mode 100644 arch/arm/mach-rockchip/sleep.S
+
+diff --git a/arch/arm/mach-rockchip/Makefile b/arch/arm/mach-rockchip/Makefile
+index e2c2c878eece..34a12fbe9f18 100755
+--- a/arch/arm/mach-rockchip/Makefile
++++ b/arch/arm/mach-rockchip/Makefile
+@@ -3,7 +3,7 @@ obj-y += cpu.o
+ obj-y += rk3188.o
+ obj-y += rk3288.o
+ obj-y += ddr_freq.o
+-obj-$(CONFIG_PM) += pm.o
++obj-$(CONFIG_PM) += pm.o sleep.o
+ obj-$(CONFIG_RK_FPGA) += fpga.o
+ obj-$(CONFIG_CPU_IDLE) += cpuidle.o
+ obj-$(CONFIG_SMP) += platsmp.o
+diff --git a/arch/arm/mach-rockchip/pm-pie.c b/arch/arm/mach-rockchip/pm-pie.c
+old mode 100644
+new mode 100755
+index c5cb5eb81fd6..9198519d22e9
+--- a/arch/arm/mach-rockchip/pm-pie.c
++++ b/arch/arm/mach-rockchip/pm-pie.c
+@@ -62,6 +62,8 @@ void PIE_FUNC(rkpm_sram_printch_pie)(char byte)
+    // if (byte == '\n')
+         //FUNC(rkpm_sram_printch_pie)('\r');
+ }
++EXPORT_PIE_SYMBOL(FUNC(rkpm_sram_printch_pie));
++
+ 
+ void  PIE_FUNC(rkpm_sram_printhex_pie)(unsigned int hex)
+ {
+@@ -74,6 +76,7 @@ void  PIE_FUNC(rkpm_sram_printhex_pie)(unsigned int hex)
+     	hex <<= 4;
+     }
+ }
++EXPORT_PIE_SYMBOL(FUNC(rkpm_sram_printhex_pie));
+ 
+ 
+ /******************************************pm main function******************************************/
+@@ -82,13 +85,13 @@ void  PIE_FUNC(rkpm_sram_printhex_pie)(unsigned int hex)
+ static void __sramfunc rkpm_sram_suspend(u32 ctrbits)
+ {
+ 
+-	rkpm_sram_printch('5');
++	rkpm_sram_printch('7');
+ 	RKPM_BITCTR_SRAM_FUN(DDR,ddr);
+     
+-	rkpm_sram_printch('6');  
++	rkpm_sram_printch('8');  
+ 	RKPM_BITCTR_SRAM_FUN(VOLTS,volts);
+     
+-        rkpm_sram_printch('7');
++        rkpm_sram_printch('9');
+                 
+        RKPM_BITCTR_SRAM_FUN(GTCLKS,gtclks);
+ 	
+@@ -108,13 +111,13 @@ static void __sramfunc rkpm_sram_suspend(u32 ctrbits)
+     
+ 	RKPM_BITCTR_SRAM_FUN(GTCLKS,re_gtclks);
+     
+-	rkpm_sram_printch('7');
++	rkpm_sram_printch('9');
+ 	RKPM_BITCTR_SRAM_FUN(VOLTS,re_volts);
+     
+-	rkpm_sram_printch('6');	
++	rkpm_sram_printch('8');	
+ 	RKPM_BITCTR_SRAM_FUN(DDR,re_ddr);
+     
+-	rkpm_sram_printch('5');	
++	rkpm_sram_printch('7');	
+ }
+ 
+ void PIE_FUNC(rkpm_sram_suspend_arg)(void *arg)
+@@ -123,10 +126,11 @@ void PIE_FUNC(rkpm_sram_suspend_arg)(void *arg)
+     
+    // rkpm_sram_printhex(rkpm_sram_ctrbits); 
+     //rkpm_sram_printhex(*((u32 *)arg));
+-    rkpm_sram_suspend(rkpm_sram_ctrbits);
+-
+-    
++    rkpm_sram_suspend(rkpm_sram_ctrbits);    
+ }
++EXPORT_PIE_SYMBOL(FUNC(rkpm_sram_suspend_arg));
++
++
+ static void rkpm_pie_init(void)
+ {
+     if(rockchip_pie_chunk)
+diff --git a/arch/arm/mach-rockchip/pm.c b/arch/arm/mach-rockchip/pm.c
+old mode 100644
+new mode 100755
+index 1f5a0fb5fa2a..e8bd3be53a45
+--- a/arch/arm/mach-rockchip/pm.c
++++ b/arch/arm/mach-rockchip/pm.c
+@@ -1,6 +1,11 @@
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/suspend.h>
++#include <asm/cacheflush.h>
++#include <asm/tlbflush.h>
++#include <asm/suspend.h>
++#include <linux/delay.h>
++
+ #include <asm/io.h>
+ #include "pm.h"
+ 
+@@ -24,7 +29,7 @@ void  rkpm_ddr_regs_dump(void __iomem * base_addr,u32 start_offset,u32 end_offse
+         
+ 	for(i=start_offset;i<=end_offset;)
+ 	{
+-            rkpm_ddr_printhex(readl_relaxed((base_addr + i)));  
++            rkpm_ddr_printhex(reg_readl((base_addr + i)));  
+             line++;
+             if((line%4==0)||i==end_offset)
+                 rkpm_ddr_printch('\n');
+@@ -57,7 +62,6 @@ void rkpm_set_pie_info(struct rkpm_sram_ops *pm_sram_ops,rkpm_sram_suspend_arg_c
+ 
+ }
+ 
+-
+ void rkpm_set_ops_prepare_finish(rkpm_ops_void_callback prepare,rkpm_ops_void_callback finish)
+ {
+ 	pm_ops.prepare=prepare;	
+@@ -99,6 +103,14 @@ void rkpm_set_ops_regs_pread(rkpm_ops_void_callback regs_pread)
+ 	pm_ops.regs_pread=regs_pread;	
+ }
+ 
++void rkpm_set_ops_regs_sleep(rkpm_ops_void_callback save,rkpm_ops_paramter_u32_cb setting
++                                                                ,rkpm_ops_void_callback re_first,rkpm_ops_void_callback re_last)
++{
++	pm_ops.slp_save=save;
++	pm_ops.slp_setting=setting;
++	pm_ops.slp_re_first=re_first;
++	pm_ops.slp_re_last=re_last;    
++}
+ 
+ 
+ /**************************************sram callback setting***************************************/
+@@ -217,12 +229,22 @@ static void inline rkpm_clr_jdg_ctrbit(int bit)
+ #define  RKPM_DDR_FUN(fun) \
+ 	if(pm_ops.fun)\
+ 		(pm_ops.fun)()
++
++// fun with paramater
++#define  RKPM_DDR_PFUN(fun,fun_p) \
++        if(pm_ops.fun_p) \
++            {pm_ops.fun;} while(0)
++
++
+     
+ 
+ #define  RKPM_BITCTR_DDR_FUN(ctr,fun) \
+ 	if(rkpm_chk_jdg_ctrbit(RKPM_CTR_##ctr)&&pm_ops.fun)\
+ 		(pm_ops.fun)()
+ 
++#define  RKPM_BITSCTR_DDR_FUN(bits,fun) \
++        if(rkpm_chk_jdg_ctrbits(bits)&&pm_ops.fun)\
++            (pm_ops.fun)()
+ 
+ 
+ void rkpm_ctrbits_prepare(void)
+@@ -233,9 +255,9 @@ void rkpm_ctrbits_prepare(void)
+ 	rkpm_jdg_ctrbits=rkpm_ctrbits;
+ 
+         //if plls is no pd,clk rate is high, volts can not setting low,so we need to judge ctrbits
+-	if(rkpm_chk_jdg_ctrbit(RKPM_CTR_VOLTS))
++	//if(rkpm_chk_jdg_ctrbit(RKPM_CTR_VOLTS))
+ 	{
+-		rkpm_clr_jdg_ctrbit(RKPM_CTR_VOLTS);
++		//rkpm_clr_jdg_ctrbit(RKPM_CTR_VOLTS);
+ 	}
+     
+         rkpm_jdg_sram_ctrbits=rkpm_jdg_ctrbits;
+@@ -348,109 +370,137 @@ void  rkpm_ddr_printhex(unsigned int hex)
+ 		hex <<= 4;
+ 	}
+ }
+-
+-inline int rkpm_dbgctr_enter(void)
++static int rk_lpmode_enter(unsigned long arg)
+ {
+-    if(rkpm_chk_jdg_ctrbits(RKPM_OR_2BITS(RET_DIRT,ONLY_WFI)))
+-    {
+-        if(rkpm_chk_jdg_ctrbit(RKPM_CTR_ONLY_WFI))
+-        {
+-            local_fiq_disable();
+-            dsb();
+-            wfi();
+-            local_fiq_enable();
+-        }
+-        return -1;
+-    }
+-    return 0;
+-}
+ 
+-void  rk_slp_mode_enter(void)
+-{
+-	//rk30_suspend_sleep();
+-         
++        RKPM_DDR_PFUN(slp_setting(rkpm_jdg_sram_ctrbits),slp_setting); 
++        
++        local_flush_tlb_all();
++        flush_cache_all();
++        outer_flush_all();
++        outer_disable();
++        cpu_proc_fin();
++        //outer_inv_all();// ???
++        //  l2x0_inv_all_pm(); //rk319x is not need
++        flush_cache_all();
++        
++        rkpm_ddr_printch('d');
++
++        dsb();
++        wfi();  
++        
++        rkpm_ddr_printch('D');
++	return 0;
+ }
+ 
+ 
++int cpu_suspend(unsigned long arg, int (*fn)(unsigned long));
++
+ static int rkpm_enter(suspend_state_t state)
+ {
++ 
++        printk("%s\n",__FUNCTION__);
++        printk(KERN_DEBUG "pm: ");
+ 
+-    printk("%s\n",__FUNCTION__);
+-    printk(KERN_DEBUG "pm: ");
++        rkpm_ctrbits_prepare();
+ 
+-    rkpm_ctrbits_prepare();
+-    
+-    if(rkpm_dbgctr_enter())
+-        return 0;
++      //  if(rkpm_chk_jdg_ctrbit(RKPM_CTR_RET_DIRT))
++      //  return 0;
+ 
+-    RKPM_DDR_FUN(prepare);
++        RKPM_DDR_FUN(prepare);
+ 
++        rkpm_ddr_printch('0');
+ 
+-    rkpm_ddr_printch('0');
++        RKPM_BITCTR_DDR_FUN(PWR_DMNS,pwr_dmns);
+ 
+-    RKPM_BITCTR_DDR_FUN(PWR_DMNS,pwr_dmns);
++        rkpm_ddr_printch('1');
+ 
+-    rkpm_ddr_printch('1');
+-    
+-    local_fiq_disable();
++        local_fiq_disable();
+ 
+-    RKPM_BITCTR_DDR_FUN(GTCLKS,gtclks);
++        RKPM_BITSCTR_DDR_FUN(RKPM_CTRBITS_SOC_DLPMD,slp_save);
++        
++        rkpm_ddr_printch('2');
++        RKPM_BITCTR_DDR_FUN(GTCLKS,gtclks);
+ 
+-    rkpm_ddr_printch('2');
+-    
+-    RKPM_BITCTR_DDR_FUN(PLLS,plls);
++        rkpm_ddr_printch('3');
+ 
+-    rkpm_ddr_printch('3');
++        RKPM_BITCTR_DDR_FUN(PLLS,plls);
+ 
+-    RKPM_BITCTR_DDR_FUN(GPIOS,gpios);
++        rkpm_ddr_printch('4');
+ 
+-    RKPM_DDR_FUN(regs_pread);
++        RKPM_BITCTR_DDR_FUN(GPIOS,gpios);
+ 
+-    rkpm_ddr_printch('4');
+-    
+-    pm_log = false;
++        RKPM_DDR_FUN(regs_pread);
+ 
+-    if(rkpm_chk_jdg_ctrbit(RKPM_CTR_NORIDLE_MD)&&p_suspend_pie_cb)
+-        call_with_stack(p_suspend_pie_cb,&rkpm_jdg_sram_ctrbits, rockchip_sram_stack);
+-     else
+-    {
+-        dsb();
+-        wfi();
+-    }
+-  
+-    pm_log = true;
+-    
+-    rkpm_ddr_printch('4');
++        rkpm_ddr_printch('5');
+ 
+-    RKPM_BITCTR_DDR_FUN(GPIOS,re_gpios);
+-    
+-    rkpm_ddr_printch('3');
+-    
+-    RKPM_BITCTR_DDR_FUN(PLLS,re_plls);
++        pm_log = false;
++
++        if(rkpm_chk_jdg_ctrbits(RKPM_CTRBITS_SOC_DLPMD))
++        {   
++            if(cpu_suspend(0,rk_lpmode_enter)==0)
++            {
++                rkpm_ddr_printch('d');
++                RKPM_DDR_FUN(slp_re_first);
++                //rk_soc_pm_ctr_bits_prepare();
++            }	  	
++        }else if(rkpm_chk_jdg_ctrbit(RKPM_CTR_IDLEAUTO_MD))
++        {
++            RKPM_DDR_PFUN(slp_setting(rkpm_jdg_sram_ctrbits),slp_setting);
++            rkpm_ddr_printch('a');	
++            dsb();
++            wfi();  
++            rkpm_ddr_printch('a');	
++        }
++        else if(rkpm_chk_jdg_ctrbit(RKPM_CTR_IDLESRAM_MD)&&p_suspend_pie_cb)
++        {
++            call_with_stack(p_suspend_pie_cb,&rkpm_jdg_sram_ctrbits, rockchip_sram_stack);
++        }
++        else
++        {
++            dsb();
++            wfi();
++        }
+ 
+-    rkpm_ddr_printch('2');
++        pm_log = true;
+ 
+-    RKPM_BITCTR_DDR_FUN(GTCLKS,re_gtclks);
++        rkpm_ddr_printch('5');
+ 
+-    local_fiq_enable();
+-    
+-    rkpm_ddr_printch('1');
++        RKPM_BITCTR_DDR_FUN(GPIOS,re_gpios);
+ 
+-    RKPM_BITCTR_DDR_FUN(PWR_DMNS,re_pwr_dmns);
++        rkpm_ddr_printch('4');
+ 
+-    rkpm_ddr_printch('0');
+-    
+-    pm_log = false;
+-    
+-    printk(KERN_CONT "\n");
+-    
+-    rkpm_ddr_printch('\n');
++        RKPM_BITCTR_DDR_FUN(PLLS,re_plls);
++
++        rkpm_ddr_printch('3');
++
++        RKPM_BITCTR_DDR_FUN(GTCLKS,re_gtclks);
++        
++        rkpm_ddr_printch('2');
++        
++        RKPM_BITSCTR_DDR_FUN(RKPM_CTRBITS_SOC_DLPMD,slp_re_last);
++
++        local_fiq_enable();
++
++        rkpm_ddr_printch('1');
++
++        RKPM_BITCTR_DDR_FUN(PWR_DMNS,re_pwr_dmns);
++
++        rkpm_ddr_printch('0');
++
++        pm_log = false;
++
++        printk(KERN_CONT "\n");
++
++        rkpm_ddr_printch('\n');
++
++        RKPM_DDR_FUN(finish);
+     
+-    RKPM_DDR_FUN(finish);
+-    return 0;
++  
++        return 0;
+ }
+ 
+-int rkpm_enter_tst(void)
++static int rkpm_enter_tst(void)
+ {
+ 
+        return rkpm_enter(0);
+@@ -478,9 +528,6 @@ static void rkpm_suspend_finish(void)
+ }
+ 
+ 
+-
+-
+-
+ static struct platform_suspend_ops rockchip_suspend_ops = {
+ 	.enter		= rkpm_enter,
+ 	.valid		= suspend_valid_only_mem,
+@@ -489,7 +536,7 @@ static struct platform_suspend_ops rockchip_suspend_ops = {
+ };
+ void __init rockchip_suspend_init(void)
+ {
+-    printk("%s\n",__FUNCTION__);
++    //printk("%s\n",__FUNCTION__);
+     suspend_set_ops(&rockchip_suspend_ops);
+     return;
+ }
+diff --git a/arch/arm/mach-rockchip/pm.h b/arch/arm/mach-rockchip/pm.h
+old mode 100644
+new mode 100755
+index e4a583b00d29..811526a227cf
+--- a/arch/arm/mach-rockchip/pm.h
++++ b/arch/arm/mach-rockchip/pm.h
+@@ -1,11 +1,34 @@
+ #ifndef __MACH_ROCKCHIP_PM_H
+ #define __MACH_ROCKCHIP_PM_H
+ 
+-#include <dt-bindings/suspend/rockchip-pm.h>
+ 
+ 
++/******************************sleep data in bootram********************************/
++#define PM_BOOT_CODE_OFFSET (0x0)
++#define PM_BOOT_CODE_SIZE	(0x100)
++
++// index data off in SLP_DATA_SAVE_BASE
++// it may be include in *.s ,so con't use enum type define
++
++#define SLPDATA_L2_CON                       (0)  //cpu resume sp
++#define SLPDATA_SP_ADDR                       (SLPDATA_L2_CON+1)  //cpu resume sp
++#define SLPDATA_SP_CPU_RESUME          (SLPDATA_SP_ADDR+1)  //cpu resume sp
++#define SLPDATA_DDR_NEED_RES            (SLPDATA_SP_CPU_RESUME+1)  //ddr ctrl is need to resume
++#define SLPDATA_DPLL_NEED_RES           (SLPDATA_DDR_NEED_RES+1) //ddr pll is need to resume
++#define SLPDATA_DDR_CODE_PHY            (SLPDATA_DPLL_NEED_RES+1) //ddr resume code phy
++#define SLPDATA_DDR_DATA_PHY            (SLPDATA_DDR_CODE_PHY+1) //ddr resume data phy
++#define SLPDATA_SLEEP_RES_CON_CNT	              (SLPDATA_DDR_DATA_PHY+1)
++
++#define PM_BOOT_DATA_SIZE   (SLPDATA_SLEEP_RES_CON_CNT*4) // all index
++
++
++#define RKPM_CTRBITS_SOC_DLPMD RKPM_OR_5BITS(ARMDP_LPMD ,ARMOFF_LPMD ,ARMLOGDP_LPMD ,ARMOFF_LOGDP_LPMD,ARMLOGOFF_DLPMD)
++
+ 
+ 
++#ifndef _RKPM_SEELP_S_INCLUDE_
++#include <dt-bindings/suspend/rockchip-pm.h>
++
+ #define RKPM_LOOPS_PER_USEC	24
+ #define RKPM_LOOP(loops)	do { unsigned int i = (loops); if (i < 7) i = 7; barrier(); asm volatile(".align 4; 1: subs %0, %0, #1; bne 1b;" : "+r" (i)); } while (0)
+ /* delay on slow mode */
+@@ -39,6 +62,11 @@ struct rkpm_ops {
+ 	
+ 	rkpm_ops_void_callback  gpios;
+ 	rkpm_ops_void_callback  re_gpios;
++
++        rkpm_ops_void_callback  slp_save;       
++        rkpm_ops_paramter_u32_cb  slp_setting;
++        rkpm_ops_void_callback  slp_re_first;
++        rkpm_ops_void_callback  slp_re_last;
+     
+         rkpm_ops_printch_callback printch;
+ 
+@@ -75,6 +103,7 @@ struct rkpm_gpios_info_st{
+ #endif
+ 
+ /******************ctr bits setting  ************************/
++
+ #define rkpm_chk_val_ctrbit(val,bit) ((val)&(bit))//check bit
+ #define rkpm_chk_val_ctrbits(val,bits) ((val)&(bits))  //check bits
+ 
+@@ -88,7 +117,7 @@ struct rkpm_gpios_info_st{
+ #define grf_readl(offset)	readl_relaxed(RK_GRF_VIRT + offset)
+ #define grf_writel(v, offset)	do { writel_relaxed(v, RK_GRF_VIRT + offset); dsb(); } while (0)
+ 
+-#define reg_readl(base)	readl_relaxed(base)
++#define reg_readl(base) readl_relaxed(base)
+ #define reg_writel(v, base)	do { writel_relaxed(v, base); dsb(); } while (0)
+ 
+ #if 0
+@@ -103,6 +132,11 @@ struct rkpm_gpios_info_st{
+ #endif
+ 
+ /*********************************pm control******************************************/
++
++extern void rkpm_slp_cpu_resume(void);
++extern void rkpm_slp_cpu_while_tst(void);
++
++//extern int  rkpm_slp_cpu_save(int state,int offset);
+ extern void rkpm_ddr_reg_offset_dump(void __iomem * base_addr,u32 _offset);
+ extern void  rkpm_ddr_regs_dump(void __iomem * base_addr,u32 start_offset,u32 end_offset);
+ 
+@@ -114,6 +148,8 @@ extern void rkpm_set_ops_plls(rkpm_ops_void_callback plls,rkpm_ops_void_callback
+ extern void rkpm_set_ops_gpios(rkpm_ops_void_callback gpios,rkpm_ops_void_callback re_gpios);
+ extern void rkpm_set_ops_printch(rkpm_ops_printch_callback printch);
+ extern void rkpm_set_ops_regs_pread(rkpm_ops_void_callback regs_pread);
++extern void rkpm_set_ops_regs_sleep(rkpm_ops_void_callback save,rkpm_ops_paramter_u32_cb setting
++                                                                ,rkpm_ops_void_callback re_first,rkpm_ops_void_callback re_last);
+ 
+ extern void rkpm_set_sram_ops_volt(rkpm_ops_void_callback volts,rkpm_ops_void_callback re_volts);
+ extern void rkpm_set_sram_ops_gtclks(rkpm_ops_void_callback gtclks,rkpm_ops_void_callback re_gtclks);
+@@ -148,4 +184,5 @@ extern void  PIE_FUNC(rkpm_sram_printhex_pie)(unsigned int hex);
+ #endif
+ 
+ #endif
++#endif
+ 
+diff --git a/arch/arm/mach-rockchip/pmu.h b/arch/arm/mach-rockchip/pmu.h
+old mode 100644
+new mode 100755
+index df55d96e8f45..19a10a55d89a
+--- a/arch/arm/mach-rockchip/pmu.h
++++ b/arch/arm/mach-rockchip/pmu.h
+@@ -61,7 +61,7 @@
+ #define RK3288_PMU_GPIO0_A_IOMUX        0x84
+ #define RK3288_PMU_GPIO0_B_IOMUX        0x88
+ #define RK3288_PMU_GPIO0_C_IOMUX        0x8c
+-#define RK3288_PMU_GPIO0_D_IOMUX        0x90
++#define RK3288_PMU_PWRMODE_CON1        0x90
+ #define RK3288_PMU_SYS_REG0             0x94
+ #define RK3288_PMU_SYS_REG1             0x98
+ #define RK3288_PMU_SYS_REG2             0x9c
+diff --git a/arch/arm/mach-rockchip/sleep.S b/arch/arm/mach-rockchip/sleep.S
+new file mode 100644
+index 000000000000..f914f7e4bc61
+--- /dev/null
++++ b/arch/arm/mach-rockchip/sleep.S
+@@ -0,0 +1,108 @@
++
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/memory.h>
++//#include <asm/suspend.h>
++
++#define _RKPM_SEELP_S_INCLUDE_
++#include "pm.h"
++
++.text
++ENTRY(rkpm_slp_cpu_while_tst)
++stmfd	sp!, { r3 - r12, lr }
++
++1: mov r3,r3
++   b 1b
++
++ldmfd	sp!, { r3 - r12, pc }
++
++ENDPROC(rkpm_slp_cpu_while_tst)
++
++
++//65 A   48 0  97 a
++ENTRY(rkpm_slp_cpu_resume)
++9:	mov r1,r1 
++        //b 9b
++	ldr r4, = 0xFF690000
++	mov r5, #65
++	str r5,[r4]
++       // b 9b
++       
++	setmode	PSR_I_BIT | PSR_F_BIT | SVC_MODE, r1  @ set SVC, irqs off
++
++	MRC p15,0,R1,c0,c0,5
++	AND     R1,R1,#0xf
++	CMP     R1,#0
++	BEQ     cpu0Run
++
++//cpu 1 stop here
++cpu1loop:
++	mov r3, #50
++	//str r3,[r4]
++	WFENE                   // ; wait if it.s locked
++	B     cpu1loop           //  ; if any failure, loop
++	
++cpu0Run:
++	//mov r3, #48
++	//str r3,[r0]
++//v7_invalidate_l1
++v7_invalidate_l1:
++        mov     r0, #0
++        mcr     p15, 0, r0, c7, c5, 0   @ invalidate I cache
++        mcr     p15, 2, r0, c0, c0, 0
++        mrc     p15, 1, r0, c0, c0, 0
++
++        ldr     r1, =0x7fff
++        and     r2, r1, r0, lsr #13
++
++        ldr     r1, =0x3ff
++
++        and     r3, r1, r0, lsr #3  @ NumWays - 1
++        add     r2, r2, #1          @ NumSets
++
++        and     r0, r0, #0x7
++        add     r0, r0, #4          @ SetShift
++
++        clz     r1, r3              @ WayShift
++        add     r4, r3, #1          @ NumWays
++1:      sub     r2, r2, #1          @ NumSets--
++        mov     r3, r4              @ Temp = NumWays
++2:      subs    r3, r3, #1          @ Temp--
++        mov     r5, r3, lsl r1
++        mov     r6, r2, lsl r0
++        orr     r5, r5, r6          @ Reg = (Temp<<WayShift)|(NumSets<<SetShift)
++        mcr     p15, 0, r5, c7, c6, 2
++        bgt     2b
++        cmp     r2, #0
++        bgt     1b
++        dsb
++        isb
++
++      #if 0 
++	ldr r1,=PM_BOOT_CODE_SP
++	mov sp, r1	//setting sp
++      #endif
++      1:  mov r1,r1 
++        //b 1b
++      
++	adr r1,9b     // boot ram base
++        ldr r2,2f     // resume data  offset ,from ram base
++        add r2,r2,r1 // resume data addr
++        
++        //l2
++        ldr r3 ,[r2,#(SLPDATA_L2_CON*4)]
++        mcr p15, 1, r3, c9, c0, 2
++
++        //sp
++        ldr sp,[r2,#(SLPDATA_SP_ADDR*4)]   //sp      
++        
++	ldr r3,[r2,#(SLPDATA_DDR_NEED_RES*4)]   //get SLP_DDR_NEED_RES ,if it is 1 ,ddr need to reusme	
++	cmp r3,#1
++	bne res
++	ldr r1,[r2,#(SLPDATA_DDR_CODE_PHY*4)]  // ddr resume code
++	ldr r0,[r2,#(SLPDATA_DDR_DATA_PHY*4)]  //ddr resume data
++	blx r1
++res:	
++	ldr     pc, [r2,#(SLPDATA_SP_CPU_RESUME*4)]
++2:      .long (PM_BOOT_CODE_OFFSET+PM_BOOT_CODE_SIZE)
++ENDPROC(rkpm_slp_cpu_resume)
+diff --git a/include/dt-bindings/suspend/rockchip-pm.h b/include/dt-bindings/suspend/rockchip-pm.h
+index cef5612515c6..6477fec599c6 100755
+--- a/include/dt-bindings/suspend/rockchip-pm.h
++++ b/include/dt-bindings/suspend/rockchip-pm.h
+@@ -19,8 +19,9 @@
+ #define __DT_BINDINGS_ROCKCHIP_PM_H__
+ /******************************bits ops************************************/
+ 
+-
+-
++#ifndef BIT
++#define BIT(nr)			(1 << (nr))
++#endif
+ 
+ #define RKPM_BITS_W_MSK(bits_shift, msk)	((msk) << ((bits_shift) + 16))
+ 
+@@ -36,36 +37,38 @@
+ 
+ #define RKPM_GETBITS(val, bits_shift, msk)	(((val)>> (bits_shift))&(msk))
+ 
+-
+-
+-
+-
+ /*********************CTRBIT DEFINE*****************************/
+-#define RKPM_CTR_PWR_DMNS (0x1<<0)
+-#define RKPM_CTR_GTCLKS (0x1<<1)
+-#define RKPM_CTR_PLLS (0x1<<2)
+-#define RKPM_CTR_VOLTS (0x1<<3)
+-#define RKPM_CTR_GPIOS (0x1<<4)
+-#define RKPM_CTR_DDR (0x1<<5)
+-#define RKPM_CTR_PMIC (0x1<<6)
+-	/*
+-	*sys_clk 24M div , it is mutex for 
+-	**RKPM_CTR_SYSCLK_DIV and RKPM_CTR_SYSCLK_32K and RKPM_CTR_SYSCLK_OSC_DIS.
+-	**you can select only one
+-	*/
+-#define RKPM_CTR_SYSCLK_DIV (0x1<<7)// system clk is 24M,and div to min
+-#define RKPM_CTR_SYSCLK_32K (0x1<<8)// switch sysclk to 32k,need hardwart susport. and div to min
+-#define RKPM_CTR_SYSCLK_OSC_DIS (0x1<<9) // switch sysclk to 32k,disable 24M OSC,need hardwart susport. and div to min
+-
+-       //pm mode Function Selection
+-#define RKPM_CTR_NORIDLE_MD (0x1<<16)
++#define RKPM_CTR_PWR_DMNS BIT(0)
++#define RKPM_CTR_GTCLKS BIT(1)
++#define RKPM_CTR_PLLS BIT(2)
++#define RKPM_CTR_VOLTS BIT(3)
++#define RKPM_CTR_GPIOS BIT(4)
++#define RKPM_CTR_DDR BIT(5)
++#define RKPM_CTR_PMIC BIT(6)
++
++/*************************************************************
++*sys_clk 24M div , it is mutex for 
++**RKPM_CTR_SYSCLK_DIV and RKPM_CTR_SYSCLK_32K and RKPM_CTR_SYSCLK_OSC_DIS.
++**you can select only one
++************************************************************/
++#define RKPM_CTR_SYSCLK_DIV BIT(7)// system clk is 24M,and div to min
++#define RKPM_CTR_SYSCLK_32K BIT(8)// switch sysclk to 32k,need hardwart susport. and div to min
++#define RKPM_CTR_SYSCLK_OSC_DIS BIT(9) // switch sysclk to 32k,disable 24M OSC,need hardwart susport. and div to min
++
++//Low Power Function Selection
++#define RKPM_CTR_IDLESRAM_MD BIT(16) // ddr reslf by soft // nor low power
++#define RKPM_CTR_IDLEAUTO_MD BIT(17) // ddr reslf by soc // nor low power
++#define RKPM_CTR_ARMDP_LPMD BIT(18) // arm enter deep sleep,not off power supply  
++#define RKPM_CTR_ARMOFF_LPMD BIT(19) // arm enter deep sleep,off power supply
++#define RKPM_CTR_ARMLOGDP_LPMD BIT(20)// arm and logic enter deep sleep,both is not off power supply  
++#define RKPM_CTR_ARMOFF_LOGDP_LPMD BIT(21)// arm off ,logic enter deep sleep,but it is not off power supply  
++#define RKPM_CTR_ARMLOGOFF_DLPMD BIT(22) //// arm and logic enter deep sleep,both is off power supply  
+     
+         //debug ctrl Selection
+-#define RKPM_CTR_RET_DIRT (0x1<<24)
+-#define RKPM_CTR_ONLY_WFI (0x1<<25)
+-#define RKPM_CTR_SRAM_NO_WFI (0x1<<26)
+-#define RKPM_CTR_WAKE_UP_KEY (0x1<<27)
+-#define RKPM_CTR_ALL (0x1<<31)
++#define RKPM_CTR_RET_DIRT BIT(24)
++#define RKPM_CTR_SRAM_NO_WFI BIT(26)
++#define RKPM_CTR_WAKE_UP_KEY BIT(27)
++#define RKPM_CTR_ALL BIT(31)
+ 
+ /*********************CTRBIT DEFINE END*****************************/
+ 
+-- 
+2.35.3
+

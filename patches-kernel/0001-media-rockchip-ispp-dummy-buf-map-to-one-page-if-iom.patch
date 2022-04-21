@@ -1,0 +1,244 @@
+From d8fa47220580434d4e436027ee042c0442dffbee Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 16 Dec 2020 18:11:06 +0800
+Subject: [PATCH] media: rockchip: ispp: dummy buf map to one page if iommu
+ enable
+
+Change-Id: Id55ff67679ffb80195bdb97478d0581cb106dab1
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/common.c | 99 ++++++++++++++++---
+ drivers/media/platform/rockchip/ispp/common.h |  1 +
+ drivers/media/platform/rockchip/ispp/hw.c     |  3 +-
+ drivers/media/platform/rockchip/ispp/hw.h     |  1 +
+ drivers/media/platform/rockchip/ispp/stream.c | 19 +---
+ 5 files changed, 94 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index 80e2b50fa355..6cb39513d93d 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -373,6 +373,67 @@ void rkispp_soft_reset(struct rkispp_device *ispp)
+ 		iommu_attach_device(domain, hw->dev);
+ }
+ 
++static int rkispp_alloc_page_dummy_buf(struct rkispp_device *dev, u32 size)
++{
++	struct rkispp_hw_dev *hw = dev->hw_dev;
++	struct rkispp_dummy_buffer *dummy_buf = &hw->dummy_buf;
++	u32 i, n_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
++	struct page *page = NULL, **pages = NULL;
++	struct sg_table *sg = NULL;
++	int ret = -ENOMEM;
++
++	page = alloc_pages(GFP_KERNEL, 0);
++	if (!page)
++		goto err;
++
++	pages = kvmalloc_array(n_pages, sizeof(struct page *), GFP_KERNEL);
++	if (!pages)
++		goto free_page;
++	for (i = 0; i < n_pages; i++)
++		pages[i] = page;
++
++	sg = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
++	if (!sg)
++		goto free_pages;
++	ret = sg_alloc_table_from_pages(sg, pages, n_pages, 0,
++					n_pages << PAGE_SHIFT, GFP_KERNEL);
++	if (ret)
++		goto free_sg;
++
++	ret = dma_map_sg(hw->dev, sg->sgl, sg->nents, DMA_BIDIRECTIONAL);
++	dummy_buf->dma_addr = sg_dma_address(sg->sgl);
++	dummy_buf->mem_priv = sg;
++	dummy_buf->pages = pages;
++	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
++		 "%s buf:0x%x map cnt:%d\n", __func__,
++		 (u32)dummy_buf->dma_addr, ret);
++	return 0;
++free_sg:
++	kfree(sg);
++free_pages:
++	kvfree(pages);
++free_page:
++	__free_pages(page, 0);
++err:
++	return ret;
++}
++
++static void rkispp_free_page_dummy_buf(struct rkispp_device *dev)
++{
++	struct rkispp_dummy_buffer *dummy_buf = &dev->hw_dev->dummy_buf;
++	struct sg_table *sg = dummy_buf->mem_priv;
++
++	if (!sg)
++		return;
++	dma_unmap_sg(dev->hw_dev->dev, sg->sgl, sg->nents, DMA_BIDIRECTIONAL);
++	sg_free_table(sg);
++	kfree(sg);
++	__free_pages(dummy_buf->pages[0], 0);
++	kvfree(dummy_buf->pages);
++	dummy_buf->mem_priv = NULL;
++	dummy_buf->pages = NULL;
++}
++
+ int rkispp_alloc_common_dummy_buf(struct rkispp_device *dev)
+ {
+ 	struct rkispp_hw_dev *hw = dev->hw_dev;
+@@ -384,31 +445,41 @@ int rkispp_alloc_common_dummy_buf(struct rkispp_device *dev)
+ 	int ret = 0;
+ 
+ 	mutex_lock(&hw->dev_lock);
+-	if (dummy_buf->mem_priv) {
+-		if (dummy_buf->size >= size)
+-			goto end;
+-		rkispp_free_buffer(dev, &dev->hw_dev->dummy_buf);
++	if (dummy_buf->mem_priv)
++		goto end;
++
++	if (hw->is_mmu) {
++		ret = rkispp_alloc_page_dummy_buf(dev, size);
++		goto end;
+ 	}
+-	dummy_buf->size = w * h * 2;
++
++	dummy_buf->size = size;
+ 	ret = rkispp_allow_buffer(dev, dummy_buf);
+-	if (ret < 0)
+-		v4l2_err(&dev->v4l2_dev,
+-			 "failed to alloc common dummy buf:%d\n", ret);
+-	else
++	if (!ret)
+ 		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+-			 "alloc common dummy buf:0x%x size:%d\n",
++			 "%s buf:0x%x size:%d\n", __func__,
+ 			 (u32)dummy_buf->dma_addr, dummy_buf->size);
+-
+ end:
++	if (ret < 0)
++		v4l2_err(&dev->v4l2_dev, "%s failed:%d\n", __func__, ret);
+ 	mutex_unlock(&hw->dev_lock);
+ 	return ret;
+ }
+ 
+ void rkispp_free_common_dummy_buf(struct rkispp_device *dev)
+ {
+-	if (atomic_read(&dev->hw_dev->refcnt))
+-		return;
+-	rkispp_free_buffer(dev, &dev->hw_dev->dummy_buf);
++	struct rkispp_hw_dev *hw = dev->hw_dev;
++
++	mutex_lock(&hw->dev_lock);
++	if (atomic_read(&hw->refcnt) ||
++	    atomic_read(&dev->stream_vdev.refcnt) > 1)
++		goto end;
++	if (hw->is_mmu)
++		rkispp_free_page_dummy_buf(dev);
++	else
++		rkispp_free_buffer(dev, &hw->dummy_buf);
++end:
++	mutex_unlock(&hw->dev_lock);
+ }
+ 
+ int rkispp_find_regbuf_by_id(struct rkispp_device *ispp, struct rkisp_ispp_reg **free_buf,
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index 5c90523890fa..6cbf20722397 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -64,6 +64,7 @@ struct rkispp_dummy_buffer {
+ 	dma_addr_t dma_addr;
+ 	void *mem_priv;
+ 	void *vaddr;
++	struct page **pages;
+ 	/* timestamp in ns */
+ 	u64 timestamp;
+ 	u32 size;
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+index 378698111947..b61f23352c61 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.c
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -284,7 +284,8 @@ static int rkispp_hw_probe(struct platform_device *pdev)
+ 	hw_dev->is_idle = true;
+ 	hw_dev->is_single = true;
+ 	hw_dev->is_fec_ext = false;
+-	if (!is_iommu_enable(dev)) {
++	hw_dev->is_mmu = is_iommu_enable(dev);
++	if (!hw_dev->is_mmu) {
+ 		ret = of_reserved_mem_device_init(dev);
+ 		if (ret)
+ 			dev_warn(dev, "No reserved memory region assign to ispp\n");
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+index cc14eeeb98ed..f17f1bc8a86a 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.h
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -48,6 +48,7 @@ struct rkispp_hw_dev {
+ 	struct mutex dev_lock;
+ 	spinlock_t buf_lock;
+ 	atomic_t refcnt;
++	bool is_mmu;
+ 	bool is_idle;
+ 	bool is_single;
+ 	bool is_fec_ext;
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index c274d22d6590..b6f93462286c 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -1406,16 +1406,7 @@ static void rkispp_buf_queue(struct vb2_buffer *vb)
+ 	spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+ }
+ 
+-static int rkispp_create_dummy_buf(struct rkispp_stream *stream)
+-{
+-	struct rkispp_device *dev = stream->isppdev;
+-
+-	if (stream->type != STREAM_OUTPUT)
+-		return 0;
+-	return rkispp_alloc_common_dummy_buf(dev);
+-}
+-
+-static void rkispp_destroy_dummy_buf(struct rkispp_stream *stream)
++static void rkispp_destroy_buf(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+ 	struct rkispp_stream_vdev *vdev= &dev->stream_vdev;
+@@ -1426,7 +1417,6 @@ static void rkispp_destroy_dummy_buf(struct rkispp_stream *stream)
+ 		nr_free_buf(dev);
+ 		fec_free_buf(dev);
+ 		rkispp_event_handle(dev, CMD_FREE_POOL, NULL);
+-		rkispp_free_common_dummy_buf(dev);
+ 	}
+ }
+ 
+@@ -1509,8 +1499,9 @@ static void rkispp_stop_streaming(struct vb2_queue *queue)
+ 	mutex_lock(&dev->hw_dev->dev_lock);
+ 	rkispp_stream_stop(stream);
+ 	destroy_buf_queue(stream, VB2_BUF_STATE_ERROR);
+-	rkispp_destroy_dummy_buf(stream);
++	rkispp_destroy_buf(stream);
+ 	mutex_unlock(&dev->hw_dev->dev_lock);
++	rkispp_free_common_dummy_buf(dev);
+ 	atomic_dec(&dev->stream_vdev.refcnt);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+@@ -1598,7 +1589,7 @@ static int rkispp_start_streaming(struct vb2_queue *queue,
+ 		goto free_buf_queue;
+ 	}
+ 
+-	ret = rkispp_create_dummy_buf(stream);
++	ret = rkispp_alloc_common_dummy_buf(stream->isppdev);
+ 	if (ret < 0)
+ 		goto free_buf_queue;
+ 
+@@ -1626,7 +1617,7 @@ static int rkispp_start_streaming(struct vb2_queue *queue,
+ 		 "%s id:%d exit\n", __func__, stream->id);
+ 	return 0;
+ free_dummy_buf:
+-	rkispp_destroy_dummy_buf(stream);
++	rkispp_free_common_dummy_buf(stream->isppdev);
+ free_buf_queue:
+ 	destroy_buf_queue(stream, VB2_BUF_STATE_QUEUED);
+ 	atomic_dec(&dev->stream_vdev.refcnt);
+-- 
+2.35.3
+

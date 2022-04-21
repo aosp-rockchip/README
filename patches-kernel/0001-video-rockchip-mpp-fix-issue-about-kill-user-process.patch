@@ -1,0 +1,473 @@
+From 6e73c8cad0fd62c001b653f2fd209064b93eef5f Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Wed, 1 Apr 2020 11:31:00 +0800
+Subject: [PATCH] video: rockchip: mpp: fix issue about kill user process
+
+If user process killed:
+1. kernel should not to alloc task, and wait all task done in session,
+   then release session.
+2. fd in user space is closed, then kernel space can not use dma_buf_get
+   to get dma handle, so kernel will crash.
+
+crash:
+
+[   35.677648 ] [<b022b098>] (__fget) from [<b0467134>]
+(dma_buf_get+0x8/0x40)
+[   35.678261 ] [<b0467134>] (dma_buf_get) from [<b0397848>]
+(mpp_dma_find_buffer_fd+0x14/0x94)
+[   35.679004 ] [<b0397848>] (mpp_dma_find_buffer_fd) from [<b03978fc>]
+(mpp_dma_release_fd+0x34/0xa0)
+[   35.679799 ] [<b03978fc>] (mpp_dma_release_fd) from [<b0395b2c>]
+(mpp_task_finalize+0x68/0xbc)
+[   35.680561 ] [<b0395b2c>] (mpp_task_finalize) from [<b0398614>]
+(rkvdec_free_task+0xc/0x1c)
+[   35.681290 ] [<b0398614>] (rkvdec_free_task) from [<b03963e4>]
+(mpp_wait_result+0xd4/0x400)
+[   35.682020 ] [<b03963e4>] (mpp_wait_result) from [<b0396940>]
+(mpp_dev_release+0x230/0x244)
+[   35.682750 ] [<b0396940>] (mpp_dev_release) from [<b020f30c>]
+(__fput+0x88/0x1c4)
+[   35.683415 ] [<b020f30c>] (__fput) from [<b0140cac>]
+(task_work_run+0x90/0xb0)
+[   35.684059 ] [<b0140cac>] (task_work_run) from [<b0128b38>]
+(do_exit+0x3c4/0xac4)
+[   35.684722 ] [<b0128b38>] (do_exit) from [<b0129f54>]
+(do_group_exit+0x3c/0xbc)
+[   35.685366 ] [<b0129f54>] (do_group_exit) from [<b0133b50>]
+(get_signal+0xe4/0x6ac)
+[   35.686040 ] [<b0133b50>] (get_signal) from [<b010b09c>]
+(do_signal+0x2a0/0x494)
+[   35.686690 ] [<b010b09c>] (do_signal) from [<b010b454>]
+(do_work_pending+0xb4/0xd0)
+[   35.687364 ] [<b010b454>] (do_work_pending) from [<b0101064>]
+(slow_work_pending+0xc/0x20)
+
+Change-Id: I8decec8ff4c356b315fe511128c5b67c5b349932
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c | 143 +++++++++++++-----------
+ drivers/video/rockchip/mpp/mpp_common.h |  14 ++-
+ drivers/video/rockchip/mpp/mpp_iommu.c  |  22 +++-
+ drivers/video/rockchip/mpp/mpp_iommu.h  |   9 +-
+ drivers/video/rockchip/mpp/mpp_rkvenc.c |   1 +
+ 5 files changed, 109 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 26fbc8a86eef..000596c64d0d 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -164,46 +164,13 @@ static int mpp_power_off(struct mpp_dev *mpp)
+ 	return 0;
+ }
+ 
+-static void *
+-mpp_fd_to_mem_region(struct mpp_session *session, int fd)
+-{
+-	struct mpp_dma_buffer *buffer = NULL;
+-	struct mpp_mem_region *mem_region = NULL;
+-	struct mpp_dev *mpp = session->mpp;
+-	struct mpp_dma_session *dma = session->dma;
+-
+-	if (fd <= 0 || !dma || !mpp)
+-		return ERR_PTR(-EINVAL);
+-
+-	mem_region = kzalloc(sizeof(*mem_region), GFP_KERNEL);
+-	if (!mem_region)
+-		return ERR_PTR(-ENOMEM);
+-
+-	down_read(&mpp->rw_sem);
+-	buffer = mpp_dma_import_fd(mpp->iommu_info, dma, fd);
+-	up_read(&mpp->rw_sem);
+-	if (IS_ERR_OR_NULL(buffer)) {
+-		mpp_err("can't import dma-buf %d\n", fd);
+-		goto fail;
+-	}
+-
+-	mem_region->hdl = (void *)(long)fd;
+-	mem_region->iova = buffer->iova;
+-	mem_region->len = buffer->size;
+-
+-	return mem_region;
+-fail:
+-	kfree(mem_region);
+-	return ERR_PTR(-ENOMEM);
+-}
+-
+ static int
+ mpp_session_push_pending(struct mpp_session *session,
+ 			 struct mpp_task *task)
+ {
+-	mutex_lock(&session->list_lock);
++	mutex_lock(&session->pending_lock);
+ 	list_add_tail(&task->session_link, &session->pending);
+-	mutex_unlock(&session->list_lock);
++	mutex_unlock(&session->pending_lock);
+ 
+ 	return 0;
+ }
+@@ -214,11 +181,14 @@ static int mpp_session_push_done(struct mpp_task *task)
+ 
+ 	session = task->session;
+ 
+-	mutex_lock(&session->list_lock);
++	mutex_lock(&session->pending_lock);
+ 	list_del_init(&task->session_link);
+-	mutex_unlock(&session->list_lock);
++	mutex_unlock(&session->pending_lock);
+ 
++	mutex_lock(&session->done_lock);
+ 	kfifo_in(&session->done_fifo, &task, 1);
++	mutex_unlock(&session->done_lock);
++
+ 	wake_up(&session->wait);
+ 
+ 	return 0;
+@@ -227,11 +197,16 @@ static int mpp_session_push_done(struct mpp_task *task)
+ static struct mpp_task *
+ mpp_session_pull_done(struct mpp_session *session)
+ {
++	int ret;
+ 	struct mpp_task *task = NULL;
+ 
+-	if (kfifo_out(&session->done_fifo, &task, 1))
+-		return task;
+-	return NULL;
++	mutex_lock(&session->done_lock);
++	ret = kfifo_out(&session->done_fifo, &task, 1);
++	mutex_unlock(&session->done_lock);
++	if (!ret)
++		task = NULL;
++
++	return task;
+ }
+ 
+ static int mpp_process_task(struct mpp_session *session,
+@@ -434,9 +409,9 @@ static int mpp_dev_abort(struct mpp_dev *mpp)
+ 	/* destroy the current task after hardware reset */
+ 	task = mpp_taskqueue_get_cur_task(mpp->queue);
+ 	if (task) {
+-		mutex_lock(&task->session->list_lock);
++		mutex_lock(&task->session->pending_lock);
+ 		list_del_init(&task->session_link);
+-		mutex_unlock(&task->session->list_lock);
++		mutex_unlock(&task->session->pending_lock);
+ 		mpp_taskqueue_abort(mpp->queue, task);
+ 		atomic_dec(&task->session->task_running);
+ 		mpp_free_task(task->session, task);
+@@ -543,17 +518,21 @@ static int mpp_session_clear(struct mpp_dev *mpp,
+ {
+ 	struct mpp_task *task, *n, *task_done;
+ 
+-	mutex_lock(&session->list_lock);
++	/* clear task which have done */
++	mutex_lock(&session->done_lock);
++	while (kfifo_out(&session->done_fifo, &task_done, 1))
++		mpp_free_task(session, task_done);
++	mutex_unlock(&session->done_lock);
++
++	/* clear task which have not start */
++	mutex_lock(&session->pending_lock);
+ 	list_for_each_entry_safe(task, n,
+ 				 &session->pending,
+ 				 session_link) {
+ 		list_del_init(&task->session_link);
+ 		mpp_free_task(session, task);
+ 	}
+-	mutex_unlock(&session->list_lock);
+-
+-	while (kfifo_out(&session->done_fifo, &task_done, 1))
+-		mpp_free_task(session, task_done);
++	mutex_unlock(&session->pending_lock);
+ 
+ 	return 0;
+ }
+@@ -965,6 +944,10 @@ static long mpp_dev_ioctl(struct file *filp,
+ 		return -EINVAL;
+ 	}
+ 	srv = session->srv;
++	if (atomic_read(&session->release_request) > 0) {
++		mpp_debug(DEBUG_IOCTL, "release session had request\n");
++		return -EBUSY;
++	}
+ 	if (atomic_read(&srv->shutdown_request) > 0) {
+ 		mpp_debug(DEBUG_IOCTL, "shutdown had request\n");
+ 		return -EBUSY;
+@@ -1039,7 +1022,9 @@ static int mpp_dev_open(struct inode *inode, struct file *filp)
+ 	session->srv = srv;
+ 	session->pid = current->pid;
+ 
+-	mutex_init(&session->list_lock);
++	mutex_init(&session->pending_lock);
++	mutex_init(&session->reg_lock);
++	mutex_init(&session->done_lock);
+ 	INIT_LIST_HEAD(&session->pending);
+ 	init_waitqueue_head(&session->wait);
+ 	ret = kfifo_alloc(&session->done_fifo,
+@@ -1051,6 +1036,7 @@ static int mpp_dev_open(struct inode *inode, struct file *filp)
+ 	}
+ 
+ 	atomic_set(&session->task_running, 0);
++	atomic_set(&session->release_request, 0);
+ 	filp->private_data = (void *)session;
+ 
+ 	mpp_debug_leave();
+@@ -1064,7 +1050,8 @@ static int mpp_dev_open(struct inode *inode, struct file *filp)
+ 
+ static int mpp_dev_release(struct inode *inode, struct file *filp)
+ {
+-	int task_running;
++	int ret;
++	int val;
+ 	struct mpp_dev *mpp;
+ 	struct mpp_session *session = filp->private_data;
+ 
+@@ -1075,12 +1062,13 @@ static int mpp_dev_release(struct inode *inode, struct file *filp)
+ 		return -EINVAL;
+ 	}
+ 
+-	task_running = atomic_read(&session->task_running);
+-	if (task_running) {
+-		mpp_err("session %d still has %d task running when closing\n",
+-			session->pid, task_running);
+-		msleep(50);
+-	}
++	/* wait for task all done */
++	atomic_inc(&session->release_request);
++	ret = readx_poll_timeout(atomic_read,
++				 &session->task_running,
++				 val, val == 0, 1000, 50000);
++	if (ret == -ETIMEDOUT)
++		mpp_err("wait total running time out\n");
+ 	wake_up(&session->wait);
+ 
+ 	/* release device resource */
+@@ -1133,17 +1121,38 @@ struct mpp_mem_region *
+ mpp_task_attach_fd(struct mpp_task *task, int fd)
+ {
+ 	struct mpp_mem_region *mem_region = NULL;
++	struct mpp_dma_buffer *buffer = NULL;
++	struct mpp_dev *mpp = task->session->mpp;
++	struct mpp_dma_session *dma = task->session->dma;
+ 
+-	mem_region = mpp_fd_to_mem_region(task->session, fd);
+-	if (IS_ERR(mem_region))
+-		return mem_region;
++	if (fd <= 0 || !dma || !mpp)
++		return ERR_PTR(-EINVAL);
+ 
+-	INIT_LIST_HEAD(&mem_region->reg_lnk);
+-	mutex_lock(&task->session->list_lock);
+-	list_add_tail(&mem_region->reg_lnk, &task->mem_region_list);
+-	mutex_unlock(&task->session->list_lock);
++	mem_region = kzalloc(sizeof(*mem_region), GFP_KERNEL);
++	if (!mem_region)
++		return ERR_PTR(-ENOMEM);
++
++	down_read(&mpp->rw_sem);
++	buffer = mpp_dma_import_fd(mpp->iommu_info, dma, fd);
++	up_read(&mpp->rw_sem);
++	if (IS_ERR_OR_NULL(buffer)) {
++		mpp_err("can't import dma-buf %d\n", fd);
++		goto fail;
++	}
++
++	mem_region->hdl = buffer;
++	mem_region->iova = buffer->iova;
++	mem_region->len = buffer->size;
++
++	INIT_LIST_HEAD(&mem_region->reg_link);
++	mutex_lock(&task->session->reg_lock);
++	list_add_tail(&mem_region->reg_link, &task->mem_region_list);
++	mutex_unlock(&task->session->reg_lock);
+ 
+ 	return mem_region;
++fail:
++	kfree(mem_region);
++	return ERR_PTR(-ENOMEM);
+ }
+ 
+ int mpp_translate_reg_address(struct mpp_session *session,
+@@ -1308,18 +1317,18 @@ int mpp_task_finalize(struct mpp_session *session,
+ 	struct mpp_mem_region *mem_region = NULL, *n;
+ 
+ 	mpp = session->mpp;
+-	mutex_lock(&session->list_lock);
++	mutex_lock(&session->reg_lock);
+ 	/* release memory region attach to this registers table. */
+ 	list_for_each_entry_safe(mem_region, n,
+ 				 &task->mem_region_list,
+-				 reg_lnk) {
++				 reg_link) {
+ 		down_read(&mpp->rw_sem);
+-		mpp_dma_release_fd(session->dma, (long)mem_region->hdl);
++		mpp_dma_release(session->dma, mem_region->hdl);
+ 		up_read(&mpp->rw_sem);
+-		list_del_init(&mem_region->reg_lnk);
++		list_del_init(&mem_region->reg_link);
+ 		kfree(mem_region);
+ 	}
+-	mutex_unlock(&session->list_lock);
++	mutex_unlock(&session->reg_lock);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index ded08e9111eb..6d68c205c68d 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -164,9 +164,7 @@ struct mpp_dev_var {
+ };
+ 
+ struct mpp_mem_region {
+-	struct list_head srv_lnk;
+-	struct list_head reg_lnk;
+-	struct list_head session_lnk;
++	struct list_head reg_link;
+ 	/* address for iommu */
+ 	dma_addr_t iova;
+ 	unsigned long len;
+@@ -214,8 +212,13 @@ struct mpp_session {
+ 	struct mpp_dev *mpp;
+ 	struct mpp_dma_session *dma;
+ 
+-	/* session tasks list lock */
+-	struct mutex list_lock;
++	/* session tasks pending list lock */
++	struct mutex pending_lock;
++	/* session tasks register list lock */
++	struct mutex reg_lock;
++	/* session tasks done list lock */
++	struct mutex done_lock;
++	/* task pending list in session */
+ 	struct list_head pending;
+ 
+ 	DECLARE_KFIFO_PTR(done_fifo, struct mpp_task *);
+@@ -223,6 +226,7 @@ struct mpp_session {
+ 	wait_queue_head_t wait;
+ 	pid_t pid;
+ 	atomic_t task_running;
++	atomic_t release_request;
+ 	/* trans info set by user */
+ 	int trans_count;
+ 	u16 trans_table[MPP_MAX_REG_TRANS_NUM];
+diff --git a/drivers/video/rockchip/mpp/mpp_iommu.c b/drivers/video/rockchip/mpp/mpp_iommu.c
+index 114850a23d79..3df57083de75 100644
+--- a/drivers/video/rockchip/mpp/mpp_iommu.c
++++ b/drivers/video/rockchip/mpp/mpp_iommu.c
+@@ -36,7 +36,7 @@ mpp_dma_find_buffer_fd(struct mpp_dma_session *dma, int fd)
+ 
+ 	mutex_lock(&dma->list_mutex);
+ 	list_for_each_entry_safe(buffer, n,
+-				 &dma->buffer_list, list) {
++				 &dma->buffer_list, link) {
+ 		/*
+ 		 * As long as the last reference is hold by the buffer pool,
+ 		 * the same fd won't be assigned to the other application.
+@@ -60,7 +60,7 @@ static void mpp_dma_release_buffer(struct kref *ref)
+ 		container_of(ref, struct mpp_dma_buffer, ref);
+ 
+ 	buffer->dma->buffer_count--;
+-	list_del_init(&buffer->list);
++	list_del_init(&buffer->link);
+ 
+ 	dma_buf_unmap_attachment(buffer->attach, buffer->sgt, buffer->dir);
+ 	dma_buf_detach(buffer->dmabuf, buffer->attach);
+@@ -80,7 +80,7 @@ mpp_dma_remove_extra_buffer(struct mpp_dma_session *dma)
+ 		mutex_lock(&dma->list_mutex);
+ 		list_for_each_entry_safe(buffer, n,
+ 					 &dma->buffer_list,
+-					 list) {
++					 link) {
+ 			if (ktime_to_ns(oldest_time) == 0 ||
+ 			    ktime_after(oldest_time, buffer->last_used)) {
+ 				oldest_time = buffer->last_used;
+@@ -95,6 +95,16 @@ mpp_dma_remove_extra_buffer(struct mpp_dma_session *dma)
+ 	return 0;
+ }
+ 
++int mpp_dma_release(struct mpp_dma_session *dma,
++		    struct mpp_dma_buffer *buffer)
++{
++	mutex_lock(&dma->list_mutex);
++	kref_put(&buffer->ref, mpp_dma_release_buffer);
++	mutex_unlock(&dma->list_mutex);
++
++	return 0;
++}
++
+ int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
+ {
+ 	struct device *dev = dma->dev;
+@@ -219,11 +229,11 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
+ 	kref_init(&buffer->ref);
+ 	/* Increase the reference for used outside the buffer pool */
+ 	kref_get(&buffer->ref);
+-	INIT_LIST_HEAD(&buffer->list);
++	INIT_LIST_HEAD(&buffer->link);
+ 
+ 	mutex_lock(&dma->list_mutex);
+ 	dma->buffer_count++;
+-	list_add_tail(&buffer->list, &dma->buffer_list);
++	list_add_tail(&buffer->link, &dma->buffer_list);
+ 	mutex_unlock(&dma->list_mutex);
+ 
+ 	return buffer;
+@@ -299,7 +309,7 @@ int mpp_dma_session_destroy(struct mpp_dma_session *dma)
+ 	mutex_lock(&dma->list_mutex);
+ 	list_for_each_entry_safe(buffer, n,
+ 				 &dma->buffer_list,
+-				 list) {
++				 link) {
+ 		kref_put(&buffer->ref, mpp_dma_release_buffer);
+ 	}
+ 	mutex_unlock(&dma->list_mutex);
+diff --git a/drivers/video/rockchip/mpp/mpp_iommu.h b/drivers/video/rockchip/mpp/mpp_iommu.h
+index e2cb42707096..a8ba6b9f5f1d 100644
+--- a/drivers/video/rockchip/mpp/mpp_iommu.h
++++ b/drivers/video/rockchip/mpp/mpp_iommu.h
+@@ -15,9 +15,11 @@
+ #include <linux/dma-mapping.h>
+ 
+ struct mpp_dma_buffer {
+-	struct list_head list;
+-	struct mpp_dma_session *dma;
++	/* link to dma session buffer list */
++	struct list_head link;
+ 
++	/* dma session belong */
++	struct mpp_dma_session *dma;
+ 	/* DMABUF information */
+ 	struct dma_buf *dmabuf;
+ 	struct dma_buf_attachment *attach;
+@@ -35,6 +37,7 @@ struct mpp_dma_buffer {
+ };
+ 
+ struct mpp_dma_session {
++	/* the buffer used in session */
+ 	struct list_head buffer_list;
+ 	/* the mutex for the above buffer list */
+ 	struct mutex list_mutex;
+@@ -76,6 +79,8 @@ int mpp_dma_free(struct mpp_dma_session *dma,
+ struct mpp_dma_buffer *
+ mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
+ 		  struct mpp_dma_session *dma, int fd);
++int mpp_dma_release(struct mpp_dma_session *dma,
++		    struct mpp_dma_buffer *buffer);
+ int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd);
+ 
+ int mpp_dma_unmap_kernel(struct mpp_dma_session *dma,
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 28514742cd93..e49de9d4c527 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -389,6 +389,7 @@ static int rkvenc_run(struct mpp_dev *mpp,
+ 		 * otherwise, osd setting will not work
+ 		 */
+ 		mpp_write_relaxed(mpp, RKVENC_OSD_CFG_BASE, 0);
++		/* ensure clear finish */
+ 		wmb();
+ 		for (i = 0; i < task->w_req_cnt; i++) {
+ 			int s, e;
+-- 
+2.35.3
+

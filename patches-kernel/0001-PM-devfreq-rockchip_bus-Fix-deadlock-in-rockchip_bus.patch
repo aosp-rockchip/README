@@ -1,0 +1,222 @@
+From d79b5fb21a87873b727382976858f5637ebbfa9a Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Tue, 22 Oct 2019 17:52:34 +0800
+Subject: [PATCH] PM / devfreq: rockchip_bus: Fix deadlock in
+ rockchip_bus_clkfreq_target()
+
+INFO: task cfinteractive:47 blocked for more than 10 seconds.
+      Not tainted 4.19.53 #111
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+cfinteractive   D    0    47      2 0x00000028
+Call trace:
+ __switch_to+0x8c/0xd0
+ __schedule+0x2e0/0x908
+ schedule+0x38/0xa0
+ schedule_preempt_disabled+0x20/0x38
+ __mutex_lock.isra.0+0x188/0x6d8
+ __mutex_lock_slowpath+0x10/0x18
+ mutex_lock+0x38/0x40
+ _find_opp_table+0x30/0x88
+ dev_pm_opp_find_freq_ceil+0x20/0x88
+ devfreq_recommended_opp+0x34/0x60
+ rockchip_bus_clkfreq_target.constprop.2+0x44/0xf0
+ rockchip_bus_clk_notifier+0x48/0x88
+ notifier_call_chain+0x50/0x90
+ __srcu_notifier_call_chain+0x54/0x80
+ srcu_notifier_call_chain+0x14/0x20
+ __clk_notify+0x8c/0xc8
+ clk_propagate_rate_change+0xac/0xc0
+ clk_propagate_rate_change+0x9c/0xc0
+ clk_core_set_rate_nolock+0x154/0x1b8
+ clk_set_rate+0x34/0x90
+ _generic_set_opp_regulator+0x70/0x1a0
+ dev_pm_opp_set_rate+0x2f0/0x3e0
+ set_target+0x40/0x70
+ __cpufreq_driver_target+0x2c8/0x540
+ cpufreq_interactive_speedchange_task+0x1f0/0x330
+ kthread+0xfc/0x128
+ ret_from_fork+0x10/0x18
+INFO: task kworker/2:2:137 blocked for more than 10 seconds.
+      Not tainted 4.19.53 #111
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+kworker/2:2     D    0   137      2 0x00000028
+Workqueue: events deferred_probe_work_func
+Call trace:
+ __switch_to+0x8c/0xd0
+ __schedule+0x2e0/0x908
+ schedule+0x38/0xa0
+ schedule_preempt_disabled+0x20/0x38
+ __mutex_lock.isra.0+0x188/0x6d8
+ __mutex_lock_slowpath+0x10/0x18
+ mutex_lock+0x38/0x40
+ clk_prepare_lock+0x40/0xa0
+ clk_hw_create_clk.isra.24+0x64/0xb8
+ __clk_create_clk+0x3c/0x58
+ __of_clk_get_from_provider+0xec/0x130
+ __of_clk_get_by_name+0xa8/0x148
+ clk_get+0x30/0x80
+ dev_pm_opp_get_opp_table+0xbc/0x130
+ dev_pm_opp_set_prop_name+0x14/0x88
+ rockchip_set_opp_prop_name+0x5c/0xd8
+ rockchip_init_opp_table+0x98/0x108
+ kbase_platform_rk_init_opp_table+0x24/0x30
+ kbase_platform_device_probe+0x228/0xd30
+ platform_drv_probe+0x50/0xa8
+ really_probe+0x1f8/0x288
+ driver_probe_device+0x58/0x100
+ __device_attach_driver+0x9c/0xf8
+ bus_for_each_drv+0x70/0xc8
+ __device_attach+0xdc/0x138
+ device_initial_probe+0x10/0x18
+ bus_probe_device+0x94/0xa0
+ deferred_probe_work_func+0x6c/0xa0
+ process_one_work+0x1ec/0x450
+ worker_thread+0x234/0x428
+ kthread+0xfc/0x128
+ ret_from_fork+0x10/0x18
+
+Change-Id: Ibf37fe60513fcfb517a381a404592859a27ed0ea
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/devfreq/rockchip_bus.c | 76 +++++++++++++++++++++++++++-------
+ 1 file changed, 62 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/devfreq/rockchip_bus.c b/drivers/devfreq/rockchip_bus.c
+index 43cd281282b3..b3c94537a94e 100644
+--- a/drivers/devfreq/rockchip_bus.c
++++ b/drivers/devfreq/rockchip_bus.c
+@@ -27,12 +27,20 @@
+ #define to_rockchip_bus_cpufreq_nb(nb) \
+ 	container_of(nb, struct rockchip_bus, cpufreq_nb)
+ 
++struct busfreq_table {
++	unsigned long freq;
++	unsigned long volt;
++};
++
+ struct rockchip_bus {
+ 	struct device *dev;
+ 	struct regulator *regulator;
+ 	struct clk *clk;
+ 	struct notifier_block clk_nb;
+ 	struct notifier_block cpufreq_nb;
++	struct busfreq_table *freq_table;
++
++	unsigned int max_state;
+ 
+ 	unsigned long cur_volt;
+ 	unsigned long cur_rate;
+@@ -101,6 +109,42 @@ static int rockchip_bus_autocs(struct rockchip_bus *bus)
+ 	return 0;
+ }
+ 
++static int rockchip_bus_set_freq_table(struct rockchip_bus *bus)
++{
++	struct device *dev = bus->dev;
++	struct dev_pm_opp *opp;
++	unsigned long freq;
++	int i, count;
++
++	count = dev_pm_opp_get_opp_count(dev);
++	if (count <= 0)
++		return -EINVAL;
++
++	bus->max_state = count;
++	bus->freq_table = devm_kcalloc(dev,
++				       bus->max_state,
++				       sizeof(*bus->freq_table),
++				       GFP_KERNEL);
++	if (!bus->freq_table) {
++		bus->max_state = 0;
++		return -ENOMEM;
++	}
++
++	for (i = 0, freq = 0; i < bus->max_state; i++, freq++) {
++		opp = dev_pm_opp_find_freq_ceil(dev, &freq);
++		if (IS_ERR(opp)) {
++			devm_kfree(dev, bus->freq_table);
++			bus->max_state = 0;
++			return PTR_ERR(opp);
++		}
++		bus->freq_table[i].volt = dev_pm_opp_get_voltage(opp);
++		bus->freq_table[i].freq = freq;
++		dev_pm_opp_put(opp);
++	}
++
++	return 0;
++}
++
+ static int rockchip_bus_power_control_init(struct rockchip_bus *bus)
+ {
+ 	struct device *dev = bus->dev;
+@@ -124,23 +168,27 @@ static int rockchip_bus_power_control_init(struct rockchip_bus *bus)
+ 		return ret;
+ 	}
+ 
++	ret = rockchip_bus_set_freq_table(bus);
++	if (ret < 0) {
++		dev_err(dev, "failed to set bus freq table\n");
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+-static int rockchip_bus_clkfreq_target(struct device *dev, unsigned long freq,
+-				       u32 flags)
++static int rockchip_bus_clkfreq_target(struct device *dev, unsigned long freq)
+ {
+ 	struct rockchip_bus *bus = dev_get_drvdata(dev);
+-	struct dev_pm_opp *opp;
+-	unsigned long target_volt, target_rate = freq;
++	unsigned long target_volt = bus->freq_table[bus->max_state - 1].volt;
++	int i;
+ 
+-	opp = devfreq_recommended_opp(dev, &target_rate, flags);
+-	if (IS_ERR(opp)) {
+-		dev_err(dev, "failed to recommended opp %lu\n", target_rate);
+-		return PTR_ERR(opp);
++	for (i = 0; i < bus->max_state; i++) {
++		if (freq <= bus->freq_table[i].freq) {
++			target_volt = bus->freq_table[i].volt;
++			break;
++		}
+ 	}
+-	target_volt = dev_pm_opp_get_voltage(opp);
+-	dev_pm_opp_put(opp);
+ 
+ 	if (bus->cur_volt != target_volt) {
+ 		dev_dbg(bus->dev, "target_volt: %lu\n", target_volt);
+@@ -170,17 +218,17 @@ static int rockchip_bus_clk_notifier(struct notifier_block *nb,
+ 	case PRE_RATE_CHANGE:
+ 		if (ndata->new_rate > ndata->old_rate)
+ 			ret = rockchip_bus_clkfreq_target(bus->dev,
+-							  ndata->new_rate, 0);
++							  ndata->new_rate);
+ 		break;
+ 	case POST_RATE_CHANGE:
+ 		if (ndata->new_rate < ndata->old_rate)
+ 			ret = rockchip_bus_clkfreq_target(bus->dev,
+-							  ndata->new_rate, 0);
++							  ndata->new_rate);
+ 		break;
+ 	case ABORT_RATE_CHANGE:
+ 		if (ndata->new_rate > ndata->old_rate)
+ 			ret = rockchip_bus_clkfreq_target(bus->dev,
+-							  ndata->old_rate, 0);
++							  ndata->old_rate);
+ 		break;
+ 	default:
+ 		break;
+@@ -202,7 +250,7 @@ static int rockchip_bus_clkfreq(struct rockchip_bus *bus)
+ 	}
+ 
+ 	init_rate = clk_get_rate(bus->clk);
+-	ret = rockchip_bus_clkfreq_target(dev, init_rate, 0);
++	ret = rockchip_bus_clkfreq_target(dev, init_rate);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.35.3
+

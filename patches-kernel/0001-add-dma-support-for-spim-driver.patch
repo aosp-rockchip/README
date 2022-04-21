@@ -1,0 +1,623 @@
+From d593d35c746a363d715467ada1e91c76ce77680a Mon Sep 17 00:00:00 2001
+From: lw <lw@rock-chips.com>
+Date: Fri, 17 Feb 2012 15:26:18 +0800
+Subject: [PATCH] add dma support for spim driver
+
+---
+ arch/arm/mach-rk30/board-rk30-sdk.c    |  11 +-
+ arch/arm/mach-rk30/devices.c           |   4 +
+ drivers/input/touchscreen/xpt2046_ts.h |   2 +-
+ drivers/spi/rk29_spim.c                | 235 ++++++++++++++-----------
+ drivers/spi/rk29_spim.h                |  11 +-
+ 5 files changed, 153 insertions(+), 110 deletions(-)
+
+diff --git a/arch/arm/mach-rk30/board-rk30-sdk.c b/arch/arm/mach-rk30/board-rk30-sdk.c
+index 1ed255ab2091..e1c4b1ea21b7 100755
+--- a/arch/arm/mach-rk30/board-rk30-sdk.c
++++ b/arch/arm/mach-rk30/board-rk30-sdk.c
+@@ -45,6 +45,9 @@
+ #elif defined(CONFIG_TOUCHSCREEN_XPT2046_CBN_SPI)
+ #include "../../../drivers/input/touchscreen/xpt2046_cbn_ts.h"
+ #endif
++#if defined(CONFIG_SPIM_RK29)
++#include "../../../drivers/spi/rk29_spim.h"
++#endif
+ 
+ 
+ /*****************************************************************************************
+@@ -141,7 +144,12 @@ static struct xpt2046_platform_data xpt2046_info = {
+ #endif	
+ };
+ #endif
+-
++#if defined(CONFIG_TOUCHSCREEN_XPT2046_SPI)
++static struct rk29xx_spi_chip xpt2046_chip = {
++	//.poll_mode = 1,
++	.enable_dma = 1,
++};
++#endif
+ static struct spi_board_info board_spi_devices[] = {
+ #if defined(CONFIG_TOUCHSCREEN_XPT2046_SPI)
+ 	{
+@@ -151,6 +159,7 @@ static struct spi_board_info board_spi_devices[] = {
+ 		.bus_num	= 0,
+ 		.irq 		= XPT2046_GPIO_INT,
+ 		.platform_data = &xpt2046_info,
++		.controller_data = &xpt2046_chip,
+ 	},
+ #endif
+ 
+diff --git a/arch/arm/mach-rk30/devices.c b/arch/arm/mach-rk30/devices.c
+index f587b0739825..ac3be39e6c32 100755
+--- a/arch/arm/mach-rk30/devices.c
++++ b/arch/arm/mach-rk30/devices.c
+@@ -615,6 +615,8 @@ struct platform_device rk29xx_device_spi0m = {
+ 	.num_resources	= ARRAY_SIZE(rk29_spi0_resources),
+ 	.resource	= rk29_spi0_resources,
+ 	.dev			= {
++		.dma_mask = &dma_dmamask,
++		.coherent_dma_mask = DMA_BIT_MASK(32),
+ 		.platform_data	= &rk29xx_spi0_platdata,
+ 	},
+ };
+@@ -650,6 +652,8 @@ struct platform_device rk29xx_device_spi1m = {
+ 	.num_resources	= ARRAY_SIZE(rk29_spi1_resources),
+ 	.resource	= rk29_spi1_resources,
+ 	.dev			= {
++		.dma_mask = &dma_dmamask,
++		.coherent_dma_mask = DMA_BIT_MASK(32),
+ 		.platform_data	= &rk29xx_spi1_platdata,
+ 	},
+ };
+diff --git a/drivers/input/touchscreen/xpt2046_ts.h b/drivers/input/touchscreen/xpt2046_ts.h
+index 3c3b90f2bbf9..1a04afec62d4 100755
+--- a/drivers/input/touchscreen/xpt2046_ts.h
++++ b/drivers/input/touchscreen/xpt2046_ts.h
+@@ -16,7 +16,7 @@
+ #ifndef __DRIVERS_TOUCHSCREEN_XPT2046_TS_H
+ #define __DRIVERS_TOUCHSCREEN_XPT2046_TS_H
+ 
+-#define IOMUX_NAME_SIZE 20
++#define IOMUX_NAME_SIZE 40
+ 
+ enum xpt2046_filter {
+ 	XPT2046_FILTER_OK,
+diff --git a/drivers/spi/rk29_spim.c b/drivers/spi/rk29_spim.c
+index a74996db7213..8b3dfd300d7c 100755
+--- a/drivers/spi/rk29_spim.c
++++ b/drivers/spi/rk29_spim.c
+@@ -47,7 +47,8 @@
+ #define DBG(x...)
+ #endif
+ 
+-#define DMA_MIN_BYTES 8
++#define DMA_BUFFER_SIZE PAGE_SIZE
++#define DMA_MIN_BYTES 32 //>32x16bits FIFO
+ 
+ 
+ #define START_STATE	((void *)0)
+@@ -249,6 +250,9 @@ static inline void mrst_spi_debugfs_remove(struct rk29xx_spi *dws)
+ }
+ #endif /* CONFIG_DEBUG_FS */
+ 
++static void dma_transfer(struct rk29xx_spi *dws) ;
++static void transfer_complete(struct rk29xx_spi *dws);
++
+ static void wait_till_not_busy(struct rk29xx_spi *dws)
+ {
+ 	unsigned long end = jiffies + 1 + usecs_to_jiffies(1000);
+@@ -410,16 +414,21 @@ static void rk29_spi_dma_rxcb(void *buf_id,
+ 	struct rk29xx_spi *dws = buf_id;
+ 	unsigned long flags;
+ 
++	DBG("func: %s, line: %d\n", __FUNCTION__, __LINE__);
++	
+ 	spin_lock_irqsave(&dws->lock, flags);
+ 
+ 	if (res == RK29_RES_OK)
+ 		dws->state &= ~RXBUSY;
+ 	else
+-		dev_err(&dws->master->dev, "DmaAbrtRx-%d, size: %d\n", res, size);
++		dev_err(&dws->master->dev, "DmaAbrtRx-%d, size: %d,res=%d\n", res, size,res);
+ 
+ 	/* If the other done */
+-	if (!(dws->state & TXBUSY))
+-		complete(&dws->xfer_completion);
++	//if (!(dws->state & TXBUSY))
++	//	complete(&dws->rx_completion);
++	
++	//DMA could not lose intterupt
++	transfer_complete(dws);
+ 
+ 	spin_unlock_irqrestore(&dws->lock, flags);
+ }
+@@ -431,17 +440,20 @@ static void rk29_spi_dma_txcb(void *buf_id,
+ 	unsigned long flags;
+ 
+ 	DBG("func: %s, line: %d\n", __FUNCTION__, __LINE__);
+-
++	
+ 	spin_lock_irqsave(&dws->lock, flags);
+ 
+ 	if (res == RK29_RES_OK)
+ 		dws->state &= ~TXBUSY;
+ 	else
+-		dev_err(&dws->master->dev, "DmaAbrtTx-%d, size: %d \n", res, size);
++		dev_err(&dws->master->dev, "DmaAbrtTx-%d, size: %d,res=%d \n", res, size,res);
+ 
+ 	/* If the other done */
+-	if (!(dws->state & RXBUSY)) 
+-		complete(&dws->xfer_completion);
++	//if (!(dws->state & RXBUSY)) 
++	//	complete(&dws->tx_completion);
++
++	//DMA could not lose intterupt
++	transfer_complete(dws);
+ 
+ 	spin_unlock_irqrestore(&dws->lock, flags);
+ }
+@@ -469,8 +481,32 @@ static int acquire_dma(struct rk29xx_spi *dws)
+ 		rk29_dma_free(dws->rx_dmach, &rk29_spi_dma_client);
+ 		return -1;
+ 	}
++
++	if (dws->tx_dma) {
++		if (rk29_dma_set_buffdone_fn(dws->tx_dmach, rk29_spi_dma_txcb)) {
++			dev_err(&dws->master->dev, "rk29_dma_set_buffdone_fn fail\n");
++			return -1;
++		}
++		if (rk29_dma_devconfig(dws->tx_dmach, RK29_DMASRC_MEM,
++					dws->sfr_start + SPIM_TXDR)) {
++			dev_err(&dws->master->dev, "rk29_dma_devconfig fail\n");
++			return -1;
++		}
++	}
++
++	if (dws->rx_dma) {
++		if (rk29_dma_set_buffdone_fn(dws->rx_dmach, rk29_spi_dma_rxcb)) {
++			dev_err(&dws->master->dev, "rk29_dma_set_buffdone_fn fail\n");
++			return -1;
++		}
++		if (rk29_dma_devconfig(dws->rx_dmach, RK29_DMASRC_HW,
++					dws->sfr_start + SPIM_RXDR)) {
++			dev_err(&dws->master->dev, "rk29_dma_devconfig fail\n");
++			return -1;
++		}
++	}
+ 	
+-    dws->dma_inited = 1;
++    	dws->dma_inited = 1;
+ 	return 0;
+ }
+ 
+@@ -489,36 +525,27 @@ static void release_dma(struct rk29xx_spi *dws)
+  */
+ static int map_dma_buffers(struct rk29xx_spi *dws)
+ {
+-	if (!dws->cur_msg->is_dma_mapped || !dws->dma_inited
+-		|| !dws->cur_chip->enable_dma)
++	if (!dws->dma_inited || !dws->cur_chip->enable_dma)
++	{
++		printk("%s:error\n",__func__);
+ 		return -1;
+-
+-	if (dws->cur_transfer->tx_dma) {
+-		dws->tx_dma = dws->cur_transfer->tx_dma;
+-		if (rk29_dma_set_buffdone_fn(dws->tx_dmach, rk29_spi_dma_txcb)) {
+-			dev_err(&dws->master->dev, "rk29_dma_set_buffdone_fn fail\n");
+-			return -1;
+-		}
+-		if (rk29_dma_devconfig(dws->tx_dmach, RK29_DMASRC_MEM,
+-					dws->sfr_start + SPIM_TXDR)) {
+-			dev_err(&dws->master->dev, "rk29_dma_devconfig fail\n");
+-			return -1;
+-		}
+ 	}
+ 
+-	if (dws->cur_transfer->rx_dma) {
+-		dws->rx_dma = dws->cur_transfer->rx_dma;
+-		if (rk29_dma_set_buffdone_fn(dws->rx_dmach, rk29_spi_dma_rxcb)) {
+-			dev_err(&dws->master->dev, "rk29_dma_set_buffdone_fn fail\n");
+-			return -1;
+-		}
+-		if (rk29_dma_devconfig(dws->rx_dmach, RK29_DMASRC_HW,
+-					dws->sfr_start + SPIM_RXDR)) {
+-			dev_err(&dws->master->dev, "rk29_dma_devconfig fail\n");
+-			return -1;
+-		}
++	if(dws->cur_transfer->tx_buf)
++	{
++		memcpy(dws->buffer_tx_dma,dws->cur_transfer->tx_buf,dws->cur_transfer->len);
++		dws->cur_transfer->tx_buf = dws->buffer_tx_dma;	
+ 	}
+ 
++	if(dws->cur_transfer->rx_buf)
++	{
++		//memcpy(dws->buffer_rx_dma,dws->cur_transfer->rx_buf,dws->cur_transfer->len);
++		dws->cur_transfer->rx_buf = dws->buffer_rx_dma;	
++	}
++	
++	dws->cur_transfer->tx_dma = dws->tx_dma;
++	dws->cur_transfer->rx_dma = dws->rx_dma;
++	
+ 	return 0;
+ }
+ 
+@@ -536,6 +563,11 @@ static void giveback(struct rk29xx_spi *dws)
+ 	dws->prev_chip = dws->cur_chip;
+ 	dws->cur_chip = NULL;
+ 	dws->dma_mapped = 0;
++	
++	/*it is important to close intterrupt*/
++	spi_umask_intr(dws, 0);
++	rk29xx_writew(dws, SPIM_DMACR, 0);
++	
+ 	queue_work(dws->workqueue, &dws->pump_messages);
+ 	spin_unlock_irqrestore(&dws->lock, flags);
+ 
+@@ -549,6 +581,7 @@ static void giveback(struct rk29xx_spi *dws)
+ 	msg->state = NULL;
+ 	if (msg->complete)
+ 		msg->complete(msg->context);
++
+ }
+ 
+ static void int_error_stop(struct rk29xx_spi *dws, const char *msg)
+@@ -583,12 +616,13 @@ static irqreturn_t interrupt_transfer(struct rk29xx_spi *dws)
+ 	u16 irq_status, irq_mask = 0x1f;
+ 	u32 int_level = dws->fifo_len / 2;
+ 	u32 left;
+-	
++
+ 	irq_status = rk29xx_readw(dws, SPIM_ISR) & irq_mask;
+ 	/* Error handling */
+ 	if (irq_status & (SPI_INT_TXOI | SPI_INT_RXOI | SPI_INT_RXUI)) {
+ 		rk29xx_writew(dws, SPIM_ICR, SPI_CLEAR_INT_TXOI | SPI_CLEAR_INT_RXOI | SPI_CLEAR_INT_RXUI);
+ 		int_error_stop(dws, "interrupt_transfer: fifo overrun");
++		mutex_unlock(&dws->dma_lock);	
+ 		return IRQ_HANDLED;
+ 	}
+ 
+@@ -629,7 +663,8 @@ static irqreturn_t interrupt_transfer(struct rk29xx_spi *dws)
+ 		else {
+ 			transfer_complete(dws);
+ 		}
+-	}
++		
++	}	
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -650,6 +685,7 @@ static irqreturn_t rk29xx_spi_irq(int irq, void *dev_id)
+ /* Must be called inside pump_transfers() */
+ static void poll_transfer(struct rk29xx_spi *dws)
+ {
++	DBG("%s\n",__func__);
+ 	while (dws->write(dws)) {
+ 		wait_till_not_busy(dws);
+ 		dws->read(dws);
+@@ -685,7 +721,12 @@ static void pump_transfers(unsigned long data)
+ 	u32 speed = 0;
+ 	u32 cr0 = 0;
+ 
+-	DBG(KERN_INFO "pump_transfers\n");
++	if((dws->cur_chip->enable_dma) && (dws->cur_transfer->len > DMA_MIN_BYTES) && (dws->cur_transfer->len < DMA_BUFFER_SIZE)){	
++		dma_transfer(dws);
++		return;
++	}	
++	
++	DBG(KERN_INFO "pump_transfers,len=%d\n",dws->cur_transfer->len);
+ 
+ 	/* Get current state information */
+ 	message = dws->cur_msg;
+@@ -718,11 +759,11 @@ static void pump_transfers(unsigned long data)
+ 	dws->dma_width = chip->dma_width;
+ 	dws->cs_control = chip->cs_control;
+ 
+-	dws->rx_dma = transfer->rx_dma;
+-	dws->tx_dma = transfer->tx_dma;
++	//dws->rx_dma = transfer->rx_dma;
++	//dws->tx_dma = transfer->tx_dma;
+ 	dws->tx = (void *)transfer->tx_buf;
+ 	dws->tx_end = dws->tx + transfer->len;
+-	dws->rx = transfer->rx_buf;
++	dws->rx = (void *)transfer->rx_buf;
+ 	dws->rx_end = dws->rx + transfer->len;
+ 	dws->write = dws->tx ? chip->write : null_writer;
+ 	dws->read = dws->rx ? chip->read : null_reader;
+@@ -813,7 +854,7 @@ static void pump_transfers(unsigned long data)
+ 	 * Interrupt mode
+ 	 * we only need set the TXEI IRQ, as TX/RX always happen syncronizely
+ 	 */
+-	if (!dws->dma_mapped && !chip->poll_mode) {
++	if (!dws->dma_mapped && !chip->poll_mode) {	
+ 		int templen ;
+ 		
+ 		if (chip->tmode == SPI_TMOD_RO) {
+@@ -871,17 +912,18 @@ static void pump_transfers(unsigned long data)
+ 	return;
+ }
+ 
+-static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
++static void dma_transfer(struct rk29xx_spi *dws) 
+ {
+ 	struct spi_message *message = NULL;
+ 	struct spi_transfer *transfer = NULL;
+ 	struct spi_transfer *previous = NULL;
+ 	struct spi_device *spi = NULL;
+ 	struct chip_data *chip = NULL;
+-	unsigned long val;
+-	int ms;
++	//unsigned long val;	
++	//unsigned long flags;
++	//int ms;
+ 	int iRet;
+-	int burst;
++	//int burst;
+ 	u8 bits = 0;
+ 	u8 spi_dfs = 0;
+ 	u8 cs_change = 0;
+@@ -889,9 +931,9 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 	u32 speed = 0;
+ 	u32 cr0 = 0;
+ 	u32 dmacr = 0;
+-
+-	DBG(KERN_INFO "dma_transfer\n");
+-
++	
++	DBG(KERN_INFO "dma_transfer,len=%d\n",dws->cur_transfer->len);	
++	
+ 	if (acquire_dma(dws)) {
+ 		dev_err(&dws->master->dev, "acquire dma failed\n");
+ 		goto err_out;
+@@ -933,11 +975,11 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 	dws->dma_width = chip->dma_width;
+ 	dws->cs_control = chip->cs_control;
+ 
+-	dws->rx_dma = transfer->rx_dma;
+-	dws->tx_dma = transfer->tx_dma;
++	//dws->rx_dma = transfer->rx_dma;
++	//dws->tx_dma = transfer->tx_dma;
+ 	dws->tx = (void *)transfer->tx_buf;
+ 	dws->tx_end = dws->tx + transfer->len;
+-	dws->rx = transfer->rx_buf;
++	dws->rx = (void *)transfer->rx_buf;
+ 	dws->rx_end = dws->rx + transfer->len;
+ 	dws->write = dws->tx ? chip->write : null_writer;
+ 	dws->read = dws->rx ? chip->read : null_reader;
+@@ -947,11 +989,10 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 		cs_change = 1;
+ 
+ 	cr0 = chip->cr0;
+-
++	
+ 	/* Handle per transfer options for bpw and speed */
+ 	if (transfer->speed_hz) {
+ 		speed = chip->speed_hz;
+-
+ 		if (transfer->speed_hz != speed) {
+ 			speed = transfer->speed_hz;
+ 			if (speed > clk_get_rate(dws->clock_spim)) {
+@@ -970,6 +1011,7 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 		}
+ 	}
+ 
++	
+ 	if (transfer->bits_per_word) {
+ 		bits = transfer->bits_per_word;
+ 
+@@ -1048,7 +1090,7 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 			dws->prev_chip = chip;
+ 	} 
+ 
+-	INIT_COMPLETION(dws->xfer_completion);
++	//INIT_COMPLETION(dws->xfer_completion);
+ 
+ 	spi_dump_regs(dws);
+ 	DBG("dws->tx_dmach: %d, dws->rx_dmach: %d, transfer->tx_dma: 0x%x\n", dws->tx_dmach, dws->rx_dmach, (unsigned int)transfer->tx_dma);
+@@ -1082,8 +1124,8 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 		}
+ 	}
+ 
+-	wait_till_not_busy(dws);
+-
++	//wait_till_not_busy(dws);
++	
+ 	if (transfer->rx_buf != NULL) {
+ 		dws->state |= RXBUSY;
+ 		if (rk29_dma_config(dws->rx_dmach, 1, 1)) {
+@@ -1105,42 +1147,6 @@ static void dma_transfer(struct rk29xx_spi *dws) //int cs_change)
+ 			goto err_out;
+ 		}
+ 	}
+-
+-	/* millisecs to xfer 'len' bytes @ 'cur_speed' */
+-	ms = transfer->len * 8 / dws->cur_chip->speed_hz;
+-	ms += 10; 
+-
+-	val = msecs_to_jiffies(ms) + 10;
+-	if (!wait_for_completion_timeout(&dws->xfer_completion, val)) {
+-		if (transfer->rx_buf != NULL && (dws->state & RXBUSY)) {
+-			rk29_dma_ctrl(dws->rx_dmach, RK29_DMAOP_FLUSH);
+-			dws->state &= ~RXBUSY;
+-			dev_err(&dws->master->dev, "function: %s, line: %d\n", __FUNCTION__, __LINE__);
+-			goto NEXT_TRANSFER;
+-		}
+-		if (transfer->tx_buf != NULL && (dws->state & TXBUSY)) {
+-			rk29_dma_ctrl(dws->tx_dmach, RK29_DMAOP_FLUSH);
+-			dws->state &= ~TXBUSY;
+-			dev_err(&dws->master->dev, "function: %s, line: %d\n", __FUNCTION__, __LINE__);
+-			goto NEXT_TRANSFER;
+-		}
+-	}
+-
+-	wait_till_not_busy(dws);
+-
+-NEXT_TRANSFER:
+-	/* Update total byte transfered return count actual bytes read */
+-	dws->cur_msg->actual_length += dws->len;
+-
+-	/* Move to next transfer */
+-	dws->cur_msg->state = next_transfer(dws);
+-
+-	/* Handle end of message */
+-	if (dws->cur_msg->state == DONE_STATE) {
+-		dws->cur_msg->status = 0;
+-		giveback(dws);
+-	} else
+-		dma_transfer(dws);
+ 	
+ 	return;
+ 
+@@ -1157,18 +1163,20 @@ static void pump_messages(struct work_struct *work)
+ 	unsigned long flags;
+ 
+ 	DBG(KERN_INFO "pump_messages\n");
+-
++	
+ 	/* Lock queue and check for queue work */
+ 	spin_lock_irqsave(&dws->lock, flags);
+ 	if (list_empty(&dws->queue) || dws->run == QUEUE_STOPPED) {
+ 		dws->busy = 0;
+ 		spin_unlock_irqrestore(&dws->lock, flags);
++		mutex_unlock(&dws->dma_lock);
+ 		return;
+ 	}
+ 
+ 	/* Make sure we are not already running a message */
+ 	if (dws->cur_msg) {
+ 		spin_unlock_irqrestore(&dws->lock, flags);
++		mutex_unlock(&dws->dma_lock);
+ 		return;
+ 	}
+ 
+@@ -1182,21 +1190,13 @@ static void pump_messages(struct work_struct *work)
+ 						struct spi_transfer,
+ 						transfer_list);
+ 	dws->cur_chip = spi_get_ctldata(dws->cur_msg->spi);
+-    dws->prev_chip = NULL; //每个pump message时强制更新cs dxj
+-    
+-	/* Mark as busy and launch transfers */
+-	if(dws->cur_msg->is_dma_mapped /*&& dws->cur_transfer->len > DMA_MIN_BYTES*/) {
+-		dws->busy = 1;
+-	    spin_unlock_irqrestore(&dws->lock, flags);
+-		dma_transfer(dws);
+-		return;
+-	}
+-	else {
+-		tasklet_schedule(&dws->pump_transfers);
+-	}
++    	dws->prev_chip = NULL; //每个pump message时强制更新cs dxj
+ 
++	/* Mark as busy and launch transfers */
++	tasklet_schedule(&dws->pump_transfers);
+ 	dws->busy = 1;
+ 	spin_unlock_irqrestore(&dws->lock, flags);
++	
+ }
+ 
+ #if defined(QUICK_TRANSFER)
+@@ -1610,7 +1610,7 @@ static int rk29xx_spi_transfer(struct spi_device *spi, struct spi_message *msg)
+ 		else {
+ 			/* If no other data transaction in air, just go */
+ 			spin_unlock_irqrestore(&dws->lock, flags);
+-			pump_messages(&dws->pump_messages);
++			pump_messages(&dws->pump_messages);			
+ 			return 0;
+ 		}
+ 	}
+@@ -1726,6 +1726,7 @@ static int __devinit init_queue(struct rk29xx_spi *dws)
+ 	if (dws->workqueue == NULL)
+ 		return -EBUSY;
+ 
++
+ 	return 0;
+ }
+ 
+@@ -1895,6 +1896,23 @@ static int __init rk29xx_spim_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "clk_get for spi fail(%p)\n", dws->clock_spim);
+ 		return PTR_ERR(dws->clock_spim);
+ 	}
++
++	
++	dws->buffer_tx_dma = dma_alloc_coherent(&pdev->dev, DMA_BUFFER_SIZE, &dws->tx_dma, GFP_KERNEL | GFP_DMA);
++	if (!dws->buffer_tx_dma)
++	{
++		dev_err(&pdev->dev, "fail to dma tx buffer alloc\n");
++		goto exit;
++	}
++
++	dws->buffer_rx_dma = dma_alloc_coherent(&pdev->dev, DMA_BUFFER_SIZE, &dws->rx_dma, GFP_KERNEL | GFP_DMA);
++	if (!dws->buffer_rx_dma)
++	{
++		dev_err(&pdev->dev, "fail to dma rx buffer alloc\n");
++		goto exit;
++	}
++	
++	mutex_init(&dws->dma_lock);
+ 	
+ 	dws->regs = ioremap(regs->start, (regs->end - regs->start) + 1);
+ 	if (!dws->regs){
+@@ -1971,6 +1989,8 @@ static int __init rk29xx_spim_probe(struct platform_device *pdev)
+ 	free_irq(dws->irq, dws);
+ err_free_master:
+ 	spi_master_put(master);
++	dma_free_coherent(&pdev->dev, DMA_BUFFER_SIZE, dws->buffer_tx_dma, dws->tx_dma);	
++	dma_free_coherent(&pdev->dev, DMA_BUFFER_SIZE, dws->buffer_rx_dma, dws->rx_dma);
+ 	iounmap(dws->regs);
+ exit:
+ 	return ret;
+@@ -1987,6 +2007,9 @@ static void __exit rk29xx_spim_remove(struct platform_device *pdev)
+ 	rk29xx_spim_cpufreq_deregister(dws);
+ 	mrst_spi_debugfs_remove(dws);
+ 
++	
++	dma_free_coherent(&pdev->dev, DMA_BUFFER_SIZE, dws->buffer_tx_dma, dws->tx_dma);	
++	dma_free_coherent(&pdev->dev, DMA_BUFFER_SIZE, dws->buffer_rx_dma, dws->rx_dma);
+ 	release_dma(dws);
+ 
+ 	/* Remove the queue */
+diff --git a/drivers/spi/rk29_spim.h b/drivers/spi/rk29_spim.h
+index 6ac385315038..6c396abfacb7 100755
+--- a/drivers/spi/rk29_spim.h
++++ b/drivers/spi/rk29_spim.h
+@@ -137,13 +137,15 @@ struct rk29xx_spi {
+ 	/* Driver message queue */
+ 	struct workqueue_struct	*workqueue;
+ 	struct work_struct	pump_messages;
+-	spinlock_t		lock;
++	spinlock_t		lock;	
++	struct mutex 		dma_lock;
+ 	struct list_head	queue;
+ 	int			busy;
+ 	int			run;
+ 
+ 	/* Message Transfer pump */
+-	struct tasklet_struct	pump_transfers;
++	struct tasklet_struct	pump_transfers;	
++	struct tasklet_struct	dma_transfers;	
+ 
+ 	/* Current message transfer state info */
+ 	struct spi_message	*cur_msg;
+@@ -158,6 +160,8 @@ struct rk29xx_spi {
+ 	int			dma_mapped;
+ 	dma_addr_t		rx_dma;
+ 	dma_addr_t		tx_dma;
++	void			*buffer_tx_dma;
++	void			*buffer_rx_dma;
+ 	size_t			rx_map_len;
+ 	size_t			tx_map_len;
+ 	u8			n_bytes;	/* current is a 1/2 bytes op */
+@@ -171,6 +175,9 @@ struct rk29xx_spi {
+ 
+ 	/* Dma info */
+ 	struct completion               xfer_completion;
++	
++	struct completion               tx_completion;
++	struct completion               rx_completion;
+ 	unsigned    state;
+ 	unsigned                        cur_speed;
+ 	unsigned long                   sfr_start;
+-- 
+2.35.3
+

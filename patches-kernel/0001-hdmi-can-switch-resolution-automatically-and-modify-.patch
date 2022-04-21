@@ -1,0 +1,404 @@
+From 31cfb366610e09b2a081d9af5e8204423f19b653 Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Wed, 29 Dec 2010 12:33:30 +0800
+Subject: [PATCH] 'hdmi can switch resolution automatically' and 'modify
+ gpio_key(vol+ vol-) report event'
+
+---
+ arch/arm/mach-rk29/board-rk29sdk-key.c |  4 ++--
+ drivers/video/hdmi/chips/anx7150.c     | 13 ++++++------
+ drivers/video/hdmi/chips/anx7150.h     |  9 --------
+ drivers/video/hdmi/chips/anx7150_hw.c  | 20 +++++++++++-------
+ drivers/video/hdmi/chips/anx7150_hw.h  |  1 +
+ drivers/video/hdmi/hdmi-core.c         |  1 +
+ drivers/video/hdmi/hdmi-fb.c           | 29 +++++++++++++++++++-------
+ drivers/video/rk29_fb.c                | 23 ++++++++++++++++++--
+ include/linux/hdmi.h                   | 19 ++++++++++++++---
+ 9 files changed, 82 insertions(+), 37 deletions(-)
+ mode change 100644 => 100755 drivers/video/hdmi/hdmi-fb.c
+
+diff --git a/arch/arm/mach-rk29/board-rk29sdk-key.c b/arch/arm/mach-rk29/board-rk29sdk-key.c
+index d00596d40504..8626e8d9d9bd 100755
+--- a/arch/arm/mach-rk29/board-rk29sdk-key.c
++++ b/arch/arm/mach-rk29/board-rk29sdk-key.c
+@@ -16,13 +16,13 @@ static struct rk29_keys_button key_button[] = {
+ 	},
+ 	{
+ 		.desc	= "vol+",
+-		.code	= KEY_VOLUMEDOWN,
++		.code	= KEY_VOLUMEUP,
+ 		.gpio	= RK29_PIN6_PA1,
+ 		.active_low = PRESS_LEV_LOW,
+ 	},
+ 	{
+ 		.desc	= "vol-",
+-		.code	= KEY_VOLUMEUP,
++		.code	= KEY_VOLUMEDOWN,
+ 		.gpio	= RK29_PIN6_PA2,
+ 		.active_low = PRESS_LEV_LOW,
+ 	},
+diff --git a/drivers/video/hdmi/chips/anx7150.c b/drivers/video/hdmi/chips/anx7150.c
+index 2c412bfbe13e..4e8212e00329 100755
+--- a/drivers/video/hdmi/chips/anx7150.c
++++ b/drivers/video/hdmi/chips/anx7150.c
+@@ -35,10 +35,9 @@ int anx7150_i2c_write_p1_reg(struct i2c_client *client, char reg, char *val)
+ static int rk29_hdmi_enter(struct anx7150_dev_s *dev)
+ {
+ 	if(dev->rk29_output_status == RK29_OUTPUT_STATUS_LCD) {
+-		printk("%s, resolution = %d\n", __func__, dev->resolution_set);
+-		if(hdmi_switch_fb(dev->resolution_set, 1) < 0)
+-			return -1;
+ 		dev->hdmi->resolution = dev->resolution_set;
++		if(hdmi_switch_fb(dev->hdmi, 1) < 0)
++			return -1;
+ 		dev->rk29_output_status = RK29_OUTPUT_STATUS_HDMI;
+ 	}
+ 	return 0;
+@@ -46,8 +45,8 @@ static int rk29_hdmi_enter(struct anx7150_dev_s *dev)
+ static int rk29_hdmi_exit(struct anx7150_dev_s *dev)
+ {
+ 	if(dev->rk29_output_status == RK29_OUTPUT_STATUS_HDMI) {
+-		printk("%s\n", __func__);
+-		if(hdmi_switch_fb(dev->resolution_set, 0) < 0)
++		dev->hdmi->resolution = dev->resolution_set;
++		if(hdmi_switch_fb(dev->hdmi, 0) < 0)
+ 			return -1;
+ 		dev->rk29_output_status = RK29_OUTPUT_STATUS_LCD;
+ 	}
+@@ -142,6 +141,7 @@ void anx7150_task(struct anx7150_pdata *anx)
+ 			rk29_hdmi_exit(&anx->dev);
+ 		if(anx->dev.HPD_status){
+ 			anx7150_plug(anx->client);
++			hdmi_changed(anx->dev.hdmi, 1);
+ 			state = READ_PARSE_EDID;
+ 		}
+ 		if(anx->dev.hdmi_auto_switch)
+@@ -344,13 +344,14 @@ static int anx7150_i2c_probe(struct i2c_client *client,const struct i2c_device_i
+ 	anx->dev.HPD_change_cnt = 0;
+ 	anx->dev.rk29_output_status = RK29_OUTPUT_STATUS_LCD;
+ 	anx->dev.hdcp_enable = ANX7150_HDCP_EN;
++	anx->dev.rate = 100;
+ 
+ 	anx->init = 1;
+ 
+ 	anx->dev.workqueue = create_singlethread_workqueue("ANX7150_WORKQUEUE");
+ 	INIT_DELAYED_WORK(&anx->dev.delay_work, anx7150_work_func);
+ 	
+-	hdmi->display_on = 0;
++	hdmi->display_on = anx->dev.hdmi_enable;
+ 	hdmi->auto_switch = anx->dev.hdmi_auto_switch;
+ 	hdmi->hdcp_on = anx->dev.hdcp_enable;
+ 	hdmi->audio_fs = anx->dev.i2s_Fs;
+diff --git a/drivers/video/hdmi/chips/anx7150.h b/drivers/video/hdmi/chips/anx7150.h
+index 868eb9ae9533..1122861d799e 100755
+--- a/drivers/video/hdmi/chips/anx7150.h
++++ b/drivers/video/hdmi/chips/anx7150.h
+@@ -32,15 +32,6 @@
+ /* HDMI HDCP ENABLE */
+ #define ANX7150_HDCP_EN  HDMI_DISABLE
+ 
+-/* HDMI default resolution */
+-#define HDMI_DEFAULT_RESOLUTION HDMI_1280x720p_50Hz
+-/* I2S Fs */
+-#define HDMI_I2S_Fs_44100 0
+-#define HDMI_I2S_Fs_48000 2
+-
+-/* I2S default sample rate */
+-#define HDMI_I2S_DEFAULT_Fs HDMI_I2S_Fs_44100
+-
+ /* ANX7150 state machine */
+ enum{
+ 	HDMI_INITIAL = 1,
+diff --git a/drivers/video/hdmi/chips/anx7150_hw.c b/drivers/video/hdmi/chips/anx7150_hw.c
+index f2bafff90617..811e607a8f41 100755
+--- a/drivers/video/hdmi/chips/anx7150_hw.c
++++ b/drivers/video/hdmi/chips/anx7150_hw.c
+@@ -191,7 +191,7 @@ void ANX7150_Set_System_State(struct i2c_client *client, u8 new_state)
+ 			hdmi_dbg(&client->dev, "SYSTEM_CONFIG\n");
+ 			break;
+         case CONFIG_VIDEO:
+-            hdmi_dbg(&client->dev, "CONFIG_VIDEO\n");
++            dev_info(&client->dev, "CONFIG_VIDEO\n");
+             break;
+         case CONFIG_AUDIO:
+             hdmi_dbg(&client->dev, "CONFIG_AUDIO\n");
+@@ -209,7 +209,7 @@ void ANX7150_Set_System_State(struct i2c_client *client, u8 new_state)
+             break;
+             ////////////////////////////////////////////////
+         case PLAY_BACK:
+-            hdmi_dbg(&client->dev, "PLAY_BACK\n");
++            dev_info(&client->dev, "PLAY_BACK\n");
+             break;
+ 		default:
+ 			hdmi_dbg(&client->dev, "unknown state\n");
+@@ -498,7 +498,7 @@ int anx7150_unplug(struct i2c_client *client)
+ {
+ 	int rc = 0;
+ 	char c;
+-	hdmi_dbg(&client->dev, "anx7150 unplug\n");
++	dev_info(&client->dev, "anx7150 unplug\n");
+ 	
+     //wen HDCP CTS
+     ANX7150_Variable_Initial();   //simon
+@@ -528,7 +528,7 @@ int anx7150_plug(struct i2c_client *client)
+ 	int rc = 0;
+ 	char c;
+ 
+-	hdmi_dbg(&client->dev, "anx7150 plug\n");
++	dev_info(&client->dev, "anx7150 plug\n");
+ 
+ 	rc = anx7150_i2c_read_p0_reg(client, ANX7150_SYS_CTRL3_REG, &c);
+ 	c |= (0x01);
+@@ -1051,7 +1051,7 @@ int ANX7150_Interrupt_Process(struct anx7150_pdata *anx, int cur_state)
+ 		anx->dev.HPD_change_cnt = 0;
+ 	}
+ 
+-	if(anx->dev.HPD_change_cnt > 2){
++	if(anx->dev.HPD_change_cnt > 1){
+ 		hdmi_dbg(&anx->client->dev, "hotplug_change\n");
+ 
+ 		if(hot_plug == HDMI_RECIVER_UNPLUG){
+@@ -2401,6 +2401,10 @@ static int anx7150_embed_sync_decode(struct i2c_client *client)
+ 	rc = anx7150_i2c_write_p0_reg(client, ANX7150_HSYNC_ACT_WIDTHH_REG, &c);
+ 	return rc;
+ }
++int ANX7150_Blue_Screen(struct anx7150_pdata *anx)
++{
++	return anx7150_blue_screen_format_config(anx->client);
++}
+ //******************************Video Config***************************************
+ int ANX7150_Config_Video(struct i2c_client *client)
+ {
+@@ -2787,8 +2791,8 @@ int ANX7150_Config_Video(struct i2c_client *client)
+     rc = anx7150_i2c_read_p0_reg(client, ANX7150_VID_CTRL_REG, &c);
+ 	c |= (ANX7150_VID_CTRL_IN_EN);
+ 	rc = anx7150_i2c_write_p0_reg(client, ANX7150_VID_CTRL_REG, &c);
+-	msleep(200);
+     //D("Video configure OK!\n");
++    msleep(60);
+ 	rc = anx7150_i2c_read_p0_reg(client, ANX7150_VID_STATUS_REG, &c);
+     if (!(c & ANX7150_VID_STATUS_VID_STABLE))
+     {
+@@ -2836,8 +2840,8 @@ int ANX7150_Config_Video(struct i2c_client *client)
+ 	rc = anx7150_i2c_read_p0_reg(client, ANX7150_TMDS_CLKCH_CONFIG_REG, &c);
+ 	c |= (ANX7150_TMDS_CLKCH_MUTE);
+ 	rc = anx7150_i2c_write_p0_reg(client, ANX7150_TMDS_CLKCH_CONFIG_REG, &c);
+-
+-    msleep(400);  //400ms only for HDCP CTS
++	if(ANX7150_HDCP_enable)
++    	msleep(400);  //400ms only for HDCP CTS
+ 
+     //ANX7150_i2c_read_p0_reg(ANX7150_VID_MODE_REG, &c);  //zy 061110
+     return 0;
+diff --git a/drivers/video/hdmi/chips/anx7150_hw.h b/drivers/video/hdmi/chips/anx7150_hw.h
+index 5c628f34b9b6..5166e577ec02 100755
+--- a/drivers/video/hdmi/chips/anx7150_hw.h
++++ b/drivers/video/hdmi/chips/anx7150_hw.h
+@@ -1260,6 +1260,7 @@ int ANX7150_GET_RECIVER_TYPE(void);
+ void  HDMI_Set_Video_Format(u8 video_format);
+ void  HDMI_Set_Audio_Fs( u8 audio_fs);
+ int ANX7150_PLAYBACK_Process(void);
++int ANX7150_Blue_Screen(struct anx7150_pdata *anx);
+ 
+ 
+ #endif
+diff --git a/drivers/video/hdmi/hdmi-core.c b/drivers/video/hdmi/hdmi-core.c
+index 59d17e4fab89..5375f6c20916 100755
+--- a/drivers/video/hdmi/hdmi-core.c
++++ b/drivers/video/hdmi/hdmi-core.c
+@@ -133,6 +133,7 @@ static void __exit hdmi_class_exit(void)
+ EXPORT_SYMBOL(hdmi_changed);
+ EXPORT_SYMBOL(hdmi_register);
+ EXPORT_SYMBOL(hdmi_unregister);
++EXPORT_SYMBOL(get_hdmi_struct);
+ 
+ subsys_initcall(hdmi_class_init);
+ module_exit(hdmi_class_exit);
+diff --git a/drivers/video/hdmi/hdmi-fb.c b/drivers/video/hdmi/hdmi-fb.c
+old mode 100644
+new mode 100755
+index 1eb2e302e224..66aee7448c8f
+--- a/drivers/video/hdmi/hdmi-fb.c
++++ b/drivers/video/hdmi/hdmi-fb.c
+@@ -1,6 +1,7 @@
+ #include <linux/console.h>
+ #include <linux/fb.h>
+ #include <linux/hdmi.h>
++#include <linux/completion.h>
+ 
+ #include "../display/screen/screen.h"
+ #include "../rk29_fb.h"
+@@ -222,14 +223,14 @@ static void hdmi_set_info(struct rk29fb_screen *screen)
+ 	screen4->standby = anx7150_standby;
+ }
+ 
+-int hdmi_switch_fb(int resolution, int type)
++int hdmi_switch_fb(struct hdmi *hdmi, int type)
+ {
+ 	int rc = 0;
+ 	struct rk29fb_screen hdmi_info[4];
+ 
+ 	hdmi_set_info(&hdmi_info[0]);
+ 
+-	switch(resolution)
++	switch(hdmi->resolution)
+ 	{
+ 		case HDMI_1280x720p_50Hz:
+ 			rc = FB_Switch_Screen(&hdmi_info[1], type);
+@@ -247,23 +248,37 @@ int hdmi_switch_fb(int resolution, int type)
+ 			rc = FB_Switch_Screen(&hdmi_info[1], type);
+ 			break;		
+ 	}
++	if(hdmi->wait == 1) {
++		complete(&hdmi->complete);
++		hdmi->wait = 0;
++	}
+ 	return rc;
+ }
+-int hdmi_resolution_changed(struct hdmi *hdmi, int xres, int yres)
++int hdmi_resolution_changed(struct hdmi *hdmi, int xres, int yres, int video_on)
+ {
+-	if(xres > 1280 && hdmi->resolution != HDMI_1920x1080p_50Hz) {
++	int ret = 0;
++	if(hdmi->display_on == 0|| hdmi->plug == 0)
++		return ret;
++	if(xres > 1280 && hdmi->resolution != HDMI_1920x1080p_50Hz) 
++	{
+ 		hdmi->resolution = HDMI_1920x1080p_50Hz;
+ 		hdmi->display_on = 1;
+ 		hdmi->hdmi_set_param(hdmi);
++		ret = 1;
+ 	}
+-	else if(xres >1024 && hdmi->resolution != HDMI_1280x720p_50Hz){
++	
++
++	else if(xres >1024 && xres <= 1280 && hdmi->resolution != HDMI_1280x720p_50Hz){
+ 		hdmi->resolution = HDMI_1280x720p_50Hz;
+ 		hdmi->display_on = 1;
+ 		hdmi->hdmi_set_param(hdmi);
++		ret = 1;
+ 	}
++	/*
+ 	else {
+ 		if(hdmi->display_on == 1)
+ 			hdmi->hdmi_display_off(hdmi);
+-	}
+-	return 0;
++	}*/
++	return ret;
+ }
++EXPORT_SYMBOL(hdmi_resolution_changed);
+\ No newline at end of file
+diff --git a/drivers/video/rk29_fb.c b/drivers/video/rk29_fb.c
+index 9a50d54916e7..473ea33ec578 100755
+--- a/drivers/video/rk29_fb.c
++++ b/drivers/video/rk29_fb.c
+@@ -44,6 +44,11 @@
+ #ifdef CONFIG_PM
+ #include <linux/pm.h>
+ #endif
++#ifdef CONFIG_HDMI
++#include <linux/completion.h>
++
++#include <linux/hdmi.h>
++#endif
+ 
+ #include <mach/iomux.h>
+ #include <mach/gpio.h>
+@@ -1320,7 +1325,9 @@ static int fb1_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
+     u16 xlcd = screen->x_res;        //size of panel
+     u16 ylcd = screen->y_res;
+     u16 yres = 0;
+-
++#ifdef CONFIG_HDMI
++	struct hdmi *hdmi = get_hdmi_struct(0);
++#endif
+     xpos = (xpos * screen->x_res) / inf->panel1_info.x_res;
+     ypos = (ypos * screen->y_res) / inf->panel1_info.y_res;
+     xsize = (xsize * screen->x_res) / inf->panel1_info.x_res;
+@@ -1411,7 +1418,19 @@ static int fb1_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
+     {
+         return -EINVAL;        // multiple of scale down or scale up can't exceed 8
+     }
+-
++#ifdef CONFIG_HDMI
++	if(inf->video_mode == 1) {
++		if(hdmi_resolution_changed(hdmi,var->xres,var->yres, 1) == 1)
++		{
++			LcdMskReg(inf, DSP_CTRL1, m_BLACK_MODE,  v_BLACK_MODE(1));
++    		LcdWrReg(inf, REG_CFG_DONE, 0x01);
++			init_completion(&hdmi->complete);
++			hdmi->wait = 1;
++			wait_for_completion_interruptible_timeout(&hdmi->complete,
++								msecs_to_jiffies(10000));
++		}
++	}
++#endif
+     return 0;
+ }
+ 
+diff --git a/include/linux/hdmi.h b/include/linux/hdmi.h
+index bf5194fb9740..3813b74e8fae 100755
+--- a/include/linux/hdmi.h
++++ b/include/linux/hdmi.h
+@@ -12,6 +12,9 @@
+ #include <linux/device.h>
+ #include <linux/workqueue.h>
+ #include <linux/i2c.h>
++#include <linux/completion.h>
++
++
+ 
+ #ifdef CONFIG_HDMI_DEBUG
+ #define hdmi_dbg(dev, format, arg...)		\
+@@ -26,11 +29,18 @@ typedef int 		BOOL;
+ 
+ #define TRUE		1
+ #define FALSE 		0
+-
++/* resolution */
+ #define HDMI_1280x720p_50Hz 	0
+ #define HDMI_1280x720p_60Hz		1
+ #define HDMI_720x576p_50Hz		2
+ #define HDMI_1920x1080p_50Hz	3
++/* HDMI default resolution */
++#define HDMI_DEFAULT_RESOLUTION HDMI_1280x720p_50Hz
++/* I2S Fs */
++#define HDMI_I2S_Fs_44100 0
++#define HDMI_I2S_Fs_48000 2
++/* I2S default sample rate */
++#define HDMI_I2S_DEFAULT_Fs HDMI_I2S_Fs_44100
+ 
+ 
+ #define HDMI_MAX_ID		32
+@@ -40,6 +50,7 @@ struct hdmi {
+ 	struct device *dev;
+ 	struct work_struct changed_work;
+ 	int id;
++	int wait;
+ 	BOOL display_on;
+ 	BOOL plug;
+ 	BOOL auto_switch;
+@@ -51,6 +62,8 @@ struct hdmi {
+ 
+ 	void *priv;
+ 
++	struct completion	complete;
++
+ 	int (*hdmi_display_on)(struct hdmi *);
+ 	int (*hdmi_display_off)(struct hdmi *);
+ 	int (*hdmi_set_param)(struct hdmi *);
+@@ -66,8 +79,8 @@ extern void hdmi_changed(struct hdmi *hdmi, int plug);
+ extern int hdmi_codec_set_audio_fs(unsigned char audio_fs);
+ extern int hdmi_fb_set_resolution(unsigned char resolution);
+ 
+-extern int hdmi_switch_fb(int resolution, int type);
+-extern int hdmi_resolution_changed(struct hdmi *hdmi, int xres, int yres);
++extern int hdmi_switch_fb(struct hdmi *hdmi, int type);
++extern int hdmi_resolution_changed(struct hdmi *hdmi, int xres, int yres, int video_on);
+ 
+ extern struct hdmi *get_hdmi_struct(int nr);
+ 
+-- 
+2.35.3
+

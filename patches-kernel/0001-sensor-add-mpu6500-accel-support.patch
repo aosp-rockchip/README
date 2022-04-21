@@ -1,0 +1,662 @@
+From 04d0060017c137fabb4282811dc9dfd05478cc4c Mon Sep 17 00:00:00 2001
+From: guoyi <gy@rock-chips.com>
+Date: Tue, 24 Mar 2015 14:30:23 +0800
+Subject: [PATCH] sensor: add mpu6500 accel support
+
+---
+ arch/arm64/boot/dts/rk3368-p9_818.dts     |  32 +--
+ drivers/input/sensors/accel/Kconfig       |   7 +
+ drivers/input/sensors/accel/Makefile      |   1 +
+ drivers/input/sensors/accel/mpu6500_acc.c | 286 ++++++++++++++++++++++
+ drivers/input/sensors/sensor-dev.c        |   4 +
+ include/linux/mpu6500.h                   | 238 ++++++++++++++++++
+ include/linux/sensor-dev.h                |   1 +
+ 7 files changed, 543 insertions(+), 26 deletions(-)
+ create mode 100644 drivers/input/sensors/accel/mpu6500_acc.c
+ create mode 100644 include/linux/mpu6500.h
+
+diff --git a/arch/arm64/boot/dts/rk3368-p9_818.dts b/arch/arm64/boot/dts/rk3368-p9_818.dts
+index c180283a6c64..158adb5d62f7 100755
+--- a/arch/arm64/boot/dts/rk3368-p9_818.dts
++++ b/arch/arm64/boot/dts/rk3368-p9_818.dts
+@@ -368,34 +368,14 @@
+ 
+ &i2c4 {
+ 	status = "okay";
+-
+-	mpu6050:mpu@68{
+-		compatible = "mpu6050";
++	mpu6500_acc:mpu_acc@68{
++		compatible = "mpu6500_acc";
+ 		reg = <0x68>;
+-		mpu-int_config = <0x10>;
+-		mpu-level_shifter = <0>;
+-		mpu-orientation = <0 1 0 1 0 0 0 0 1>;
+-		orientation-x= <0>;
+-		orientation-y= <1>;
+-		orientation-z= <1>;
+-		irq-gpio = <&gpio3 GPIO_B6 IRQ_TYPE_LEVEL_LOW>;
+-		mpu-debug = <0>;
+-	};
+-
+-
+-	ak8963:compass@0d{
+-		compatible = "mpu_ak8963";
+-		reg = <0x0d>;
+-		compass-bus = <0>;
+-		compass-adapt_num = <0>;
+-		compass-orientation = <1 0 0 0 1 0 0 0 1>;
+-		orientation-x= <0>;
+-		orientation-y= <0>;
+-		orientation-z= <1>;
+-		compass-debug = <1>;
+-		status = "okay";
++		irq_enable = <0>;
++		poll_delay_ms = <30>;
++		type = <SENSOR_TYPE_ACCEL>;
++		layout = <7>;
+ 	};
+-
+ };
+ 
+ &i2c5 {
+diff --git a/drivers/input/sensors/accel/Kconfig b/drivers/input/sensors/accel/Kconfig
+index d37e937bf486..4d4f1cd48959 100755
+--- a/drivers/input/sensors/accel/Kconfig
++++ b/drivers/input/sensors/accel/Kconfig
+@@ -24,6 +24,13 @@ config MPU6880_ACC
+ 	  To have support for your specific gsesnor you will have to
+ 	  select the proper drivers which depend on this option.
+ 
++config MPU6500_ACC
++  bool "Sensor mpu6500_acc"
++  default y
++	help
++	  To have support for your specific gsesnor you will have to
++	  select the proper drivers which depend on this option.
++
+ config GS_KXTIK
+     bool "gsensor kxtik"
+ 	help
+diff --git a/drivers/input/sensors/accel/Makefile b/drivers/input/sensors/accel/Makefile
+index 87dbb03bac96..add3a9541704 100755
+--- a/drivers/input/sensors/accel/Makefile
++++ b/drivers/input/sensors/accel/Makefile
+@@ -8,3 +8,4 @@ obj-$(CONFIG_GS_DMT10)      += dmard10.o
+ obj-$(CONFIG_GS_LSM303D)    += lsm303d.o
+ obj-$(CONFIG_GS_MC3230)    += mc3230.o
+ obj-$(CONFIG_MPU6880_ACC)   += mpu6880_acc.o
++obj-$(CONFIG_MPU6500_ACC)   += mpu6500_acc.o
+diff --git a/drivers/input/sensors/accel/mpu6500_acc.c b/drivers/input/sensors/accel/mpu6500_acc.c
+new file mode 100644
+index 000000000000..07a807ffedff
+--- /dev/null
++++ b/drivers/input/sensors/accel/mpu6500_acc.c
+@@ -0,0 +1,286 @@
++/* drivers/input/sensors/access/mpu6500_acc.c
++ *
++ * Copyright (C) 2012-2015 ROCKCHIP.
++ * Author: oeh<oeh@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++#include <linux/mpu6500.h>
++
++
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++	int result = 0;
++	int status = 0;
++	u8 pwrm1 = 0;	
++	
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	pwrm1 = sensor_read_reg(client, MPU6500_PWR_MGMT_1);
++	//关闭
++	if(!enable)
++	{	
++		status = BIT_ACCEL_STBY;	
++		sensor->ops->ctrl_data |= status;	
++		//gyro和acc都不工作时，模块进入休眠
++		if(sensor->ops->ctrl_data && (BIT_ACCEL_STBY | BIT_GYRO_STBY) != 0)
++		{
++			pwrm1 |= MPU6500_PWRM1_SLEEP;
++		}
++	}
++	else//打开
++	{
++		status = ~BIT_ACCEL_STBY;	
++		sensor->ops->ctrl_data &= status;
++		pwrm1 &=~MPU6500_PWRM1_SLEEP;
++	}
++	result = sensor_write_reg(client, sensor->ops->ctrl_reg, sensor->ops->ctrl_data);
++	if(result)
++	{
++		printk("%s:fail to set pwrm2\n",__func__);
++		return -1;
++	}
++	msleep(20);
++
++	result = sensor_write_reg(client, MPU6500_PWR_MGMT_1,pwrm1);
++	if(result)
++	{
++		printk("%s:fail to set pwrm1\n",__func__);
++		return -1;
++	}
++	msleep(20);
++	
++	return result;
++
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	int res=0; 
++	u8 read_data = 0;
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++
++	//检测IC是否为MPU6500
++	read_data = sensor_read_reg(client,sensor->ops->id_reg);
++	
++	if(read_data != sensor->ops->id_data)
++	{
++		printk("%s:check id err,read_data:%d,ops->id_data:%d\n",__func__,read_data,sensor->ops->id_data);
++		return -1;
++	}
++	
++	//寄存器初始化
++	res = sensor_write_reg(client, MPU6500_PWR_MGMT_1,0x80);
++	if (res) 
++	{
++		printk("set MPU6500_PWR_MGMT_1 error,res: %d!\n", res);
++		return res;
++	}
++	msleep(40);
++
++	res = sensor_write_reg(client, MPU6500_GYRO_CONFIG,0x18);  //config gyro for 2000dps
++	if (res) 
++	{
++		printk("set MPU6500_GYRO_CONFIG error,res: %d!\n", res);
++		return res;
++	}
++	msleep(10);
++
++	res = sensor_write_reg(client, MPU6500_ACCEL_CONFIG,0x00);  //config Accel for +_2G
++	if (res) 
++	{
++		printk("set MPU6500_ACCEL_CONFIG error,res: %d!\n", res);
++		return res;
++	}
++	msleep(10);
++
++	res = sensor_write_reg(client, MPU6500_ACCEL_CONFIG2,0x00);
++	if (res) 
++	{
++		printk("set MPU6500_ACCEL_CONFIG2 error,res: %d!\n", res);
++		return res;
++	}
++	res = sensor_write_reg(client, MPU6500_PWR_MGMT_2,0x3F); //set accl and gyro all axis into standby mode
++	if (res) 
++	{
++		printk("set MPU6500_PWR_MGMT_2 error,res: %d!\n", res);
++		return res;
++	}	
++	msleep(10);	
++	res = sensor_write_reg(client, MPU6500_PWR_MGMT_1,0x41);
++	if (res) 
++	{
++		printk("set MPU6500_PWR_MGMT_1 error,res: %d!\n", res);
++		return res;
++	}	
++	msleep(10); 
++
++	//默认关闭
++	res = sensor->ops->active(client,0,0);
++	if(res)
++	{
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return res;
++	}
++	return res;
++}
++
++static int gsensor_report_value(struct i2c_client *client, struct sensor_axis *axis)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);	
++
++	/* Report acceleration sensor information */
++	input_report_abs(sensor->input_dev, ABS_X, axis->x);
++	input_report_abs(sensor->input_dev, ABS_Y, axis->y);
++	input_report_abs(sensor->input_dev, ABS_Z, axis->z);
++	input_sync(sensor->input_dev);
++	DBG("Gsensor x==%d  y==%d z==%d\n",axis->x,axis->y,axis->z);
++
++	return 0;
++}
++
++#define GSENSOR_MIN  		10
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);	
++	struct sensor_platform_data *pdata = sensor->pdata;
++	int ret = 0;
++	short x,y,z;
++	struct sensor_axis axis;
++	u8 buffer[6] = {0};	
++	char value = 0;
++	
++	if(sensor->ops->read_len < 6)	//sensor->ops->read_len = 6
++	{
++		printk("%s:lenth is error,len=%d\n",__func__,sensor->ops->read_len);
++		return -1;
++	}
++	
++	memset(buffer, 0, 6);
++	
++	/* Data bytes from hardware xL, xH, yL, yH, zL, zH */	
++	do {
++		*buffer = sensor->ops->read_reg;
++		ret = sensor_rx_data(client, buffer, sensor->ops->read_len);
++		if (ret < 0)
++		return ret;
++	} while (0);
++
++	x = ((buffer[0] << 8) & 0xff00) + (buffer[1] & 0xFF);
++	y = ((buffer[2] << 8) & 0xff00) + (buffer[3] & 0xFF);
++	z = ((buffer[4] << 8) & 0xff00) + (buffer[5] & 0xFF);
++	/*
++	printk("mpu6500_acc: x:%d,y:%d,z:%d,-4:%d\n",x,y,z,-4);
++	printk("mpu6500_acc:orientation:\n%d %d %d\n%d %d %d\n%d %d %d\n",pdata->orientation[0],
++		pdata->orientation[1],pdata->orientation[2],pdata->orientation[3],pdata->orientation[4],
++		pdata->orientation[5],pdata->orientation[6],pdata->orientation[7],pdata->orientation[8]);
++	*/
++	axis.x = (pdata->orientation[0])*x + (pdata->orientation[1])*y + (pdata->orientation[2])*z;
++	axis.y = (pdata->orientation[3])*x + (pdata->orientation[4])*y + (pdata->orientation[5])*z; 
++	axis.z = (pdata->orientation[6])*x + (pdata->orientation[7])*y + (pdata->orientation[8])*z;
++
++	//为了不修改hal层代码，数据转换后上报
++	axis.x = 61*axis.x;
++	axis.y = 61*axis.y;
++	axis.z = 61*axis.z;
++	
++	//if((abs(sensor->axis.x - axis.x) > GSENSOR_MIN) || (abs(sensor->axis.y - axis.y) > GSENSOR_MIN) || (abs(sensor->axis.z - axis.z) > GSENSOR_MIN))
++	{
++		gsensor_report_value(client, &axis);
++
++		/* 互斥地缓存数据. */
++		mutex_lock(&(sensor->data_mutex) );
++		sensor->axis = axis;
++		mutex_unlock(&(sensor->data_mutex) );
++	}
++
++	if((sensor->pdata->irq_enable)&& (sensor->ops->int_status_reg >= 0))	//read sensor intterupt status register
++	{
++		
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++		DBG("%s:sensor int status :0x%x\n",__func__,value);
++	}
++	
++	return ret;
++}
++
++
++struct sensor_operate gsensor_mpu6500_ops = {
++	.name				= "mpu6500_acc",
++	.type				= SENSOR_TYPE_ACCEL,			//sensor type and it should be correct
++	.id_i2c				= ACCEL_ID_MPU6500,				//i2c id number
++	.read_reg			= MPU6500_ACCEL_XOUT_H,		//read data
++	.read_len			= 6,							//data length
++	.id_reg				= MPU6500_WHOAMI,			//read device id from this register
++	.id_data 			= MPU6500_DEVICE_ID,			//device id
++	.precision			= MPU6500_PRECISION,			//16 bit
++	.ctrl_reg 			= MPU6500_PWR_MGMT_2,		//enable or disable 	
++	.int_status_reg 	= MPU6500_INT_STATUS,			//intterupt status register
++	.range				= {-32768*61,32768*61},	//range
++	.trig				= IRQF_TRIGGER_HIGH |IRQF_ONESHOT,		
++	.active				= sensor_active,	
++	.init				= sensor_init,
++	.report 			= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++
++//function name should not be changed
++static struct sensor_operate *gsensor_get_ops(void)
++{
++	return &gsensor_mpu6500_ops;
++}
++
++
++static int __init gsensor_mpu6500_init(void)
++{
++	struct sensor_operate *ops = gsensor_get_ops();
++	int result = 0;
++	int type = ops->type;
++	result = sensor_register_slave(type, NULL, NULL, gsensor_get_ops);	
++	return result;
++}
++
++static void __exit gsensor_mpu6500_exit(void)
++{
++	struct sensor_operate *ops = gsensor_get_ops();
++	int type = ops->type;
++	sensor_unregister_slave(type, NULL, NULL, gsensor_get_ops);
++}
++
++
++module_init(gsensor_mpu6500_init);
++module_exit(gsensor_mpu6500_exit);
++
++
++
+diff --git a/drivers/input/sensors/sensor-dev.c b/drivers/input/sensors/sensor-dev.c
+index b952f1797275..d7536fc421f7 100755
+--- a/drivers/input/sensors/sensor-dev.c
++++ b/drivers/input/sensors/sensor-dev.c
+@@ -1456,6 +1456,9 @@ static int sensor_misc_device_register(struct sensor_private_data *sensor, int t
+ 			{
+ 				sensor->fops.owner = THIS_MODULE;
+ 				sensor->fops.unlocked_ioctl = gsensor_dev_ioctl;
++                #ifdef CONFIG_COMPAT
++				sensor->fops.compat_ioctl = gsensor_dev_ioctl;
++				#endif
+ 				sensor->fops.open = gsensor_dev_open;
+ 				sensor->fops.release = gsensor_dev_release;
+ 
+@@ -2099,6 +2102,7 @@ static const struct i2c_device_id sensor_id[] = {
+ 	{"gs_lsm303d", ACCEL_ID_LSM303D},
+ 	{"gs_mc3230",ACCEL_ID_MC3230},
+ 	{"mpu6880_acc",ACCEL_ID_MPU6880},
++	{"mpu6500_acc",ACCEL_ID_MPU6500},
+ 	/*compass*/
+ 	{"compass", COMPASS_ID_ALL},
+ 	{"ak8975", COMPASS_ID_AK8975},	
+diff --git a/include/linux/mpu6500.h b/include/linux/mpu6500.h
+new file mode 100644
+index 000000000000..e601c300b490
+--- /dev/null
++++ b/include/linux/mpu6500.h
+@@ -0,0 +1,238 @@
++/*
++ * Definitions for mma8452 compass chip.
++ */
++#ifndef __MPU6500_H
++#define __MPU6500_H
++
++#include <linux/ioctl.h>
++/**add***/
++#define MPU6500_PRECISION		16
++#define MPU6500_RANGE			2000000
++
++#define MPU6500_SMPLRT_DIV		0x19
++#define MPU6500_CONFIG 			0x1A
++#define MPU6500_GYRO_CONFIG		0x1B
++#define MPU6500_ACCEL_CONFIG	0x1C
++#define MPU6500_ACCEL_CONFIG2	0x1D
++#define MPU6500_LP_ACCEL_ODR   0x1E
++#define MPU6500_WOM_THRESH	0x1F
++#define MPU6500_FIFO_EN			0x23
++#define MPU6500_INT_PIN_CFG		0x37
++#define MPU6500_INT_ENABLE		0x38
++#define MPU6500_DMP_INT_STATUS	0x39
++#define MPU6500_INT_STATUS		0x3A
++#define MPU6500_ACCEL_XOUT_H	0x3B
++#define MPU6500_TEMP_OUT_H	0x41
++#define MPU6500_GYRO_XOUT_H	0x43
++#define MPU6500_ACCEL_INTEL_CTRL 0x69
++#define MPU6500_USER_CTRL		0x6A
++#define MPU6500_PWR_MGMT_1		0x6B
++#define MPU6500_PWR_MGMT_2		0x6C
++#define MPU6500_PRGM_STRT_ADDRH     0x70
++#define MPU6500_FIFO_COUNTH		0x72
++#define MPU6500_FIFO_R_W		0x74
++#define MPU6500_WHOAMI			0x75
++
++#define MPU6500_DEVICE_ID		0x70
++/*------------------------------
++	MPU6500_CONFIG
++--------------------------------*/
++#define DLPF_CFG_250HZ		0x00
++#define DLPF_CFG_184HZ		0x01
++#define DLPF_CFG_98HZ		0x02
++#define DLPF_CFG_41HZ		0x03
++#define DLPF_CFG_20HZ		0x04
++#define DLPF_CFG_10HZ		0x05
++#define DLPF_CFG_5HZ		0x06
++#define DLPF_CFG_3600HZ		0x07
++#define EXT_SYNC_SET_TEMP	0x08
++#define EXT_SYNC_SET_GYRO_X	0x10
++#define EXT_SYNC_SET_GYRO_Y	0x18
++#define EXT_SYNC_SET_GYRO_Z	0x20
++#define EXT_SYNC_SET_ACCEL_X	0x28
++#define EXT_SYNC_SET_ACCEL_Y	0x30
++#define EXT_SYNC_SET_ACCEL_Z	0x38
++
++
++/*------------------------------
++	MPU6500_GYRO_CONFIG
++--------------------------------*/
++#define GFSR_250DPS			(0 <<3)
++#define GFSR_500DPS			(1 <<3)
++#define GFSR_1000DPS		(2 <<3)
++#define GFSR_2000DPS		(3 <<3)
++
++/*------------------------------
++	MPU6500_ACCEL_CONFIG
++--------------------------------*/
++#define AFSR_2G		(0 <<3)
++#define AFSR_4G		(1 <<3)
++#define AFSR_8G		(2 <<3)
++#define AFSR_16G	(3 <<3)
++
++
++/*------------------------------
++	MPU6500_ACCEL_CONFIG2
++--------------------------------*/
++#define A_DLPF_CFG_460HZ		0x00
++#define A_DLPF_CFG_184HZ		0x01
++#define A_DLPF_CFG_92HZ		0x02
++#define A_DLPF_CFG_41HZ		0x03
++#define A_DLPF_CFG_20HZ		0x04
++#define A_DLPF_CFG_10HZ		0x05
++#define A_DLPF_CFG_5HZ			0x06
++//#define A_DLPF_CFG_460HZ      0x07
++#define BIT_FIFO_SIZE_1K                 0x40
++#define BIT_ACCEL_FCHOICE_B		0x08
++
++
++/*------------------------------
++	MPU6500_LP_ACCEL_ODR
++--------------------------------*/
++#define LPA_CLK_P24HZ	0x0
++#define LPA_CLK_P49HZ	0x1
++#define LPA_CLK_P98HZ	0x2
++#define LPA_CLK_1P95HZ	0x3
++#define LPA_CLK_3P91HZ	0x4
++#define LPA_CLK_7P81HZ	0x5
++#define LPA_CLK_15P63HZ	0x6
++#define LPA_CLK_31P25HZ	0x7
++#define LPA_CLK_62P50HZ	0x8
++#define LPA_CLK_125HZ	0x9
++#define LPA_CLK_250HZ	0xa
++#define LPA_CLK_500HZ	0xb
++
++
++/*------------------------------
++	MPU6500_PWR_MGMT_1
++--------------------------------*/
++#define BIT_H_RESET			(1<<7)
++#define BIT_SLEEP			(1<<6)
++#define BIT_CYCLE			(1<<5)
++#define BIT_GYRO_STANDBY	(1<<4)
++#define BIT_PD_PTAT			(1<<3)
++#define BIT_CLKSEL			(1<<0)
++
++#define CLKSEL_INTERNAL		0
++#define CLKSEL_PLL			1
++
++/*------------------------------
++	MPU6500_PWR_MGMT_2
++--------------------------------*/
++#define BIT_ACCEL_STBY              0x38
++#define BIT_GYRO_STBY               0x07
++#define BITS_LPA_WAKE_CTRL 0xC0
++#define BITS_LPA_WAKE_1HZ 0x00
++#define BITS_LPA_WAKE_2HZ 0x40
++#define BITS_LPA_WAKE_20HZ 0x80
++
++#define MPU6500_PWRM1_SLEEP				0x40
++#define MPU6500_PWRM1_GYRO_STANDBY		0x10
++#define MPU6500_PWRM2_ACCEL_DISABLE		0x38
++#define MPU6500_PWRM2_GYRO_DISABLE		0x07
++
++/*------------------------------
++	MPU6500_ACCEL_INTEL_CTRL
++--------------------------------*/
++#define BIT_ACCEL_INTEL_EN	0x80
++#define BIT_ACCEL_INTEL_MODE	0x40
++
++
++/*------------------------------
++	MPU6500_USER_CTRL
++--------------------------------*/
++#define BIT_FIFO_RST                    0x04
++#define BIT_DMP_RST                     0x08
++#define BIT_I2C_MST_EN                  0x20
++#define BIT_FIFO_EN                     0x40
++#define BIT_DMP_EN                      0x80
++
++
++/*------------------------------
++	MPU6500_FIFO_EN
++--------------------------------*/
++#define BIT_ACCEL_OUT           0x08
++#define BITS_GYRO_OUT           0x70
++
++
++/*------------------------------
++	MPU6500_INT_PIN_CFG
++--------------------------------*/
++#define BIT_BYPASS_EN           0x2
++
++/*------------------------------
++	MPU6500_INT_EN/INT_STATUS
++--------------------------------*/
++#define BIT_FIFO_OVERLOW 	0x80
++#define BIT_MOT_INT				0x40
++#define BIT_MPU_RDY                 0x04
++#define BIT_DMP_INT                 0x02
++#define BIT_RAW_RDY                 0x01
++
++
++#define DMP_START_ADDR           0x400
++
++
++
++#define AXIS_NUM 3
++#define AXIS_ADC_BYTE 2
++#define SENSOR_PACKET (AXIS_NUM * AXIS_ADC_BYTE)
++
++
++
++
++
++/*
++	self-test parameter
++*/
++
++#define DEF_ST_PRECISION            1000
++#define DEF_ST_MPU6500_ACCEL_LPF        2
++#define DEF_STABLE_TIME_ST 50
++#define DEF_SELFTEST_GYRO_FS            (0 << 3)
++#define DEF_SELFTEST_ACCEL_FS           (2 << 3)
++#define DEF_SELFTEST_6500_ACCEL_FS      (0 << 3)
++#define DEF_SW_SELFTEST_GYRO_FS	GFSR_2000DPS
++#define DEF_SW_SELFTEST_SENSITIVITY	\
++	(2000*DEF_ST_PRECISION)/32768
++
++#define DEF_SW_SELFTEST_SAMPLE_COUNT 75
++#define DEF_SW_SELFTEST_SAMPLE_TIME 75
++#define DEF_SW_ACCEL_CAL_SAMPLE_TIME 50
++#define DEF_SW_SKIP_COUNT 10
++
++#define DEF_ST_6500_STABLE_TIME         20
++#define BYTES_PER_SENSOR        (6)
++#define DEF_SELFTEST_SAMPLE_RATE             0
++#define DEF_GYRO_WAIT_TIME          50
++#define THREE_AXIS              (3)
++#define INIT_ST_SAMPLES          200
++#define FIFO_COUNT_BYTE         (2)
++#define DEF_ST_TRY_TIMES            2
++#define REG_6500_XG_ST_DATA     0x0
++#define REG_6500_XA_ST_DATA     0xD
++#define BITS_SELF_TEST_EN		0xE0
++
++#define DEF_ST_SCALE                    (1L << 15)
++
++/*---- MPU6500 Self Test Pass/Fail Criteria ----*/
++/* Gyro Offset Max Value (dps) */
++#define DEF_GYRO_OFFSET_MAX             20
++/* Gyro Self Test Absolute Limits ST_AL (dps) */
++#define DEF_GYRO_ST_AL                  60
++/* Accel Self Test Absolute Limits ST_AL (mg) */
++#define DEF_ACCEL_ST_AL_MIN             225
++#define DEF_ACCEL_ST_AL_MAX             675
++#define DEF_6500_ACCEL_ST_SHIFT_DELTA   500
++#define DEF_6500_GYRO_CT_SHIFT_DELTA    500
++#define DEF_ST_MPU6500_ACCEL_LPF        2
++#define DEF_ST_6500_ACCEL_FS_MG         2000UL
++#define DEF_SELFTEST_6500_ACCEL_FS      (0 << 3)
++
++#define DEF_SELFTEST_GYRO_SENS          (32768 / 250)
++
++
++#define  GSENSOR_DEV_PATH    "/dev/mma8452_daemon"
++
++#endif
++
+diff --git a/include/linux/sensor-dev.h b/include/linux/sensor-dev.h
+index c10c76045a3b..b009cf48ec36 100755
+--- a/include/linux/sensor-dev.h
++++ b/include/linux/sensor-dev.h
+@@ -56,6 +56,7 @@ enum sensor_id {
+ 	ACCEL_ID_LSM303D,
+ 	ACCEL_ID_MC3230,
+ 	ACCEL_ID_MPU6880,
++        ACCEL_ID_MPU6500,
+ 	COMPASS_ID_ALL,
+ 	COMPASS_ID_AK8975,
+ 	COMPASS_ID_AK8963,
+-- 
+2.35.3
+

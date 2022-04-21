@@ -1,0 +1,206 @@
+From 0250b83f98aa74265121890c09d648e0d57e084f Mon Sep 17 00:00:00 2001
+From: Shunqing Chen <csq@rock-chips.com>
+Date: Thu, 23 Nov 2017 16:40:53 +0800
+Subject: [PATCH] power: rk818: add power_supply property for CTS.
+
+Android8.0 CTS needs to get max charging current,
+max charging voltage and battery charge counter.
+
+Change-Id: Ia0e6589e92f24ece179299040336e050b21258b1
+Signed-off-by: Shunqing Chen <csq@rock-chips.com>
+---
+ drivers/power/rk818_battery.c | 28 +++++++++++++
+ drivers/power/rk818_charger.c | 75 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+diff --git a/drivers/power/rk818_battery.c b/drivers/power/rk818_battery.c
+index ffaf4aa0a8ed..a5c1e704a359 100644
+--- a/drivers/power/rk818_battery.c
++++ b/drivers/power/rk818_battery.c
+@@ -174,6 +174,8 @@ struct rk818_battery {
+ 	bool				is_initialized;
+ 	bool				is_first_power_on;
+ 	u8				res_div;
++	int				current_max;
++	int				voltage_max;
+ 	int				current_avg;
+ 	int				voltage_avg;
+ 	int				voltage_ocv;
+@@ -250,6 +252,8 @@ struct rk818_battery {
+ 	int				dbg_calc_rsoc;
+ 	u8				ac_in;
+ 	u8				usb_in;
++	int				is_charging;
++	unsigned long			charge_count;
+ };
+ 
+ #define DIV(x)	((x) ? (x) : 1)
+@@ -877,6 +881,9 @@ static enum power_supply_property rk818_bat_props[] = {
+ 	POWER_SUPPLY_PROP_CAPACITY,
+ 	POWER_SUPPLY_PROP_TEMP,
+ 	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
+ };
+ 
+ static int rk818_bat_get_usb_psy(struct device *dev, void *data)
+@@ -991,6 +998,15 @@ static int rk818_battery_get_property(struct power_supply *psy,
+ 		else
+ 			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++		val->intval = di->charge_count;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		val->intval = di->voltage_max;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		val->intval = di->current_max;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -2555,12 +2571,24 @@ static void rk818_bat_rsoc_daemon(struct rk818_battery *di)
+ 
+ static void rk818_bat_update_info(struct rk818_battery *di)
+ {
++	int is_charging;
++
+ 	di->voltage_avg = rk818_bat_get_avg_voltage(di);
+ 	di->current_avg = rk818_bat_get_avg_current(di);
+ 	di->voltage_relax = rk818_bat_get_relax_voltage(di);
+ 	di->rsoc = rk818_bat_get_rsoc(di);
+ 	di->remain_cap = rk818_bat_get_coulomb_cap(di);
+ 	di->chrg_status = rk818_bat_get_chrg_status(di);
++	is_charging = rk818_bat_get_charge_state(di);
++	if (is_charging != di->is_charging) {
++		di->is_charging = is_charging;
++		if (is_charging)
++			di->charge_count++;
++	}
++	if (di->voltage_avg > di->voltage_max)
++		di->voltage_max = di->voltage_avg;
++	if (di->current_avg > di->current_max)
++		di->current_max = di->current_avg;
+ 
+ 	/* smooth charge */
+ 	if (di->remain_cap > di->fcc) {
+diff --git a/drivers/power/rk818_charger.c b/drivers/power/rk818_charger.c
+index bd5b03e1f649..e885c21b0049 100644
+--- a/drivers/power/rk818_charger.c
++++ b/drivers/power/rk818_charger.c
+@@ -134,6 +134,7 @@ struct rk818_charger {
+ 	struct regmap *regmap;
+ 	struct power_supply *ac_psy;
+ 	struct power_supply *usb_psy;
++	struct power_supply *bat_psy;
+ 	struct extcon_dev *cable_edev;
+ 	struct charger_platform_data *pdata;
+ 	struct workqueue_struct *usb_charger_wq;
+@@ -297,14 +298,76 @@ static int rk818_cg_lowpwr_check(struct rk818_charger *cg)
+ 	return fake_offline;
+ }
+ 
++static int rk818_cg_get_bat_psy(struct device *dev, void *data)
++{
++	struct rk818_charger *cg = data;
++	struct power_supply *psy = dev_get_drvdata(dev);
++
++	if (psy->desc->type == POWER_SUPPLY_TYPE_BATTERY) {
++		cg->bat_psy = psy;
++		return 1;
++	}
++
++	return 0;
++}
++
++static void rk818_cg_get_psy(struct rk818_charger *cg)
++{
++	if (!cg->bat_psy)
++		class_for_each_device(power_supply_class, NULL, (void *)cg,
++				      rk818_cg_get_bat_psy);
++}
++
++static int rk818_cg_get_bat_max_cur(struct rk818_charger *cg)
++{
++	union power_supply_propval val;
++	int ret;
++
++	rk818_cg_get_psy(cg);
++
++	if (!cg->bat_psy)
++		return cg->pdata->max_chrg_current;
++
++	ret = cg->bat_psy->desc->get_property(cg->bat_psy,
++					      POWER_SUPPLY_PROP_CURRENT_MAX,
++					      &val);
++	if (!ret && val.intval)
++		return val.intval;
++
++	return cg->pdata->max_chrg_current;
++}
++
++static int rk818_cg_get_bat_max_vol(struct rk818_charger *cg)
++{
++	union power_supply_propval val;
++	int ret;
++
++	rk818_cg_get_psy(cg);
++
++	if (!cg->bat_psy)
++		return cg->pdata->max_chrg_voltage;
++
++	ret = cg->bat_psy->desc->get_property(cg->bat_psy,
++					      POWER_SUPPLY_PROP_VOLTAGE_MAX,
++					      &val);
++	if (!ret && val.intval)
++		return val.intval;
++
++	return cg->pdata->max_chrg_voltage;
++}
++
+ static enum power_supply_property rk818_ac_props[] = {
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
+ };
+ 
+ static enum power_supply_property rk818_usb_props[] = {
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
+ };
+ 
+ static int rk818_cg_ac_get_property(struct power_supply *psy,
+@@ -338,6 +401,12 @@ static int rk818_cg_ac_get_property(struct power_supply *psy,
+ 
+ 		DBG("report prop: %d\n", val->intval);
+ 		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		val->intval = rk818_cg_get_bat_max_vol(cg);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		val->intval = rk818_cg_get_bat_max_cur(cg);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+@@ -377,6 +446,12 @@ static int rk818_cg_usb_get_property(struct power_supply *psy,
+ 
+ 		DBG("report prop: %d\n", val->intval);
+ 		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
++		val->intval = rk818_cg_get_bat_max_vol(cg);
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		val->intval = rk818_cg_get_bat_max_cur(cg);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+-- 
+2.35.3
+

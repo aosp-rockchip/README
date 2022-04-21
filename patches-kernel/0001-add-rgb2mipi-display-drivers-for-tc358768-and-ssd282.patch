@@ -1,0 +1,1191 @@
+From bb7e7b9fe4914980fb0b6aad828c30adef8bf535 Mon Sep 17 00:00:00 2001
+From: hhb <hhb@rock-chips.com>
+Date: Thu, 21 Feb 2013 15:45:14 +0800
+Subject: [PATCH] add rgb2mipi display drivers for tc358768 and ssd2828
+
+---
+ drivers/video/display/transmitter/Kconfig    |  18 +-
+ drivers/video/display/transmitter/Makefile   |   2 +
+ drivers/video/display/transmitter/mipi_dsi.c | 162 ++++++
+ drivers/video/display/transmitter/mipi_dsi.h | 107 ++++
+ drivers/video/display/transmitter/ssd2828.c  | 503 +++++++++++++++++++
+ drivers/video/display/transmitter/tc358768.c | 111 ++--
+ drivers/video/display/transmitter/tc358768.h |  99 ----
+ 7 files changed, 866 insertions(+), 136 deletions(-)
+ create mode 100644 drivers/video/display/transmitter/mipi_dsi.c
+ create mode 100644 drivers/video/display/transmitter/mipi_dsi.h
+ create mode 100644 drivers/video/display/transmitter/ssd2828.c
+ delete mode 100644 drivers/video/display/transmitter/tc358768.h
+
+diff --git a/drivers/video/display/transmitter/Kconfig b/drivers/video/display/transmitter/Kconfig
+index bca74070441a..2b875c41135e 100644
+--- a/drivers/video/display/transmitter/Kconfig
++++ b/drivers/video/display/transmitter/Kconfig
+@@ -11,10 +11,6 @@ config RK610_LVDS
+ 	help
+ 		Support Jetta(RK610) to output LCD1 and LVDS.
+ 		
+-config TC358768_RGB2MIPI
+-	bool "toshiba RGB to MIPI DSI"
+-	help
+-	"a chip that change RGB interface parallel signal into DSI serial signal"
+ 
+ config DP_ANX6345
+ 	bool "RGB to Display Port transmitter anx6345,anx9804,anx9805 support"
+@@ -23,3 +19,17 @@ config DP501
+ 	bool"RGB to Display Port transmitter dp501 support"
+ 	
+ endchoice
++
++config MIPI_DSI
++	bool "RGB to MIPI DSI"
++			
++config TC358768_RGB2MIPI
++	bool "toshiba TC358768 RGB to MIPI DSI"
++	depends on MIPI_DSI
++	help
++	"a chip that change RGB interface parallel signal into DSI serial signal"
++config SSD2828_RGB2MIPI
++	bool "solomon SSD2828 RGB to MIPI DSI"
++	depends on MIPI_DSI
++	help
++	"a chip that change RGB interface parallel signal into DSI serial signal"
+diff --git a/drivers/video/display/transmitter/Makefile b/drivers/video/display/transmitter/Makefile
+index 284e9c5a54d3..ed8fb564c78e 100644
+--- a/drivers/video/display/transmitter/Makefile
++++ b/drivers/video/display/transmitter/Makefile
+@@ -2,6 +2,8 @@
+ # Makefile for display transmitter like lvds edp mipi
+ #
+ obj-$(CONFIG_RK610_LVDS)	  += rk610_lcd.o
++obj-$(CONFIG_MIPI_DSI)   += mipi_dsi.o
+ obj-$(CONFIG_TC358768_RGB2MIPI)   += tc358768.o
++obj-$(CONFIG_SSD2828_RGB2MIPI)   += ssd2828.o
+ obj-$(CONFIG_DP_ANX6345)          += dp_anx6345.o
+ obj-$(CONFIG_DP501)          += dp501.o
+diff --git a/drivers/video/display/transmitter/mipi_dsi.c b/drivers/video/display/transmitter/mipi_dsi.c
+new file mode 100644
+index 000000000000..5a648d7ff89e
+--- /dev/null
++++ b/drivers/video/display/transmitter/mipi_dsi.c
+@@ -0,0 +1,162 @@
++/*
++ * Copyright (C) 2012 ROCKCHIP, Inc.
++ *
++ * author: hhb@rock-chips.com
++ * create date: 2013-01-17
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#include "mipi_dsi.h"
++#include <linux/module.h>
++#include <linux/init.h>
++#include <asm/system.h>
++
++#define MAX_DSI_CHIPS 5
++
++static struct mipi_dsi_ops *dsi_ops[MAX_DSI_CHIPS] = {NULL};
++static struct mipi_dsi_ops *cur_dsi_ops;
++
++int register_dsi_ops(struct mipi_dsi_ops *ops) {
++
++	int i = 0;
++	for(i = 0; i < MAX_DSI_CHIPS; i++) {
++		if(!dsi_ops[i]) {
++			dsi_ops[i] = ops;
++			break;	
++		}	
++	}
++	if(i == MAX_DSI_CHIPS) {
++		printk("dsi ops support 5 chips at most\n");
++		return -1;
++	}
++	return 0;	
++}
++EXPORT_SYMBOL(register_dsi_ops);
++
++
++int del_dsi_ops(struct mipi_dsi_ops *ops) {
++
++	int i = 0;
++	for(i = 0; i < MAX_DSI_CHIPS; i++) {
++		if(dsi_ops[i] == ops) {
++			dsi_ops[i] = NULL;
++			break;	
++		}	
++	}
++	if(cur_dsi_ops == ops)
++		cur_dsi_ops = NULL;
++	if(i == MAX_DSI_CHIPS) {
++		printk("dsi ops not found\n");
++		return -1;
++	}
++	return 0;	
++}
++EXPORT_SYMBOL(del_dsi_ops);
++
++int dsi_probe_current_chip(void) {
++
++	int i = 0, id;
++	struct mipi_dsi_ops *ops = NULL;
++
++	for(i = 0; i < MAX_DSI_CHIPS; i++) {
++		if(dsi_ops[i]) {
++			ops = dsi_ops[i];
++			id = ops->get_id();
++			if(id == ops->id) {
++				cur_dsi_ops = ops;
++				printk("load mipi dsi chip:%s id:%04x\n", ops->name, ops->id);
++				break;
++			} else {
++				printk("mipi dsi chip is not found, read id:%04x, but %04x is correct\n", id, ops->id);
++				dsi_ops[i] = NULL;
++				cur_dsi_ops = NULL;
++			}
++		}	
++	}
++	if(i == MAX_DSI_CHIPS)
++		printk("no mipi dsi chip\n");
++
++	return 0;
++}
++EXPORT_SYMBOL(dsi_probe_current_chip);
++
++int dsi_power_up(void) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->power_up)
++		cur_dsi_ops->power_up();
++	return 0;
++}
++EXPORT_SYMBOL(dsi_power_up);
++
++
++int dsi_power_off(void) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->power_down)
++		cur_dsi_ops->power_down();
++	return 0;
++}
++EXPORT_SYMBOL(dsi_power_off);
++
++int dsi_set_regs(void *array, int n) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->dsi_set_regs)
++		cur_dsi_ops->dsi_set_regs(array, n);
++	return 0;
++}
++EXPORT_SYMBOL(dsi_set_regs);
++
++int dsi_init(void *array, int n) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->dsi_init)
++		cur_dsi_ops->dsi_init(array, n);
++	return 0;
++}
++EXPORT_SYMBOL(dsi_init);
++
++
++int dsi_send_dcs_packet(unsigned char *packet, int n) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->dsi_send_dcs_packet)
++		cur_dsi_ops->dsi_send_dcs_packet(packet, n);
++	return 0;
++}
++EXPORT_SYMBOL(dsi_send_dcs_packet);
++
++
++int dsi_read_dcs_packet(unsigned char *packet, int n) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->dsi_read_dcs_packet)
++		cur_dsi_ops->dsi_read_dcs_packet(packet, n);
++	return 0;
++}
++EXPORT_SYMBOL(dsi_read_dcs_packet);
++
++
++int dsi_send_packet(void *packet, int n) {
++
++	if(!cur_dsi_ops)
++		return -1;
++	if(cur_dsi_ops->dsi_send_packet)
++		cur_dsi_ops->dsi_send_packet(packet, n);
++		
++	return 0;
++}
++EXPORT_SYMBOL(dsi_send_packet);
+diff --git a/drivers/video/display/transmitter/mipi_dsi.h b/drivers/video/display/transmitter/mipi_dsi.h
+new file mode 100644
+index 000000000000..5ceda86163f9
+--- /dev/null
++++ b/drivers/video/display/transmitter/mipi_dsi.h
+@@ -0,0 +1,107 @@
++
++#ifndef MIPI_DSI_H_
++#define MIPI_DSI_H_
++
++#include <linux/fb.h>
++#include <linux/delay.h>
++#include <linux/rk_fb.h>
++#include <linux/rk_screen.h>
++#include <linux/ktime.h>
++
++
++//DSI DATA TYPE
++#define DTYPE_DCS_SWRITE_0P		0X05 
++#define DTYPE_DCS_SWRITE_1P		0X15 
++#define DTYPE_DCS_LWRITE		0X39 
++#define DTYPE_GEN_LWRITE		0X29 
++#define DTYPE_GEN_SWRITE_2P		0X23 
++#define DTYPE_GEN_SWRITE_1P		0X13
++#define DTYPE_GEN_SWRITE_0P		0X03
++
++struct spi_t {
++	int cs;
++	char* cs_mux_name;
++	int sck;
++	char* sck_mux_name;
++	int miso;
++	char* miso_mux_name;
++	int mosi;
++	char* mosi_mux_name;
++};
++
++struct power_t {
++	int	enable_pin;    //gpio that control power
++	char* mux_name;
++	u32 mux_mode;
++	u32 effect_value;
++	
++	u32 min_voltage;
++	u32 max_voltage;
++	int (*enable)(void *);
++	int (*disable)(void *);
++};
++
++struct reset_t {
++	int	reset_pin;    //gpio that control reset
++	char* mux_name;
++	u32 mux_mode;
++	u32 effect_value;
++	
++	u32 time_before_reset;    //ms
++ 	u32 time_after_reset;
++	
++	int (*do_reset)(void *);
++};
++
++struct tc358768_t {
++	u32 id;
++	struct reset_t reset;
++	struct power_t vddc;
++	struct power_t vddio;
++	struct power_t vdd_mipi;
++	struct i2c_client *client;
++	int (*gpio_init)(void *);
++	int (*gpio_deinit)(void *);
++	int (*power_up)(void);
++	int (*power_down)(void);
++};
++
++
++struct ssd2828_t {
++	u32 id;
++	struct reset_t reset;
++	struct power_t vddio;
++	struct power_t vdd_mipi;
++	
++	struct spi_t spi;
++	int (*gpio_init)(void *);
++	int (*gpio_deinit)(void *);
++	int (*power_up)(void);
++	int (*power_down)(void);
++};
++
++struct mipi_dsi_ops {
++	u32 id;
++	char *name;
++	int (*get_id)(void);
++	int (*dsi_init)(void *, int n);
++	int (*dsi_set_regs)(void *, int n);
++	int (*dsi_send_dcs_packet)(unsigned char *, int n);
++	int (*dsi_read_dcs_packet)(unsigned char *, int n);
++	int (*dsi_send_packet)(void *, int n);
++	int (*power_up)(void);
++	int (*power_down)(void);	
++};
++
++
++int register_dsi_ops(struct mipi_dsi_ops *ops);
++int del_dsi_ops(struct mipi_dsi_ops *ops);
++int dsi_power_up(void);
++int dsi_power_off(void);
++int dsi_probe_current_chip(void);
++int dsi_init(void *array, int n);
++int dsi_set_regs(void *array, int n);
++int dsi_send_dcs_packet(unsigned char *packet, int n);
++int dsi_read_dcs_packet(unsigned char *packet, int n);
++int dsi_send_packet(void *packet, int n);
++#endif /* end of MIPI_DSI_H_ */
+diff --git a/drivers/video/display/transmitter/ssd2828.c b/drivers/video/display/transmitter/ssd2828.c
+new file mode 100644
+index 000000000000..bc7faddc28a2
+--- /dev/null
++++ b/drivers/video/display/transmitter/ssd2828.c
+@@ -0,0 +1,503 @@
++/*
++ * Copyright (C) 2012 ROCKCHIP, Inc.
++ *
++ * author: hhb@rock-chips.com
++ * create date: 2013-01-17
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#include <linux/fb.h>
++#include <linux/delay.h>
++#include <linux/rk_fb.h>
++#include <mach/gpio.h>
++#include <mach/iomux.h>
++#include <mach/board.h>
++#include <linux/rk_screen.h>
++#include "mipi_dsi.h"
++
++/* define spi gpio*/
++#define TXD_PORT        ssd2828->spi.mosi
++#define CLK_PORT        ssd2828->spi.sck
++#define CS_PORT         ssd2828->spi.cs
++#define RXD_PORT        ssd2828->spi.miso
++
++#define CS_OUT()        gpio_direction_output(CS_PORT, 0)
++#define CS_SET()        gpio_set_value(CS_PORT, GPIO_HIGH)
++#define CS_CLR()        gpio_set_value(CS_PORT, GPIO_LOW)
++#define CLK_OUT()       gpio_direction_output(CLK_PORT, 0)
++#define CLK_SET()       gpio_set_value(CLK_PORT, GPIO_HIGH)
++#define CLK_CLR()       gpio_set_value(CLK_PORT, GPIO_LOW)
++#define TXD_OUT()       gpio_direction_output(TXD_PORT, 0)
++#define TXD_SET()       gpio_set_value(TXD_PORT, GPIO_HIGH)
++#define TXD_CLR()       gpio_set_value(TXD_PORT, GPIO_LOW)
++#define RXD_INPUT()		gpio_direction_input(RXD_PORT)
++#define RXD_GET()  		gpio_get_value(RXD_PORT)
++
++
++struct ssd2828_t *ssd2828 = NULL;
++
++
++int ssd2828_gpio_init(void *data) {
++	int ret = 0;
++	struct reset_t *reset = &ssd2828->reset;
++	struct power_t *vdd = &ssd2828->vddio;
++	struct spi_t *spi = &ssd2828->spi;
++	
++	if(reset->reset_pin > INVALID_GPIO) {
++		ret = gpio_request(reset->reset_pin, "ssd2828_reset");
++		if (ret != 0) {
++			//gpio_free(reset->reset_pin);
++			printk("%s: request ssd2828_RST_PIN error\n", __func__);
++		} else {
++			if(reset->mux_name)
++				rk30_mux_api_set(reset->mux_name, 0);
++			gpio_direction_output(reset->reset_pin, reset->effect_value);
++		}
++	}
++	
++	if(vdd->enable_pin > INVALID_GPIO) {
++		ret = gpio_request(vdd->enable_pin, "ssd2828_vddio");
++		if (ret != 0) {
++			//gpio_free(vdd->enable_pin);
++			printk("%s: request ssd2828_vddio_PIN error\n", __func__);
++		} else {
++			if(vdd->mux_name)
++				rk30_mux_api_set(vdd->mux_name, 0);	
++			gpio_direction_output(vdd->enable_pin, !vdd->effect_value);	
++		}
++	}
++	
++	vdd = &ssd2828->vdd_mipi;
++	if(vdd->enable_pin > INVALID_GPIO) {
++		ret = gpio_request(vdd->enable_pin, "ssd2828_vdd_mipi");
++		if (ret != 0) {
++			//gpio_free(vdd->enable_pin);
++			printk("%s: request ssd2828_vdd_mipi_PIN error\n", __func__);
++		} else {
++			if(vdd->mux_name)
++				rk30_mux_api_set(vdd->mux_name, 0);	
++			gpio_direction_output(vdd->enable_pin, !vdd->effect_value);	
++		}
++	}
++	
++	if(spi->cs > INVALID_GPIO) {
++		ret = gpio_request(spi->cs, "ssd2828_spi_cs");
++		if (ret != 0) {
++			//gpio_free(spi->cs);
++			printk("%s: request ssd2828_spi->cs_PIN error\n", __func__);
++		} else {
++			if(spi->cs_mux_name)
++				rk30_mux_api_set(spi->cs_mux_name, 0);	
++			gpio_direction_output(spi->cs, GPIO_HIGH);	
++		}
++	}
++	if(spi->sck > INVALID_GPIO) {
++		ret = gpio_request(spi->sck, "ssd2828_spi_sck");
++		if (ret != 0) {
++			//gpio_free(spi->sck);
++			printk("%s: request ssd2828_spi->sck_PIN error\n", __func__);
++		} else {
++			if(spi->sck_mux_name)
++				rk30_mux_api_set(spi->sck_mux_name, 0);	
++			gpio_direction_output(spi->sck, GPIO_HIGH);	
++		}
++	}	
++	if(spi->mosi > INVALID_GPIO) {
++		ret = gpio_request(spi->mosi, "ssd2828_spi_mosi");
++		if (ret != 0) {
++			//gpio_free(spi->mosi);
++			printk("%s: request ssd2828_spi->mosi_PIN error\n", __func__);
++		} else {
++			if(spi->mosi_mux_name)
++				rk30_mux_api_set(spi->mosi_mux_name, 0);	
++			gpio_direction_output(spi->mosi, GPIO_HIGH);	
++		}
++	}	
++	if(spi->miso > INVALID_GPIO) {
++		ret = gpio_request(spi->miso, "ssd2828_spi_miso");
++		if (ret != 0) {
++			//gpio_free(spi->miso);
++			printk("%s: request ssd2828_spi->miso_PIN error\n", __func__);
++		} else {
++			if(spi->miso_mux_name)
++				rk30_mux_api_set(spi->miso_mux_name, 0);	
++			gpio_direction_input(spi->miso);	
++		}
++	}	
++	
++	return 0;
++
++}
++
++int ssd2828_gpio_deinit(void *data) {
++	struct reset_t *reset = &ssd2828->reset;
++	struct power_t *vdd = &ssd2828->vddio;
++	struct spi_t *spi = &ssd2828->spi;
++	
++	gpio_direction_input(reset->reset_pin);
++	gpio_free(reset->reset_pin);
++	
++	gpio_direction_input(vdd->enable_pin);
++	gpio_free(vdd->enable_pin);
++	
++	vdd = &ssd2828->vdd_mipi;
++	gpio_direction_input(vdd->enable_pin);
++	gpio_free(vdd->enable_pin);
++	
++	gpio_direction_input(spi->cs);
++	gpio_free(spi->cs);
++	gpio_direction_input(spi->sck);
++	gpio_free(spi->sck);
++	gpio_direction_input(spi->mosi);
++	gpio_free(spi->mosi);
++	gpio_free(spi->miso);
++	
++	return 0;
++}
++
++int ssd2828_reset(void *data) {
++	int ret = 0;
++	struct reset_t *reset = &ssd2828->reset;
++	if(reset->reset_pin <= INVALID_GPIO)
++		return -1;
++	gpio_set_value(reset->reset_pin, reset->effect_value);
++	if(reset->time_before_reset <= 0)
++		msleep(1);
++	else
++		msleep(reset->time_before_reset);
++	
++	gpio_set_value(reset->reset_pin, !reset->effect_value);
++	if(reset->time_after_reset <= 0)
++		msleep(5);
++	else
++		msleep(reset->time_after_reset);
++	return ret;	
++}
++
++int ssd2828_vdd_enable(void *data) {
++	int ret = 0;
++	struct power_t *vdd = (struct power_t *)data;
++	if(vdd->enable_pin > INVALID_GPIO) {
++		gpio_set_value(vdd->enable_pin, vdd->effect_value);
++	} else {
++		//for other control
++	}
++	return ret;
++}
++
++int ssd2828_vdd_disable(void *data) {
++	int ret = 0;
++	struct power_t *vdd = (struct power_t *)data;
++	
++	if(vdd->enable_pin > INVALID_GPIO) {
++		gpio_set_value(vdd->enable_pin, !vdd->effect_value);
++	} else {
++		//for other control
++	}
++	return ret;
++}
++
++
++int ssd2828_power_up(void) {
++
++	int ret = 0;
++	struct ssd2828_t *ssd = (struct ssd2828_t *)ssd2828;
++	
++	ssd2828_gpio_init(NULL);
++	ssd->vdd_mipi.enable(&ssd->vdd_mipi);
++	ssd->vddio.enable(&ssd->vddio);
++	ssd->reset.do_reset(&ssd->reset);
++	
++	return ret;
++}
++
++int ssd2828_power_down(void) {
++
++	int ret = 0;
++	struct ssd2828_t *ssd = (struct ssd2828_t *)ssd2828;
++	
++	ssd->vddio.disable(&ssd->vddio);
++	ssd->vdd_mipi.disable(&ssd->vdd_mipi);
++	ssd2828_gpio_deinit(NULL);
++	
++	return ret;
++}
++
++
++
++/* spi write a data frame,type mean command or data 
++	3 wire 24 bit SPI interface
++*/
++
++static void spi_send_data(unsigned int data)
++{
++    unsigned int i;
++
++    CS_SET();
++    udelay(1);
++    CLK_SET();
++    TXD_SET();
++
++    CS_CLR();
++    udelay(1);
++
++    for (i = 0; i < 24; i++)
++    {
++        //udelay(1); 
++        CLK_CLR();
++        udelay(1);
++        if (data & 0x00800000) {
++            TXD_SET();
++        } else {
++            TXD_CLR();
++        }
++        udelay(1);
++        CLK_SET();
++        udelay(1);
++        data <<= 1;
++    }
++
++    TXD_SET();
++    CS_SET();
++}
++
++static void spi_recv_data(unsigned int* data)
++{
++    unsigned int i = 0, temp = 0x73;   //read data
++
++    CS_SET();
++    udelay(1);
++    CLK_SET();
++    TXD_SET();
++
++    CS_CLR();
++    udelay(1);
++
++	for(i = 0; i < 8; i++) // 8 bits Data
++    {
++		udelay(1); 
++		CLK_CLR();
++		if (temp & 0x80)
++		   TXD_SET();
++		else
++		   TXD_CLR();
++		temp <<= 1;
++		udelay(1); 
++		CLK_SET();
++		udelay(1); 
++	}
++	udelay(1);
++	temp = 0;
++	for(i = 0; i < 16; i++) // 16 bits Data
++	{
++		udelay(1); 
++		CLK_CLR();
++		udelay(1); 
++		CLK_SET();
++		udelay(1); 
++		temp <<= 1;
++		if(RXD_GET() == GPIO_HIGH)
++		   temp |= 0x01;
++		
++	}
++
++    TXD_SET();
++    CS_SET();
++    *data = temp;
++}
++
++#define DEVIE_ID (0x70 << 16)
++void send_ctrl_cmd(unsigned int cmd)
++{
++    unsigned int out = (DEVIE_ID | cmd );
++    spi_send_data(out);
++}
++
++static void send_data_cmd(unsigned int data)
++{
++    unsigned int out = (DEVIE_ID | (0x2 << 16) | data );
++    spi_send_data(out);
++}
++
++unsigned int ssd_read_register(unsigned int reg) {
++	unsigned int data = 0;
++	send_ctrl_cmd(reg);
++	spi_recv_data(&data);
++	return data;
++}
++
++void ssd_set_register(unsigned int reg_and_value)
++{
++    send_ctrl_cmd(reg_and_value >> 16);
++    send_data_cmd(reg_and_value & 0x0000ffff);
++}
++
++int ssd_set_registers(unsigned int reg_array[], int n) {
++
++	int i = 0;
++	for(i = 0; i < n; i++) {
++		if(reg_array[i] < 0x00b00000) {      //the lowest address is 0xb0 of ssd2828
++		    if(reg_array[i] < 20000)
++		    	udelay(reg_array[i]);
++		    else {
++		    	mdelay(reg_array[i]/1000);
++		    }
++		} else {
++			ssd_set_register(reg_array[i]);
++		}
++	}
++	return 0;
++}
++
++int ssd_mipi_dsi_send_dcs_packet(unsigned char regs[], int n) {
++	//unsigned int data = 0, i = 0;
++	ssd_set_register(0x00B70363);
++	ssd_set_register(0x00B80000);
++	ssd_set_register(0x00Bc0001);
++	
++	ssd_set_register(0x00Bf0000 | regs[0]);
++	msleep(1);
++
++	return 0;
++}
++
++
++int _ssd2828_send_packet(unsigned char type, unsigned char regs[], int n) {
++
++	
++	return 0;
++}
++
++int ssd2828_send_packet(unsigned char type, unsigned char regs[], int n) {
++	return _ssd2828_send_packet(type, regs, n);
++}
++
++int ssd_mipi_dsi_read_dcs_packet(unsigned char *data, int n) {
++	//DCS READ 
++	unsigned int i = 0;
++	
++	i = ssd_read_register(0xc6);
++	printk("read mipi slave error:%04x\n", i);
++	ssd_set_register(0x00B70382);
++	ssd_set_register(0x00BB0008);
++	ssd_set_register(0x00C1000A);
++	ssd_set_register(0x00C00001);
++	ssd_set_register(0x00Bc0001);
++	ssd_set_register(0x00Bf0000 | *data);
++	msleep(10);
++	i = ssd_read_register(0xc6);
++	printk("read mipi slave error:%04x\n", i);
++	
++	if(i & 1) {
++		i = ssd_read_register(0xff);
++		printk("read %02x:%04x\n", *data, i);
++		i = ssd_read_register(0xff);
++		printk("read %02x:%04x\n", *data, i);
++		i = ssd_read_register(0xff);
++		printk("read %02x:%04x\n", *data, i);
++	
++	} 
++		
++	return 0;
++}
++
++
++int ssd2828_get_id(void) {
++	
++	int id = -1;
++	ssd2828_power_up();
++	id = ssd_read_register(0xb0);
++	
++	return id;
++}
++
++static struct mipi_dsi_ops ssd2828_ops = {
++	.id = 0x2828,
++	.name = "ssd2828",
++	.get_id = ssd2828_get_id,
++	.dsi_set_regs = ssd_set_registers,
++	.dsi_send_dcs_packet = ssd_mipi_dsi_send_dcs_packet,
++	.dsi_read_dcs_packet = ssd_mipi_dsi_read_dcs_packet,
++	.power_up = ssd2828_power_up,
++	.power_down = ssd2828_power_down,
++	
++};
++
++static int ssd2828_probe(struct platform_device *pdev) {
++
++	if(pdev->dev.platform_data)
++		ssd2828 = pdev->dev.platform_data;
++		
++    if(!ssd2828->gpio_init)
++    	ssd2828->gpio_init = ssd2828_gpio_init;
++    	
++    if(!ssd2828->gpio_deinit)
++    	ssd2828->gpio_deinit = ssd2828_gpio_deinit;    
++    
++    if(!ssd2828->power_up)
++    	ssd2828->power_up = ssd2828_power_up;  
++    if(!ssd2828->power_down)
++    	ssd2828->power_down = ssd2828_power_down;  	
++    
++    if(!ssd2828->reset.do_reset)
++    	ssd2828->reset.do_reset = ssd2828_reset;
++    
++    if(!ssd2828->vddio.enable)
++    	ssd2828->vddio.enable = ssd2828_vdd_enable;    
++    if(!ssd2828->vddio.disable)
++    	ssd2828->vddio.disable = ssd2828_vdd_disable;
++    
++    if(!ssd2828->vdd_mipi.enable)
++    	ssd2828->vdd_mipi.enable = ssd2828_vdd_enable;    
++    if(!ssd2828->vdd_mipi.disable)
++    	ssd2828->vdd_mipi.disable = ssd2828_vdd_disable;	
++	
++	return 0;
++}
++
++
++static int ssd2828_remove(struct platform_device *pdev) {
++
++	if(!ssd2828)
++		ssd2828 = NULL;
++
++	return 0;
++}
++
++
++static struct platform_driver ssd2828_driver = {
++	.probe		= ssd2828_probe,
++	.remove		= ssd2828_remove,
++	//.suspend		= mipi_dsi_suspend,
++	//.resume		= mipi_dsi_resume,
++	.driver = {
++		.name = "ssd2828",
++		.owner	= THIS_MODULE,
++	}
++};
++
++static int __init ssd2828_init(void)
++{
++	platform_driver_register(&ssd2828_driver);
++	if(!ssd2828)
++		return -1;
++	register_dsi_ops(&ssd2828_ops);
++	if(ssd2828->id > 0)
++		ssd2828_ops.id = ssd2828->id;
++	return 0;
++}
++
++static void __exit ssd2828_exit(void)
++{
++	platform_driver_unregister(&ssd2828_driver);
++	del_dsi_ops(&ssd2828_ops);
++}
++
++subsys_initcall_sync(ssd2828_init);
++module_exit(ssd2828_exit);
+diff --git a/drivers/video/display/transmitter/tc358768.c b/drivers/video/display/transmitter/tc358768.c
+index 7beb9e4ae8ab..d8e2811a2eb2 100644
+--- a/drivers/video/display/transmitter/tc358768.c
++++ b/drivers/video/display/transmitter/tc358768.c
+@@ -12,8 +12,19 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  */
+- 
+-#include "tc358768.h"
++#include <linux/fb.h>
++#include <linux/delay.h>
++#include <linux/rk_fb.h>
++#include <mach/gpio.h>
++#include <mach/iomux.h>
++#include <mach/board.h>
++#include <linux/rk_screen.h>
++#include <linux/ktime.h>
++#include "mipi_dsi.h"
++
++#define CONFIG_TC358768_I2C     1
++#define CONFIG_TC358768_I2C_CLK     400*1000
++
+ 
+ #if 0
+ #define dsi_debug   printk
+@@ -22,9 +33,9 @@
+ #endif
+ 
+ #ifdef CONFIG_TC358768_I2C
+-struct tc358768_t *tc358768 = NULL;
+-struct i2c_client *tc358768_client = NULL;
+-struct mipi_dsi_t *dsi;
++static struct tc358768_t *tc358768 = NULL;
++static struct i2c_client *tc358768_client = NULL;
++static struct mipi_dsi_ops tc358768_ops;
+ 
+ 
+ u32 i2c_write_32bits(u32 value) 
+@@ -89,7 +100,7 @@ int tc358768_gpio_init(void *data) {
+ 	if(reset->reset_pin > INVALID_GPIO) {
+ 		ret = gpio_request(reset->reset_pin, "tc358768_reset");
+ 		if (ret != 0) {
+-			gpio_free(reset->reset_pin);
++			//gpio_free(reset->reset_pin);
+ 			printk("%s: request TC358768_RST_PIN error\n", __func__);
+ 		} else {
+ 			if(reset->mux_name)
+@@ -101,7 +112,7 @@ int tc358768_gpio_init(void *data) {
+ 	if(vdd->enable_pin > INVALID_GPIO) {
+ 		ret = gpio_request(vdd->enable_pin, "tc358768_vddc");
+ 		if (ret != 0) {
+-			gpio_free(vdd->enable_pin);
++			//gpio_free(vdd->enable_pin);
+ 			printk("%s: request TC358768_vddc_PIN error\n", __func__);
+ 		} else {
+ 			if(vdd->mux_name)
+@@ -114,7 +125,7 @@ int tc358768_gpio_init(void *data) {
+ 	if(vdd->enable_pin > INVALID_GPIO) {
+ 		ret = gpio_request(vdd->enable_pin, "tc358768_vddio");
+ 		if (ret != 0) {
+-			gpio_free(vdd->enable_pin);
++			//gpio_free(vdd->enable_pin);
+ 			printk("%s: request TC358768_vddio_PIN error\n", __func__);
+ 		} else {
+ 			if(vdd->mux_name)
+@@ -127,7 +138,7 @@ int tc358768_gpio_init(void *data) {
+ 	if(vdd->enable_pin > INVALID_GPIO) {
+ 		ret = gpio_request(vdd->enable_pin, "tc358768_vdd_mipi");
+ 		if (ret != 0) {
+-			gpio_free(vdd->enable_pin);
++			//gpio_free(vdd->enable_pin);
+ 			printk("%s: request TC358768_vdd_mipi_PIN error\n", __func__);
+ 		} else {
+ 			if(vdd->mux_name)
+@@ -142,12 +153,18 @@ int tc358768_gpio_init(void *data) {
+ int tc358768_gpio_deinit(void *data) {
+ 	struct reset_t *reset = &tc358768->reset;
+ 	struct power_t *vdd = &tc358768->vddc;
++	gpio_direction_input(reset->reset_pin);
+ 	gpio_free(reset->reset_pin);
+ 	
++	gpio_direction_input(vdd->enable_pin);
++	gpio_free(vdd->enable_pin);
++	
+ 	vdd = &tc358768->vddio;
++	gpio_direction_input(vdd->enable_pin);
+ 	gpio_free(vdd->enable_pin);
+ 	
+ 	vdd = &tc358768->vdd_mipi;
++	gpio_direction_input(vdd->enable_pin);
+ 	gpio_free(vdd->enable_pin);
+ 	return 0;
+ }
+@@ -195,10 +212,12 @@ int tc358768_vdd_disable(void *data) {
+ }
+ 
+ 
+-int tc358768_power_up(void *data) {
++int tc358768_power_up(void) {
++
+ 	int ret = 0;
+ 	struct tc358768_t *tc = (struct tc358768_t *)tc358768;
+ 	
++	tc358768_gpio_init(NULL);
+ 	tc->vddc.enable(&tc->vddc);
+ 	tc->vdd_mipi.enable(&tc->vdd_mipi);
+ 	tc->vddio.enable(&tc->vddio);
+@@ -207,13 +226,15 @@ int tc358768_power_up(void *data) {
+ 	return ret;
+ }
+ 
+-int tc358768_power_down(void *data) {
++int tc358768_power_down(void) {
++
+ 	int ret = 0;
+ 	struct tc358768_t *tc = (struct tc358768_t *)tc358768;
+ 	
+ 	tc->vddio.disable(&tc->vddio);
+ 	tc->vdd_mipi.disable(&tc->vdd_mipi);
+ 	tc->vddc.disable(&tc->vddc);
++	tc358768_gpio_deinit(NULL);
+ 	
+ 	return ret;
+ }
+@@ -222,7 +243,6 @@ static int tc358768_probe(struct i2c_client *client,
+ 			 const struct i2c_device_id *did) 
+ {
+     struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
+-    
+     int ret = 0;
+ 
+     if (!i2c_check_functionality(adapter, I2C_FUNC_I2C)) {
+@@ -230,13 +250,14 @@ static int tc358768_probe(struct i2c_client *client,
+         	 "I2C-Adapter doesn't support I2C_FUNC_I2C\n");
+         return -EIO;
+     }
++    
+     tc358768 = (struct tc358768_t *)client->dev.platform_data;
+     if(!tc358768) {
+     	ret = -1;
+     	printk("%s:%d tc358768 is null\n", __func__, __LINE__);
+     	return ret;
+     }	
+-    
++
+     tc358768_client = client;
+     if(!tc358768_client) {
+     	ret = -1;
+@@ -272,9 +293,7 @@ static int tc358768_probe(struct i2c_client *client,
+     	tc358768->vdd_mipi.enable = tc358768_vdd_enable;    
+     if(!tc358768->vdd_mipi.disable)
+     	tc358768->vdd_mipi.disable = tc358768_vdd_disable;
+-    	
+-    dsi->chip = tc358768; 	
+-    	
++   
+     return ret;
+ }
+ static int tc358768_remove(struct i2c_client *client)
+@@ -666,24 +685,50 @@ int mipi_dsi_read_dcs_packet(unsigned char *data, int n) {
+ 	return 0;
+ }
+ 
++int tc358768_get_id(void) {
++	
++	int id = -1;
++	
++	tc358768_power_up();
++	id = tc358768_rd_reg_32bits(0);
++	return id;
++}
+ 
+-int tc358768_init(struct mipi_dsi_t *pram) {
+-	int ret = 0;
+-	dsi = pram;
+-	if(!dsi)
+-		return -1;
+-	dsi->id = 0x4401;
+-	dsi->dsi_init = _tc358768_wr_regs_32bits;
+-	dsi->dsi_hs_start = _tc358768_wr_regs_32bits;
+-	dsi->dsi_send_dcs_packet = mipi_dsi_send_dcs_packet;
+-	dsi->dsi_read_dcs_packet = mipi_dsi_read_dcs_packet;
++static struct mipi_dsi_ops tc358768_ops = {
++	.id = 0x4401,
++	.name = "tc358768a",
++	.get_id = tc358768_get_id,
++	.dsi_set_regs = _tc358768_wr_regs_32bits,
++	.dsi_send_dcs_packet = mipi_dsi_send_dcs_packet,
++	.dsi_read_dcs_packet = mipi_dsi_read_dcs_packet,
++	.power_up = tc358768_power_up,
++	.power_down = tc358768_power_down,
++	
++};
++
++static int __init tc358768_module_init(void)
++{
+ #ifdef CONFIG_TC358768_I2C    
+     i2c_add_driver(&tc358768_driver);
+-#endif    
+-	tc358768_gpio_init(NULL);
+-	return 0;
+-exit_init:
+-	//tc358768_power_down(NULL);
+-	tc358768_gpio_deinit(NULL);
+-	return -1;
++    
++	if(!tc358768 || !tc358768_client)
++		return -1;
++#endif		
++		
++	register_dsi_ops(&tc358768_ops);
++	if(tc358768->id > 0)
++		tc358768_ops.id = tc358768->id;
++    return 0;
++}
++
++static void __exit tc358768_module_exit(void)
++{
++	del_dsi_ops(&tc358768_ops);
++#ifdef CONFIG_TC358768_I2C
++	i2c_del_driver(&tc358768_driver);
++#endif
+ }
++
++subsys_initcall_sync(tc358768_module_init);
++//module_exit(tc358768_module_init);
++module_exit(tc358768_module_exit);
+diff --git a/drivers/video/display/transmitter/tc358768.h b/drivers/video/display/transmitter/tc358768.h
+deleted file mode 100644
+index ca3744cca7e9..000000000000
+--- a/drivers/video/display/transmitter/tc358768.h
++++ /dev/null
+@@ -1,99 +0,0 @@
+-
+-#ifndef TC358768_H_
+-#define TC358768_H_
+-
+-#include <linux/fb.h>
+-#include <linux/delay.h>
+-#include <linux/rk_fb.h>
+-#include <mach/gpio.h>
+-#include <mach/iomux.h>
+-#include <mach/board.h>
+-#include <linux/rk_screen.h>
+-#include <linux/ktime.h>
+-
+-
+-//DSI DATA TYPE
+-#define DTYPE_DCS_SWRITE_0P		0X05 
+-#define DTYPE_DCS_SWRITE_1P		0X15 
+-#define DTYPE_DCS_LWRITE		0X39 
+-#define DTYPE_GEN_LWRITE		0X29 
+-#define DTYPE_GEN_SWRITE_2P		0X23 
+-#define DTYPE_GEN_SWRITE_1P		0X13
+-#define DTYPE_GEN_SWRITE_0P		0X03
+-
+-#define CONFIG_TC358768_I2C     1
+-#define CONFIG_TC358768_I2C_CLK     400*1000
+-
+-#if !CONFIG_TC358768_I2C 
+-/* define spi write command and data interface function */
+-#define TXD_PORT        gLcd_info->txd_pin
+-#define CLK_PORT        gLcd_info->clk_pin
+-#define CS_PORT         gLcd_info->cs_pin
+-#define LCD_RST_PORT    gLcd_info->reset_pin
+-
+-#define CS_OUT()        gpio_direction_output(CS_PORT, 0)
+-#define CS_SET()        gpio_set_value(CS_PORT, GPIO_HIGH)
+-#define CS_CLR()        gpio_set_value(CS_PORT, GPIO_LOW)
+-#define CLK_OUT()       gpio_direction_output(CLK_PORT, 0)
+-#define CLK_SET()       gpio_set_value(CLK_PORT, GPIO_HIGH)
+-#define CLK_CLR()       gpio_set_value(CLK_PORT, GPIO_LOW)
+-#define TXD_OUT()       gpio_direction_output(TXD_PORT, 0)
+-#define TXD_SET()       gpio_set_value(TXD_PORT, GPIO_HIGH)
+-#define TXD_CLR()       gpio_set_value(TXD_PORT, GPIO_LOW)
+-#define LCD_RST_OUT(i)   gpio_direction_output(LCD_RST_PORT, i)
+-#define LCD_RST(i)      gpio_set_value(LCD_RST_PORT, i)
+-#endif
+-
+-
+-struct mipi_dsi_t {
+-	u32 id;
+-	int (*dsi_init)(void *, int n);
+-	int (*dsi_hs_start)(void *, int n);
+-	int (*dsi_send_dcs_packet)(unsigned char *, int n);
+-	int (*dsi_read_dcs_packet)(unsigned char *, int n);
+-	int (*dsi_send_packet)(void *, int n);
+-
+-	void *chip;	
+-};
+-
+-struct power_t {
+-	int	enable_pin;    //gpio that control power
+-	char* mux_name;
+-	u32 mux_mode;
+-	u32 effect_value;
+-	
+-	u32 min_voltage;
+-	u32 max_voltage;
+-	int (*enable)(void *);
+-	int (*disable)(void *);
+-};
+-
+-struct reset_t {
+-	int	reset_pin;    //gpio that control reset
+-	char* mux_name;
+-	u32 mux_mode;
+-	u32 effect_value;
+-	
+-	u32 time_before_reset;    //ms
+- 	u32 time_after_reset;
+-	
+-	int (*do_reset)(void *);
+-};
+-
+-struct tc358768_t {
+-	struct reset_t reset;
+-	struct power_t vddc;
+-	struct power_t vddio;
+-	struct power_t vdd_mipi;
+-	struct i2c_client *client;
+-	int (*gpio_init)(void *);
+-	int (*gpio_deinit)(void *);
+-	int (*power_up)(void *);
+-	int (*power_down)(void *);
+-};
+-
+-
+-int tc358768_init(struct mipi_dsi_t *pram);
+-u32 tc358768_wr_reg_32bits_delay(u32 delay, u32 data);
+-
+-#endif /* end of TC358768_H_ */
+-- 
+2.35.3
+

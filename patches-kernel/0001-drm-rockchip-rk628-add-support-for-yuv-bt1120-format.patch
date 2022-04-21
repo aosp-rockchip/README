@@ -1,0 +1,388 @@
+From 32d90bf6dc8682f874f3368bea4d1048dcbf2c2f Mon Sep 17 00:00:00 2001
+From: Guochun Huang <hero.huang@rock-chips.com>
+Date: Tue, 20 Oct 2020 08:43:00 +0800
+Subject: [PATCH] drm/rockchip: rk628: add support for yuv/bt1120 format
+
+Signed-off-by: Guochun Huang <hero.huang@rock-chips.com>
+Change-Id: I3112e0ce273e7f8207b4b354fefe0040e3c9ae99
+---
+ drivers/gpu/drm/rockchip/rk628/rk628_rgb.c | 232 ++++++++++++++++++---
+ drivers/mfd/rk628.c                        |  16 +-
+ include/linux/mfd/rk628.h                  |  14 ++
+ 3 files changed, 236 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rk628/rk628_rgb.c b/drivers/gpu/drm/rockchip/rk628/rk628_rgb.c
+index 9c5a270beba0..a7983f8ab6f9 100644
+--- a/drivers/gpu/drm/rockchip/rk628/rk628_rgb.c
++++ b/drivers/gpu/drm/rockchip/rk628/rk628_rgb.c
+@@ -12,6 +12,7 @@
+ #include <linux/regmap.h>
+ #include <linux/mfd/rk628.h>
+ #include <linux/phy/phy.h>
++#include <linux/reset.h>
+ 
+ #include <drm/drmP.h>
+ #include <drm/drm_of.h>
+@@ -23,14 +24,27 @@
+ #include <video/of_display_timing.h>
+ #include <video/videomode.h>
+ 
++enum interface_type {
++	RGB_TX,
++	YUV_RX,
++	YUV_TX,
++	BT1120_RX,
++	BT1120_TX,
++};
++
+ struct rk628_rgb {
+ 	struct drm_bridge base;
+ 	struct drm_connector connector;
+ 	struct drm_display_mode mode;
+ 	struct drm_panel *panel;
++	struct drm_bridge *bridge;
+ 	struct device *dev;
+ 	struct regmap *grf;
+ 	struct rk628 *parent;
++	struct clk *decclk;
++	struct reset_control *rstc;
++	bool dual_edge;
++	enum interface_type interface_type;
+ };
+ 
+ static inline struct rk628_rgb *bridge_to_rgb(struct drm_bridge *b)
+@@ -43,6 +57,22 @@ static inline struct rk628_rgb *connector_to_rgb(struct drm_connector *c)
+ 	return container_of(c, struct rk628_rgb, connector);
+ }
+ 
++static enum interface_type rk628_rgb_get_interface_type(struct rk628_rgb *rgb)
++{
++	const struct device_node *of_node = rgb->dev->of_node;
++
++	if (of_device_is_compatible(of_node, "rockchip,rk628-yuv-rx"))
++		return YUV_RX;
++	else if (of_device_is_compatible(of_node, "rockchip,rk628-yuv-tx"))
++		return YUV_TX;
++	else if (of_device_is_compatible(of_node, "rockchip,rk628-bt1120-rx"))
++		return BT1120_RX;
++	else if (of_device_is_compatible(of_node, "rockchip,rk628-bt1120-tx"))
++		return BT1120_TX;
++	else
++		return RGB_TX;
++}
++
+ static struct drm_encoder *
+ rk628_rgb_connector_best_encoder(struct drm_connector *connector)
+ {
+@@ -80,24 +110,123 @@ static const struct drm_connector_funcs rk628_rgb_connector_funcs = {
+ 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+ };
+ 
+-static void rk628_rgb_bridge_enable(struct drm_bridge *bridge)
++static void rk628_bt1120_rx_enable(struct rk628_rgb *rgb)
+ {
+-	struct rk628_rgb *rgb = bridge_to_rgb(bridge);
++	const struct drm_display_mode *mode = &rgb->mode;
++
++	reset_control_assert(rgb->rstc);
++	udelay(10);
++	reset_control_deassert(rgb->rstc);
++	udelay(10);
++
++	clk_set_rate(rgb->decclk, mode->clock * 1000);
++	clk_prepare_enable(rgb->decclk);
++
++	if (rgb->dual_edge) {
++		regmap_update_bits(rgb->grf, GRF_RGB_DEC_CON0,
++				   DEC_DUALEDGE_EN, DEC_DUALEDGE_EN);
++
++		regmap_write(rgb->grf,
++			     GRF_BT1120_DCLK_DELAY_CON0, 0x10000000);
++		regmap_write(rgb->grf, GRF_BT1120_DCLK_DELAY_CON1, 0);
++	} else
++		regmap_update_bits(rgb->grf, GRF_RGB_DEC_CON0,
++				   DEC_DUALEDGE_EN, 0);
++
++	regmap_update_bits(rgb->grf, GRF_RGB_DEC_CON1,
++			   SW_SET_X_MASK, SW_SET_X(mode->hdisplay));
++	regmap_update_bits(rgb->grf, GRF_RGB_DEC_CON2,
++			   SW_SET_Y_MASK, SW_SET_Y(mode->vdisplay));
++
++	regmap_update_bits(rgb->grf, GRF_SYSTEM_CON0,
++			   SW_BT_DATA_OEN_MASK | SW_INPUT_MODE_MASK,
++			   SW_BT_DATA_OEN | SW_INPUT_MODE(INPUT_MODE_BT1120));
++
++	regmap_write(rgb->grf, GRF_CSC_CTRL_CON, SW_Y2R_EN(1));
++
++	regmap_update_bits(rgb->grf, GRF_RGB_DEC_CON0,
++			   SW_CAP_EN_PSYNC | SW_CAP_EN_ASYNC | SW_PROGRESS_EN,
++			   SW_CAP_EN_PSYNC | SW_CAP_EN_ASYNC | SW_PROGRESS_EN);
++}
++
++static void rk628_bt1120_tx_enable(struct rk628_rgb *rgb)
++{
++	u32 val = 0;
+ 
+ 	regmap_update_bits(rgb->grf, GRF_SYSTEM_CON0,
+ 			   SW_BT_DATA_OEN_MASK | SW_OUTPUT_MODE_MASK,
+-			   SW_OUTPUT_MODE(OUTPUT_MODE_RGB));
++			   SW_OUTPUT_MODE(OUTPUT_MODE_BT1120));
++	regmap_write(rgb->grf, GRF_CSC_CTRL_CON, SW_R2Y_EN(1));
++	regmap_update_bits(rgb->grf, GRF_POST_PROC_CON,
++			   SW_DCLK_OUT_INV_EN, SW_DCLK_OUT_INV_EN);
++
++	if (rgb->dual_edge) {
++		val |= ENC_DUALEDGE_EN(1);
++		regmap_write(rgb->grf, GRF_BT1120_DCLK_DELAY_CON0, 0x10000000);
++		regmap_write(rgb->grf, GRF_BT1120_DCLK_DELAY_CON1, 0);
++	}
++
++	val |= BT1120_UV_SWAP(1);
++	regmap_write(rgb->grf, GRF_RGB_ENC_CON, val);
+ 
+-	drm_panel_prepare(rgb->panel);
+-	drm_panel_enable(rgb->panel);
++}
++
++static void rk628_rgb_bridge_enable(struct drm_bridge *bridge)
++{
++	struct rk628_rgb *rgb = bridge_to_rgb(bridge);
++
++	switch (rgb->interface_type) {
++	case YUV_RX:
++		regmap_write(rgb->grf, GRF_CSC_CTRL_CON, SW_Y2R_EN(1));
++		regmap_update_bits(rgb->grf, GRF_SYSTEM_CON0,
++				   SW_BT_DATA_OEN_MASK | SW_INPUT_MODE_MASK,
++				   SW_BT_DATA_OEN | SW_INPUT_MODE(INPUT_MODE_YUV));
++		break;
++	case YUV_TX:
++		regmap_write(rgb->grf, GRF_CSC_CTRL_CON, SW_R2Y_EN(1));
++		regmap_update_bits(rgb->grf, GRF_POST_PROC_CON,
++				   SW_DCLK_OUT_INV_EN, SW_DCLK_OUT_INV_EN);
++
++		regmap_update_bits(rgb->grf, GRF_SYSTEM_CON0,
++				   SW_BT_DATA_OEN_MASK | SW_OUTPUT_MODE_MASK,
++				   SW_OUTPUT_MODE(OUTPUT_MODE_YUV));
++		break;
++	case BT1120_RX:
++		rk628_bt1120_rx_enable(rgb);
++		break;
++	case BT1120_TX:
++		rk628_bt1120_tx_enable(rgb);
++		break;
++	case RGB_TX:
++	default:
++		regmap_update_bits(rgb->grf, GRF_SYSTEM_CON0,
++				   SW_BT_DATA_OEN_MASK | SW_OUTPUT_MODE_MASK,
++				   SW_OUTPUT_MODE(OUTPUT_MODE_RGB));
++		regmap_update_bits(rgb->grf, GRF_POST_PROC_CON,
++				   SW_DCLK_OUT_INV_EN, SW_DCLK_OUT_INV_EN);
++		break;
++	}
++
++	if (rgb->panel) {
++		drm_panel_prepare(rgb->panel);
++		drm_panel_enable(rgb->panel);
++	}
+ }
+ 
+ static void rk628_rgb_bridge_disable(struct drm_bridge *bridge)
+ {
+ 	struct rk628_rgb *rgb = bridge_to_rgb(bridge);
+ 
+-	drm_panel_disable(rgb->panel);
+-	drm_panel_unprepare(rgb->panel);
++	if (rgb->panel) {
++		drm_panel_disable(rgb->panel);
++		drm_panel_unprepare(rgb->panel);
++	}
++
++	if (rgb->decclk)
++		clk_disable_unprepare(rgb->decclk);
++
++	if (rgb->rstc)
++		reset_control_assert(rgb->rstc);
+ }
+ 
+ static int rk628_rgb_bridge_attach(struct drm_bridge *bridge)
+@@ -105,22 +234,60 @@ static int rk628_rgb_bridge_attach(struct drm_bridge *bridge)
+ 	struct rk628_rgb *rgb = bridge_to_rgb(bridge);
+ 	struct drm_connector *connector = &rgb->connector;
+ 	struct drm_device *drm = bridge->dev;
++	struct device *dev = rgb->dev;
+ 	int ret;
+ 
+-	ret = drm_connector_init(drm, connector, &rk628_rgb_connector_funcs,
+-				 DRM_MODE_CONNECTOR_DPI);
+-	if (ret) {
+-		dev_err(rgb->dev, "Failed to initialize connector with drm\n");
++	ret = drm_of_find_panel_or_bridge(dev->of_node, 1, -1,
++					  &rgb->panel, &rgb->bridge);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	drm_connector_helper_add(connector, &rk628_rgb_connector_helper_funcs);
+-	drm_connector_attach_encoder(connector, bridge->encoder);
+ 
+-	ret = drm_panel_attach(rgb->panel, connector);
+-	if (ret) {
+-		dev_err(rgb->dev, "Failed to attach panel\n");
+-		return ret;
++	if (rgb->interface_type == YUV_RX || rgb->interface_type == BT1120_RX) {
++		if (!rgb->bridge) {
++			dev_err(dev, "decoder failed to find bridge\n");
++			return -EPROBE_DEFER;
++		}
++
++		rgb->bridge->encoder = bridge->encoder;
++		ret = drm_bridge_attach(bridge->encoder, rgb->bridge, bridge);
++		if (ret) {
++			dev_err(dev, "failed to attach bridge\n");
++			return ret;
++		}
++
++		bridge->next = rgb->bridge;
++	} else {
++		if (rgb->bridge) {
++			rgb->bridge->encoder = bridge->encoder;
++			ret = drm_bridge_attach(bridge->encoder, rgb->bridge, bridge);
++			if (ret) {
++				dev_err(dev, "failed to attach bridge\n");
++				return ret;
++			}
++
++			bridge->next = rgb->bridge;
++		}
++
++		if (rgb->panel) {
++			ret = drm_connector_init(drm, connector,
++						 &rk628_rgb_connector_funcs,
++						 DRM_MODE_CONNECTOR_DPI);
++			if (ret) {
++				dev_err(dev,
++					"Failed to initialize connector with drm\n");
++				return ret;
++			}
++
++			drm_connector_helper_add(connector,
++						 &rk628_rgb_connector_helper_funcs);
++			drm_connector_attach_encoder(connector,
++							  bridge->encoder);
++			ret = drm_panel_attach(rgb->panel, connector);
++			if (ret) {
++				dev_err(dev, "Failed to attach panel\n");
++				return ret;
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -159,12 +326,25 @@ static int rk628_rgb_probe(struct platform_device *pdev)
+ 	rgb->dev = dev;
+ 	rgb->parent = rk628;
+ 	rgb->grf = rk628->grf;
++	rgb->interface_type = rk628_rgb_get_interface_type(rgb);
++	rgb->dual_edge = of_property_read_bool(dev->of_node, "dual-edge");
+ 	platform_set_drvdata(pdev, rgb);
+ 
+-	ret = drm_of_find_panel_or_bridge(dev->of_node, 1, -1,
+-					  &rgb->panel, NULL);
+-	if (ret)
+-		return ret;
++	if (rgb->interface_type == BT1120_RX) {
++		rgb->decclk = devm_clk_get(dev, "bt1120dec");
++		if (IS_ERR(rgb->decclk)) {
++			ret = PTR_ERR(rgb->decclk);
++			dev_err(dev, "failed to get dec clk: %d\n", ret);
++			return ret;
++		}
++
++		rgb->rstc = of_reset_control_get(dev->of_node, NULL);
++		if (IS_ERR(rgb->rstc)) {
++			ret = PTR_ERR(rgb->rstc);
++			dev_err(dev, "failed to get reset control: %d\n", ret);
++			return ret;
++		}
++	}
+ 
+ 	rgb->base.funcs = &rk628_rgb_bridge_funcs;
+ 	rgb->base.of_node = dev->of_node;
+@@ -183,7 +363,11 @@ static int rk628_rgb_remove(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id rk628_rgb_of_match[] = {
+-	{ .compatible = "rockchip,rk628-rgb", },
++	{ .compatible = "rockchip,rk628-rgb-tx", },
++	{ .compatible = "rockchip,rk628-yuv-rx", },
++	{ .compatible = "rockchip,rk628-yuv-tx", },
++	{ .compatible = "rockchip,rk628-bt1120-rx", },
++	{ .compatible = "rockchip,rk628-bt1120-tx", },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, rk628_rgb_of_match);
+diff --git a/drivers/mfd/rk628.c b/drivers/mfd/rk628.c
+index 998941d80c4d..4858456f1a9d 100644
+--- a/drivers/mfd/rk628.c
++++ b/drivers/mfd/rk628.c
+@@ -104,8 +104,20 @@ static const struct mfd_cell rk628_devs[] = {
+ 		.resources = rk628_dsi0_resources,
+ 		.num_resources = ARRAY_SIZE(rk628_dsi0_resources),
+ 	}, {
+-		.name = "rk628-rgb",
+-		.of_compatible = "rockchip,rk628-rgb",
++		.name = "rk628-rgb-tx",
++		.of_compatible = "rockchip,rk628-rgb-tx",
++	}, {
++		.name = "rk628-yuv-rx",
++		.of_compatible = "rockchip,rk628-yuv-rx",
++	}, {
++		.name = "rk628-yuv-tx",
++		.of_compatible = "rockchip,rk628-yuv-tx",
++	}, {
++		.name = "rk628-bt1120-rx",
++		.of_compatible = "rockchip,rk628-bt1120-rx",
++	}, {
++		.name = "rk628-bt1120-tx",
++		.of_compatible = "rockchip,rk628-bt1120-tx",
+ 	}, {
+ 		.name = "rk628-lvds",
+ 		.of_compatible = "rockchip,rk628-lvds",
+diff --git a/include/linux/mfd/rk628.h b/include/linux/mfd/rk628.h
+index 24a7e4b04cd6..27b5eb3b8bd9 100644
+--- a/include/linux/mfd/rk628.h
++++ b/include/linux/mfd/rk628.h
+@@ -73,6 +73,8 @@
+ #define SW_SPLIT_MODE(x)		UPDATE(x, 1, 1)
+ #define SW_SPLIT_EN			BIT(0)
+ #define GRF_CSC_CTRL_CON		0x0038
++#define SW_R2Y_EN(x)			HIWORD_UPDATE(x, 4, 4)
++#define SW_Y2R_EN(x)			HIWORD_UPDATE(x, 0, 0)
+ #define GRF_LVDS_TX_CON			0x003c
+ #define SW_LVDS_CON_DUAL_SEL(x)		HIWORD_UPDATE(x, 12, 12)
+ #define SW_LVDS_CON_DEN_POLARITY(x)	HIWORD_UPDATE(x, 11, 11)
+@@ -89,9 +91,21 @@
+ #define GRF_RGB_DEC_CON0		0x0040
+ #define SW_HRES_MASK			GENMASK(28, 16)
+ #define SW_HRES(x)			UPDATE(x, 28, 16)
++#define DUAL_DATA_SWAP			BIT(6)
++#define DEC_DUALEDGE_EN			BIT(5)
++#define SW_PROGRESS_EN			BIT(4)
++#define SW_YC_SWAP			BIT(3)
++#define SW_CAP_EN_ASYNC			BIT(1)
++#define SW_CAP_EN_PSYNC			BIT(0)
+ #define GRF_RGB_DEC_CON1		0x0044
++#define SW_SET_X_MASK			GENMASK(28, 16)
++#define SW_SET_X(x)			HIWORD_UPDATE(x, 28, 16)
++#define SW_SET_Y_MASK			GENMASK(28, 16)
++#define SW_SET_Y(x)			HIWORD_UPDATE(x, 28, 16)
+ #define GRF_RGB_DEC_CON2		0x0048
+ #define GRF_RGB_ENC_CON			0x004c
++#define BT1120_UV_SWAP(x)		HIWORD_UPDATE(x, 5, 5)
++#define ENC_DUALEDGE_EN(x)		HIWORD_UPDATE(x, 3, 3)
+ #define GRF_MIPI_LANE_DELAY_CON0	0x0050
+ #define GRF_MIPI_LANE_DELAY_CON1	0x0054
+ #define GRF_BT1120_DCLK_DELAY_CON0	0x0058
+-- 
+2.35.3
+

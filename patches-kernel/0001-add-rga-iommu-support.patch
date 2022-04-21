@@ -1,0 +1,764 @@
+From ef11544fd7b27dfb456297355b766cf5a39cf3f3 Mon Sep 17 00:00:00 2001
+From: zsq <zsq@rock-chips.com>
+Date: Thu, 5 Jun 2014 16:57:04 +0800
+Subject: [PATCH] add rga iommu support
+
+---
+ drivers/video/rockchip/rga2/rga2.h          |  10 +
+ drivers/video/rockchip/rga2/rga2_drv.c      | 100 ++++++-
+ drivers/video/rockchip/rga2/rga2_mmu_info.c | 300 ++++++++++----------
+ drivers/video/rockchip/rga2/rga2_reg_info.c |   7 +-
+ 4 files changed, 250 insertions(+), 167 deletions(-)
+
+diff --git a/drivers/video/rockchip/rga2/rga2.h b/drivers/video/rockchip/rga2/rga2.h
+index dbdf2db90a88..799365e7ca54 100644
+--- a/drivers/video/rockchip/rga2/rga2.h
++++ b/drivers/video/rockchip/rga2/rga2.h
+@@ -2,6 +2,9 @@
+ #define _RGA_DRIVER_H_
+ 
+ #include <linux/mutex.h>
++#include <linux/scatterlist.h>
++
++
+ 
+ #define RGA_BLIT_SYNC	0x5017
+ #define RGA_BLIT_ASYNC  0x5018
+@@ -445,6 +448,13 @@ struct rga2_req
+     u8 dither_mode;
+ 
+     u8 rgb2yuv_mode;
++
++    #if defined(CONFIG_ROCKCHIP_IOMMU) & defined(CONFIG_ION_ROCKCHIP)
++    struct sg_table *sg_src0;
++    struct sg_table *sg_src1;
++    struct sg_table *sg_dst;
++    struct sg_table *sg_els;
++    #endif
+ };
+ 
+ struct rga2_mmu_buf_t {
+diff --git a/drivers/video/rockchip/rga2/rga2_drv.c b/drivers/video/rockchip/rga2/rga2_drv.c
+index 679ab9b5d3ae..e57006910fe0 100755
+--- a/drivers/video/rockchip/rga2/rga2_drv.c
++++ b/drivers/video/rockchip/rga2/rga2_drv.c
+@@ -40,17 +40,23 @@
+ #include <linux/slab.h>
+ #include <linux/fb.h>
+ #include <linux/wakelock.h>
++#include <linux/scatterlist.h>
++
+ 
+ #if defined(CONFIG_ION_ROCKCHIP)
+ #include <linux/rockchip_ion.h>
+ #endif
+ 
+-
+ #include "rga2.h"
+ #include "rga2_reg_info.h"
+ #include "rga2_mmu_info.h"
+ #include "RGA2_API.h"
+ 
++#if defined(CONFIG_ROCKCHIP_IOMMU) & defined(CONFIG_ION_ROCKCHIP)
++#define CONFIG_RGA_IOMMU
++#endif
++
++
+ 
+ #define RGA2_TEST_FLUSH_TIME 0
+ #define RGA2_INFO_BUS_ERROR 1
+@@ -465,24 +471,20 @@ static struct rga2_reg * rga2_reg_init(rga2_session *session, struct rga2_req *r
+         || (req->mmu_info.dst_mmu_flag & 1) || (req->mmu_info.els_mmu_flag & 1))
+     {
+         ret = rga2_set_mmu_info(reg, req);
+-        if(ret < 0)
+-        {
++        if(ret < 0) {
+             printk("%s, [%d] set mmu info error \n", __FUNCTION__, __LINE__);
+             if(reg != NULL)
+-            {
+                 kfree(reg);
+-            }
++
+             return NULL;
+         }
+     }
+ 
+-    if(RGA2_gen_reg_info((uint8_t *)reg->cmd_reg, req) == -1)
+-    {
++    if(RGA2_gen_reg_info((uint8_t *)reg->cmd_reg, req) == -1) {
+         printk("gen reg info error\n");
+         if(reg != NULL)
+-        {
+             kfree(reg);
+-        }
++
+         return NULL;
+     }
+ 
+@@ -543,6 +545,7 @@ static void rga2_try_set_reg(void)
+ 
+             rga2_power_on();
+             udelay(1);
++            //mdelay(500);
+ 
+             rga2_copy_reg(reg, 0);
+             rga2_reg_from_wait_to_run(reg);
+@@ -685,6 +688,10 @@ static int rga2_convert_dma_buf(struct rga2_req *req)
+ 	ion_phys_addr_t phy_addr;
+ 	size_t len;
+     int ret;
++    req->sg_src0 = NULL;
++    req->sg_src1 = NULL;
++    req->sg_dst  = NULL;
++    req->sg_els  = NULL;
+ 
+     if(req->src.yrgb_addr) {
+         hdl = ion_import_dma_buf(rga2_drvdata->ion_client, req->src.yrgb_addr);
+@@ -693,10 +700,25 @@ static int rga2_convert_dma_buf(struct rga2_req *req)
+             printk("RGA2 ERROR ion buf handle\n");
+             return ret;
+         }
+-	    ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
++        #ifdef CONFIG_RGA_IOMMU
++        if (req->mmu_info.src0_mmu_flag) {
++            req->sg_src0 = ion_sg_table(rga2_drvdata->ion_client, hdl);
++            req->src.yrgb_addr = req->src.uv_addr;
++            req->src.uv_addr = req->src.yrgb_addr + (req->src.vir_w * req->src.vir_h);
++            req->src.v_addr = req->src.uv_addr + (req->src.vir_w * req->src.vir_h)/4;
++        }
++        else {
++            ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
++            req->src.yrgb_addr = phy_addr;
++            req->src.uv_addr = req->src.yrgb_addr + (req->src.vir_w * req->src.vir_h);
++            req->src.v_addr = req->src.uv_addr + (req->src.vir_w * req->src.vir_h)/4;
++        }
++        #else
++        ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
+         req->src.yrgb_addr = phy_addr;
+         req->src.uv_addr = req->src.yrgb_addr + (req->src.vir_w * req->src.vir_h);
+         req->src.v_addr = req->src.uv_addr + (req->src.vir_w * req->src.vir_h)/4;
++        #endif
+         ion_free(rga2_drvdata->ion_client, hdl);
+     }
+     else {
+@@ -712,10 +734,25 @@ static int rga2_convert_dma_buf(struct rga2_req *req)
+             printk("RGA2 ERROR ion buf handle\n");
+             return ret;
+         }
++        #ifdef CONFIG_RGA_IOMMU
++        if (req->mmu_info.dst_mmu_flag) {
++            req->sg_dst = ion_sg_table(rga2_drvdata->ion_client, hdl);
++            req->dst.yrgb_addr = req->dst.uv_addr;
++            req->dst.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++            req->dst.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        }
++        else {
++            ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
++            req->dst.yrgb_addr = phy_addr;
++            req->dst.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++            req->dst.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        }
++        #else
+ 	    ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
+         req->dst.yrgb_addr = phy_addr;
+         req->dst.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
+         req->dst.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        #endif
+         ion_free(rga2_drvdata->ion_client, hdl);
+     }
+     else {
+@@ -724,6 +761,40 @@ static int rga2_convert_dma_buf(struct rga2_req *req)
+         req->dst.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
+     }
+ 
++    if(req->src1.yrgb_addr) {
++        hdl = ion_import_dma_buf(rga2_drvdata->ion_client, req->src1.yrgb_addr);
++        if (IS_ERR(hdl)) {
++            ret = PTR_ERR(hdl);
++            printk("RGA2 ERROR ion buf handle\n");
++            return ret;
++        }
++        #ifdef CONFIG_RGA_IOMMU
++        if (req->mmu_info.dst_mmu_flag) {
++            req->sg_src1 = ion_sg_table(rga2_drvdata->ion_client, hdl);
++            req->src1.yrgb_addr = 0;
++            req->src1.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++            req->src1.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        }
++        else {
++            ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
++            req->src1.yrgb_addr = phy_addr;
++            req->src1.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++            req->src1.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        }
++        #else
++	    ion_phys(rga2_drvdata->ion_client, hdl, &phy_addr, &len);
++        req->src1.yrgb_addr = phy_addr;
++        req->src1.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++        req->src1.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++        #endif
++        ion_free(rga2_drvdata->ion_client, hdl);
++    }
++    else {
++        req->src1.yrgb_addr = req->dst.uv_addr;
++        req->src1.uv_addr = req->dst.yrgb_addr + (req->dst.vir_w * req->dst.vir_h);
++        req->src1.v_addr = req->dst.uv_addr + (req->dst.vir_w * req->dst.vir_h)/4;
++    }
++
+     return 0;
+ }
+ 
+@@ -862,7 +933,6 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
+ 	switch (cmd)
+ 	{
+         case RGA_BLIT_SYNC:
+-
+     		if (unlikely(copy_from_user(&req_rga, (struct rga_req*)arg, sizeof(struct rga_req))))
+             {
+         		ERR("copy_from_user failed\n");
+@@ -1305,6 +1375,14 @@ void rga2_test_0(void)
+     printk("************ RGA2_TEST ************\n");
+     printk("********************************\n\n");
+ 
++    req.pat.act_w = 16;
++    req.pat.act_h = 16;
++    req.pat.vir_w = 16;
++    req.pat.vir_h = 16;
++    req.pat.yrgb_addr = virt_to_phys(src);
++    req.render_mode = update_palette_table_mode;
++    rga2_blit_sync(&session, &req);
++
+     req.src.act_w  = 4096;
+     req.src.act_h = 2304;
+ 
+diff --git a/drivers/video/rockchip/rga2/rga2_mmu_info.c b/drivers/video/rockchip/rga2/rga2_mmu_info.c
+index 03eecaa64699..5a75cac8ebe5 100644
+--- a/drivers/video/rockchip/rga2/rga2_mmu_info.c
++++ b/drivers/video/rockchip/rga2/rga2_mmu_info.c
+@@ -14,6 +14,7 @@
+ #include <linux/slab.h>
+ #include <linux/memory.h>
+ #include <linux/dma-mapping.h>
++#include <linux/scatterlist.h>
+ #include <asm/memory.h>
+ #include <asm/atomic.h>
+ #include <asm/cacheflush.h>
+@@ -178,7 +179,6 @@ static int rga2_buf_size_cal(uint32_t yrgb_addr, uint32_t uv_addr, uint32_t v_ad
+             size_yrgb = stride * h;
+             size_uv = stride * h;
+             start = MIN(yrgb_addr, uv_addr);
+-
+             start >>= PAGE_SHIFT;
+             end = MAX((yrgb_addr + size_yrgb), (uv_addr + size_uv));
+             end = (end + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+@@ -206,6 +206,8 @@ static int rga2_buf_size_cal(uint32_t yrgb_addr, uint32_t uv_addr, uint32_t v_ad
+             end = MAX((yrgb_addr + size_yrgb), (uv_addr + size_uv));
+             end = (end + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+             pageCount = end - start;
++            //printk("yrgb_addr = %.8x\n", yrgb_addr);
++            //printk("uv_addr = %.8x\n", uv_addr);
+             break;
+         case RGA2_FORMAT_YCbCr_420_P :
+         case RGA2_FORMAT_YCrCb_420_P :
+@@ -393,6 +395,40 @@ static int rga2_MapUserMemory(struct page **pages,
+     return status;
+ }
+ 
++static int rga2_MapION(struct sg_table *sg,
++                               uint32_t *Memory,
++                               int32_t  pageCount)
++{
++    uint32_t i;
++    uint32_t status;
++    uint32_t Address;
++    uint32_t mapped_size = 0;
++    uint32_t len;
++    struct scatterlist *sgl = sg->sgl;
++    uint32_t sg_num = 0;
++
++    status = 0;
++    Address = 0;
++    //printk("pageCount=%d\n", pageCount);
++    do {
++        len = sg_dma_len(sgl) >> PAGE_SHIFT;
++        Address = sg_phys(sgl);
++        //printk("len = %d\n", len);
++        //printk("Address = %.8x\n", Address);
++        for(i=0; i<len; i++) {
++            Memory[mapped_size + i] = Address + (i << PAGE_SHIFT);
++        }
++
++        //printk("mapped_size = %d\n", mapped_size);
++        mapped_size += len;
++        sg_num += 1;
++    }
++    while((sgl = sg_next(sgl)) && (mapped_size < pageCount) && (sg_num < sg->nents));
++
++    return 0;
++}
++
++
+ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+ {
+     int Src0MemSize, DstMemSize, Src1MemSize;
+@@ -453,15 +489,15 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+         DstMemSize  = (DstMemSize+15)&(~15);
+         AllSize = Src0MemSize + Src1MemSize + DstMemSize;
+ 
+-        pages = kzalloc((AllSize)* sizeof(struct page *), GFP_KERNEL);
+-        if(pages == NULL) {
+-            pr_err("RGA MMU malloc pages mem failed\n");
++        if (rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize)) {
++            pr_err("RGA2 Get MMU mem failed\n");
+             status = RGA2_MALLOC_ERROR;
+             break;
+         }
+ 
+-        if (rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize)) {
+-            pr_err("RGA2 Get MMU mem failed\n");
++        pages = kzalloc((AllSize)* sizeof(struct page *), GFP_KERNEL);
++        if(pages == NULL) {
++            pr_err("RGA MMU malloc pages mem failed\n");
+             status = RGA2_MALLOC_ERROR;
+             break;
+         }
+@@ -470,11 +506,18 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+         MMU_Base = rga2_mmu_buf.buf_virtual + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
+         MMU_Base_phys = rga2_mmu_buf.buf + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
+         mutex_unlock(&rga2_service.lock);
+-
+         if(Src0MemSize) {
+-            ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0], Src0Start, Src0MemSize);
++            if (req->sg_src0) {
++                ret = rga2_MapION(req->sg_src0, &MMU_Base[0], Src0MemSize);
++            }
++            else {
++                ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0], Src0Start, Src0MemSize);
++            }
++
+             if (ret < 0) {
+                 pr_err("rga2 map src0 memory failed\n");
++                pr_err("RGA2 : yrgb = %.8x, uv = %.8x format = %d\n", req->src.yrgb_addr, req->src.uv_addr, req->src.format);
++                pr_err("RGA2 : vir_w = %d, vir_h = %d\n", req->src.vir_w, req->src.vir_h);
+                 status = ret;
+                 break;
+             }
+@@ -490,9 +533,17 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+         }
+ 
+         if(Src1MemSize) {
+-            ret = rga2_MapUserMemory(&pages[0], MMU_Base + Src0MemSize, Src1Start, Src1MemSize);
++            if (req->sg_src1) {
++                ret = rga2_MapION(req->sg_src1, MMU_Base + Src0MemSize, Src1MemSize);
++            }
++            else {
++                ret = rga2_MapUserMemory(&pages[0], MMU_Base + Src0MemSize, Src1Start, Src1MemSize);
++            }
++
+             if (ret < 0) {
+                 pr_err("rga2 map src1 memory failed\n");
++                pr_err("RGA2 : yrgb = %.8x, format = %d\n", req->src1.yrgb_addr, req->src1.format);
++                pr_err("RGA2 : vir_w = %d, vir_h = %d\n", req->src1.vir_w, req->src1.vir_h);
+                 status = ret;
+                 break;
+             }
+@@ -503,9 +554,16 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+         }
+ 
+         if(DstMemSize) {
+-            ret = rga2_MapUserMemory(&pages[0], MMU_Base + Src0MemSize + Src1MemSize, DstStart, DstMemSize);
++            if (req->sg_dst) {
++                ret = rga2_MapION(req->sg_dst, MMU_Base + Src0MemSize + Src1MemSize, DstMemSize);
++            }
++            else {
++                ret = rga2_MapUserMemory(&pages[0], MMU_Base + Src0MemSize + Src1MemSize, DstStart, DstMemSize);
++            }
+             if (ret < 0) {
+                 pr_err("rga2 map dst memory failed\n");
++                pr_err("RGA2 : yrgb = %.8x, uv = %.8x\n, format = %d\n", req->dst.yrgb_addr, req->dst.uv_addr, req->dst.format);
++                pr_err("RGA2 : vir_w = %d, vir_h = %d\n", req->dst.vir_w, req->dst.vir_h);
+                 status = ret;
+                 break;
+             }
+@@ -543,23 +601,16 @@ static int rga2_mmu_info_BitBlt_mode(struct rga2_reg *reg, struct rga2_req *req)
+         kfree(pages);
+     }
+ 
+-    /* Free MMU table */
+-    if(MMU_Base != NULL) {
+-        kfree(MMU_Base);
+-    }
+-
+     return status;
+ }
+ 
+ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_req *req)
+ {
+-    int SrcMemSize, DstMemSize, CMDMemSize;
+-    uint32_t SrcStart, DstStart, CMDStart;
++    int SrcMemSize, DstMemSize;
++    uint32_t SrcStart, DstStart;
+     struct page **pages = NULL;
+-    uint32_t i;
+     uint32_t AllSize;
+-    uint32_t *MMU_Base = NULL;
+-    uint32_t *MMU_p;
++    uint32_t *MMU_Base = NULL, *MMU_Base_phys;
+     int ret, status;
+     uint32_t stride;
+ 
+@@ -567,31 +618,41 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+     uint16_t sw, byte_num;
+ 
+     shift = 3 - (req->palette_mode & 3);
+-    sw = req->src.vir_w;
++    sw = req->src.vir_w*req->src.vir_h;
+     byte_num = sw >> shift;
+     stride = (byte_num + 3) & (~3);
+ 
++    SrcMemSize = 0;
++    DstMemSize = 0;
++
+     do
+     {
+-
+-        SrcMemSize = rga2_mem_size_cal(req->src.yrgb_addr, stride, &SrcStart);
+-        if(SrcMemSize == 0) {
+-            return -EINVAL;
++        if (req->mmu_info.src0_mmu_flag) {
++            SrcMemSize = rga2_mem_size_cal(req->src.yrgb_addr, stride, &SrcStart);
++            if(SrcMemSize == 0) {
++                return -EINVAL;
++            }
+         }
+ 
+-        DstMemSize = rga2_buf_size_cal(req->dst.yrgb_addr, req->dst.uv_addr, req->dst.v_addr,
+-                                        req->dst.format, req->dst.vir_w, req->dst.vir_h,
+-                                        &DstStart);
+-        if(DstMemSize == 0) {
+-            return -EINVAL;
++        if (req->mmu_info.dst_mmu_flag) {
++            DstMemSize = rga2_buf_size_cal(req->dst.yrgb_addr, req->dst.uv_addr, req->dst.v_addr,
++                                            req->dst.format, req->dst.vir_w, req->dst.vir_h,
++                                            &DstStart);
++            if(DstMemSize == 0) {
++                return -EINVAL;
++            }
+         }
+ 
+-        CMDMemSize = rga2_mem_size_cal((uint32_t)rga2_service.cmd_buff, RGA2_CMD_BUF_SIZE, &CMDStart);
+-        if(CMDMemSize == 0) {
+-            return -EINVAL;
+-        }
++        SrcMemSize = (SrcMemSize + 15) & (~15);
++        DstMemSize = (DstMemSize + 15) & (~15);
++
++        AllSize = SrcMemSize + DstMemSize;
+ 
+-        AllSize = SrcMemSize + DstMemSize + CMDMemSize;
++        if (rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize)) {
++            pr_err("RGA2 Get MMU mem failed\n");
++            status = RGA2_MALLOC_ERROR;
++            break;
++        }
+ 
+         pages = kzalloc(AllSize * sizeof(struct page *), GFP_KERNEL);
+         if(pages == NULL) {
+@@ -599,76 +660,45 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+             return -EINVAL;
+         }
+ 
+-        MMU_Base = kzalloc(AllSize * sizeof(uint32_t), GFP_KERNEL);
+-        if(MMU_Base == NULL) {
+-            pr_err("RGA MMU malloc MMU_Base point failed\n");
+-            break;
+-        }
+-
+-        /* map CMD addr */
+-        for(i=0; i<CMDMemSize; i++)
+-        {
+-            MMU_Base[i] = virt_to_phys((uint32_t *)((CMDStart + i)<<PAGE_SHIFT));
+-        }
++        mutex_lock(&rga2_service.lock);
++        MMU_Base = rga2_mmu_buf.buf_virtual + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
++        MMU_Base_phys = rga2_mmu_buf.buf + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
++        mutex_unlock(&rga2_service.lock);
+ 
+-        /* map src addr */
+-        if (req->src.yrgb_addr < KERNEL_SPACE_VALID)
+-        {
+-            ret = rga2_MapUserMemory(&pages[CMDMemSize], &MMU_Base[CMDMemSize], SrcStart, SrcMemSize);
+-            if (ret < 0)
+-            {
+-                pr_err("rga map src memory failed\n");
++        if(SrcMemSize) {
++            ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0], SrcStart, SrcMemSize);
++            if (ret < 0) {
++                pr_err("rga2 map src0 memory failed\n");
+                 status = ret;
+                 break;
+             }
+-        }
+-        else
+-        {
+-            MMU_p = MMU_Base + CMDMemSize;
+ 
+-            for(i=0; i<SrcMemSize; i++)
+-            {
+-                MMU_p[i] = (uint32_t)virt_to_phys((uint32_t *)((SrcStart + i) << PAGE_SHIFT));
+-            }
++            /* change the buf address in req struct */
++            req->mmu_info.src0_base_addr = (((uint32_t)MMU_Base_phys));
++            req->src.yrgb_addr = (req->src.yrgb_addr & (~PAGE_MASK));
+         }
+ 
+-        /* map dst addr */
+-        if (req->src.yrgb_addr < KERNEL_SPACE_VALID)
+-        {
+-            ret = rga2_MapUserMemory(&pages[CMDMemSize + SrcMemSize], &MMU_Base[CMDMemSize + SrcMemSize], DstStart, DstMemSize);
+-            if (ret < 0)
+-            {
+-                pr_err("rga map dst memory failed\n");
++        if(DstMemSize) {
++            ret = rga2_MapUserMemory(&pages[0], MMU_Base + SrcMemSize, DstStart, DstMemSize);
++            if (ret < 0) {
++                pr_err("rga2 map dst memory failed\n");
+                 status = ret;
+                 break;
+             }
+-        }
+-        else
+-        {
+-            MMU_p = MMU_Base + CMDMemSize + SrcMemSize;
+ 
+-            for(i=0; i<DstMemSize; i++)
+-            {
+-                MMU_p[i] = (uint32_t)virt_to_phys((uint32_t *)((DstStart + i) << PAGE_SHIFT));
+-            }
++            /* change the buf address in req struct */
++            req->mmu_info.dst_base_addr  = ((uint32_t)(MMU_Base_phys + SrcMemSize));
++            req->dst.yrgb_addr = (req->dst.yrgb_addr & (~PAGE_MASK));
+         }
+ 
++        /* flush data to DDR */
++        dmac_flush_range(MMU_Base, (MMU_Base + AllSize));
++        outer_flush_range(virt_to_phys(MMU_Base),virt_to_phys(MMU_Base + AllSize));
+ 
+-        /* zsq
+-         * change the buf address in req struct
+-         * for the reason of lie to MMU
+-         */
+-        req->mmu_info.src0_base_addr = (virt_to_phys(MMU_Base)>>2);
+-        req->src.yrgb_addr = (req->src.yrgb_addr & (~PAGE_MASK)) | (CMDMemSize << PAGE_SHIFT);
+-        req->dst.yrgb_addr = (req->dst.yrgb_addr & (~PAGE_MASK)) | ((CMDMemSize + SrcMemSize) << PAGE_SHIFT);
+-
+-
+-        /*record the malloc buf for the cmd end to release*/
+-        reg->MMU_base = MMU_Base;
++        rga2_mmu_buf_get(&rga2_mmu_buf, AllSize);
++        reg->MMU_len = AllSize;
+ 
+-        /* flush data to DDR */
+-        dmac_flush_range(MMU_Base, (MMU_Base + AllSize + 1));
+-        outer_flush_range(virt_to_phys(MMU_Base),virt_to_phys(MMU_Base + AllSize + 1));
++        status = 0;
+ 
+         /* Free the page table */
+         if (pages != NULL) {
+@@ -676,7 +706,6 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+         }
+ 
+         return status;
+-
+     }
+     while(0);
+ 
+@@ -685,11 +714,6 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+         kfree(pages);
+     }
+ 
+-    /* Free mmu table */
+-    if (MMU_Base != NULL) {
+-        kfree(MMU_Base);
+-    }
+-
+     return 0;
+ }
+ 
+@@ -754,7 +778,7 @@ static int rga2_mmu_info_color_fill_mode(struct rga2_reg *reg, struct rga2_req *
+         dmac_flush_range(MMU_Base, (MMU_Base + AllSize + 1));
+         outer_flush_range(virt_to_phys(MMU_Base),virt_to_phys(MMU_Base + AllSize + 1));
+ 
+-        rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize);
++        rga2_mmu_buf_get(&rga2_mmu_buf, AllSize);
+ 
+         /* Free the page table */
+         if (pages != NULL)
+@@ -767,21 +791,17 @@ static int rga2_mmu_info_color_fill_mode(struct rga2_reg *reg, struct rga2_req *
+     if (pages != NULL)
+         kfree(pages);
+ 
+-    if (MMU_Base != NULL)
+-        kfree(MMU_Base);
+-
+     return status;
+ }
+ 
+ 
+ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct rga2_req *req)
+ {
+-    int SrcMemSize, CMDMemSize;
+-    uint32_t SrcStart, CMDStart;
++    int SrcMemSize;
++    uint32_t SrcStart;
+     struct page **pages = NULL;
+-    uint32_t i;
+     uint32_t AllSize;
+-    uint32_t *MMU_Base, *MMU_p;
++    uint32_t *MMU_Base, *MMU_Base_phys;
+     int ret, status;
+ 
+     MMU_Base = NULL;
+@@ -789,69 +809,51 @@ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct
+     do
+     {
+         /* cal src buf mmu info */
+-        SrcMemSize = rga2_mem_size_cal(req->src.yrgb_addr, req->src.vir_w * req->src.vir_h, &SrcStart);
++        SrcMemSize = rga2_mem_size_cal(req->pat.yrgb_addr, req->pat.vir_w * req->pat.vir_h, &SrcStart);
+         if(SrcMemSize == 0) {
+             return -EINVAL;
+         }
+ 
+-        /* cal cmd buf mmu info */
+-        CMDMemSize = rga2_mem_size_cal((uint32_t)rga2_service.cmd_buff, RGA2_CMD_BUF_SIZE, &CMDStart);
+-        if(CMDMemSize == 0) {
+-            return -EINVAL;
+-        }
++        SrcMemSize = (SrcMemSize + 15) & (~15);
++        AllSize = SrcMemSize;
+ 
+-        AllSize = SrcMemSize + CMDMemSize;
+-
+-        pages = kzalloc(AllSize * sizeof(struct page *), GFP_KERNEL);
+-        if(pages == NULL) {
+-            pr_err("RGA MMU malloc pages mem failed\n");
++        if (rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize)) {
++            pr_err("RGA2 Get MMU mem failed\n");
+             status = RGA2_MALLOC_ERROR;
+             break;
+         }
+ 
+-        MMU_Base = kzalloc((AllSize + 1)* sizeof(uint32_t), GFP_KERNEL);
++        mutex_lock(&rga2_service.lock);
++        MMU_Base = rga2_mmu_buf.buf_virtual + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
++        MMU_Base_phys = rga2_mmu_buf.buf + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
++        mutex_unlock(&rga2_service.lock);
++
++        pages = kzalloc(AllSize * sizeof(struct page *), GFP_KERNEL);
+         if(pages == NULL) {
+-            pr_err("RGA MMU malloc MMU_Base point failed\n");
++            pr_err("RGA MMU malloc pages mem failed\n");
+             status = RGA2_MALLOC_ERROR;
+             break;
+         }
+ 
+-        for(i=0; i<CMDMemSize; i++) {
+-            MMU_Base[i] = virt_to_phys((uint32_t *)((CMDStart + i) << PAGE_SHIFT));
+-        }
+-
+-        if (req->src.yrgb_addr < KERNEL_SPACE_VALID)
+-        {
+-            ret = rga2_MapUserMemory(&pages[CMDMemSize], &MMU_Base[CMDMemSize], SrcStart, SrcMemSize);
++        if(SrcMemSize) {
++            ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0], SrcStart, SrcMemSize);
+             if (ret < 0) {
+-                pr_err("rga map src memory failed\n");
+-                return -EINVAL;
++                pr_err("rga2 map palette memory failed\n");
++                status = ret;
++                break;
+             }
+-        }
+-        else
+-        {
+-            MMU_p = MMU_Base + CMDMemSize;
+ 
+-                for(i=0; i<SrcMemSize; i++)
+-                {
+-                    MMU_p[i] = (uint32_t)virt_to_phys((uint32_t *)((SrcStart + i) << PAGE_SHIFT));
+-                }
++            /* change the buf address in req struct */
++            req->mmu_info.src0_base_addr = (((uint32_t)MMU_Base_phys));
++            req->pat.yrgb_addr = (req->pat.yrgb_addr & (~PAGE_MASK));
+         }
+ 
+-        /* zsq
+-         * change the buf address in req struct
+-         * for the reason of lie to MMU
+-         */
+-        req->mmu_info.src0_base_addr = (virt_to_phys(MMU_Base) >> 2);
+-
+-        req->src.yrgb_addr = (req->src.yrgb_addr & (~PAGE_MASK)) | (CMDMemSize << PAGE_SHIFT);
+-
+-        /*record the malloc buf for the cmd end to release*/
+-        reg->MMU_base = MMU_Base;
+-
+         /* flush data to DDR */
+         dmac_flush_range(MMU_Base, (MMU_Base + AllSize));
+-        outer_flush_range(virt_to_phys(MMU_Base),virt_to_phys(MMU_Base + AllSize));
++        outer_flush_range(virt_to_phys(MMU_Base), virt_to_phys(MMU_Base + AllSize));
++
++        rga2_mmu_buf_get(&rga2_mmu_buf, AllSize);
++        reg->MMU_len = AllSize;
+ 
+         if (pages != NULL) {
+             /* Free the page table */
+@@ -865,9 +867,6 @@ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct
+     if (pages != NULL)
+         kfree(pages);
+ 
+-    if (MMU_Base != NULL)
+-        kfree(MMU_Base);
+-
+     return status;
+ }
+ 
+@@ -965,9 +964,6 @@ static int rga2_mmu_info_update_patten_buff_mode(struct rga2_reg *reg, struct rg
+     if (pages != NULL)
+         kfree(pages);
+ 
+-    if (MMU_Base != NULL)
+-        kfree(MMU_Base);
+-
+     return status;
+ }
+ 
+diff --git a/drivers/video/rockchip/rga2/rga2_reg_info.c b/drivers/video/rockchip/rga2/rga2_reg_info.c
+index 535944f24f23..f993ba8f9705 100644
+--- a/drivers/video/rockchip/rga2/rga2_reg_info.c
++++ b/drivers/video/rockchip/rga2/rga2_reg_info.c
+@@ -824,8 +824,7 @@ RGA2_set_pat_info(RK_U8 *base, struct rga2_req *msg)
+ 
+     reg = (pat->act_w-1) | ((pat->act_h-1) << 8) | (pat->x_offset << 16) | (pat->y_offset << 24);
+     *bRGA_PAT_CON = reg;
+-
+-    *bRGA_FADING_CTRL = (num << 8) | offset;  //???pat_addr???
++    *bRGA_FADING_CTRL = (num << 8) | offset;
+ }
+ 
+ 
+@@ -1122,8 +1121,8 @@ void RGA_MSG_2_RGA2_MSG(struct rga_req *req_rga, struct rga2_req *req)
+                 req->alpha_mode_1 = 0x3848;
+             }
+             else if ((req_rga->alpha_rop_mode & 3) == 1) {
+-                req->alpha_mode_0 = 0x384A;
+-                req->alpha_mode_1 = 0x384A;
++                req->alpha_mode_0 = 0x483A;
++                req->alpha_mode_1 = 0x483A;
+             }
+             else if ((req_rga->alpha_rop_mode & 3) == 2) {
+                 req->alpha_mode_0 = 0x384C;
+-- 
+2.35.3
+

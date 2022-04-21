@@ -1,0 +1,256 @@
+From 0f8c1152786a89b720a4e35453de2c208f540e10 Mon Sep 17 00:00:00 2001
+From: zwl <zwl@rock-chips.com>
+Date: Fri, 21 Feb 2014 17:33:24 +0800
+Subject: [PATCH] 1.hdmi: fix cat66121 driver run error 2. rkfb: fix some code
+ error
+
+---
+ .../hdmi/chips/cat66121/cat66121_hdmi.c       | 72 ++++++++++++-------
+ .../video/rockchip/hdmi/rk_hdmi_parse_dt.c    | 22 ++++--
+ drivers/video/rockchip/rk_fb.c                |  8 +--
+ 3 files changed, 68 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
+index 4b417099931a..68e0207b22a5 100755
+--- a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
+@@ -3,7 +3,6 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/interrupt.h>
+-#include <linux/of_gpio.h>
+ #include <linux/i2c.h>
+ #include <linux/uaccess.h>
+ #if defined(CONFIG_DEBUG_FS)
+@@ -11,6 +10,8 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #endif
++#include <linux/of_gpio.h>
++#include <linux/of_device.h>
+ 
+ #include "cat66121_hdmi.h"
+ #include "cat66121_hdmi_hw.h"
+@@ -193,9 +194,6 @@ static int rk_hdmi_drv_init(struct hdmi *hdmi_drv)
+ 	hdmi_drv->detect_hotplug = cat66121_hdmi_sys_detect_hpd;
+ 	hdmi_drv->read_edid = cat66121_hdmi_sys_read_edid;
+ 
+-	hdmi_drv->workqueue = create_singlethread_workqueue("hdmi");
+-	INIT_DELAYED_WORK(&(hdmi->delay_work), hdmi_work);
+-
+ 	#ifdef CONFIG_HAS_EARLYSUSPEND
+ 	hdmi_drv->early_suspend.suspend = hdmi_early_suspend;
+ 	hdmi_drv->early_suspend.resume = hdmi_early_resume;
+@@ -216,10 +214,27 @@ static int rk_hdmi_drv_init(struct hdmi *hdmi_drv)
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_OF)
++static const struct of_device_id cat66121_dt_ids[] = {
++	{.compatible = "ite,cat66121",},
++	{}
++};
++MODULE_DEVICE_TABLE(of, cat66121_dt_ids);
++#endif
++
+ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_device_id *id)
+ {
+ 	int rc = 0;
+ 
++	printk("%s,line=%d\n", __func__,__LINE__);
++
++	if (client->dev.of_node) {
++		if (!of_match_device(cat66121_dt_ids, &client->dev)) {
++			dev_err(&client->dev,"Failed to find matching dt id\n");
++			return -EINVAL;
++		}
++	}
++
+ 	cat66121_hdmi = kzalloc(sizeof(struct cat66121_hdmi_pdata), GFP_KERNEL);
+ 	if(!cat66121_hdmi)
+ 	{
+@@ -238,6 +253,10 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 	memset(hdmi, 0, sizeof(struct hdmi));
+ 	hdmi->dev = &client->dev;
+ 
++	rk_hdmi_parse_dt(hdmi);
++	//power on
++	rk_hdmi_pwr_enable(hdmi);
++
+ 	if(cat66121_detect_device()!=1){
+ 		dev_err(hdmi->dev, "can't find it66121 device \n");
+ 		rc = -ENXIO;
+@@ -245,38 +264,30 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 	}
+ 
+ 	cat66121_hdmi->plug_status = -1;
+-	
+-	rk_hdmi_parse_dt(hdmi);
+ 	rk_hdmi_drv_init(hdmi);
+-	
+-	//power on
+-	rk_hdmi_pwr_enable(hdmi);
+ 	cat66121_hdmi_sys_init(hdmi);
+ 
+-#if defined(CONFIG_DEBUG_FS)
+-	{
+-		struct dentry *debugfs_dir = debugfs_create_dir("it66121", NULL);
+-		if (IS_ERR(debugfs_dir))
+-		{
+-			dev_err(&client->dev,"failed to create debugfs dir for it66121!\n");
+-		}
+-		else
+-			debugfs_create_file("hdmi", S_IRUSR,debugfs_dir,hdmi,&hdmi_reg_fops);
+-	}
+-#endif
++	hdmi->workqueue = create_singlethread_workqueue("hdmi");
++	INIT_DELAYED_WORK(&(hdmi->delay_work), hdmi_work);
+ 
+ 	if(gpio_is_valid(hdmi->irq)) {
+-		cat66121_irq_work_func(NULL);
++		//cat66121_irq_work_func(NULL);
+ 		if((rc = gpio_request(hdmi->irq, "hdmi gpio")) < 0)
+ 		{
+-			dev_err(&client->dev, "fail to request gpio %d\n", client->irq);
++			dev_err(&client->dev, "fail to request gpio %d\n", hdmi->irq);
+ 			goto err_request_lcdc;
+ 		}
+ 
+ 		cat66121_hdmi->gpio = hdmi->irq;
+ 		//gpio_pull_updown(hdmi->irq, GPIOPullUp);	//TODO Daisen
+ 		gpio_direction_input(hdmi->irq);
+-		if((rc = request_threaded_irq(hdmi->irq, NULL ,cat66121_thread_interrupt, IRQF_TRIGGER_LOW | IRQF_ONESHOT, dev_name(&client->dev), hdmi)) < 0)
++		hdmi->irq = gpio_to_irq(hdmi->irq);
++		if(hdmi->irq <= 0) {
++			dev_err(hdmi->dev, "failed to get hdmi irq resource (%d).\n", hdmi->irq);
++			goto err_request_irq;
++		}
++
++		if((rc = request_threaded_irq(hdmi->irq, NULL ,cat66121_thread_interrupt, IRQF_TRIGGER_LOW | IRQF_ONESHOT, dev_name(&client->dev), hdmi)) < 0) 
+ 		{
+ 			dev_err(&client->dev, "fail to request hdmi irq\n");
+ 			goto err_request_irq;
+@@ -287,12 +298,24 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 		cat66121_irq_work_func(NULL);
+ 	}
+ 
++#if defined(CONFIG_DEBUG_FS)
++	{
++		struct dentry *debugfs_dir = debugfs_create_dir("it66121", NULL);
++		if (IS_ERR(debugfs_dir))
++		{
++			dev_err(&client->dev,"failed to create debugfs dir for it66121!\n");
++		}
++		else
++			debugfs_create_file("hdmi", S_IRUSR,debugfs_dir,hdmi,&hdmi_reg_fops);
++	}
++#endif
++
+ 	dev_info(&client->dev, "cat66121 hdmi i2c probe ok\n");
+ 	
+     return 0;
+ 	
+ err_request_irq:
+-	gpio_free(client->irq);
++	gpio_free(hdmi->irq);
+ err_request_lcdc:
+ 	kfree(hdmi);
+ 	hdmi = NULL;
+@@ -357,6 +380,7 @@ static struct i2c_driver cat66121_hdmi_i2c_driver = {
+     .driver = {
+         .name  = "cat66121_hdmi",
+         .owner = THIS_MODULE,
++        .of_match_table = of_match_ptr(cat66121_dt_ids),
+     },
+     .probe      = cat66121_hdmi_i2c_probe,
+     .remove     = cat66121_hdmi_i2c_remove,
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c b/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
+index bc7d1dd4d965..7e2b39190612 100644
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
+@@ -10,8 +10,8 @@
+ */
+ int rk_hdmi_pwr_ctr_parse_dt(struct hdmi *dev_drv)
+ {
+-	struct device_node *root  = of_parse_phandle(dev_drv->dev->of_node,
+-				"power_ctr", 0);
++	struct device_node *root  = of_find_node_by_name(dev_drv->dev->of_node,
++				"power_ctr");
+ 	struct device_node *child;
+ 	struct rk_disp_pwr_ctr_list *pwr_ctr;
+ 	struct list_head *pos;
+@@ -94,8 +94,14 @@ int rk_hdmi_pwr_enable(struct hdmi *dev_drv)
+ 		if (pwr_ctr->type == GPIO) {
+ 			gpio_direction_output(pwr_ctr->gpio,pwr_ctr->atv_val);
+ 			mdelay(pwr_ctr->delay);
+-			if(pwr_ctr->is_rst == 1)
+-				gpio_direction_output(pwr_ctr->gpio,((pwr_ctr->atv_val == 1) ? 0:1));
++			if(pwr_ctr->is_rst == 1) {
++				if(pwr_ctr->atv_val == 1)
++					gpio_set_value(pwr_ctr->gpio, 0);
++				else
++					gpio_set_value(pwr_ctr->gpio, 1);
++
++				mdelay(pwr_ctr->delay);
++			}
+ 		}
+ 	}
+ 
+@@ -116,8 +122,12 @@ int rk_hdmi_pwr_disable(struct hdmi *dev_drv)
+ 		pwr_ctr = &pwr_ctr_list->pwr_ctr;
+ 		if (pwr_ctr->type == GPIO) {
+ 			gpio_set_value(pwr_ctr->gpio,pwr_ctr->atv_val);
+-			if(pwr_ctr->is_rst == 1)
+-				gpio_direction_output(pwr_ctr->gpio,((pwr_ctr->atv_val == 1) ? 0:1));
++			if(pwr_ctr->is_rst == 1) {
++				if(pwr_ctr->atv_val == 1)
++					gpio_set_value(pwr_ctr->gpio, 0);
++				else
++					gpio_set_value(pwr_ctr->gpio, 1);
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 41185fa74597..0032769dbeb5 100755
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -307,7 +307,7 @@ static struct rk_lcdc_driver *rk_get_prmry_lcdc_drv(void)
+ 		return NULL;
+ 
+ 	for (i = 0; i < inf->num_lcdc; i++) {
+-		if (inf->lcdc_dev_drv[i]->screen_ctr_info->prop ==  PRMRY) {
++		if (inf->lcdc_dev_drv[i]->prop ==  PRMRY) {
+ 			dev_drv = inf->lcdc_dev_drv[i];
+ 			break;
+ 		}
+@@ -349,7 +349,7 @@ static struct rk_lcdc_driver  *rk_get_extend_lcdc_drv(void)
+ 		return NULL;
+ 
+ 	for (i = 0; i < inf->num_lcdc; i++) {
+-		if (inf->lcdc_dev_drv[i]->screen_ctr_info->prop == EXTEND) {
++		if (inf->lcdc_dev_drv[i]->prop == EXTEND) {
+ 			dev_drv = inf->lcdc_dev_drv[i];
+ 			break;
+ 		}
+@@ -1510,7 +1510,7 @@ int rk_fb_disp_scale(u8 scale_x, u8 scale_y, u8 lcdc_id)
+ 	dev_drv = inf->lcdc_dev_drv[0];
+ #else
+ 	for (i = 0; i < inf->num_lcdc; i++) {
+-		if (inf->lcdc_dev_drv[i]->screen_ctr_info->prop == EXTEND) {
++		if (inf->lcdc_dev_drv[i]->prop == EXTEND) {
+ 			dev_drv = inf->lcdc_dev_drv[i];
+ 			break;
+ 		}
+@@ -1661,7 +1661,7 @@ static int init_lcdc_win(struct rk_lcdc_driver *dev_drv, struct rk_lcdc_win *def
+ 			dev_err(dev_drv->dev, "kzmalloc for win fail!");
+ 			return   -ENOMEM;
+ 		}
+-		win = &def_win[i];
++
+ 		strcpy(win->name, def_win->name);
+ 		win->id = def_win->id;
+ 		win->support_3d = def_win->support_3d;
+-- 
+2.35.3
+

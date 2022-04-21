@@ -1,0 +1,964 @@
+From 4ff60a36b21e7de8c591d4adbf0e74d128fa3560 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Fri, 27 Nov 2020 14:52:37 +0800
+Subject: [PATCH] media: rockchip: isp: extend line to fix merge bypass bug for
+ isp20
+
+Change-Id: Ia1ed6a885cffd55859dcec5ad35f22b99d506336
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  |  87 ++++++--------
+ drivers/media/platform/rockchip/isp/capture.c |   7 ++
+ .../media/platform/rockchip/isp/capture_v20.c |  35 ++++--
+ .../media/platform/rockchip/isp/capture_v21.c |  42 ++++---
+ drivers/media/platform/rockchip/isp/common.h  |   2 -
+ drivers/media/platform/rockchip/isp/csi.c     | 111 ++++++------------
+ drivers/media/platform/rockchip/isp/dev.h     |   5 +
+ drivers/media/platform/rockchip/isp/dmarx.c   |  42 +++++--
+ drivers/media/platform/rockchip/isp/dmarx.h   |   4 +
+ .../platform/rockchip/isp/isp_params_v2x.c    |  34 ++++--
+ .../media/platform/rockchip/isp/regs_v2x.h    |  10 --
+ drivers/media/platform/rockchip/isp/rkisp.c   |  58 ++++++++-
+ drivers/media/platform/rockchip/isp/rkisp.h   |   5 +-
+ include/uapi/linux/rk-camera-module.h         |   5 +-
+ 14 files changed, 260 insertions(+), 187 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index f843715e0988..2a21c5fd24e9 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -532,6 +532,7 @@ static int config_mpfbc(struct rkisp_bridge_device *dev)
+ 	rkisp_write(dev->ispdev, ISP_MPFBC_BASE, ctrl, true);
+ 	rkisp_set_bits(dev->ispdev, MI_WR_CTRL, MI_LUM_BURST_MASK,
+ 		       MI_MIPI_LUM_BURST16, true);
++	dev->ispdev->irq_ends_mask |= ISP_FRAME_MPFBC;
+ 	return 0;
+ }
+ 
+@@ -601,6 +602,7 @@ static int config_mp(struct rkisp_bridge_device *dev)
+ 	rkisp_set_bits(dev->ispdev, CIF_MI_CTRL, MI_CTRL_MP_FMT_MASK,
+ 		       MI_CTRL_MP_WRITE_YUV_SPLA | CIF_MI_CTRL_MP_ENABLE |
+ 		       CIF_MI_MP_AUTOUPDATE_ENABLE, true);
++	dev->ispdev->irq_ends_mask |= ISP_FRAME_MP;
+ 	return 0;
+ }
+ 
+@@ -814,37 +816,33 @@ static void crop_on(struct rkisp_bridge_device *dev)
+ 	u32 dest_h = dev->crop.height;
+ 	u32 left = dev->crop.left;
+ 	u32 top = dev->crop.top;
+-	u32 ctrl;
+-
++	u32 ctrl = CIF_DUAL_CROP_CFG_UPD;
++
++	if (ispdev->isp_ver == ISP_V20 &&
++	    ispdev->csi_dev.rd_mode == HDR_RDBK_FRAME1 &&
++	    ispdev->isp_sdev.in_fmt.fmt_type == FMT_BAYER)
++		src_h += RKMODULE_EXTEND_LINE;
++
++	rkisp_write(ispdev, CIF_DUAL_CROP_M_H_OFFS, left, false);
++	rkisp_write(ispdev, CIF_DUAL_CROP_M_V_OFFS, top, false);
++	rkisp_write(ispdev, CIF_DUAL_CROP_M_H_SIZE, dest_w, false);
++	rkisp_write(ispdev, CIF_DUAL_CROP_M_V_SIZE, dest_h, false);
++	ctrl |= rkisp_read(ispdev, CIF_DUAL_CROP_CTRL, true);
+ 	if (src_w == dest_w && src_h == dest_h)
+-		return;
+-
+-	rkisp_write(ispdev, CIF_DUAL_CROP_M_H_OFFS, left, true);
+-	rkisp_write(ispdev, CIF_DUAL_CROP_M_V_OFFS, top, true);
+-	rkisp_write(ispdev, CIF_DUAL_CROP_M_H_SIZE, dest_w, true);
+-	rkisp_write(ispdev, CIF_DUAL_CROP_M_V_SIZE, dest_h, true);
+-	ctrl = rkisp_read(ispdev, CIF_DUAL_CROP_CTRL, true);
+-	ctrl |= CIF_DUAL_CROP_MP_MODE_YUV | CIF_DUAL_CROP_CFG_UPD;
+-	rkisp_write(ispdev, CIF_DUAL_CROP_CTRL, ctrl, true);
++		ctrl &= ~(CIF_DUAL_CROP_MP_MODE_YUV | CIF_DUAL_CROP_MP_MODE_RAW);
++	else
++		ctrl |= CIF_DUAL_CROP_MP_MODE_YUV;
++	rkisp_write(ispdev, CIF_DUAL_CROP_CTRL, ctrl, false);
+ }
+ 
+ static void crop_off(struct rkisp_bridge_device *dev)
+ {
+ 	struct rkisp_device *ispdev = dev->ispdev;
+-	u32 src_w = ispdev->isp_sdev.out_crop.width;
+-	u32 src_h = ispdev->isp_sdev.out_crop.height;
+-	u32 dest_w = dev->crop.width;
+-	u32 dest_h = dev->crop.height;
+-	u32 ctrl;
+-
+-	if (src_w == dest_w && src_h == dest_h)
+-		return;
++	u32 ctrl = CIF_DUAL_CROP_GEN_CFG_UPD;
+ 
+ 	ctrl = rkisp_read(ispdev, CIF_DUAL_CROP_CTRL, true);
+-	ctrl &= ~(CIF_DUAL_CROP_MP_MODE_YUV |
+-		  CIF_DUAL_CROP_MP_MODE_RAW);
+-	ctrl |= CIF_DUAL_CROP_GEN_CFG_UPD;
+-	rkisp_write(ispdev, CIF_DUAL_CROP_CTRL, ctrl, true);
++	ctrl &= ~(CIF_DUAL_CROP_MP_MODE_YUV | CIF_DUAL_CROP_MP_MODE_RAW);
++	rkisp_write(ispdev, CIF_DUAL_CROP_CTRL, ctrl, false);
+ }
+ 
+ static int bridge_start(struct rkisp_bridge_device *dev)
+@@ -858,6 +856,7 @@ static int bridge_start(struct rkisp_bridge_device *dev)
+ 
+ 		if (!(dev->work_mode & ISP_ISPP_QUICK))
+ 			update_mi(dev);
++		hdr_update_dmatx_buf(dev->ispdev);
+ 	}
+ 	dev->ispdev->skip_frame = 0;
+ 	rkisp_stats_first_ddr_config(&dev->ispdev->stats_vdev);
+@@ -868,6 +867,7 @@ static int bridge_start(struct rkisp_bridge_device *dev)
+ static int bridge_stop(struct rkisp_bridge_device *dev)
+ {
+ 	int ret;
++	u32 irq;
+ 
+ 	dev->stopping = true;
+ 	dev->ops->disable(dev);
+@@ -880,6 +880,9 @@ static int bridge_stop(struct rkisp_bridge_device *dev)
+ 	crop_off(dev);
+ 	dev->stopping = false;
+ 	dev->en = false;
++	irq = dev->cfg->frame_end_id;
++	irq = (irq == MI_MPFBC_FRAME) ? ISP_FRAME_MPFBC : ISP_FRAME_MP;
++	dev->ispdev->irq_ends_mask &= ~irq;
+ 
+ 	/* make sure ispp last frame done */
+ 	if (dev->work_mode & ISP_ISPP_QUICK) {
+@@ -893,11 +896,16 @@ static int bridge_stop(struct rkisp_bridge_device *dev)
+ static int bridge_start_stream(struct v4l2_subdev *sd)
+ {
+ 	struct rkisp_bridge_device *dev = v4l2_get_subdevdata(sd);
+-	int ret;
++	int ret = -EINVAL;
+ 
+ 	if (WARN_ON(dev->en))
+ 		return -EBUSY;
+ 
++	if (dev->ispdev->isp_sdev.out_fmt.fmt_type == FMT_BAYER) {
++		v4l2_err(sd, "no support raw from isp to ispp\n");
++		goto free_buf;
++	}
++
+ 	if (dev->ispdev->isp_inp & INP_CSI ||
+ 	    dev->ispdev->isp_inp & INP_DVP ||
+ 	    dev->ispdev->isp_inp & INP_LVDS ||
+@@ -919,7 +927,6 @@ static int bridge_start_stream(struct v4l2_subdev *sd)
+ 	ret = bridge_start(dev);
+ 	if (ret)
+ 		goto close_pipe;
+-	hdr_update_dmatx_buf(dev->ispdev);
+ 
+ 	/* start sub-devices */
+ 	ret = dev->ispdev->pipe.set_stream(&dev->ispdev->pipe, true);
+@@ -1137,32 +1144,16 @@ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev)
+ {
+ 	struct rkisp_bridge_device *bridge = &dev->br_dev;
+ 	void __iomem *base = dev->base_addr;
+-	u32 val = 0;
+-
+-	/* dmarx isr is unreliable, MI frame end to replace it */
+-	if (*mis_val & (MI_MP_FRAME | MI_MPFBC_FRAME) &&
+-	    IS_HDR_RDBK(dev->csi_dev.rd_mode)) {
+-		switch (dev->csi_dev.rd_mode) {
+-		case HDR_RDBK_FRAME3://for rd1 rd0 rd2
+-			val |= RAW1_RD_FRAME;
+-			/* FALLTHROUGH */
+-		case HDR_RDBK_FRAME2://for rd0 rd2
+-			val |= RAW0_RD_FRAME;
+-			/* FALLTHROUGH */
+-		default:// for rd2
+-			val |= RAW2_RD_FRAME;
+-			/* FALLTHROUGH */
+-		}
+-		rkisp2_rawrd_isr(val, dev);
+-	}
++	u32 irq;
+ 
+ 	if (!bridge->cfg ||
+ 	    (bridge->cfg &&
+ 	     !(*mis_val & bridge->cfg->frame_end_id)))
+ 		return;
+ 
+-	*mis_val &= ~bridge->cfg->frame_end_id;
+-	writel(bridge->cfg->frame_end_id, base + CIF_MI_ICR);
++	irq = bridge->cfg->frame_end_id;
++	*mis_val &= ~irq;
++	writel(irq, base + CIF_MI_ICR);
+ 
+ 	if (bridge->stopping) {
+ 		if (bridge->ops->is_stopped(bridge)) {
+@@ -1172,13 +1163,13 @@ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev)
+ 		}
+ 	}
+ 
++	irq = (irq == MI_MPFBC_FRAME) ? ISP_FRAME_MPFBC : ISP_FRAME_MP;
+ 	if (!(bridge->work_mode & ISP_ISPP_QUICK)) {
+ 		frame_end(bridge, bridge->en);
+ 		if (!bridge->en)
+-			dev->isp_state = ISP_STOP;
++			dev->irq_ends_mask &= ~irq;
+ 	}
+-	if (dev->dmarx_dev.trigger == T_MANUAL)
+-		rkisp_csi_trigger_event(dev, T_CMD_END, NULL);
++	rkisp_check_idle(dev, irq);
+ }
+ 
+ int rkisp_register_bridge_subdev(struct rkisp_device *dev,
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index 0a16cb0b46f5..deb5543dbf75 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -39,6 +39,7 @@ int rkisp_fcc_xysubs(u32 fcc, u32 *xsubs, u32 *ysubs)
+ 	case V4L2_PIX_FMT_YUYV:
+ 	case V4L2_PIX_FMT_YVYU:
+ 	case V4L2_PIX_FMT_VYUY:
++	case V4L2_PIX_FMT_UYVY:
+ 	case V4L2_PIX_FMT_YUV422P:
+ 	case V4L2_PIX_FMT_NV16:
+ 	case V4L2_PIX_FMT_NV61:
+@@ -599,9 +600,15 @@ static int rkisp_set_fmt(struct rkisp_stream *stream,
+ 			height = pixm->height / ysubs;
+ 		}
+ 
++		if (dev->isp_ver == ISP_V20 &&
++		    fmt->fmt_type == FMT_BAYER &&
++		    stream->id == RKISP_STREAM_DMATX2)
++			height += RKMODULE_EXTEND_LINE;
++
+ 		if ((dev->isp_ver == ISP_V20 ||
+ 		     dev->isp_ver == ISP_V21) &&
+ 		    !dev->csi_dev.memory &&
++		    fmt->fmt_type == FMT_BAYER &&
+ 		    stream->id != RKISP_STREAM_MP &&
+ 		    stream->id != RKISP_STREAM_SP)
+ 			/* compact mode need bytesperline 4byte align */
+diff --git a/drivers/media/platform/rockchip/isp/capture_v20.c b/drivers/media/platform/rockchip/isp/capture_v20.c
+index 6be8ad74cf95..dd55d2fdfedb 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v20.c
++++ b/drivers/media/platform/rockchip/isp/capture_v20.c
+@@ -404,6 +404,7 @@ int hdr_update_dmatx_buf(struct rkisp_device *dev)
+ int hdr_config_dmatx(struct rkisp_device *dev)
+ {
+ 	struct rkisp_stream *stream;
++	struct v4l2_pix_format_mplane pixm;
+ 
+ 	if (atomic_inc_return(&dev->hdr.refcnt) > 1 ||
+ 	    !dev->active_sensor ||
+@@ -413,7 +414,7 @@ int hdr_config_dmatx(struct rkisp_device *dev)
+ 		return 0;
+ 
+ 	rkisp_create_hdr_buf(dev);
+-
++	memset(&pixm, 0, sizeof(pixm));
+ 	if (dev->hdr.op_mode == HDR_FRAMEX2_DDR ||
+ 	    dev->hdr.op_mode == HDR_LINEX2_DDR ||
+ 	    dev->hdr.op_mode == HDR_FRAMEX3_DDR ||
+@@ -423,6 +424,13 @@ int hdr_config_dmatx(struct rkisp_device *dev)
+ 		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX0];
+ 		if (stream->ops && stream->ops->config_mi)
+ 			stream->ops->config_mi(stream);
++
++		if (!dev->dmarx_dev.trigger) {
++			pixm = stream->out_fmt;
++			stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD0];
++			rkisp_dmarx_set_fmt(stream, pixm);
++			mi_raw_length(stream);
++		}
+ 	}
+ 	if (dev->hdr.op_mode == HDR_FRAMEX3_DDR ||
+ 	    dev->hdr.op_mode == HDR_LINEX3_DDR ||
+@@ -430,6 +438,13 @@ int hdr_config_dmatx(struct rkisp_device *dev)
+ 		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX1];
+ 		if (stream->ops && stream->ops->config_mi)
+ 			stream->ops->config_mi(stream);
++
++		if (!dev->dmarx_dev.trigger) {
++			pixm = stream->out_fmt;
++			stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD1];
++			rkisp_dmarx_set_fmt(stream, pixm);
++			mi_raw_length(stream);
++		}
+ 	}
+ 	if (dev->hdr.op_mode == HDR_RDBK_FRAME1 ||
+ 	    dev->hdr.op_mode == HDR_RDBK_FRAME2 ||
+@@ -437,16 +452,19 @@ int hdr_config_dmatx(struct rkisp_device *dev)
+ 		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX2];
+ 		if (stream->ops && stream->ops->config_mi)
+ 			stream->ops->config_mi(stream);
++
++		if (!dev->dmarx_dev.trigger) {
++			pixm = stream->out_fmt;
++			stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2];
++			rkisp_dmarx_set_fmt(stream, pixm);
++			mi_raw_length(stream);
++		}
+ 	}
+ 
+-	if (IS_HDR_RDBK(dev->hdr.op_mode) && !dev->dmarx_dev.trigger) {
++	if (dev->hdr.op_mode != HDR_NORMAL && !dev->dmarx_dev.trigger) {
+ 		raw_rd_ctrl(dev->base_addr, dev->csi_dev.memory << 2);
+-		mi_raw_length(&dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2]);
+-		if (dev->hdr.op_mode == HDR_RDBK_FRAME3)
+-			mi_raw_length(&dev->dmarx_dev.stream[RKISP_STREAM_RAWRD1]);
+-		if (dev->hdr.op_mode == HDR_RDBK_FRAME3 ||
+-		    dev->hdr.op_mode == HDR_RDBK_FRAME2)
+-			mi_raw_length(&dev->dmarx_dev.stream[RKISP_STREAM_RAWRD0]);
++		if (pixm.width && pixm.height)
++			rkisp_rawrd_set_pic_size(dev, pixm.width, pixm.height);
+ 	}
+ 	return 0;
+ }
+@@ -843,7 +861,6 @@ static int dmatx2_config_mi(struct rkisp_stream *stream)
+ 				    stream->out_fmt.width,
+ 				    stream->out_fmt.height);
+ 		raw_wr_set_pic_offs(stream, 0);
+-		raw_rd_set_pic_size(stream);
+ 		vc = csi->sink[CSI_SRC_CH3 - 1].index;
+ 		val = SW_CSI_RAW_WR_CH_EN(vc);
+ 		val |= csi->memory;
+diff --git a/drivers/media/platform/rockchip/isp/capture_v21.c b/drivers/media/platform/rockchip/isp/capture_v21.c
+index 87cf213c7ba3..843017477b42 100644
+--- a/drivers/media/platform/rockchip/isp/capture_v21.c
++++ b/drivers/media/platform/rockchip/isp/capture_v21.c
+@@ -370,7 +370,6 @@ static int dmatx2_config_mi(struct rkisp_stream *stream)
+ 				    stream->out_fmt.width,
+ 				    stream->out_fmt.height);
+ 		raw_wr_set_pic_offs(stream, 0);
+-		raw_rd_set_pic_size(stream);
+ 		vc = csi->sink[CSI_SRC_CH3 - 1].index;
+ 		val = SW_CSI_RAW_WR_CH_EN(vc);
+ 		val |= csi->memory;
+@@ -845,6 +844,9 @@ static void rkisp_stream_stop(struct rkisp_stream *stream)
+ 	    stream->id == RKISP_STREAM_SP) {
+ 		rkisp_disable_dcrop(stream, true);
+ 		rkisp_disable_rsz(stream, true);
++		ret = (stream->id == RKISP_STREAM_MP) ?
++			ISP_FRAME_MP : ISP_FRAME_SP;
++		dev->irq_ends_mask &= ~ret;
+ 	}
+ 
+ 	stream->burst =
+@@ -895,6 +897,8 @@ static int rkisp_start(struct rkisp_stream *stream)
+ 		force_cfg_update(dev);
+ 		mi_frame_end(stream);
+ 		hdr_update_dmatx_buf(dev);
++		dev->irq_ends_mask |=
++			(stream->id == RKISP_STREAM_MP) ? ISP_FRAME_MP : ISP_FRAME_SP;
+ 	}
+ 	stream->streaming = true;
+ 
+@@ -1390,23 +1394,6 @@ void rkisp_unregister_stream_v21(struct rkisp_device *dev)
+ 
+ /****************  Interrupter Handler ****************/
+ 
+-static void rawrd_frame_end(struct rkisp_device *dev)
+-{
+-	u32 val = 0;
+-
+-	if (IS_HDR_RDBK(dev->csi_dev.rd_mode)) {
+-		switch (dev->csi_dev.rd_mode) {
+-		case HDR_RDBK_FRAME2://for rd0 rd2
+-			val |= RAW0_RD_FRAME;
+-			/* FALLTHROUGH */
+-		default:// for rd2
+-			val |= RAW2_RD_FRAME;
+-			/* FALLTHROUGH */
+-		}
+-		rkisp2_rawrd_isr(val, dev);
+-	}
+-}
+-
+ void rkisp_mi_v21_isr(u32 mis_val, struct rkisp_device *dev)
+ {
+ 	struct rkisp_stream *stream;
+@@ -1462,10 +1449,21 @@ void rkisp_mi_v21_isr(u32 mis_val, struct rkisp_device *dev)
+ 		}
+ 	}
+ 
+-	if (mis_val & (CIF_MI_MP_FRAME | CIF_MI_SP_FRAME)) {
+-		rawrd_frame_end(dev);
+-		if (dev->dmarx_dev.trigger == T_MANUAL)
+-			rkisp_csi_trigger_event(dev, T_CMD_END, NULL);
++	if (mis_val & CIF_MI_MP_FRAME) {
++		stream = &dev->cap_dev.stream[RKISP_STREAM_MP];
++		if (!stream->streaming)
++			dev->irq_ends_mask &= ~ISP_FRAME_MP;
++		else
++			dev->irq_ends_mask |= ISP_FRAME_MP;
++		rkisp_check_idle(dev, ISP_FRAME_MP);
++	}
++	if (mis_val & CIF_MI_SP_FRAME) {
++		stream = &dev->cap_dev.stream[RKISP_STREAM_SP];
++		if (!stream->streaming)
++			dev->irq_ends_mask &= ~ISP_FRAME_SP;
++		else
++			dev->irq_ends_mask |= ISP_FRAME_SP;
++		rkisp_check_idle(dev, ISP_FRAME_SP);
+ 	}
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/common.h b/drivers/media/platform/rockchip/isp/common.h
+index d7eabf9ab247..f9ac8674ab8b 100644
+--- a/drivers/media/platform/rockchip/isp/common.h
++++ b/drivers/media/platform/rockchip/isp/common.h
+@@ -63,8 +63,6 @@
+ #define RKISP_EMDDATA_FIFO_MAX		4
+ #define RKISP_DMATX_CHECK              0xA5A5A5A5
+ 
+-#define RKISP_NORMAL_MERGE_EN		1
+-
+ struct rkisp_device;
+ 
+ /* ISP_V10_1 for only support MP */
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index aad9b7bbc095..5481e833e335 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -13,54 +13,6 @@
+ #include "dev.h"
+ #include "regs.h"
+ 
+-static void __maybe_unused fixed_normal_merge_config(struct rkisp_device *dev)
+-{
+-	struct rkisp_stream *stream;
+-	int i;
+-
+-	if (dev->isp_ver != ISP_V20 &&
+-	    dev->csi_dev.rd_mode != HDR_RDBK_FRAME1)
+-		return;
+-
+-	stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2];
+-	if (stream->curr_buf)
+-		rkisp_write(dev, MI_RAW0_RD_BASE,
+-			    stream->curr_buf->buff_addr[0], false);
+-	rkisp_write(dev, MI_RAW0_RD_LENGTH,
+-		    rkisp_read(dev, MI_RAW2_RD_LENGTH, false), false);
+-
+-	rkisp_write(dev, ISP_HDRMGE_BASE, SW_HDRMGE_EN |
+-		    SW_HDRMGE_MODE_FRAMEX2, false);
+-	rkisp_write(dev, ISP_HDRMGE_GAIN0, 0xfff0040, false);
+-	rkisp_write(dev, ISP_HDRMGE_GAIN1, 0xfff0040, false);
+-	rkisp_write(dev, ISP_HDRMGE_GAIN2, 0x40, false);
+-	rkisp_write(dev, ISP_HDRMGE_CONS_DIFF, 0x26e626cd, false);
+-	for (i = ISP_HDRMGE_DIFF_Y0; i <= ISP_HDRMGE_DIFF_Y3; i += 4)
+-		rkisp_write(dev, i, 0, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y4, 0x10001, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y5, 0x40004, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y6, 0xd000d, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y7, 0x2b002b, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y8, 0x890089, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y9, 0x1680168, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y10, 0x29e029e, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y11, 0x3790379, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y12, 0x3d603d6, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y13, 0x3f303f3, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y14, 0x3fc03fc, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y15, 0x3ff03ff, false);
+-	rkisp_write(dev, ISP_HDRMGE_DIFF_Y16, 0x3ff03ff, false);
+-	for (i = ISP_HDRMGE_OVER_Y0; i <= ISP_HDRMGE_OVER_Y7; i += 4)
+-		rkisp_write(dev, i, 0, false);
+-	rkisp_write(dev, ISP_HDRMGE_OVER_Y8, 0x4, false);
+-	rkisp_write(dev, ISP_HDRMGE_OVER_Y9, 0x2a, false);
+-	rkisp_write(dev, ISP_HDRMGE_OVER_Y10, 0x162, false);
+-	rkisp_write(dev, ISP_HDRMGE_OVER_Y11, 0x376, false);
+-	rkisp_write(dev, ISP_HDRMGE_OVER_Y12, 0x3f3, false);
+-	for (i = ISP_HDRMGE_OVER_Y12; i <= ISP_HDRMGE_OVER_Y16; i += 4)
+-		rkisp_write(dev, i, 0x3ff, false);
+-}
+-
+ static void get_remote_mipi_sensor(struct rkisp_device *dev,
+ 				  struct v4l2_subdev **sensor_sd, u32 function)
+ {
+@@ -497,23 +449,14 @@ int rkisp_csi_config_patch(struct rkisp_device *dev)
+ 	}
+ 
+ 	if (IS_HDR_RDBK(dev->hdr.op_mode)) {
+-		dev->csi_dev.rd_mode = dev->hdr.op_mode;
+ 		rkisp_set_bits(dev, CTRL_SWS_CFG,
+ 			       0, SW_MPIP_DROP_FRM_DIS, true);
+-#if RKISP_NORMAL_MERGE_EN
+-		if (!dev->hw_dev->is_mi_update &&
+-		    dev->hdr.op_mode == HDR_RDBK_FRAME1 &&
+-		    dev->isp_ver == ISP_V20)
+-			rkisp_write(dev, CSI2RX_CTRL0,
+-				    SW_IBUF_OP_MODE(HDR_RDBK_FRAME2) |
+-				    SW_HDR_ESP_MODE(dev->hdr.esp_mode), true);
+-		fixed_normal_merge_config(dev);
+-#endif
+ 	}
+ 	dev->csi_dev.frame_cnt = -1;
+ 	dev->csi_dev.frame_cnt_x1 = -1;
+ 	dev->csi_dev.frame_cnt_x2 = -1;
+ 	dev->csi_dev.frame_cnt_x3 = -1;
++	dev->csi_dev.rd_mode = dev->hdr.op_mode;
+ 	return ret;
+ }
+ 
+@@ -526,9 +469,11 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 	struct rkisp_device *dev = csi->ispdev;
+ 	struct rkisp_hw_dev *hw = dev->hw_dev;
+ 	struct rkisp_isp_params_vdev *params_vdev = &dev->params_vdev;
+-	u32 val, cur_frame_id, tmp;
++	u32 val, cur_frame_id, tmp, rd_mode;
+ 	bool is_upd = false;
+ 
++	if (dev->isp_ver == ISP_V21)
++		dma2frm = 0;
+ 	hw->cur_dev_id = dev->dev_id;
+ 	rkisp_dmarx_get_frame(dev, &cur_frame_id, NULL, NULL, true);
+ 	if (dma2frm > 2)
+@@ -543,32 +488,56 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 
+ 	val = 0;
+ 	if (mode & T_START_X1) {
+-		csi->rd_mode = HDR_RDBK_FRAME1;
+-#if RKISP_NORMAL_MERGE_EN
+-		fixed_normal_merge_config(dev);
+-		if (dev->isp_ver == ISP_V20)
+-			val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX2;
+-#endif
++		rd_mode = HDR_RDBK_FRAME1;
+ 	} else if (mode & T_START_X2) {
+-		csi->rd_mode = HDR_RDBK_FRAME2;
++		rd_mode = HDR_RDBK_FRAME2;
+ 		val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX2;
+ 	} else if (mode & T_START_X3) {
+-		csi->rd_mode = HDR_RDBK_FRAME3;
++		rd_mode = HDR_RDBK_FRAME3;
+ 		val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX3;
++	} else {
++		rd_mode = csi->rd_mode;
++		val = rkisp_read(dev, ISP_HDRMGE_BASE, false) & 0xf;
+ 	}
+-
+ 	tmp = rkisp_read(dev, ISP_HDRMGE_BASE, false) & 0xf;
+ 	if (val != tmp) {
+ 		rkisp_write(dev, ISP_HDRMGE_BASE, val, false);
+ 		dev->skip_frame = 2;
+ 		is_upd = true;
+ 	}
++	if (dev->isp_ver == ISP_V20 && dev->dmarx_dev.trigger == T_MANUAL) {
++		if (csi->rd_mode != rd_mode && dev->br_dev.en) {
++			tmp = dev->isp_sdev.in_crop.height;
++			val = rkisp_read(dev, CIF_DUAL_CROP_CTRL, false);
++			if (rd_mode == HDR_RDBK_FRAME1) {
++				val |= CIF_DUAL_CROP_MP_MODE_YUV;
++				tmp += RKMODULE_EXTEND_LINE;
++			} else {
++				val &= ~CIF_DUAL_CROP_MP_MODE_YUV;
++			}
++			rkisp_write(dev, CIF_DUAL_CROP_CTRL, val, false);
++			rkisp_write(dev, CIF_ISP_ACQ_V_SIZE, tmp, false);
++			rkisp_write(dev, CIF_ISP_OUT_V_SIZE, tmp, false);
++		}
++		csi->rd_mode = rd_mode;
++		rkisp_rawrd_set_pic_size(dev,
++			dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2].out_fmt.width,
++			dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2].out_fmt.height);
++	}
++	csi->rd_mode = rd_mode;
++
+ 	/* configure hdr params in rdbk mode */
++	if (is_upd)
++		rkisp_params_first_cfg(&dev->params_vdev,
++				       &dev->isp_sdev.in_fmt,
++				       dev->isp_sdev.quantization);
+ 	rkisp_params_cfg(params_vdev, cur_frame_id, dma2frm + 1);
+ 
+ 	if (!hw->is_single) {
+ 		rkisp_update_regs(dev, CTRL_VI_ISP_PATH, SUPER_IMP_COLOR_CR);
+-		rkisp_update_regs(dev, ISP_ACQ_PROP, ISP_LSC_CTRL);
++		rkisp_update_regs(dev, DUAL_CROP_M_H_OFFS, DUAL_CROP_S_V_SIZE);
++		rkisp_update_regs(dev, ISP_ACQ_PROP, DUAL_CROP_CTRL);
++		rkisp_update_regs(dev, ISP_GAMMA_OUT_CTRL, ISP_LSC_CTRL);
+ 		rkisp_update_regs(dev, ISP_LSC_XGRAD_01, ISP_RAWAWB_RAM_DATA);
+ 		is_upd = true;
+ 	}
+@@ -585,10 +554,6 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 	val = rkisp_read(dev, CSI2RX_CTRL0, true);
+ 	val &= ~SW_IBUF_OP_MODE(0xf);
+ 	tmp = SW_IBUF_OP_MODE(csi->rd_mode);
+-#if RKISP_NORMAL_MERGE_EN
+-	if (csi->rd_mode == HDR_RDBK_FRAME1 && dev->isp_ver == ISP_V20)
+-		tmp = SW_IBUF_OP_MODE(HDR_RDBK_FRAME2);
+-#endif
+ 	val |= tmp | SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm);
+ 	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
+ 		 "readback frame:%d time:%d 0x%x\n",
+diff --git a/drivers/media/platform/rockchip/isp/dev.h b/drivers/media/platform/rockchip/isp/dev.h
+index afe7bc835722..0ff1199c7aa7 100644
+--- a/drivers/media/platform/rockchip/isp/dev.h
++++ b/drivers/media/platform/rockchip/isp/dev.h
+@@ -81,6 +81,9 @@ enum rkisp_isp_state {
+ 	ISP_FRAME_END = BIT(0),
+ 	ISP_FRAME_IN = BIT(1),
+ 	ISP_FRAME_VS = BIT(2),
++	ISP_FRAME_MP = BIT(3),
++	ISP_FRAME_SP = BIT(4),
++	ISP_FRAME_MPFBC = BIT(5),
+ 
+ 	ISP_STOP = BIT(8),
+ 	ISP_START = BIT(9),
+@@ -210,5 +213,7 @@ struct rkisp_device {
+ 	size_t resmem_size;
+ 	int dev_id;
+ 	unsigned int skip_frame;
++	unsigned int irq_ends;
++	unsigned int irq_ends_mask;
+ };
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 8d42f22a7b22..1460563def31 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -320,7 +320,8 @@ static int rawrd_config_mi(struct rkisp_stream *stream)
+ 		val |= CIF_CSI2_DT_RAW12;
+ 	}
+ 	rkisp_write(dev, CSI2RX_DATA_IDS_1, val, false);
+-	raw_rd_set_pic_size(stream);
++	rkisp_rawrd_set_pic_size(dev, stream->out_fmt.width,
++				 stream->out_fmt.height);
+ 	rkisp_set_bits(dev, CSI2RX_RAW_RD_CTRL, 0,
+ 		       dev->csi_dev.memory << 2 |
+ 		       1 << (stream->id - 1), true);
+@@ -374,14 +375,6 @@ static void update_rawrd(struct rkisp_stream *stream)
+ 			val = readl(base + rawwr_addr);
+ 		}
+ 		mi_set_y_addr(stream, val);
+-#if RKISP_NORMAL_MERGE_EN
+-		if (dev->isp_ver == ISP_V20 &&
+-		    dev->csi_dev.rd_mode == HDR_RDBK_FRAME1) {
+-			rkisp_write(dev, MI_RAW0_RD_BASE, val, true);
+-			rkisp_write(dev, MI_RAW0_RD_LENGTH,
+-				rkisp_read(dev, MI_RAW2_RD_LENGTH, true), true);
+-		}
+-#endif
+ 	}
+ }
+ 
+@@ -666,8 +659,14 @@ static int rkisp_set_fmt(struct rkisp_stream *stream,
+ 			height = pixm->height / ysubs;
+ 		}
+ 
++		if (stream->ispdev->isp_ver == ISP_V20 &&
++		    stream->id == RKISP_STREAM_RAWRD2 &&
++		    fmt->fmt_type == FMT_BAYER)
++			height += RKMODULE_EXTEND_LINE;
++
+ 		if ((stream->ispdev->isp_ver == ISP_V20 ||
+ 		     stream->ispdev->isp_ver == ISP_V21) &&
++		    fmt->fmt_type == FMT_BAYER &&
+ 		    !stream->ispdev->csi_dev.memory &&
+ 		    stream->id != RKISP_STREAM_DMARX)
+ 			bytesperline = ALIGN(width * fmt->bpp[i] / 8, 256);
+@@ -949,6 +948,31 @@ static int dmarx_init(struct rkisp_device *dev, u32 id)
+ 		RKISP_ISP_PAD_SINK, stream->linked);
+ }
+ 
++void rkisp_dmarx_set_fmt(struct rkisp_stream *stream,
++			 struct v4l2_pix_format_mplane pixm)
++{
++	rkisp_set_fmt(stream, &pixm, false);
++}
++
++void rkisp_rawrd_set_pic_size(struct rkisp_device *dev,
++			      u32 width, u32 height)
++{
++	struct rkisp_isp_subdev *sdev = &dev->isp_sdev;
++
++	/* 1. isp20 extend line for normal read back mode to fix internal bug
++	 * 2. rx height should equal to isp height + offset for read back mode
++	 */
++	if (dev->isp_ver == ISP_V20 &&
++	    sdev->in_fmt.fmt_type == FMT_BAYER &&
++	    sdev->out_fmt.fmt_type != FMT_BAYER &&
++	    dev->csi_dev.rd_mode == HDR_RDBK_FRAME1)
++		height += RKMODULE_EXTEND_LINE;
++	else if (IS_HDR_RDBK(dev->hdr.op_mode))
++		height = sdev->in_crop.top + sdev->in_crop.height;
++
++	rkisp_write(dev, CSI2RX_RAW_RD_PIC_SIZE, height << 16 | width, false);
++}
++
+ void rkisp_dmarx_get_frame(struct rkisp_device *dev, u32 *id,
+ 			   u64 *sof_timestamp, u64 *timestamp,
+ 			   bool sync)
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.h b/drivers/media/platform/rockchip/isp/dmarx.h
+index 4ed00383fd24..b07711aa2a28 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.h
++++ b/drivers/media/platform/rockchip/isp/dmarx.h
+@@ -48,6 +48,10 @@ struct rkisp_dmarx_device {
+ 
+ void rkisp_dmarx_isr(u32 mis_val, struct rkisp_device *dev);
+ void rkisp2_rawrd_isr(u32 mis_val, struct rkisp_device *dev);
++void rkisp_dmarx_set_fmt(struct rkisp_stream *stream,
++			 struct v4l2_pix_format_mplane pixm);
++void rkisp_rawrd_set_pic_size(struct rkisp_device *dev,
++			      u32 width, u32 height);
+ void rkisp_dmarx_get_frame(struct rkisp_device *dev, u32 *id,
+ 			   u64 *sof_timestamp, u64 *timestamp,
+ 			   bool sync);
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index 4e67186e69f0..fa60f9bd27d4 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -60,8 +60,13 @@ isp_param_get_insize(struct rkisp_isp_params_vdev *params_vdev)
+ {
+ 	struct rkisp_device *dev = params_vdev->dev;
+ 	struct rkisp_isp_subdev *isp_sdev = &dev->isp_sdev;
++	u32 height = isp_sdev->in_crop.height;
+ 
+-	return isp_sdev->in_crop.width * isp_sdev->in_crop.height;
++	if (dev->isp_ver == ISP_V20 &&
++	    dev->csi_dev.rd_mode == HDR_RDBK_FRAME1)
++		height += RKMODULE_EXTEND_LINE;
++
++	return isp_sdev->in_crop.width * height;
+ }
+ 
+ static void
+@@ -3437,10 +3442,6 @@ isp_gain_config(struct rkisp_isp_params_vdev *params_vdev,
+ 		mge_en = 1;
+ 	else
+ 		mge_en = 0;
+-#if RKISP_NORMAL_MERGE_EN
+-	if (dev->csi_dev.rd_mode == HDR_RDBK_FRAME1)
+-		mge_en = 1;
+-#endif
+ 
+ 	gain_wsize = rkisp_ioread32(params_vdev, MI_GAIN_WR_SIZE);
+ 	gain_wsize &= 0x0FFFFFF0;
+@@ -3547,7 +3548,7 @@ isp_ldch_config(struct rkisp_isp_params_vdev *params_vdev,
+ 	struct rkisp_isp_params_val_v2x *priv_val;
+ 	struct isp2x_ldch_head *ldch_head;
+ 	int buf_idx, i;
+-	u32 value;
++	u32 value, vsize;
+ 
+ 	priv_val = (struct rkisp_isp_params_val_v2x *)params_vdev->priv_val;
+ 	for (i = 0; i < ISP2X_LDCH_BUF_NUM; i++) {
+@@ -3573,10 +3574,21 @@ isp_ldch_config(struct rkisp_isp_params_vdev *params_vdev,
+ 	ldch_head->stat = LDCH_BUF_CHIPINUSE;
+ 	priv_val->buf_ldch_idx = buf_idx;
+ 
++	vsize = arg->vsize;
++	/* normal extend line for ldch mesh */
++	if (dev->isp_ver == ISP_V20) {
++		void *buf = priv_val->buf_ldch[buf_idx].vaddr + ldch_head->data_oft;
++		u32 cnt = RKMODULE_EXTEND_LINE / 8;
++
++		value = arg->hsize * 4;
++		memcpy(buf + value * vsize, buf + value * (vsize - cnt), cnt * value);
++		if (dev->csi_dev.rd_mode == HDR_RDBK_FRAME1)
++			vsize += cnt;
++	}
+ 	value = priv_val->buf_ldch[buf_idx].dma_addr + ldch_head->data_oft;
+ 	rkisp_iowrite32(params_vdev, value, MI_LUT_LDCH_RD_BASE);
+ 	rkisp_iowrite32(params_vdev, arg->hsize, MI_LUT_LDCH_RD_H_WSIZE);
+-	rkisp_iowrite32(params_vdev, arg->vsize, MI_LUT_LDCH_RD_V_SIZE);
++	rkisp_iowrite32(params_vdev, vsize, MI_LUT_LDCH_RD_V_SIZE);
+ }
+ 
+ static void
+@@ -4239,10 +4251,14 @@ static void rkisp_clear_first_param_v2x(struct rkisp_isp_params_vdev *params_vde
+ static u32 rkisp_get_ldch_meshsize(struct rkisp_isp_params_vdev *params_vdev,
+ 				   struct rkisp_ldchbuf_size *ldchsize)
+ {
+-	int mesh_w, mesh_h, map_align;
++	int mesh_w, mesh_h, map_align, height;
++
++	height = ldchsize->meas_height;
++	if (params_vdev->dev->isp_ver == ISP_V20)
++		height += RKMODULE_EXTEND_LINE;
+ 
+ 	mesh_w = ((ldchsize->meas_width + (1 << 4) - 1) >> 4) + 1;
+-	mesh_h = ((ldchsize->meas_height + (1 << 3) - 1) >> 3) + 1;
++	mesh_h = ((height + (1 << 3) - 1) >> 3) + 1;
+ 
+ 	map_align = ((mesh_w + 1) >> 1) << 1;
+ 	return map_align * mesh_h;
+diff --git a/drivers/media/platform/rockchip/isp/regs_v2x.h b/drivers/media/platform/rockchip/isp/regs_v2x.h
+index a3c38fecd802..2fa1857921c2 100644
+--- a/drivers/media/platform/rockchip/isp/regs_v2x.h
++++ b/drivers/media/platform/rockchip/isp/regs_v2x.h
+@@ -2647,16 +2647,6 @@ static inline void mi_raw2_rd_set_addr(void __iomem *base, u32 val)
+ 	writel(val, base + MI_RAW2_RD_BASE);
+ }
+ 
+-static inline void raw_rd_set_pic_size(struct rkisp_stream *stream)
+-{
+-	struct rkisp_device *dev = stream->ispdev;
+-	u32 w = stream->out_fmt.width;
+-	u32 h = dev->isp_sdev.in_crop.top + dev->isp_sdev.in_crop.height;
+-
+-	/* rx height should equal to isp height + offset */
+-	rkisp_write(dev, CSI2RX_RAW_RD_PIC_SIZE, h << 16 | w, false);
+-}
+-
+ static inline void raw_rd_ctrl(void __iomem *base, u32 val)
+ {
+ 	writel(val, base + CSI2RX_RAW_RD_CTRL);
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 1c9a61c97ec8..036cd53192b8 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -444,6 +444,41 @@ u32 rkisp_mbus_pixelcode_to_v4l2(u32 pixelcode)
+ 	return pixelformat;
+ }
+ 
++void rkisp_check_idle(struct rkisp_device *dev, u32 irq)
++{
++	u32 val = 0;
++
++	dev->irq_ends |= (irq & dev->irq_ends_mask);
++	v4l2_dbg(3, rkisp_debug, &dev->v4l2_dev,
++		 "%s irq:0x%x ends:0x%x mask:0x%x\n",
++		 __func__, irq, dev->irq_ends, dev->irq_ends_mask);
++	if (dev->irq_ends != dev->irq_ends_mask || !IS_HDR_RDBK(dev->csi_dev.rd_mode))
++		return;
++
++	if (!(dev->irq_ends_mask & (ISP_FRAME_MP | ISP_FRAME_SP | ISP_FRAME_MPFBC)))
++		dev->isp_state = ISP_STOP;
++
++	dev->irq_ends = 0;
++	switch (dev->csi_dev.rd_mode) {
++	case HDR_RDBK_FRAME3://for rd1 rd0 rd2
++		val |= RAW1_RD_FRAME;
++		/* FALLTHROUGH */
++	case HDR_RDBK_FRAME2://for rd0 rd2
++		val |= RAW0_RD_FRAME;
++		/* FALLTHROUGH */
++	default:// for rd2
++		val |= RAW2_RD_FRAME;
++		/* FALLTHROUGH */
++	}
++	rkisp2_rawrd_isr(val, dev);
++	if (!(dev->irq_ends_mask & (ISP_FRAME_MP | ISP_FRAME_SP | ISP_FRAME_MPFBC)))
++		dev->isp_state = ISP_STOP;
++	if (dev->dmarx_dev.trigger == T_MANUAL)
++		rkisp_csi_trigger_event(dev, T_CMD_END, NULL);
++	if (dev->isp_state == ISP_STOP)
++		wake_up(&dev->sync_onoff);
++}
++
+ static void rkisp_set_state(struct rkisp_device *dev, u32 state)
+ {
+ 	u32 mask = 0xff;
+@@ -503,6 +538,7 @@ static int rkisp_config_isp(struct rkisp_device *dev)
+ 	u32 signal = 0;
+ 	u32 acq_mult = 0;
+ 	u32 acq_prop = 0;
++	u32 extend_line = 0;
+ 
+ 	sensor = dev->active_sensor;
+ 	in_fmt = &dev->isp_sdev.in_fmt;
+@@ -544,6 +580,10 @@ static int rkisp_config_isp(struct rkisp_device *dev)
+ 				isp_ctrl = CIF_ISP_CTRL_ISP_MODE_BAYER_ITU656;
+ 			else
+ 				isp_ctrl = CIF_ISP_CTRL_ISP_MODE_BAYER_ITU601;
++
++			if (dev->isp_ver == ISP_V20 &&
++			    dev->csi_dev.rd_mode == HDR_RDBK_FRAME1)
++				extend_line = RKMODULE_EXTEND_LINE;
+ 		}
+ 
+ 		if (dev->isp_inp == INP_DMARX_ISP)
+@@ -604,8 +644,8 @@ static int rkisp_config_isp(struct rkisp_device *dev)
+ 		rkisp_write(dev, CIF_ISP_ACQ_V_SIZE, in_crop->height / 2, false);
+ 		rkisp_write(dev, CIF_ISP_OUT_V_SIZE, in_crop->height / 2, false);
+ 	} else {
+-		rkisp_write(dev, CIF_ISP_ACQ_V_SIZE, in_crop->height, false);
+-		rkisp_write(dev, CIF_ISP_OUT_V_SIZE, in_crop->height, false);
++		rkisp_write(dev, CIF_ISP_ACQ_V_SIZE, in_crop->height + extend_line, false);
++		rkisp_write(dev, CIF_ISP_OUT_V_SIZE, in_crop->height + extend_line, false);
+ 	}
+ 
+ 	/* interrupt mask */
+@@ -948,6 +988,8 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
+ 	dev->hw_dev->is_idle = true;
+ 	dev->hw_dev->is_mi_update = false;
+ end:
++	dev->irq_ends_mask = 0;
++	dev->hdr.op_mode = 0;
+ 	rkisp_set_state(dev, ISP_STOP);
+ 
+ 	if (dev->isp_ver == ISP_V20 || dev->isp_ver == ISP_V21)
+@@ -1007,6 +1049,8 @@ static int rkisp_isp_start(struct rkisp_device *dev)
+ 	dev->isp_err_cnt = 0;
+ 	dev->isp_isr_cnt = 0;
+ 	dev->isp_state = ISP_START | ISP_FRAME_END;
++	dev->irq_ends_mask |= ISP_FRAME_END | ISP_FRAME_IN;
++	dev->irq_ends = 0;
+ 
+ 	/* XXX: Is the 1000us too long?
+ 	 * CIF spec says to wait for sufficient time after enabling
+@@ -1599,7 +1643,10 @@ static int rkisp_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 
+ 	if (!on) {
+ 		rkisp_stop_3a_run(isp_dev);
+-
++		wait_event_timeout(isp_dev->sync_onoff,
++			isp_dev->irq_ends_mask == (ISP_FRAME_END | ISP_FRAME_IN) &&
++			(!IS_HDR_RDBK(isp_dev->csi_dev.rd_mode) ||
++			 isp_dev->isp_state & ISP_STOP), msecs_to_jiffies(5));
+ 		return rkisp_isp_stop(isp_dev);
+ 	}
+ 
+@@ -2340,6 +2387,11 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 	 * Do the updates in the order of the processing flow.
+ 	 */
+ 	rkisp_params_isr(&dev->params_vdev, isp_mis);
++
++	if (isp_mis & CIF_ISP_FRAME_IN)
++		rkisp_check_idle(dev, ISP_FRAME_IN);
++	if (isp_mis & CIF_ISP_FRAME)
++		rkisp_check_idle(dev, ISP_FRAME_END);
+ }
+ 
+ irqreturn_t rkisp_vs_isr_handler(int irq, void *ctx)
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.h b/drivers/media/platform/rockchip/isp/rkisp.h
+index 8b01aca0551f..b10700be7b98 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.h
++++ b/drivers/media/platform/rockchip/isp/rkisp.h
+@@ -35,9 +35,10 @@
+ #ifndef _RKISP_H
+ #define _RKISP_H
+ 
++#include <linux/interrupt.h>
+ #include <linux/kfifo.h>
+ #include <linux/platform_device.h>
+-#include <linux/interrupt.h>
++#include <linux/rk-camera-module.h>
+ #include <media/v4l2-fwnode.h>
+ #include "common.h"
+ 
+@@ -157,6 +158,8 @@ u32 rkisp_mbus_pixelcode_to_v4l2(u32 pixelcode);
+ 
+ void rkisp_isp_queue_event_sof(struct rkisp_isp_subdev *isp);
+ 
++void rkisp_check_idle(struct rkisp_device *dev, u32 irq);
++
+ static inline
+ struct ispsd_out_fmt *rkisp_get_ispsd_out_fmt(struct rkisp_isp_subdev *isp_sdev)
+ {
+diff --git a/include/uapi/linux/rk-camera-module.h b/include/uapi/linux/rk-camera-module.h
+index 776a6cbee5d6..6cdf8df5d867 100644
+--- a/include/uapi/linux/rk-camera-module.h
++++ b/include/uapi/linux/rk-camera-module.h
+@@ -9,7 +9,10 @@
+ 
+ #include <linux/types.h>
+ 
+-#define RKMODULE_API_VERSION		KERNEL_VERSION(0, 1, 0x1)
++#define RKMODULE_API_VERSION		KERNEL_VERSION(0, 1, 0x2)
++
++/* using for rv1109 and rv1126 */
++#define RKMODULE_EXTEND_LINE		24
+ 
+ #define RKMODULE_NAME_LEN		32
+ #define RKMODULE_LSCDATA_LEN		441
+-- 
+2.35.3
+

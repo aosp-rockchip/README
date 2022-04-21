@@ -1,0 +1,189 @@
+From e852813c6a30807f938e8820f26d56c002667dc8 Mon Sep 17 00:00:00 2001
+From: lyx <lyx@rock-chips.com>
+Date: Mon, 27 Dec 2010 22:27:53 -0800
+Subject: [PATCH] rk29 vmac: add power, clock control when open or close vmac
+ for power reduce
+
+---
+ arch/arm/mach-rk29/board-rk29sdk.c      | 40 ++++++++++--------------
+ arch/arm/mach-rk29/include/mach/board.h |  1 +
+ drivers/net/rk29_vmac.c                 | 41 +++++++++++++++++++------
+ 3 files changed, 50 insertions(+), 32 deletions(-)
+
+diff --git a/arch/arm/mach-rk29/board-rk29sdk.c b/arch/arm/mach-rk29/board-rk29sdk.c
+index 9b99fd19628f..c56d250d023c 100755
+--- a/arch/arm/mach-rk29/board-rk29sdk.c
++++ b/arch/arm/mach-rk29/board-rk29sdk.c
+@@ -1324,54 +1324,48 @@ static int rk29_rmii_io_init(void)
+ {
+ 	int err;
+ 
+-	//set dm9161 rmii
+-	rk29_mux_api_set(GPIO2D3_I2S0SDI_MIICOL_NAME, GPIO2H_GPIO2D3);
+-	err = gpio_request(RK29_PIN2_PD3, "rmii");
+-	if (err) {
+-		gpio_free(RK29_PIN2_PD3);
+-		printk("-------request RK29_PIN2_PD3 fail--------\n");
+-		return -1;
+-	}
+-	gpio_direction_output(RK29_PIN2_PD3, GPIO_HIGH);
+-	gpio_set_value(RK29_PIN2_PD3, GPIO_HIGH);
+-
+-	//rmii power on
+-	err = gpio_request(RK29_PIN6_PB0, "rmii_power_en");
++	//phy power gpio
++	err = gpio_request(RK29_PIN6_PB0, "phy_power_en");
+ 	if (err) {
+ 		gpio_free(RK29_PIN6_PB0);
+-		gpio_free(RK29_PIN2_PD3);
+ 		printk("-------request RK29_PIN6_PB0 fail--------\n");
+ 		return -1;
+ 	}
+-	gpio_direction_output(RK29_PIN6_PB0, GPIO_HIGH);
+-	gpio_set_value(RK29_PIN6_PB0, GPIO_HIGH);
++	//phy power down
++	gpio_direction_output(RK29_PIN6_PB0, GPIO_LOW);
++	gpio_set_value(RK29_PIN6_PB0, GPIO_LOW);
+ 
+ 	return 0;
+ }
+ 
++static int rk29_rmii_io_deinit(void)
++{
++	//phy power down
++	gpio_direction_output(RK29_PIN6_PB0, GPIO_LOW);
++	gpio_set_value(RK29_PIN6_PB0, GPIO_LOW);
++	//free
++	gpio_free(RK29_PIN6_PB0);
++	return 0;
++}
++
+ static int rk29_rmii_power_control(int enable)
+ {
+ 	if (enable) {
+-		//set dm9161 as rmii
+-		gpio_direction_output(RK29_PIN2_PD3, GPIO_HIGH);
+-		gpio_set_value(RK29_PIN2_PD3, GPIO_HIGH);
+-
+-		//enable rmii power
++		//enable phy power
+ 		gpio_direction_output(RK29_PIN6_PB0, GPIO_HIGH);
+ 		gpio_set_value(RK29_PIN6_PB0, GPIO_HIGH);
+-
+ 	}
+ 	else {
+ 		gpio_direction_output(RK29_PIN6_PB0, GPIO_LOW);
+ 		gpio_set_value(RK29_PIN6_PB0, GPIO_LOW);
+ 	}
+-
+ 	return 0;
+ }
+ 
+ struct rk29_vmac_platform_data rk29_vmac_pdata = {
+ 	.vmac_register_set = rk29_vmac_register_set,
+ 	.rmii_io_init = rk29_rmii_io_init,
++	.rmii_io_deinit = rk29_rmii_io_deinit,
+ 	.rmii_power_control = rk29_rmii_power_control,
+ };
+ 
+diff --git a/arch/arm/mach-rk29/include/mach/board.h b/arch/arm/mach-rk29/include/mach/board.h
+index 93fceaf0169e..7a6a671f7ff5 100755
+--- a/arch/arm/mach-rk29/include/mach/board.h
++++ b/arch/arm/mach-rk29/include/mach/board.h
+@@ -40,6 +40,7 @@ struct rk29xx_spi_platform_data {
+ struct rk29_vmac_platform_data {
+ 	int (*vmac_register_set)(void);
+ 	int (*rmii_io_init)(void);
++	int (*rmii_io_deinit)(void);
+     int (*rmii_power_control)(int enable);
+ };
+ 
+diff --git a/drivers/net/rk29_vmac.c b/drivers/net/rk29_vmac.c
+index a1b5df3315d2..2548cffbb0b0 100755
+--- a/drivers/net/rk29_vmac.c
++++ b/drivers/net/rk29_vmac.c
+@@ -1020,12 +1020,26 @@ int vmac_open(struct net_device *dev)
+ 	struct phy_device *phydev;
+ 	unsigned int temp;
+ 	int err = 0;
++	struct rk29_vmac_platform_data *pdata = ap->pdev->dev.platform_data;
+ 
+ 	if (ap == NULL)
+ 		return -ENODEV;
+ 
+ 	ap->shutdown = 0;
+-	
++		
++	//set rmii ref clock 50MHz
++	clk_set_rate(clk_get(NULL, "mac_ref_div"), 50000000);
++	clk_enable(clk_get(NULL,"mii_rx"));
++	clk_enable(clk_get(NULL,"mii_tx"));
++	clk_enable(clk_get(NULL,"hclk_mac"));
++	clk_enable(clk_get(NULL,"mac_ref"));
++
++	//phy power on
++	if (pdata && pdata->rmii_power_control)
++		pdata->rmii_power_control(1);
++
++	msleep(1000);
++
+ 	vmac_hw_init(dev);
+ 
+ 	/* mac address changed? */
+@@ -1096,6 +1110,7 @@ int vmac_close(struct net_device *dev)
+ {
+ 	struct vmac_priv *ap = netdev_priv(dev);
+ 	unsigned int temp;
++	struct rk29_vmac_platform_data *pdata = ap->pdev->dev.platform_data;
+ 
+ 	netif_stop_queue(dev);
+ 	napi_disable(&ap->napi);
+@@ -1124,6 +1139,16 @@ int vmac_close(struct net_device *dev)
+ 	wmb();
+ 
+ 	free_buffers(dev);
++
++	//set rmii ref clock 50MHz
++	clk_disable(clk_get(NULL,"mii_rx"));
++	clk_disable(clk_get(NULL,"mii_tx"));
++	clk_disable(clk_get(NULL,"hclk_mac"));
++	clk_disable(clk_get(NULL,"mac_ref"));
++
++	//phy power off
++	if (pdata && pdata->rmii_power_control)
++		pdata->rmii_power_control(0);
+ 	
+ 	return 0;
+ }
+@@ -1436,15 +1461,8 @@ static int __devinit vmac_probe(struct platform_device *pdev)
+ 	//config rk29 vmac as rmii, 100MHz 
+ 	if (pdata && pdata->vmac_register_set)
+ 		pdata->vmac_register_set();
+-	
+-	//set rmii ref clock 50MHz
+-	sys_clk = clk_get(NULL, "mac_ref_div");////////
+-	clk_set_rate(sys_clk,50000000);
+-
+-	sys_clk = clk_get(NULL, "mac_ref");////////
+-	clk_set_rate(sys_clk,50000000);
+ 
+-	//power on
++	//power gpio init, phy power off default for power reduce
+ 	if (pdata && pdata->rmii_io_init)
+ 		pdata->rmii_io_init();
+ 
+@@ -1464,6 +1482,11 @@ static int __devexit vmac_remove(struct platform_device *pdev)
+ 	struct net_device *dev;
+ 	struct vmac_priv *ap;
+ 	struct resource *res;
++	struct rk29_vmac_platform_data *pdata = pdev->dev.platform_data;
++
++	//power gpio deinit, phy power off
++	if (pdata && pdata->rmii_io_deinit)
++		pdata->rmii_io_deinit();
+ 
+ 	dev = platform_get_drvdata(pdev);
+ 	if (!dev) {
+-- 
+2.35.3
+

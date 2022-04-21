@@ -1,0 +1,130 @@
+From 489cae173fd3ac9ecb5501919870e4d6df068613 Mon Sep 17 00:00:00 2001
+From: Xu Hongfei <xuhf@rock-chips.com>
+Date: Mon, 9 Nov 2020 16:47:27 +0800
+Subject: [PATCH] media: rockchip: vicap: support measuring luma in normal mode
+
+Signed-off-by: Xu Hongfei <xuhf@rock-chips.com>
+Change-Id: I5e36c03f46bd3362e288e3a3332caf412afe4a7b
+---
+ drivers/media/platform/rockchip/cif/capture.c  | 13 ++++++++++---
+ drivers/media/platform/rockchip/cif/cif-luma.c | 10 +++++++---
+ drivers/media/platform/rockchip/cif/cif-luma.h |  3 ++-
+ 3 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+index 019b45525b77..db0f47cff9fe 100644
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -1686,13 +1686,15 @@ static void rkcif_do_cru_reset(struct rkcif_device *dev)
+ 
+ 	unsigned int val, i;
+ 
++	if (dev->luma_vdev.enable)
++		rkcif_stop_luma(&dev->luma_vdev);
++
+ 	if (dev->hdr.mode != NO_HDR) {
+ 		if (dev->chip_id == CHIP_RK1808_CIF) {
+ 			val = rkcif_read_register(dev, CIF_REG_MIPI_WATER_LINE);
+ 			val |= CIF_MIPI_LVDS_SW_DMA_IDLE_RK1808;
+ 			rkcif_write_register(dev, CIF_REG_MIPI_WATER_LINE, val);
+ 		} else {
+-			rkcif_stop_luma(&dev->luma_vdev);
+ 			val = rkcif_read_register(dev, CIF_REG_MIPI_LVDS_CTRL);
+ 			val |= CIF_MIPI_LVDS_SW_DMA_IDLE;
+ 			rkcif_write_register(dev, CIF_REG_MIPI_LVDS_CTRL, val);
+@@ -2303,7 +2305,12 @@ static int rkcif_start_streaming(struct vb2_queue *queue, unsigned int count)
+ 			goto stop_stream;
+ 	}
+ 
+-	if (dev->hdr.mode == HDR_X2) {
++	if (dev->hdr.mode == NO_HDR) {
++		if (dev->stream[RKCIF_STREAM_MIPI_ID0].state == RKCIF_STATE_STREAMING) {
++			rkcif_start_luma(&dev->luma_vdev,
++					dev->stream[RKCIF_STREAM_MIPI_ID0].cif_fmt_in);
++		}
++	} else if (dev->hdr.mode == HDR_X2) {
+ 		if (dev->stream[RKCIF_STREAM_MIPI_ID0].state == RKCIF_STATE_STREAMING &&
+ 		    dev->stream[RKCIF_STREAM_MIPI_ID1].state == RKCIF_STATE_STREAMING) {
+ 			rkcif_start_luma(&dev->luma_vdev,
+@@ -3793,7 +3800,7 @@ static void rkcif_update_stream(struct rkcif_device *cif_dev,
+ 
+ 	if (cif_dev->chip_id == CHIP_RV1126_CIF ||
+ 	    cif_dev->chip_id == CHIP_RV1126_CIF_LITE)
+-		rkcif_luma_isr(&cif_dev->luma_vdev, mipi_id);
++		rkcif_luma_isr(&cif_dev->luma_vdev, mipi_id, stream->frame_idx);
+ 
+ 	if (active_buf) {
+ 		vb_done = &active_buf->vb;
+diff --git a/drivers/media/platform/rockchip/cif/cif-luma.c b/drivers/media/platform/rockchip/cif/cif-luma.c
+index efc42ce5a899..fb1d8612128c 100644
+--- a/drivers/media/platform/rockchip/cif/cif-luma.c
++++ b/drivers/media/platform/rockchip/cif/cif-luma.c
+@@ -291,10 +291,9 @@ static void rkcif_luma_readout_task(unsigned long data)
+ 	}
+ }
+ 
+-void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int mipi_id)
++void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int mipi_id, u32 frame_id)
+ {
+ 	u8 hdr_mode = luma_vdev->cifdev->hdr.mode;
+-	unsigned int cur_frame_id = rkcif_get_sof(luma_vdev->cifdev);
+ 	enum rkcif_luma_frm_mode frm_mode;
+ 	bool send_task;
+ 	u32 i, value;
+@@ -304,6 +303,9 @@ void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int mipi_id)
+ 		goto unlock;
+ 
+ 	switch (hdr_mode) {
++	case NO_HDR:
++		frm_mode = RKCIF_LUMA_ONEFRM;
++		break;
+ 	case HDR_X2:
+ 		frm_mode = RKCIF_LUMA_TWOFRM;
+ 		break;
+@@ -364,7 +366,7 @@ void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int mipi_id)
+ 	if (send_task) {
+ 		luma_vdev->work.readout = RKCIF_READOUT_LUMA;
+ 		luma_vdev->work.timestamp = ktime_get_ns();
+-		luma_vdev->work.frame_id = cur_frame_id;
++		luma_vdev->work.frame_id = frame_id;
+ 
+ 		if (frm_mode == RKCIF_LUMA_THREEFRM)
+ 			luma_vdev->work.meas_type = ISP2X_RAW0_Y_STATE | ISP2X_RAW1_Y_STATE |
+@@ -425,11 +427,13 @@ void rkcif_start_luma(struct rkcif_luma_vdev *luma_vdev, const struct cif_input_
+ 
+ 	rkcif_write_register(luma_vdev->cifdev, CIF_REG_Y_STAT_CONTROL,
+ 			     SW_Y_STAT_BAYER_TYPE(bayer) | SW_Y_STAT_EN);
++	luma_vdev->enable = true;
+ }
+ 
+ void rkcif_stop_luma(struct rkcif_luma_vdev *luma_vdev)
+ {
+ 	rkcif_write_register(luma_vdev->cifdev, CIF_REG_Y_STAT_CONTROL, 0x0);
++	luma_vdev->enable = false;
+ }
+ 
+ static void rkcif_init_luma_vdev(struct rkcif_luma_vdev *luma_vdev)
+diff --git a/drivers/media/platform/rockchip/cif/cif-luma.h b/drivers/media/platform/rockchip/cif/cif-luma.h
+index 8322e364df1c..f57d19c4123a 100644
+--- a/drivers/media/platform/rockchip/cif/cif-luma.h
++++ b/drivers/media/platform/rockchip/cif/cif-luma.h
+@@ -53,6 +53,7 @@ struct rkcif_luma_node {
+ struct rkcif_luma_vdev {
+ 	struct rkcif_luma_node vnode;
+ 	struct rkcif_device *cifdev;
++	bool enable;
+ 
+ 	spinlock_t irq_lock;	/* tasklet queue lock */
+ 	struct list_head stat;
+@@ -71,7 +72,7 @@ void rkcif_start_luma(struct rkcif_luma_vdev *luma_vdev, const struct cif_input_
+ 
+ void rkcif_stop_luma(struct rkcif_luma_vdev *luma_vdev);
+ 
+-void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int isp_stat);
++void rkcif_luma_isr(struct rkcif_luma_vdev *luma_vdev, int isp_stat, u32 frame_id);
+ 
+ int rkcif_register_luma_vdev(struct rkcif_luma_vdev *luma_vdev,
+ 			     struct v4l2_device *v4l2_dev,
+-- 
+2.35.3
+

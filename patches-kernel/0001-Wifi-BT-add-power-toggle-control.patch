@@ -1,0 +1,249 @@
+From ed7869a3f4ce42bea89299b49ff29783bb9700c0 Mon Sep 17 00:00:00 2001
+From: gwl <gwl@rock-chips.com>
+Date: Thu, 10 Apr 2014 09:52:49 +0800
+Subject: [PATCH] Wifi:BT: add power toggle control.
+
+---
+ arch/arm/boot/dts/rk3288-tb.dts |  2 ++
+ include/linux/rfkill-bt.h       |  3 +++
+ include/linux/rfkill-wlan.h     |  1 +
+ net/rfkill/rfkill-bt.c          | 35 ++++++++++++++++++++++++++
+ net/rfkill/rfkill-wlan.c        | 44 ++++++++++++++++++++++++++++++---
+ 5 files changed, 81 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/boot/dts/rk3288-tb.dts b/arch/arm/boot/dts/rk3288-tb.dts
+index 2f92b7ec099b..b885f6049a28 100755
+--- a/arch/arm/boot/dts/rk3288-tb.dts
++++ b/arch/arm/boot/dts/rk3288-tb.dts
+@@ -28,6 +28,8 @@
+     wireless-bluetooth {
+         compatible = "bluetooth-platdata";
+ 
++        //wifi-bt-power-toggle;
++
+         uart_rts_gpios = <&gpio4 GPIO_C3 GPIO_ACTIVE_LOW>;
+         pinctrl-names = "default","rts_gpio";
+         pinctrl-0 = <&uart0_rts>;
+diff --git a/include/linux/rfkill-bt.h b/include/linux/rfkill-bt.h
+index de81161ff3a1..4a014b64a92c 100755
+--- a/include/linux/rfkill-bt.h
++++ b/include/linux/rfkill-bt.h
+@@ -56,6 +56,7 @@ struct rfkill_rk_irq {
+ struct rfkill_rk_platform_data {
+     char                    *name;
+     enum rfkill_type        type;
++    bool                    power_toggle;
+     struct pinctrl          *pinctrl;
+     struct rfkill_rk_gpio   poweron_gpio;
+     struct rfkill_rk_gpio   reset_gpio;
+@@ -64,5 +65,7 @@ struct rfkill_rk_platform_data {
+     struct rfkill_rk_gpio   rts_gpio;
+ };
+ 
++int rfkill_get_bt_power_state(int *power, bool *toggle);
++
+ #endif /* __RFKILL_GPIO_H */
+ 
+diff --git a/include/linux/rfkill-wlan.h b/include/linux/rfkill-wlan.h
+index 8711e8afc050..00be802805ca 100755
+--- a/include/linux/rfkill-wlan.h
++++ b/include/linux/rfkill-wlan.h
+@@ -38,6 +38,7 @@ struct rksdmmc_gpio_wifi_moudle {
+     struct rksdmmc_gpio   GPS_LAN;  //pin33--GPS_LAN
+ };
+ 
++int rfkill_get_wifi_power_state(int *power);
+ void *rockchip_mem_prealloc(int section, unsigned long size);
+ int rockchip_wifi_power(int on);
+ int rockchip_wifi_set_carddetect(int val);
+diff --git a/net/rfkill/rfkill-bt.c b/net/rfkill/rfkill-bt.c
+index 90f7918d4480..3728bec39443 100755
+--- a/net/rfkill/rfkill-bt.c
++++ b/net/rfkill/rfkill-bt.c
+@@ -24,6 +24,7 @@
+ #include <asm/gpio.h>
+ #include <linux/delay.h>
+ #include <linux/rfkill-bt.h>
++#include <linux/rfkill-wlan.h>
+ #include <linux/wakelock.h>
+ #include <linux/interrupt.h>
+ #include <asm/irq.h>
+@@ -245,6 +246,22 @@ void rfkill_rk_sleep_bt(bool sleep)
+ }
+ EXPORT_SYMBOL(rfkill_rk_sleep_bt);
+ 
++static int bt_power_state = 0;
++int rfkill_get_bt_power_state(int *power, bool *toggle)
++{
++    struct rfkill_rk_data *mrfkill = g_rfkill;
++
++    if (mrfkill == NULL) {
++        LOG("%s: rfkill-bt driver has not Successful initialized\n", __func__);
++        return -1;
++    }
++
++    *toggle = mrfkill->pdata->power_toggle;
++    *power = bt_power_state;
++
++    return 0;
++}
++
+ static int rfkill_rk_set_power(void *data, bool blocked)
+ {
+ 	struct rfkill_rk_data *rfkill = data;
+@@ -254,11 +271,20 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+     struct rfkill_rk_gpio* rts = &rfkill->pdata->rts_gpio;
+     struct pinctrl *pinctrl = rfkill->pdata->pinctrl;
+ #endif
++    int power = 0; bool toggle = false;
+ 
+     DBG("Enter %s\n", __func__);
+ 
+     DBG("Set blocked:%d\n", blocked);
+ 
++    toggle = rfkill->pdata->power_toggle;
++    if (toggle) {
++        if(!rfkill_get_wifi_power_state(&power) && power == 1) {
++            LOG("%s: bt shouldn't control the power, it was enabled by wifi!\n", __func__);
++            return 0;
++        }
++    }
++
+ 	if (false == blocked) { 
+         rfkill_rk_sleep_bt(BT_WAKEUP); // ensure bt is wakeup
+ 
+@@ -287,6 +313,7 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+             pinctrl_select_state(pinctrl, rts->default_state);
+         }
+ #endif
++        bt_power_state = 1;
+     	LOG("bt turn on power\n");
+ 	} else {
+             if (gpio_is_valid(poweron->io))
+@@ -295,6 +322,7 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+                 msleep(20);
+             }
+ 
++            bt_power_state = 0;
+     		LOG("bt shut off power\n");
+ 		if (gpio_is_valid(reset->io))
+         {      
+@@ -436,6 +464,13 @@ static int bluetooth_platdata_parse_dt(struct device *dev,
+ 
+     memset(data, 0, sizeof(*data));
+ 
++    if (of_find_property(node, "wifi-bt-power-toggle", NULL)) {
++        data->power_toggle = true;
++        LOG("%s: get property wifi-bt-power-toggle.\n");
++    } else {
++        data->power_toggle = false;
++    }
++
+     gpio = of_get_named_gpio_flags(node, "uart_rts_gpios", 0, &flags);
+     if (gpio_is_valid(gpio)) {
+         data->rts_gpio.io = gpio;
+diff --git a/net/rfkill/rfkill-wlan.c b/net/rfkill/rfkill-wlan.c
+index a4b2c02f0856..acc25127d6f7 100755
+--- a/net/rfkill/rfkill-wlan.c
++++ b/net/rfkill/rfkill-wlan.c
+@@ -24,6 +24,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/delay.h>
+ #include <linux/rfkill-wlan.h>
++#include <linux/rfkill-bt.h>
+ #include <linux/wakelock.h>
+ #include <linux/interrupt.h>
+ #include <asm/irq.h>
+@@ -178,6 +179,26 @@ void *rockchip_mem_prealloc(int section, unsigned long size) { return NULL;}
+ #endif
+ EXPORT_SYMBOL(rockchip_mem_prealloc);
+ 
++/**************************************************************************
++ *
++ * get wifi power state Func
++ *
++ *************************************************************************/
++static int wifi_power_state = 0;
++int rfkill_get_wifi_power_state(int *power)
++{
++    struct rfkill_wlan_data *mrfkill = g_rfkill;
++
++    if (mrfkill == NULL) {
++        LOG("%s: rfkill-wlan driver has not Successful initialized\n", __func__);
++        return -1;
++    }
++
++    *power = wifi_power_state;
++
++    return 0;
++}
++
+ /**************************************************************************
+  *
+  * Wifi Power Control Func
+@@ -190,6 +211,8 @@ int rockchip_wifi_power(int on)
+ 	struct rfkill_wlan_data *mrfkill = g_rfkill;
+     struct rksdmmc_gpio *poweron, *reset;
+     struct regulator *ldo = NULL;
++    int power = 0;
++    bool toggle = false;
+ 
+     LOG("%s: %d\n", __func__, on);
+ 
+@@ -198,6 +221,13 @@ int rockchip_wifi_power(int on)
+         return -1;
+     }
+ 
++    if(!rfkill_get_bt_power_state(&power, &toggle)) {
++        if (toggle == true && power == 1) {
++            LOG("%s: wifi shouldn't control the power, it was enabled by BT!\n", __func__);
++            return 0;
++        }
++    }
++
+     if (mrfkill->pdata->mregulator.power_ctrl_by_pmu) {
+         char *ldostr;
+         int ret = -1;
+@@ -218,15 +248,19 @@ int rockchip_wifi_power(int on)
+ 				ret = regulator_enable(ldo);
+ 				if(ret != 0){
+ 				    LOG("%s: faild to enable %s\n", __func__, ldostr);
+-				}
+-			    LOG("wifi turn on power.\n");
++				} else {
++                    wifi_power_state = 1;
++			        LOG("wifi turn on power.\n");
++                }
+             } else {
+-			    LOG("wifi shut off power.\n");
+ 				LOG("%s: %s disabled\n", __func__, ldostr);
+ 				ret = regulator_disable(ldo);
+ 				if(ret != 0){
+ 					LOG("%s: faild to disable %s\n", __func__, ldostr);
+-				}
++				} else {
++                    wifi_power_state = 0;
++			        LOG("wifi shut off power.\n");
++                }
+ 			}
+ 			regulator_put(ldo);
+ 			msleep(100);
+@@ -246,6 +280,7 @@ int rockchip_wifi_power(int on)
+ 				msleep(100);
+ 			}
+ 
++            wifi_power_state = 1;
+ 			LOG("wifi turn on power. %d\n", poweron->io);
+ 		}else{
+ 			if (gpio_is_valid(poweron->io)) {
+@@ -257,6 +292,7 @@ int rockchip_wifi_power(int on)
+ 				gpio_set_value(reset->io, !(reset->enable));
+ 			}
+ 
++            wifi_power_state = 0;
+ 			LOG("wifi shut off power.\n");
+ 		}
+     }
+-- 
+2.35.3
+

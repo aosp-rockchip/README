@@ -1,0 +1,229 @@
+From e2e5c0bb24ea9cb1af09f57cc965c7017b0d0809 Mon Sep 17 00:00:00 2001
+From: Xing Zheng <zhengxing@rock-chips.com>
+Date: Mon, 19 Nov 2018 19:01:43 +0800
+Subject: [PATCH] ASoC: rockchip: i2s-tdm: add supports i2s RX/TX route map
+
+Change-Id: I4a6834a95bf34a8fd75613296488517134321c9d
+Signed-off-by: Xing Zheng <zhengxing@rock-chips.com>
+---
+ sound/soc/rockchip/rockchip_i2s_tdm.c | 158 ++++++++++++++++++++++++++
+ sound/soc/rockchip/rockchip_i2s_tdm.h |   6 +
+ 2 files changed, 164 insertions(+)
+
+diff --git a/sound/soc/rockchip/rockchip_i2s_tdm.c b/sound/soc/rockchip/rockchip_i2s_tdm.c
+index 038789f243dd..8272a5853a2b 100644
+--- a/sound/soc/rockchip/rockchip_i2s_tdm.c
++++ b/sound/soc/rockchip/rockchip_i2s_tdm.c
+@@ -30,6 +30,7 @@
+ #define DRV_NAME "rockchip-i2s-tdm"
+ 
+ #define DEFAULT_MCLK_FS				256
++#define CH_GRP_MAX				4  /* The max channel 8 / 2 */
+ 
+ struct rk_i2s_soc_data {
+ 	u32 softrst_offset;
+@@ -70,6 +71,8 @@ struct rk_i2s_tdm_dev {
+ 	unsigned int mclk_tx_freq;
+ 	unsigned int bclk_fs;
+ 	unsigned int clk_trcm;
++	unsigned int i2s_sdis[CH_GRP_MAX];
++	unsigned int i2s_sdos[CH_GRP_MAX];
+ 	atomic_t refcount;
+ 	spinlock_t lock; /* xfer lock */
+ };
+@@ -1105,6 +1108,149 @@ static int rockchip_i2s_tdm_dai_prepare(struct platform_device *pdev,
+ 	return 0;
+ }
+ 
++static int rockchip_i2s_tdm_path_check(struct rk_i2s_tdm_dev *i2s_tdm,
++				       int num,
++				       bool is_rx_path)
++{
++	unsigned int *i2s_data;
++	int i, j, ret = 0;
++
++	if (is_rx_path)
++		i2s_data = i2s_tdm->i2s_sdis;
++	else
++		i2s_data = i2s_tdm->i2s_sdos;
++
++	for (i = 0; i < num; i++) {
++		if (i2s_data[i] > CH_GRP_MAX - 1) {
++			dev_err(i2s_tdm->dev,
++				"%s path i2s_data[%d]: %d is overflow, max is: %d\n",
++				is_rx_path ? "RX" : "TX",
++				i, i2s_data[i], CH_GRP_MAX);
++			ret = -EINVAL;
++			goto err;
++		}
++
++		for (j = 0; j < num; j++) {
++			if (i == j)
++				continue;
++
++			if (i2s_data[i] == i2s_data[j]) {
++				dev_err(i2s_tdm->dev,
++					"%s path invalid routed i2s_data: [%d]%d == [%d]%d\n",
++					is_rx_path ? "RX" : "TX",
++					i, i2s_data[i],
++					j, i2s_data[j]);
++				ret = -EINVAL;
++				goto err;
++			}
++		}
++	}
++
++err:
++	return ret;
++}
++
++static void rockchip_i2s_tdm_tx_path_config(struct rk_i2s_tdm_dev *i2s_tdm,
++					    int num)
++{
++	int idx;
++
++	for (idx = 0; idx < num; idx++) {
++		regmap_update_bits(i2s_tdm->regmap, I2S_TXCR,
++				   I2S_TXCR_PATH_MASK(idx),
++				   I2S_TXCR_PATH(idx, i2s_tdm->i2s_sdos[idx]));
++	}
++}
++
++static void rockchip_i2s_tdm_rx_path_config(struct rk_i2s_tdm_dev *i2s_tdm,
++					    int num)
++{
++	int idx;
++
++	for (idx = 0; idx < num; idx++) {
++		regmap_update_bits(i2s_tdm->regmap, I2S_RXCR,
++				   I2S_RXCR_PATH_MASK(idx),
++				   I2S_RXCR_PATH(idx, i2s_tdm->i2s_sdis[idx]));
++	}
++}
++
++static void rockchip_i2s_tdm_path_config(struct rk_i2s_tdm_dev *i2s_tdm,
++					 int num, bool is_rx_path)
++{
++	if (is_rx_path)
++		rockchip_i2s_tdm_rx_path_config(i2s_tdm, num);
++	else
++		rockchip_i2s_tdm_tx_path_config(i2s_tdm, num);
++}
++
++static int rockchip_i2s_tdm_path_prepare(struct rk_i2s_tdm_dev *i2s_tdm,
++					 struct device_node *np,
++					 bool is_rx_path)
++{
++	char *i2s_tx_path_prop = "rockchip,i2s-tx-route";
++	char *i2s_rx_path_prop = "rockchip,i2s-rx-route";
++	char *i2s_path_prop;
++	unsigned int *i2s_data;
++	int num, ret = 0;
++
++	if (is_rx_path) {
++		i2s_path_prop = i2s_rx_path_prop;
++		i2s_data = i2s_tdm->i2s_sdis;
++	} else {
++		i2s_path_prop = i2s_tx_path_prop;
++		i2s_data = i2s_tdm->i2s_sdos;
++	}
++
++	num = of_count_phandle_with_args(np, i2s_path_prop, NULL);
++	if (num < 0) {
++		if (num != -ENOENT) {
++			dev_err(i2s_tdm->dev,
++				"Failed to read '%s' num: %d\n",
++				i2s_path_prop, num);
++			ret = num;
++		}
++		goto out;
++	} else if (num != CH_GRP_MAX) {
++		dev_err(i2s_tdm->dev,
++			"The num: %d should be: %d\n", num, CH_GRP_MAX);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = of_property_read_u32_array(np, i2s_path_prop,
++					 i2s_data, num);
++	if (ret < 0) {
++		dev_err(i2s_tdm->dev,
++			"Failed to read '%s': %d\n",
++			i2s_path_prop, ret);
++		goto out;
++	}
++
++	ret = rockchip_i2s_tdm_path_check(i2s_tdm, num, is_rx_path);
++	if (ret < 0) {
++		dev_err(i2s_tdm->dev,
++			"Failed to check i2s data bus: %d\n", ret);
++		goto out;
++	}
++
++	rockchip_i2s_tdm_path_config(i2s_tdm, num, is_rx_path);
++
++out:
++	return ret;
++}
++
++static int rockchip_i2s_tdm_tx_path_prepare(struct rk_i2s_tdm_dev *i2s_tdm,
++					    struct device_node *np)
++{
++	return rockchip_i2s_tdm_path_prepare(i2s_tdm, np, 0);
++}
++
++static int rockchip_i2s_tdm_rx_path_prepare(struct rk_i2s_tdm_dev *i2s_tdm,
++					    struct device_node *np)
++{
++	return rockchip_i2s_tdm_path_prepare(i2s_tdm, np, 1);
++}
++
+ static int rockchip_i2s_tdm_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *node = pdev->dev.of_node;
+@@ -1229,6 +1375,18 @@ static int rockchip_i2s_tdm_probe(struct platform_device *pdev)
+ 	i2s_tdm->capture_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+ 	i2s_tdm->capture_dma_data.maxburst = 8;
+ 
++	ret = rockchip_i2s_tdm_tx_path_prepare(i2s_tdm, node);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "I2S TX path prepare failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = rockchip_i2s_tdm_rx_path_prepare(i2s_tdm, node);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "I2S RX path prepare failed: %d\n", ret);
++		return ret;
++	}
++
+ 	atomic_set(&i2s_tdm->refcount, 0);
+ 	dev_set_drvdata(&pdev->dev, i2s_tdm);
+ 
+diff --git a/sound/soc/rockchip/rockchip_i2s_tdm.h b/sound/soc/rockchip/rockchip_i2s_tdm.h
+index 32a91ed85d4e..eb1f5405b9cc 100644
+--- a/sound/soc/rockchip/rockchip_i2s_tdm.h
++++ b/sound/soc/rockchip/rockchip_i2s_tdm.h
+@@ -18,6 +18,9 @@
+  * TXCR
+  * transmit operation control register
+  */
++#define I2S_TXCR_PATH_SHIFT(x)	(23 + (x) * 2)
++#define I2S_TXCR_PATH_MASK(x)	(0x3 << I2S_TXCR_PATH_SHIFT(x))
++#define I2S_TXCR_PATH(x, v)	((v) << I2S_TXCR_PATH_SHIFT(x))
+ #define I2S_TXCR_RCNT_SHIFT	17
+ #define I2S_TXCR_RCNT_MASK	(0x3f << I2S_TXCR_RCNT_SHIFT)
+ #define I2S_TXCR_CSR_SHIFT	15
+@@ -52,6 +55,9 @@
+  * RXCR
+  * receive operation control register
+  */
++#define I2S_RXCR_PATH_SHIFT(x)	(17 + (x) * 2)
++#define I2S_RXCR_PATH_MASK(x)	(0x3 << I2S_RXCR_PATH_SHIFT(x))
++#define I2S_RXCR_PATH(x, v)	((v) << I2S_RXCR_PATH_SHIFT(x))
+ #define I2S_RXCR_CSR_SHIFT	15
+ #define I2S_RXCR_CSR(x)		(x << I2S_RXCR_CSR_SHIFT)
+ #define I2S_RXCR_CSR_MASK	(3 << I2S_RXCR_CSR_SHIFT)
+-- 
+2.35.3
+

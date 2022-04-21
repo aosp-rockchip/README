@@ -1,0 +1,273 @@
+From 89ad83006599bf9de93bec11d3d20c108f8ead1e Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Wed, 23 Sep 2020 17:27:08 +0800
+Subject: [PATCH] video: rockchip: mpp: add iommu pagefault handle for rkvenc
+
+method: When iommu read/write pagefault is caused by insufficient buffer,
+map a 4K buffer to keep the hardware running normally, so as to avoid
+hardware timeout.
+
+Change-Id: Ib55f92e5e63224f789c2e9dbeba51d413a600d3c
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c |  44 +++++++----
+ drivers/video/rockchip/mpp/mpp_rkvenc.c | 100 ++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index dad3ed64fb76..e860d73bf26f 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -316,10 +316,12 @@ static void mpp_task_timeout_work(struct work_struct *work_s)
+ 					     struct mpp_task,
+ 					     timeout_work);
+ 
+-	if (test_and_set_bit(TASK_STATE_HANDLE, &task->state))
++	if (test_and_set_bit(TASK_STATE_HANDLE, &task->state)) {
++		mpp_err("task has been handled\n");
+ 		return;
++	}
+ 
+-	mpp_err("task %p processing timed out!\n", task);
++	mpp_err("task %p processing time out!\n", task);
+ 	if (!task->session) {
+ 		mpp_err("task %p, task->session is null.\n", task);
+ 		return;
+@@ -1567,7 +1569,6 @@ static int mpp_iommu_handle(struct iommu_domain *iommu,
+ 			    unsigned long iova,
+ 			    int status, void *arg)
+ {
+-	u32 i, s, e;
+ 	struct mpp_dev *mpp = (struct mpp_dev *)arg;
+ 	struct mpp_task *task = mpp_taskqueue_get_running_task(mpp->queue);
+ 
+@@ -1578,14 +1579,18 @@ static int mpp_iommu_handle(struct iommu_domain *iommu,
+ 
+ 	mpp_task_dump_mem_region(mpp, task);
+ 
+-	s = task->hw_info->reg_start;
+-	e = task->hw_info->reg_end;
+-	mpp_err("--- dump register ---\n");
+-	for (i = s; i <= e; i++) {
+-		u32 reg = i * sizeof(u32);
++	if (mpp_debug_unlikely(DEBUG_DUMP_ERR_REG)) {
++		u32 i;
++		u32 s = task->hw_info->reg_start;
++		u32 e = task->hw_info->reg_end;
++
++		mpp_err("--- dump register ---\n");
++		for (i = s; i <= e; i++) {
++			u32 reg = i * sizeof(u32);
+ 
+-		mpp_err("reg[%03d]: %04x: 0x%08x\n",
+-			i, reg, readl_relaxed(mpp->reg_base + reg));
++			mpp_err("reg[%03d]: %04x: 0x%08x\n",
++				i, reg, readl_relaxed(mpp->reg_base + reg));
++		}
+ 	}
+ 
+ 	if (mpp->iommu_info->hdl)
+@@ -1721,26 +1726,31 @@ int mpp_dev_remove(struct mpp_dev *mpp)
+ 
+ irqreturn_t mpp_dev_irq(int irq, void *param)
+ {
+-	irqreturn_t ret = IRQ_NONE;
++	bool ret = false;
+ 	struct mpp_dev *mpp = param;
+ 	struct mpp_task *task = mpp->cur_task;
++	irqreturn_t irq_ret = IRQ_NONE;
+ 
+ 	if (task) {
+ 		/* if wait or delayed work timeout, abort request will turn on,
+ 		 * isr should not to response, and handle it in delayed work
+ 		 */
+-		if (test_and_set_bit(TASK_STATE_HANDLE, &task->state))
+-			return IRQ_HANDLED;
++		if (test_and_set_bit(TASK_STATE_HANDLE, &task->state)) {
++			mpp_err("error, task has been handled, irq_status %08x\n", mpp->irq_status);
++			goto done;
++		}
+ 		cancel_delayed_work(&task->timeout_work);
+-
++		/* normal condition, set state and wake up isr thread */
+ 		set_bit(TASK_STATE_IRQ, &task->state);
+-		if (mpp->dev_ops->irq)
+-			ret = mpp->dev_ops->irq(mpp);
++		ret = true;
+ 	} else {
+ 		mpp_err("error, task is null\n");
+ 	}
++done:
++	if (mpp->dev_ops->irq)
++		irq_ret = mpp->dev_ops->irq(mpp);
+ 
+-	return ret;
++	return ret ? irq_ret : IRQ_HANDLED;
+ }
+ 
+ irqreturn_t mpp_dev_isr_sched(int irq, void *param)
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 0259d80be39e..83a39373e4e8 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -26,6 +26,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/proc_fs.h>
+ #include <linux/nospec.h>
++#include <linux/workqueue.h>
+ #include <soc/rockchip/pm_domains.h>
+ #include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+@@ -41,6 +42,9 @@
+ 
+ #define RKVENC_DRIVER_NAME			"mpp_rkvenc"
+ 
++#define IOMMU_GET_BUS_ID(x)			(((x) >> 6) & 0x1f)
++#define IOMMU_PAGE_SIZE				SZ_4K
++
+ #define	RKVENC_SESSION_MAX_BUFFERS		40
+ /* The maximum registers number of all the version */
+ #define RKVENC_REG_L1_NUM			780
+@@ -197,6 +201,12 @@ struct rkvenc_dev {
+ 	struct thermal_cooling_device *devfreq_cooling;
+ 	struct monitor_dev_info *mdev_info;
+ #endif
++	/* for iommu pagefault handle */
++	struct work_struct iommu_work;
++	struct workqueue_struct *iommu_wq;
++	struct page *aux_page;
++	unsigned long aux_iova;
++	unsigned long fault_iova;
+ };
+ 
+ struct link_table_elem {
+@@ -488,6 +498,9 @@ static int rkvenc_isr(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_task *task = NULL;
+ 	struct mpp_task *mpp_task = mpp->cur_task;
++	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
++
++	mpp_debug_enter();
+ 
+ 	/* FIXME use a spin lock here */
+ 	if (!mpp_task) {
+@@ -508,7 +521,14 @@ static int rkvenc_isr(struct mpp_dev *mpp)
+ 			mpp_task_dump_reg(mpp, mpp_task);
+ 	}
+ 
++	/* unmap reserve buffer */
++	if (enc->aux_iova != -1) {
++		iommu_unmap(mpp->iommu_info->domain, enc->aux_iova, IOMMU_PAGE_SIZE);
++		enc->aux_iova = -1;
++	}
++
+ 	mpp_task_finish(mpp_task->session, mpp_task);
++
+ 	mpp_debug_leave();
+ 
+ 	return IRQ_HANDLED;
+@@ -1036,6 +1056,52 @@ static int rkvenc_devfreq_remove(struct mpp_dev *mpp)
+ }
+ #endif
+ 
++static void rkvenc_iommu_handle_work(struct work_struct *work_s)
++{
++	int ret = 0;
++	struct rkvenc_dev *enc = container_of(work_s, struct rkvenc_dev, iommu_work);
++	struct mpp_dev *mpp = &enc->mpp;
++	unsigned long page_iova = 0;
++
++
++	/* avoid another page fault occur after page fault */
++	down_write(&mpp->iommu_info->rw_sem);
++
++	if (enc->aux_iova != -1) {
++		iommu_unmap(mpp->iommu_info->domain, enc->aux_iova, IOMMU_PAGE_SIZE);
++		enc->aux_iova = -1;
++	}
++
++	page_iova = round_down(enc->fault_iova, SZ_4K);
++	ret = iommu_map(mpp->iommu_info->domain, page_iova,
++			page_to_phys(enc->aux_page), IOMMU_PAGE_SIZE,
++			IOMMU_READ | IOMMU_WRITE);
++	if (ret)
++		mpp_err("iommu_map iova %lx error.\n", page_iova);
++	else
++		enc->aux_iova = page_iova;
++
++	up_write(&mpp->iommu_info->rw_sem);
++}
++
++static int rkvenc_iommu_fault_handle(struct iommu_domain *iommu,
++				     struct device *iommu_dev,
++				     unsigned long iova, int status, void *arg)
++{
++	struct mpp_dev *mpp = (struct mpp_dev *)arg;
++	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
++
++	mpp_debug_enter();
++	mpp_debug(DEBUG_IOMMU, "IOMMU_GET_BUS_ID(status)=%d\n", IOMMU_GET_BUS_ID(status));
++	if (IOMMU_GET_BUS_ID(status)) {
++		enc->fault_iova = iova;
++		queue_work(enc->iommu_wq, &enc->iommu_work);
++	}
++	mpp_debug_leave();
++
++	return 0;
++}
++
+ static int rkvenc_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+@@ -1077,14 +1143,48 @@ static int rkvenc_init(struct mpp_dev *mpp)
+ 	if (ret)
+ 		mpp_err("failed to add venc devfreq\n");
+ #endif
++
++	/* for mmu pagefault */
++	enc->aux_page = alloc_page(GFP_KERNEL);
++	if (!enc->aux_page) {
++		dev_err(mpp->dev, "allocate a page for auxiliary usage\n");
++		return -ENOMEM;
++	}
++	enc->aux_iova = -1;
++
++	enc->iommu_wq = create_singlethread_workqueue("iommu_wq");
++	if (!enc->iommu_wq) {
++		mpp_err("failed to create workqueue\n");
++		return -ENOMEM;
++	}
++	INIT_WORK(&enc->iommu_work, rkvenc_iommu_handle_work);
++
++	mpp->iommu_info->hdl = rkvenc_iommu_fault_handle;
++
+ 	return ret;
+ }
+ 
+ static int rkvenc_exit(struct mpp_dev *mpp)
+ {
++	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
++
+ #ifdef CONFIG_PM_DEVFREQ
+ 	rkvenc_devfreq_remove(mpp);
+ #endif
++
++	if (enc->aux_page)
++		__free_page(enc->aux_page);
++
++	if (enc->aux_iova != -1) {
++		iommu_unmap(mpp->iommu_info->domain, enc->aux_iova, IOMMU_PAGE_SIZE);
++		enc->aux_iova = -1;
++	}
++
++	if (enc->iommu_wq) {
++		destroy_workqueue(enc->iommu_wq);
++		enc->iommu_wq = NULL;
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.35.3
+

@@ -1,0 +1,121 @@
+From 1846e7d725d986786e4fc427f8f3c39c105c2809 Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Tue, 7 Mar 2017 17:36:50 +0800
+Subject: [PATCH] nvmem: rockchip-efuse: add rk3368-efuse support
+
+This adds the necessary data for handling efuse on the rk3368.
+As efuse of rk3368 is secure, use secure interface to access efuse.
+
+Change-Id: I72c29348b7744b232d75ab51c56dc7de0988c24e
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ .../bindings/nvmem/rockchip-efuse.txt         |  1 +
+ drivers/nvmem/rockchip-efuse.c                | 52 +++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/nvmem/rockchip-efuse.txt b/Documentation/devicetree/bindings/nvmem/rockchip-efuse.txt
+index fba905b32aac..36ee06eb8469 100644
+--- a/Documentation/devicetree/bindings/nvmem/rockchip-efuse.txt
++++ b/Documentation/devicetree/bindings/nvmem/rockchip-efuse.txt
+@@ -6,6 +6,7 @@ Required properties:
+   - "rockchip,rk3188-efuse" - for RK3188 SoCs.
+   - "rockchip,rk3288-efuse" - for RK3288 SoCs.
+   - "rockchip,rk3366-efuse" - for RK3366 SoCs.
++  - "rockchip,rk3368-efuse" - for RK3368 SoCs.
+   - "rockchip,rk3399-efuse" - for RK3399 SoCs.
+ - reg: Should contain the registers location and exact eFuse size
+ - clocks: Should be the clock id of eFuse
+diff --git a/drivers/nvmem/rockchip-efuse.c b/drivers/nvmem/rockchip-efuse.c
+index 0995634ba1ba..986734aef252 100644
+--- a/drivers/nvmem/rockchip-efuse.c
++++ b/drivers/nvmem/rockchip-efuse.c
+@@ -24,6 +24,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
++#include <linux/rockchip/rockchip_sip.h>
+ 
+ #define RK3288_A_SHIFT		6
+ #define RK3288_A_MASK		0x3ff
+@@ -55,6 +56,7 @@ struct rockchip_efuse_chip {
+ 	struct device *dev;
+ 	void __iomem *base;
+ 	struct clk *clk;
++	phys_addr_t phys;
+ };
+ 
+ static int rockchip_rk3288_efuse_read(void *context, unsigned int offset,
+@@ -137,6 +139,51 @@ static int rockchip_rk3366_efuse_read(void *context, unsigned int offset,
+ 	return 0;
+ }
+ 
++static int rockchip_rk3368_efuse_read(void *context, unsigned int offset,
++				      void *val, size_t bytes)
++{
++	struct rockchip_efuse_chip *efuse = context;
++	u8 *buf = val;
++	u32 wr_val;
++	int ret;
++
++	ret = clk_prepare_enable(efuse->clk);
++	if (ret < 0) {
++		dev_err(efuse->dev, "failed to prepare/enable efuse clk\n");
++		return ret;
++	}
++
++	sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL,
++				 RK3288_LOAD | RK3288_PGENB);
++	udelay(1);
++	while (bytes--) {
++		wr_val = sip_smc_secure_reg_read(efuse->phys + REG_EFUSE_CTRL) &
++			 (~(RK3288_A_MASK << RK3288_A_SHIFT));
++		sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL, wr_val);
++		wr_val = sip_smc_secure_reg_read(efuse->phys + REG_EFUSE_CTRL) |
++			 ((offset++ & RK3288_A_MASK) << RK3288_A_SHIFT);
++		sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL, wr_val);
++		udelay(1);
++		wr_val = sip_smc_secure_reg_read(efuse->phys + REG_EFUSE_CTRL) |
++			 RK3288_STROBE;
++		sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL, wr_val);
++		udelay(1);
++		*buf++ = sip_smc_secure_reg_read(efuse->phys + REG_EFUSE_DOUT);
++		wr_val = sip_smc_secure_reg_read(efuse->phys + REG_EFUSE_CTRL) &
++			 (~RK3288_STROBE);
++		sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL, wr_val);
++		udelay(1);
++	}
++
++	/* Switch to standby mode */
++	sip_smc_secure_reg_write(efuse->phys + REG_EFUSE_CTRL,
++				 RK3288_PGENB | RK3288_CSB);
++
++	clk_disable_unprepare(efuse->clk);
++
++	return 0;
++}
++
+ static int rockchip_rk3399_efuse_read(void *context, unsigned int offset,
+ 				      void *val, size_t bytes)
+ {
+@@ -222,6 +269,10 @@ static const struct of_device_id rockchip_efuse_match[] = {
+ 		.compatible = "rockchip,rk3366-efuse",
+ 		.data = (void *)&rockchip_rk3366_efuse_read,
+ 	},
++	{
++		.compatible = "rockchip,rk3368-efuse",
++		.data = (void *)&rockchip_rk3368_efuse_read,
++	},
+ 	{
+ 		.compatible = "rockchip,rk3399-efuse",
+ 		.data = (void *)&rockchip_rk3399_efuse_read,
+@@ -250,6 +301,7 @@ static int __init rockchip_efuse_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	efuse->phys = res->start;
+ 	efuse->base = devm_ioremap_resource(&pdev->dev, res);
+ 	if (IS_ERR(efuse->base))
+ 		return PTR_ERR(efuse->base);
+-- 
+2.35.3
+

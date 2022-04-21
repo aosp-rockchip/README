@@ -1,0 +1,270 @@
+From 6dd99e4e6ff37a6de06b24c09c91e896501f20dd Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Mon, 22 Jul 2019 14:35:04 +0800
+Subject: [PATCH] drm/rockchip: driver: add support more function
+
+Change-Id: I4175947340647891dd7422b6ab30af23fb47876e
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c   | 60 ++++++++++++++++++-
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h   |  3 +
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.c    |  5 +-
+ drivers/gpu/drm/rockchip/rockchip_drm_fbdev.c | 22 ++++++-
+ drivers/gpu/drm/rockchip/rockchip_drm_gem.c   |  6 +-
+ drivers/gpu/drm/rockchip/rockchip_drm_gem.h   |  3 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c   | 20 ++++++-
+ 7 files changed, 107 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 418d878d52a6..813c6648c740 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -1029,6 +1029,32 @@ static int __init rockchip_clocks_loader_unprotect(void)
+ late_initcall_sync(rockchip_clocks_loader_unprotect);
+ #endif
+ 
++int rockchip_drm_crtc_send_mcu_cmd(struct drm_device *drm_dev,
++				   struct device_node *np_crtc,
++				   u32 type, u32 value)
++{
++	struct drm_crtc *crtc;
++	int pipe = 0;
++	struct rockchip_drm_private *priv;
++
++	if (!np_crtc || !of_device_is_available(np_crtc))
++		return -EINVAL;
++
++	drm_for_each_crtc(crtc, drm_dev) {
++		if (of_get_parent(crtc->port) == np_crtc)
++			break;
++	}
++
++	pipe = drm_crtc_index(crtc);
++	if (pipe >= ROCKCHIP_MAX_CRTC)
++		return -EINVAL;
++	priv = crtc->dev->dev_private;
++	if (priv->crtc_funcs[pipe]->crtc_send_mcu_cmd)
++		priv->crtc_funcs[pipe]->crtc_send_mcu_cmd(crtc, type, value);
++
++	return 0;
++}
++
+ /*
+  * Attach a (component) device to the shared drm dma mapping from master drm
+  * device.  This is used by the VOPs to map GEM buffers to a common DMA
+@@ -1089,6 +1115,29 @@ void rockchip_unregister_crtc_funcs(struct drm_crtc *crtc)
+ 	priv->crtc_funcs[pipe] = NULL;
+ }
+ 
++static int rockchip_drm_fault_handler(struct iommu_domain *iommu,
++				      struct device *dev,
++				      unsigned long iova, int flags, void *arg)
++{
++	struct drm_device *drm_dev = arg;
++	struct rockchip_drm_private *priv = drm_dev->dev_private;
++	struct drm_crtc *crtc;
++
++	drm_for_each_crtc(crtc, drm_dev) {
++		int pipe = drm_crtc_index(crtc);
++
++		if (priv->crtc_funcs[pipe] &&
++		    priv->crtc_funcs[pipe]->regs_dump)
++			priv->crtc_funcs[pipe]->regs_dump(crtc, NULL);
++
++		if (priv->crtc_funcs[pipe] &&
++		    priv->crtc_funcs[pipe]->debugfs_dump)
++			priv->crtc_funcs[pipe]->debugfs_dump(crtc, NULL);
++	}
++
++	return 0;
++}
++
+ static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
+ {
+ 	struct rockchip_drm_private *private = drm_dev->dev_private;
+@@ -1111,6 +1160,9 @@ static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
+ 	drm_mm_init(&private->mm, start, end - start + 1);
+ 	mutex_init(&private->mm_lock);
+ 
++	iommu_set_fault_handler(private->domain, rockchip_drm_fault_handler,
++				drm_dev);
++
+ 	return 0;
+ }
+ 
+@@ -1374,9 +1426,6 @@ static int rockchip_drm_bind(struct device *dev)
+ 	if (IS_ERR(drm_dev))
+ 		return PTR_ERR(drm_dev);
+ 
+-	ret = drm_dev_set_unique(drm_dev, dev_name(dev));
+-	if (ret)
+-		goto err_free;
+ 	dev_set_drvdata(dev, drm_dev);
+ 
+ 	private = devm_kzalloc(drm_dev->dev, sizeof(*private), GFP_KERNEL);
+@@ -1481,6 +1530,9 @@ static int rockchip_drm_bind(struct device *dev)
+ 		struct drm_fb_helper *helper = private->fbdev_helper;
+ 		struct rockchip_crtc_state *s = NULL;
+ 
++		if (!helper)
++			break;
++
+ 		s = to_rockchip_crtc_state(crtc->state);
+ 		if (is_support_hotplug(s->output_type)) {
+ 			crtc->primary->fb = helper->fb;
+@@ -1604,6 +1656,8 @@ static struct drm_driver rockchip_drm_driver = {
+ 	.gem_vm_ops		= &drm_gem_cma_vm_ops,
+ 	.gem_free_object_unlocked = rockchip_gem_free_object,
+ 	.dumb_create		= rockchip_gem_dumb_create,
++	.dumb_map_offset	= rockchip_gem_dumb_map_offset,
++	.dumb_destroy		= drm_gem_dumb_destroy,
+ 	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
+ 	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
+ 	.gem_prime_import	= drm_gem_prime_import,
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 901c1eae69a1..f3129287088b 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -185,6 +185,9 @@ int rockchip_register_crtc_funcs(struct drm_crtc *crtc,
+ 				 const struct rockchip_crtc_funcs *crtc_funcs);
+ void rockchip_unregister_crtc_funcs(struct drm_crtc *crtc);
+ int rockchip_drm_wait_vact_end(struct drm_crtc *crtc, unsigned int mstimeout);
++int rockchip_drm_crtc_send_mcu_cmd(struct drm_device *drm_dev,
++				   struct device_node *np_crtc,
++				   u32 type, u32 value);
+ 
+ extern struct platform_driver cdn_dp_driver;
+ extern struct platform_driver dw_hdmi_rockchip_pltfm_driver;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+index 05b262bc9503..2bea5f1a2d1b 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+@@ -483,8 +483,9 @@ void rockchip_drm_mode_config_init(struct drm_device *dev)
+ 	 * this value would be used to check framebuffer size limitation
+ 	 * at drm_mode_addfb().
+ 	 */
+-	dev->mode_config.max_width = 4096;
+-	dev->mode_config.max_height = 4096;
++	dev->mode_config.max_width = 8192;
++	dev->mode_config.max_height = 8192;
++	dev->mode_config.async_page_flip = true;
+ 
+ 	dev->mode_config.funcs = &rockchip_drm_mode_config_funcs;
+ 	dev->mode_config.helper_private = &rockchip_mode_config_helpers;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fbdev.c b/drivers/gpu/drm/rockchip/rockchip_drm_fbdev.c
+index 42c1467390e4..d8e080fae71a 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fbdev.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fbdev.c
+@@ -50,13 +50,31 @@ static struct dma_buf *rockchip_fbdev_get_dma_buf(struct fb_info *info)
+ 	return buf;
+ }
+ 
++static int rockchip_fbdev_blank(int blank, struct fb_info *info)
++{
++	struct drm_fb_helper *helper = info->par;
++
++	drm_fb_helper_restore_fbdev_mode_unlocked(helper);
++
++	return drm_fb_helper_blank(blank, info);
++}
++
+ static struct fb_ops rockchip_drm_fbdev_ops = {
+ 	.owner		= THIS_MODULE,
+-	DRM_FB_HELPER_DEFAULT_OPS,
+-	.fb_mmap	= rockchip_fbdev_mmap,
++	.fb_check_var	= drm_fb_helper_check_var,
++	.fb_set_par	= drm_fb_helper_set_par,
++	.fb_setcmap	= drm_fb_helper_setcmap,
++	.fb_pan_display	= drm_fb_helper_pan_display,
++	.fb_debug_enter = drm_fb_helper_debug_enter,
++	.fb_debug_leave = drm_fb_helper_debug_leave,
++	.fb_ioctl	= drm_fb_helper_ioctl,
+ 	.fb_fillrect	= drm_fb_helper_cfb_fillrect,
+ 	.fb_copyarea	= drm_fb_helper_cfb_copyarea,
+ 	.fb_imageblit	= drm_fb_helper_cfb_imageblit,
++	.fb_read	= drm_fb_helper_sys_read,
++	.fb_write	= drm_fb_helper_sys_write,
++	.fb_mmap		= rockchip_fbdev_mmap,
++	.fb_blank		= rockchip_fbdev_blank,
+ 	.fb_dmabuf_export	= rockchip_fbdev_get_dma_buf,
+ };
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+index cd8845bbec01..bb2c108a81f5 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+@@ -839,9 +839,9 @@ void rockchip_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr)
+ 	/* Nothing to do if allocated by DMA mapping API. */
+ }
+ 
+-static int rockchip_gem_dumb_map_offset(struct drm_file *file_priv,
+-					struct drm_device *dev, uint32_t handle,
+-					uint64_t *offset)
++int rockchip_gem_dumb_map_offset(struct drm_file *file_priv,
++				 struct drm_device *dev, uint32_t handle,
++				 uint64_t *offset)
+ {
+ 	struct drm_gem_object *obj;
+ 	int ret;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.h b/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
+index ce39f0537e74..9b3b01ede8ec 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
+@@ -68,6 +68,9 @@ void rockchip_gem_free_object(struct drm_gem_object *obj);
+ int rockchip_gem_dumb_create(struct drm_file *file_priv,
+ 			     struct drm_device *dev,
+ 			     struct drm_mode_create_dumb *args);
++int rockchip_gem_dumb_map_offset(struct drm_file *file_priv,
++				 struct drm_device *dev, uint32_t handle,
++				 uint64_t *offset);
+ /*
+  * request gem object creation and buffer allocation as the size
+  * that it is calculated with framebuffer information such as width,
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index d19fc282cc1f..e20cc42aa590 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -1484,6 +1484,22 @@ static void vop_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	}
+ }
+ 
++static int vop_plane_prepare_fb(struct drm_plane *plane,
++				struct drm_plane_state *new_state)
++{
++	if (plane->state->fb)
++		drm_framebuffer_get(plane->state->fb);
++
++	return 0;
++}
++
++static void vop_plane_cleanup_fb(struct drm_plane *plane,
++				 struct drm_plane_state *old_state)
++{
++	if (old_state->fb)
++		drm_framebuffer_put(old_state->fb);
++}
++
+ static int vop_plane_atomic_check(struct drm_plane *plane,
+ 			   struct drm_plane_state *state)
+ {
+@@ -1794,6 +1810,8 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ }
+ 
+ static const struct drm_plane_helper_funcs plane_helper_funcs = {
++	.prepare_fb = vop_plane_prepare_fb,
++	.cleanup_fb = vop_plane_cleanup_fb,
+ 	.atomic_check = vop_plane_atomic_check,
+ 	.atomic_update = vop_plane_atomic_update,
+ 	.atomic_disable = vop_plane_atomic_disable,
+@@ -2516,8 +2534,6 @@ static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc,  u32 type, u32 value)
+ 
+ static const struct rockchip_crtc_funcs private_crtc_funcs = {
+ 	.loader_protect = vop_crtc_loader_protect,
+-	.enable_vblank = vop_crtc_enable_vblank,
+-	.disable_vblank = vop_crtc_disable_vblank,
+ 	.cancel_pending_vblank = vop_crtc_cancel_pending_vblank,
+ 	.debugfs_init = vop_crtc_debugfs_init,
+ 	.debugfs_dump = vop_crtc_debugfs_dump,
+-- 
+2.35.3
+

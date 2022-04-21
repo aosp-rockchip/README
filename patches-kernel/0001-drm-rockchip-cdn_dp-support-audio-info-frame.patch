@@ -1,0 +1,147 @@
+From ce1a9c72c5a7d70094e8991b8caea1e028274c50 Mon Sep 17 00:00:00 2001
+From: Chris Zhong <zyw@rock-chips.com>
+Date: Thu, 30 Mar 2017 13:49:21 +0800
+Subject: [PATCH] drm/rockchip: cdn_dp: support audio info frame
+
+Change-Id: I867b79dce73aa7c82dd06e6ed6e2963e118f1129
+Signed-off-by: Chris Zhong <zyw@rock-chips.com>
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/cdn-dp-core.c | 51 ++++++++++++++++++++++++++
+ drivers/gpu/drm/rockchip/cdn-dp-reg.c  | 18 +++++++++
+ drivers/gpu/drm/rockchip/cdn-dp-reg.h  | 14 +++++++
+ 3 files changed, 83 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.c b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+index f33841a3c1db..e483bd941d89 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+@@ -1051,6 +1051,53 @@ static int cdn_dp_parse_dt(struct cdn_dp_device *dp)
+ 	return 0;
+ }
+ 
++struct dp_sdp {
++	struct edp_sdp_header sdp_header;
++	u8 db[28];
++} __packed;
++
++static int cdn_dp_setup_audio_infoframe(struct cdn_dp_device *dp)
++{
++	struct dp_sdp infoframe_sdp;
++	struct hdmi_audio_infoframe frame;
++	u8 buffer[14];
++	ssize_t err;
++
++	/* Prepare VSC packet as per EDP 1.4 spec, Table 6.9 */
++	memset(&infoframe_sdp, 0, sizeof(infoframe_sdp));
++	infoframe_sdp.sdp_header.HB0 = 0;
++	infoframe_sdp.sdp_header.HB1 = HDMI_INFOFRAME_TYPE_AUDIO;
++	infoframe_sdp.sdp_header.HB2 = 0x1b;
++	infoframe_sdp.sdp_header.HB3 = 0x48;
++
++	err = hdmi_audio_infoframe_init(&frame);
++	if (err < 0) {
++		DRM_DEV_ERROR(dp->dev, "Failed to setup audio infoframe: %zd\n",
++			      err);
++		return err;
++	}
++
++	frame.coding_type = HDMI_AUDIO_CODING_TYPE_STREAM;
++	frame.sample_frequency = HDMI_AUDIO_SAMPLE_FREQUENCY_STREAM;
++	frame.sample_size = HDMI_AUDIO_SAMPLE_SIZE_STREAM;
++	frame.channels = 0;
++
++	err = hdmi_audio_infoframe_pack(&frame, buffer, sizeof(buffer));
++	if (err < 0) {
++		DRM_DEV_ERROR(dp->dev, "Failed to pack audio infoframe: %zd\n",
++			      err);
++		return err;
++	}
++
++	memcpy(&infoframe_sdp.db[0], &buffer[HDMI_INFOFRAME_HEADER_SIZE],
++	       sizeof(buffer) - HDMI_INFOFRAME_HEADER_SIZE);
++
++	cdn_dp_infoframe_set(dp, 0, (u8 *)&infoframe_sdp,
++			     sizeof(infoframe_sdp), 0x84);
++
++	return 0;
++}
++
+ static int cdn_dp_audio_hw_params(struct device *dev,  void *data,
+ 				  struct hdmi_codec_daifmt *daifmt,
+ 				  struct hdmi_codec_params *params)
+@@ -1082,6 +1129,10 @@ static int cdn_dp_audio_hw_params(struct device *dev,  void *data,
+ 		goto out;
+ 	}
+ 
++	ret = cdn_dp_setup_audio_infoframe(dp);
++	if (ret)
++		goto out;
++
+ 	ret = cdn_dp_audio_config(dp, &audio);
+ 	if (!ret)
+ 		dp->audio_info = audio;
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.c b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+index d70bd3d8872b..c0395a871d5e 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+@@ -1032,6 +1032,24 @@ static void cdn_dp_audio_config_spdif(struct cdn_dp_device *dp)
+ 	clk_set_rate(dp->spdif_clk, CDN_DP_SPDIF_CLK);
+ }
+ 
++void cdn_dp_infoframe_set(struct cdn_dp_device *dp, int entry_id,
++			  u8 *buf, u32 len, int type)
++{
++	unsigned int idx;
++	u32 *packet = (u32 *)buf;
++	u32 length = len / 4;
++
++	for (idx = 0; idx < length; idx++)
++		writel(cpu_to_le32(*packet++), dp->regs + SOURCE_PIF_DATA_WR);
++
++	writel(entry_id, dp->regs + SOURCE_PIF_WR_ADDR);
++	writel(HOST_WR, dp->regs + SOURCE_PIF_WR_REQ);
++	writel(ACTIVE_IDLE_TYPE(1) | TYPE_VALID |
++	       PACKET_TYPE(type) | PKT_ALLOC_ADDRESS(entry_id),
++	       dp->regs + SOURCE_PIF_PKT_ALLOC_REG);
++	writel(PKT_ALLOC_WR_EN, dp->regs + SOURCE_PIF_PKT_ALLOC_WR_EN);
++}
++
+ int cdn_dp_audio_config(struct cdn_dp_device *dp, struct audio_info *audio)
+ {
+ 	int ret;
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.h b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+index a558624e4a4d..effc2ef34171 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+@@ -457,6 +457,18 @@
+ #define SPDIF_JITTER_THRSH(x)			(((x) & 0xff) << 3)
+ #define SPDIF_JITTER_AVG_WIN(x)			((x) & 0x7)
+ 
++/* SOURCE_PIF_WR_REQ */
++#define HOST_WR			BIT(0)
++
++/* SOURCE_PIF_PKT_ALLOC_REG */
++#define ACTIVE_IDLE_TYPE(x)	(((x) & 0x1) << 17)
++#define TYPE_VALID		BIT(16)
++#define PACKET_TYPE(x)		(((x) & 0xff) << 8)
++#define PKT_ALLOC_ADDRESS(x)	(((x) & 0xf) << 0)
++
++/* SOURCE_PIF_PKT_ALLOC_WR_EN */
++#define PKT_ALLOC_WR_EN		BIT(0)
++
+ /* Reference cycles when using lane clock as reference */
+ #define LANE_REF_CYC				0xf000
+ 
+@@ -556,6 +568,8 @@ int cdn_dp_config_video(struct cdn_dp_device *dp);
+ int cdn_dp_audio_stop(struct cdn_dp_device *dp, struct audio_info *audio);
+ int cdn_dp_audio_mute(struct cdn_dp_device *dp, bool enable);
+ int cdn_dp_audio_config(struct cdn_dp_device *dp, struct audio_info *audio);
++void cdn_dp_infoframe_set(struct cdn_dp_device *dp, int entry_id, u8 *buf,
++			  u32 len, int type);
+ int cdn_dp_hdcp_tx_configuration(struct cdn_dp_device *dp, int tx_mode,
+ 						 bool active);
+ int cdn_dp_hdcp_tx_status_req(struct cdn_dp_device *dp, uint16_t *tx_status);
+-- 
+2.35.3
+

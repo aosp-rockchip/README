@@ -1,0 +1,426 @@
+From 6f2dead30462a395ae4739cd66ea0e1c02aa7c00 Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Tue, 11 Jun 2019 17:30:56 +0800
+Subject: [PATCH] rk: scripts: add repack-bootimg
+
+Also add unpack_bootimg and update mkbootimg
+
+AOSP 96fd8874ef8e ("Check DTB image size for boot image header version 2 and above")
+
+Change-Id: I4582913b21f711c84d62bed0ffd024b583a094f7
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ scripts/mkbootimg      |  32 ++++++++-
+ scripts/repack-bootimg | 160 +++++++++++++++++++++++++++++++++++++++++
+ scripts/unpack_bootimg | 152 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 342 insertions(+), 2 deletions(-)
+ create mode 100755 scripts/repack-bootimg
+ create mode 100755 scripts/unpack_bootimg
+
+diff --git a/scripts/mkbootimg b/scripts/mkbootimg
+index fda9af0d28fb..934f28e43029 100755
+--- a/scripts/mkbootimg
++++ b/scripts/mkbootimg
+@@ -62,7 +62,13 @@ def get_recovery_dtbo_offset(args):
+ 
+ 
+ def write_header(args):
++    BOOT_IMAGE_HEADER_V1_SIZE = 1648
++    BOOT_IMAGE_HEADER_V2_SIZE = 1660
+     BOOT_MAGIC = 'ANDROID!'.encode()
++
++    if (args.header_version > 2):
++        raise ValueError('Boot header version %d not supported' % args.header_version)
++
+     args.output.write(pack('8s', BOOT_MAGIC))
+     args.output.write(pack('10I',
+         filesize(args.kernel),                          # size in bytes
+@@ -85,6 +91,8 @@ def write_header(args):
+ 
+     if args.header_version > 0:
+         update_sha(sha, args.recovery_dtbo)
++    if args.header_version > 1:
++        update_sha(sha, args.dtb)
+ 
+     img_id = pack('32s', sha.digest())
+ 
+@@ -97,8 +105,20 @@ def write_header(args):
+             args.output.write(pack('Q', get_recovery_dtbo_offset(args))) # recovery dtbo offset
+         else:
+             args.output.write(pack('Q', 0)) # Will be set to 0 for devices without a recovery dtbo
+-        args.output.write(pack('I', args.output.tell() + 4))         # size of boot header
+ 
++    # Populate boot image header size for header versions 1 and 2.
++    if args.header_version == 1:
++        args.output.write(pack('I', BOOT_IMAGE_HEADER_V1_SIZE))
++    elif args.header_version == 2:
++        args.output.write(pack('I', BOOT_IMAGE_HEADER_V2_SIZE))
++
++    if args.header_version > 1:
++
++        if filesize(args.dtb) == 0:
++            raise ValueError("DTB image must not be empty.")
++
++        args.output.write(pack('I', filesize(args.dtb)))   # size in bytes
++        args.output.write(pack('Q', args.base + args.dtb_offset)) # dtb physical load address
+     pad_file(args.output, args.pagesize)
+     return img_id
+ 
+@@ -161,7 +181,11 @@ def parse_cmdline():
+                         required=True)
+     parser.add_argument('--ramdisk', help='path to the ramdisk', type=FileType('rb'))
+     parser.add_argument('--second', help='path to the 2nd bootloader', type=FileType('rb'))
+-    parser.add_argument('--recovery_dtbo', help='path to the recovery DTBO', type=FileType('rb'))
++    parser.add_argument('--dtb', help='path to dtb', type=FileType('rb'))
++    recovery_dtbo_group = parser.add_mutually_exclusive_group()
++    recovery_dtbo_group.add_argument('--recovery_dtbo', help='path to the recovery DTBO', type=FileType('rb'))
++    recovery_dtbo_group.add_argument('--recovery_acpio', help='path to the recovery ACPIO',
++                                     type=FileType('rb'), metavar='RECOVERY_ACPIO', dest='recovery_dtbo')
+     parser.add_argument('--cmdline', help='extra arguments to be passed on the '
+                         'kernel command line', default='', action=ValidateStrLenAction, maxlen=1536)
+     parser.add_argument('--base', help='base address', type=parse_int, default=0x10000000)
+@@ -169,6 +193,8 @@ def parse_cmdline():
+     parser.add_argument('--ramdisk_offset', help='ramdisk offset', type=parse_int, default=0x01000000)
+     parser.add_argument('--second_offset', help='2nd bootloader offset', type=parse_int,
+                         default=0x00f00000)
++    parser.add_argument('--dtb_offset', help='dtb offset', type=parse_int, default=0x01f00000)
++
+     parser.add_argument('--os_version', help='operating system version', type=parse_os_version,
+                         default=0)
+     parser.add_argument('--os_patch_level', help='operating system patch level',
+@@ -193,6 +219,8 @@ def write_data(args):
+ 
+     if args.header_version > 0:
+         write_padded_file(args.output, args.recovery_dtbo, args.pagesize)
++    if args.header_version > 1:
++        write_padded_file(args.output, args.dtb, args.pagesize)
+ 
+ def main():
+     args = parse_cmdline()
+diff --git a/scripts/repack-bootimg b/scripts/repack-bootimg
+new file mode 100755
+index 000000000000..a4f0298c449b
+--- /dev/null
++++ b/scripts/repack-bootimg
+@@ -0,0 +1,160 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++# Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd.
++set -e
++
++usage() {
++	cat >&2 << USAGE
++usage: $0 [-h] [-z] --boot_img BOOT_IMG [--out OUT] [--kernel KERNEL] [--ramdisk RAMDISK] [--second SECOND] [--dtb DTB ] [--recovery_dtbo RECOVERY_DTBO] -o OUTPUT
++
++optional arguments:
++  -h, --help            show this help message and exit
++  -z                    pack compressed kernel image
++  --boot_img BOOT_IMG   path to the original boot image
++  --out OUT             path to out binaries (default: out)
++  --kernel KERNEL       path to the new kernel
++  --ramdisk RAMDISK     path to the new ramdisk
++  --second SECOND       path to the new 2nd bootloader (default: resource.img)
++  --dtb DTB             path to the new dtb
++  --recovery_dtbo RECOVERY_DTBO
++                        path to the new recovery DTBO
++  -o OUTPUT, --output OUTPUT
++                        output file name
++USAGE
++}
++
++# Parse command-line arguments
++while [ $# -gt 0 ]; do
++	case $1 in
++		--boot_img)
++			boot_img=$2
++			shift 2
++			;;
++		--out)
++			out=$2
++			shift 2
++			;;
++		--kernel)
++			kernel=$2
++			shift 2
++			;;
++		--ramdisk)
++			ramdisk=$2
++			shift 2
++			;;
++		--second)
++			second=$2
++			shift 2
++			;;
++		--dtb)
++			dtb=$2
++			shift 2
++			;;
++		--recovery_dtbo)
++			recovery_dtbo=$2
++			shift 2
++			;;
++		-h)
++			usage
++			exit 0
++			;;
++		--help)
++			usage
++			exit 0
++			;;
++		-z)
++			compressed_kernel=y
++			shift
++			;;
++		-o)
++			output=$2
++			shift 2
++			;;
++		--output)
++			output=$2
++			shift 2
++			;;
++		*)
++			shift
++			;;
++        esac
++done
++
++if [ "$boot_img" == "" -o ! -e "$boot_img" ]; then
++	echo "No boot img"
++	usage
++	exit 1
++fi
++
++if [ "$output" == "" ]; then
++	echo "No output file name"
++	usage
++	exit 1
++fi
++
++srctree=${srctree-"."}
++objtree=${objtree-"."}
++out=${out-"out"}
++if [ "$($srctree/scripts/config --state CONFIG_ARM64)" == "y" ]; then
++	if [ "$compressed_kernel" == "y" ]; then
++		default_kernel=arch/arm64/boot/Image.lz4
++	else
++		default_kernel=arch/arm64/boot/Image
++	fi
++else
++	if [ "$compressed_kernel" == "y" ]; then
++		default_kernel=arch/arm/boot/zImage
++	else
++		default_kernel=arch/arm/boot/Image
++	fi
++fi
++kernel=${kernel-$objtree/$default_kernel}
++second=${second-$objtree/resource.img}
++ramdisk=${ramdisk-$out/ramdisk}
++dtb=${dtb-$out/dtb}
++recovery_dtbo=${recovery_dtbo-$out/recovery_dtbo}
++log="$out/unpack.log"
++
++mkdir -p $out
++$srctree/scripts/unpack_bootimg --boot_img $boot_img --out $out > $log
++
++cmdline=$(grep -a "^command line args: " $log | tr '\0' '\n'| sed "s/^command line args: //")
++extra_cmdline=$(grep -a "^additional command line args: " $log | tr '\0' '\n'| sed "s/^additional command line args: //")
++version=$(grep -a "^boot image header version: " $log | sed "s/^boot image header version: //")
++
++os_version_patch_level=$(grep -a "^os version and patch level: " $log | sed "s/^os version and patch level: //")
++
++v=$(($os_version_patch_level >> 11))
++a=$(($v >> 14))
++b=$((($v >> 7) & 0x7f))
++c=$(($v & 0x7f))
++os_version=$(printf '%d.%d.%d' $a $b $c)
++
++v=$(($os_version_patch_level & 0x7ff))
++y=$((($v >> 4) + 2000))
++m=$((($v & 15)))
++os_patch_level=$(printf '%d-%02d-01' $y $m)
++
++dtb_size=$(grep -a "^dtb size: " $log | sed "s/^dtb size: //")
++dtb_size=${dtb_size:-0}
++if [ $dtb_size -gt 0 -a -e "$dtb" ]; then
++	DTB="--dtb $dtb"
++fi
++
++recovery_dtbo_size=$(grep -a "^recovery dtbo size: " $log | sed "s/^recovery dtbo size: //")
++recovery_dtbo_size=${recovery_dtbo_size:-0}
++if [ $recovery_dtbo_size -gt 0 -a -e "$recovery_dtbo" ]; then
++	RECOVERY_DTBO="--recovery_dtbo $recovery_dtbo"
++fi
++
++$srctree/scripts/mkbootimg \
++--kernel $kernel \
++--second $second \
++--ramdisk $ramdisk \
++$DTB \
++$RECOVERY_DTBO \
++--cmdline "${cmdline}${extra_cmdline}" \
++--header_version $version \
++--os_version $os_version \
++--os_patch_level $os_patch_level \
++--output $output
+diff --git a/scripts/unpack_bootimg b/scripts/unpack_bootimg
+new file mode 100755
+index 000000000000..789bf5e6d906
+--- /dev/null
++++ b/scripts/unpack_bootimg
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python
++# Copyright 2018, The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""unpacks the bootimage.
++
++Extracts the kernel, ramdisk, second bootloader, dtb and recovery dtbo images.
++"""
++
++from __future__ import print_function
++from argparse import ArgumentParser, FileType
++from struct import unpack
++import os
++
++
++def create_out_dir(dir_path):
++    """creates a directory 'dir_path' if it does not exist"""
++    if not os.path.exists(dir_path):
++        os.makedirs(dir_path)
++
++
++def extract_image(offset, size, bootimage, extracted_image_name):
++    """extracts an image from the bootimage"""
++    bootimage.seek(offset)
++    with open(extracted_image_name, 'wb') as file_out:
++        file_out.write(bootimage.read(size))
++
++
++def get_number_of_pages(image_size, page_size):
++    """calculates the number of pages required for the image"""
++    return (image_size + page_size - 1) / page_size
++
++
++def unpack_bootimage(args):
++    """extracts kernel, ramdisk, second bootloader and recovery dtbo"""
++    boot_magic = unpack('8s', args.boot_img.read(8))
++    print('boot_magic: %s' % boot_magic)
++    kernel_ramdisk_second_info = unpack('10I', args.boot_img.read(10 * 4))
++    print('kernel_size: %s' % kernel_ramdisk_second_info[0])
++    print('kernel load address: %#x' % kernel_ramdisk_second_info[1])
++    print('ramdisk size: %s' % kernel_ramdisk_second_info[2])
++    print('ramdisk load address: %#x' % kernel_ramdisk_second_info[3])
++    print('second bootloader size: %s' % kernel_ramdisk_second_info[4])
++    print('second bootloader load address: %#x' % kernel_ramdisk_second_info[5])
++    print('kernel tags load address: %#x' % kernel_ramdisk_second_info[6])
++    print('page size: %s' % kernel_ramdisk_second_info[7])
++    print('boot image header version: %s' % kernel_ramdisk_second_info[8])
++    print('os version and patch level: %s' % kernel_ramdisk_second_info[9])
++
++    product_name = unpack('16s', args.boot_img.read(16))
++    print('product name: %s' % product_name)
++    cmdline = unpack('512s', args.boot_img.read(512))
++    print('command line args: %s' % cmdline)
++
++    args.boot_img.read(32)  # ignore SHA
++
++    extra_cmdline = unpack('1024s', args.boot_img.read(1024))
++    print('additional command line args: %s' % extra_cmdline)
++
++    kernel_size = kernel_ramdisk_second_info[0]
++    ramdisk_size = kernel_ramdisk_second_info[2]
++    second_size = kernel_ramdisk_second_info[4]
++    page_size = kernel_ramdisk_second_info[7]
++    version = kernel_ramdisk_second_info[8]
++    if version > 0:
++        recovery_dtbo_size = unpack('I', args.boot_img.read(1 * 4))[0]
++        print('recovery dtbo size: %s' % recovery_dtbo_size)
++        recovery_dtbo_offset = unpack('Q', args.boot_img.read(8))[0]
++        print('recovery dtbo offset: %#x' % recovery_dtbo_offset)
++        boot_header_size = unpack('I', args.boot_img.read(4))[0]
++        print('boot header size: %s' % boot_header_size)
++    else:
++        recovery_dtbo_size = 0
++    if version > 1:
++        dtb_size = unpack('I', args.boot_img.read(4))[0]
++        print('dtb size: %s' % dtb_size)
++        dtb_load_address = unpack('Q', args.boot_img.read(8))[0]
++        print('dtb address: %#x' % dtb_load_address)
++    else:
++        dtb_size = 0
++
++
++    # The first page contains the boot header
++    num_header_pages = 1
++
++    num_kernel_pages = get_number_of_pages(kernel_size, page_size)
++    kernel_offset = page_size * num_header_pages  # header occupies a page
++    image_info_list = [(kernel_offset, kernel_size, 'kernel')]
++
++    num_ramdisk_pages = get_number_of_pages(ramdisk_size, page_size)
++    ramdisk_offset = page_size * (num_header_pages + num_kernel_pages
++                                 ) # header + kernel
++    image_info_list.append((ramdisk_offset, ramdisk_size, 'ramdisk'))
++
++    if second_size > 0:
++        second_offset = page_size * (
++                num_header_pages + num_kernel_pages + num_ramdisk_pages
++                )  # header + kernel + ramdisk
++        image_info_list.append((second_offset, second_size, 'second'))
++
++    if recovery_dtbo_size > 0:
++        image_info_list.append((recovery_dtbo_offset, recovery_dtbo_size,
++                                'recovery_dtbo'))
++    if dtb_size > 0:
++        num_second_pages = get_number_of_pages(second_size, page_size)
++        num_recovery_dtbo_pages = get_number_of_pages(recovery_dtbo_size, page_size)
++        dtb_offset = page_size * (
++            num_header_pages + num_kernel_pages + num_ramdisk_pages + num_second_pages +
++            num_recovery_dtbo_pages
++        )
++
++        image_info_list.append((dtb_offset, dtb_size, 'dtb'))
++
++    for image_info in image_info_list:
++        extract_image(image_info[0], image_info[1], args.boot_img,
++                      os.path.join(args.out, image_info[2]))
++
++
++def parse_cmdline():
++    """parse command line arguments"""
++    parser = ArgumentParser(
++        description='Unpacks boot.img/recovery.img, extracts the kernel,'
++        'ramdisk, second bootloader, recovery dtbo and dtb')
++    parser.add_argument(
++        '--boot_img',
++        help='path to boot image',
++        type=FileType('rb'),
++        required=True)
++    parser.add_argument('--out', help='path to out binaries', default='out')
++    return parser.parse_args()
++
++
++def main():
++    """parse arguments and unpack boot image"""
++    args = parse_cmdline()
++    create_out_dir(args.out)
++    unpack_bootimage(args)
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.35.3
+

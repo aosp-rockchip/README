@@ -1,0 +1,322 @@
+From 10232a98b003c356096840a258a5e5f5a2fc69ad Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Mon, 24 Aug 2020 15:11:39 +0800
+Subject: [PATCH] media: rockchip: isp: switch hdr frame mode for read back
+
+Change-Id: I4077f35579023b30e42952dd2c2ac917b49cbfbf
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  |  4 +-
+ drivers/media/platform/rockchip/isp/capture.c |  2 +-
+ drivers/media/platform/rockchip/isp/csi.c     | 52 +++++++++++--------
+ drivers/media/platform/rockchip/isp/csi.h     |  7 +--
+ drivers/media/platform/rockchip/isp/dmarx.c   |  2 +-
+ .../platform/rockchip/isp/isp_params_v2x.c    | 10 ++--
+ drivers/media/platform/rockchip/isp/rkisp.c   |  4 +-
+ include/uapi/linux/rkisp2-config.h            | 20 +++++++
+ 8 files changed, 62 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 17e374d1060f..586af13437f7 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -733,8 +733,8 @@ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev)
+ 
+ 	/* dmarx isr is unreliable, MI frame end to replace it */
+ 	if (*mis_val & (MI_MP_FRAME | MI_MPFBC_FRAME) &&
+-	    IS_HDR_RDBK(dev->hdr.op_mode)) {
+-		switch (dev->hdr.op_mode) {
++	    IS_HDR_RDBK(dev->csi_dev.rd_mode)) {
++		switch (dev->csi_dev.rd_mode) {
+ 		case HDR_RDBK_FRAME3://for rd1 rd0 rd2
+ 			val |= RAW1_RD_FRAME;
+ 			/* FALLTHROUGH */
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index ae329b342968..af9eecf50b9a 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -3227,7 +3227,7 @@ void rkisp_mi_isr(u32 mis_val, struct rkisp_device *dev)
+ 				end_tx0 = false;
+ 				end_tx1 = false;
+ 				end_tx2 = false;
+-				rkisp_trigger_read_back(&dev->csi_dev, false);
++				rkisp_trigger_read_back(&dev->csi_dev, false, false);
+ 			}
+ 		}
+ 	}
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index a4d33f99fb8a..ded417065b40 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -133,7 +133,6 @@ static int rkisp_csi_s_stream(struct v4l2_subdev *sd, int on)
+ 	struct rkisp_device *dev = csi->ispdev;
+ 
+ 	memset(csi->tx_first, 0, sizeof(csi->tx_first));
+-	memset(csi->filt_state, 0, sizeof(csi->filt_state));
+ 
+ 	if (!IS_HDR_RDBK(dev->hdr.op_mode))
+ 		return 0;
+@@ -452,10 +451,11 @@ int rkisp_csi_config_patch(struct rkisp_device *dev)
+ 		rkisp_write(dev, CSI2RX_MASK_STAT, 0x7FFFFF7F, true);
+ 	}
+ 
+-	if (IS_HDR_RDBK(dev->hdr.op_mode))
++	if (IS_HDR_RDBK(dev->hdr.op_mode)) {
++		dev->csi_dev.rd_mode = dev->hdr.op_mode;
+ 		rkisp_set_bits(dev, CTRL_SWS_CFG,
+ 			       0, SW_MPIP_DROP_FRM_DIS, true);
+-	dev->csi_dev.is_isp_end = true;
++	}
+ 	return ret;
+ }
+ 
+@@ -463,32 +463,38 @@ int rkisp_csi_config_patch(struct rkisp_device *dev)
+  * for hdr read back mode, rawrd read back data
+  * this will update rawrd base addr to shadow.
+  */
+-void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
++void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ {
+ 	struct rkisp_device *dev = csi->ispdev;
+ 	struct rkisp_hw_dev *hw = dev->hw_dev;
+ 	struct rkisp_isp_params_vdev *params_vdev = &dev->params_vdev;
+-	u32 val, cur_frame_id;
++	u32 val, cur_frame_id, tmp;
++	bool is_upd = false;
+ 
+ 	rkisp_dmarx_get_frame(dev, &cur_frame_id, NULL, true);
+ 	if (dma2frm > 2)
+ 		dma2frm = 2;
+-	memset(csi->filt_state, 0, sizeof(csi->filt_state));
+-	switch (dev->hdr.op_mode) {
+-	case HDR_RDBK_FRAME3://is rawrd1 rawrd0 rawrd2
+-		csi->filt_state[CSI_F_RD1] = dma2frm;
+-	case HDR_RDBK_FRAME2://is rawrd0 and rawrd2
+-		csi->filt_state[CSI_F_RD0] = dma2frm;
+-	case HDR_RDBK_FRAME1://only rawrd2
+-		csi->filt_state[CSI_F_RD2] = dma2frm;
+-		break;
+-	default://other no support readback
+-		return;
+-	}
+ 
+ 	/* configure hdr params in rdbk mode */
+ 	rkisp_params_cfg(params_vdev, cur_frame_id, dma2frm + 1);
+ 
++	val = 0;
++	if (mode & T_START_X1) {
++		csi->rd_mode = HDR_RDBK_FRAME1;
++	} else if (mode & T_START_X2) {
++		csi->rd_mode = HDR_RDBK_FRAME2;
++		val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX2;
++	} else if (mode & T_START_X3) {
++		csi->rd_mode = HDR_RDBK_FRAME3;
++		val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX3;
++	}
++
++	tmp = rkisp_read(dev, ISP_HDRMGE_BASE, false) & 0xf;
++	if (val != tmp) {
++		rkisp_write(dev, ISP_HDRMGE_BASE, val, false);
++		is_upd = true;
++	}
++
+ 	if (!hw->is_single) {
+ 		rkisp_update_regs(dev, CTRL_VI_ISP_PATH, SUPER_IMP_COLOR_CR);
+ 		rkisp_update_regs(dev, ISP_ACQ_PROP, CSI2RX_VERSION);
+@@ -499,7 +505,9 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 			val = ISP_LSC_LUT_EN | ISP_LSC_EN;
+ 			rkisp_set_bits(dev, ISP_LSC_CTRL, val, val, true);
+ 		}
+-
++		is_upd = true;
++	}
++	if (is_upd) {
+ 		val = rkisp_read(dev, ISP_CTRL, false);
+ 		val |= CIF_ISP_CTRL_ISP_CFG_UPD;
+ 		rkisp_write(dev, ISP_CTRL, val, true);
+@@ -507,15 +515,13 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 		/* wait 50 us to load lsc table, otherwise lsc lut error will occur */
+ 		udelay(50);
+ 	}
+-	/* not using isp V_START irq to generate sof event */
+-	csi->filt_state[CSI_F_VS] = dma2frm + 1;
+ 	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
+ 		 "readback frame:%d time:%d\n",
+ 		 cur_frame_id, dma2frm + 1);
+ 	val = rkisp_read(dev, CSI2RX_CTRL0, true);
+ 	val &= ~SW_IBUF_OP_MODE(0xf);
+ 	val |= SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) |
+-		SW_IBUF_OP_MODE(dev->hdr.op_mode);
++		SW_IBUF_OP_MODE(csi->rd_mode);
+ 	rkisp_write(dev, CSI2RX_CTRL0, val, true);
+ }
+ 
+@@ -527,6 +533,7 @@ static void rkisp_dev_trigger_handle(struct rkisp_device *dev, u32 cmd)
+ 	unsigned long lock_flags = 0;
+ 	int i, times = -1, max = 0, id = 0;
+ 	int len[DEV_MAX] = { 0 };
++	u32 mode = 0;
+ 
+ 	spin_lock_irqsave(&hw->rdbk_lock, lock_flags);
+ 	if (cmd == T_CMD_END)
+@@ -553,6 +560,7 @@ static void rkisp_dev_trigger_handle(struct rkisp_device *dev, u32 cmd)
+ 		isp->dmarx_dev.pre_frame = isp->dmarx_dev.cur_frame;
+ 		isp->dmarx_dev.cur_frame.id = t.frame_id;
+ 		isp->dmarx_dev.cur_frame.timestamp = t.frame_timestamp;
++		mode = t.mode;
+ 		times = t.times;
+ 		hw->cur_dev_id = id;
+ 		hw->is_idle = false;
+@@ -560,7 +568,7 @@ static void rkisp_dev_trigger_handle(struct rkisp_device *dev, u32 cmd)
+ end:
+ 	spin_unlock_irqrestore(&hw->rdbk_lock, lock_flags);
+ 	if (times >= 0)
+-		rkisp_trigger_read_back(&isp->csi_dev, times);
++		rkisp_trigger_read_back(&isp->csi_dev, times, mode);
+ }
+ 
+ /* handle read back event from user or isp idle isr */
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 490c93a79a3a..230b0f0a7c82 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -70,10 +70,8 @@ struct sink_info {
+  * rdbk_kfifo: read back event fifo
+  * rdbk_lock: lock for read back event
+  * mipi_di: Data Identifier (vc[7:6],dt[5:0])
+- * filt_state: multiframe read back mode to filt irq event
+  * tx_first: flags for dmatx first Y_STATE irq
+  * memory: compact or big/little endian byte order for tx/rx
+- * is_isp_end: flags of isp frame end
+  */
+ struct rkisp_csi_device {
+ 	struct rkisp_device *ispdev;
+@@ -83,11 +81,10 @@ struct rkisp_csi_device {
+ 	struct kfifo rdbk_kfifo;
+ 	spinlock_t rdbk_lock;
+ 	int max_pad;
++	u32 rd_mode;
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
+-	u8 filt_state[CSI_F_MAX];
+ 	u8 tx_first[HDR_DMA_MAX];
+ 	u8 memory;
+-	bool is_isp_end;
+ };
+ 
+ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+@@ -95,7 +92,7 @@ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+ void rkisp_unregister_csi_subdev(struct rkisp_device *dev);
+ 
+ int rkisp_csi_config_patch(struct rkisp_device *dev);
+-void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm);
++void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode);
+ int rkisp_csi_trigger_event(struct rkisp_device *dev, u32 cmd, void *arg);
+ void rkisp_csi_sof(struct rkisp_device *dev, u8 id);
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 1db095d00fb4..2ce6c11f383a 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -948,7 +948,7 @@ void rkisp_dmarx_get_frame(struct rkisp_device *dev,
+ 	}
+ 
+ 	spin_lock_irqsave(&dev->csi_dev.rdbk_lock, flag);
+-	if (sync || dev->csi_dev.is_isp_end) {
++	if (sync) {
+ 		frame_id = dev->dmarx_dev.cur_frame.id;
+ 		frame_timestamp = dev->dmarx_dev.cur_frame.timestamp;
+ 	} else {
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index a9603ac2b399..2d9676c663c5 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -3435,8 +3435,8 @@ isp_gain_config(struct rkisp_isp_params_vdev *params_vdev,
+ 	u32 value, i, gain_wsize;
+ 	u8 tmo_en, mge_en;
+ 
+-	if (dev->hdr.op_mode != HDR_NORMAL &&
+-	    dev->hdr.op_mode != HDR_RDBK_FRAME1) {
++	if (dev->csi_dev.rd_mode != HDR_NORMAL &&
++	    dev->csi_dev.rd_mode != HDR_RDBK_FRAME1) {
+ 		tmo_en = 1;
+ 		mge_en = 1;
+ 	} else {
+@@ -4255,7 +4255,7 @@ rkisp_params_cfg_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 		cur_buf = list_first_entry(&params_vdev->params,
+ 				struct rkisp_buffer, queue);
+ 
+-		if (!IS_HDR_RDBK(dev->hdr.op_mode)) {
++		if (!IS_HDR_RDBK(dev->csi_dev.rd_mode)) {
+ 			list_del(&cur_buf->queue);
+ 			break;
+ 		}
+@@ -4312,13 +4312,13 @@ rkisp_params_isr_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 			return;
+ 
+ 		params_vdev->rdbk_times--;
+-		if (IS_HDR_RDBK(dev->hdr.op_mode) && !params_vdev->rdbk_times) {
++		if (IS_HDR_RDBK(dev->csi_dev.rd_mode) && !params_vdev->rdbk_times) {
+ 			rkisp_params_cfg_v2x(params_vdev, cur_frame_id, 0, RKISP_PARAMS_SHD);
+ 			return;
+ 		}
+ 	}
+ 
+-	if ((isp_mis & CIF_ISP_FRAME) && !IS_HDR_RDBK(dev->hdr.op_mode))
++	if ((isp_mis & CIF_ISP_FRAME) && !IS_HDR_RDBK(dev->csi_dev.rd_mode))
+ 		rkisp_params_cfg_v2x(params_vdev, cur_frame_id, 0, RKISP_PARAMS_ALL);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index d2d331a93093..e997471d5a26 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -2162,9 +2162,7 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 	/* start edge of v_sync */
+ 	if (isp_mis & CIF_ISP_V_START) {
+ 		rkisp_set_state(dev, ISP_FRAME_VS);
+-		dev->csi_dev.is_isp_end = false;
+-		/* filt v_sync when frame read back mode */
+-		if (dev->csi_dev.filt_state[CSI_F_VS]) {
++		if (IS_HDR_RDBK(dev->hdr.op_mode)) {
+ 			rkisp_stats_rdbk_enable(&dev->stats_vdev, true);
+ 			goto vs_skip;
+ 		}
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index eb3bf1bf1c5f..c0c419884f8c 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -151,11 +151,31 @@
+ 
+ #define ISP2X_THUNDERBOOT_VIDEO_BUF_NUM	30
+ 
++/* trigger event mode
++ * T_TRY: trigger maybe with retry
++ * T_TRY_YES: trigger to retry
++ * T_TRY_NO: trigger no to retry
++ *
++ * T_START_X1: isp read one frame
++ * T_START_X2: isp read hdr two frame
++ * T_START_X3: isp read hdr three frame
++ */
++enum isp2x_trigger_mode {
++	T_TRY = BIT(0),
++	T_TRY_YES = BIT(1),
++	T_TRY_NO = BIT(2),
++
++	T_START_X1 = BIT(4),
++	T_START_X2 = BIT(5),
++	T_START_X3 = BIT(6),
++};
++
+ struct isp2x_csi_trigger {
+ 	/* timestamp in ns */
+ 	u64 frame_timestamp;
+ 	u32 frame_id;
+ 	int times;
++	enum isp2x_trigger_mode mode;
+ } __attribute__ ((packed));
+ 
+ enum isp2x_csi_memory {
+-- 
+2.35.3
+

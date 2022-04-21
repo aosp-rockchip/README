@@ -1,0 +1,701 @@
+From b9d7e4ad9e54b2d2300ac4020625fc72055ac0e8 Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Fri, 28 Aug 2020 17:40:10 +0800
+Subject: [PATCH] video: rockchip: mpp: add session info for rkvenc and vepu2
+
+usage:
+    show all session info
+        cat /proc/mpp_service/session_summary
+    show session info for rkvenc
+        cat /proc/mpp_service/rkvenc/session_info
+    show session info for vepu
+        cat /proc/mpp_service/vepu/session_info
+
+Change-Id: Ide903ddbe2c1584eb07fc56693b324c70012e20e
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c  |  41 +++++-
+ drivers/video/rockchip/mpp/mpp_common.h  |  46 ++++++-
+ drivers/video/rockchip/mpp/mpp_rkvenc.c  | 161 +++++++++++++++++++++++
+ drivers/video/rockchip/mpp/mpp_service.c |  31 +++++
+ drivers/video/rockchip/mpp/mpp_vepu2.c   | 160 ++++++++++++++++++++++
+ 5 files changed, 437 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 9c4cd68316fe..61eb1bd14fb8 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -47,7 +47,7 @@
+ #define MPP_CMD_INIT_SUPPORT_MASK_V1		(0x00000007)
+ #define MPP_CMD_SEND_SUPPORT_MASK_V1		(0x0000001F)
+ #define MPP_CMD_POLL_SUPPORT_MASK_V1		(0x00000001)
+-#define MPP_CMD_CONTROL_SUPPORT_MASK_V1		(0x00000007)
++#define MPP_CMD_CONTROL_SUPPORT_MASK_V1		(0x0000000F)
+ 
+ /* input parmater structure for version 1 */
+ struct mpp_msg_v1 {
+@@ -58,6 +58,38 @@ struct mpp_msg_v1 {
+ 	__u64 data_ptr;
+ };
+ 
++#ifdef CONFIG_PROC_FS
++const char *mpp_device_name[MPP_DEVICE_BUTT] = {
++	[MPP_DEVICE_VDPU1]		= "VDPU1",
++	[MPP_DEVICE_VDPU2]		= "VDPU2",
++	[MPP_DEVICE_VDPU1_PP]		= "VDPU1_PP",
++	[MPP_DEVICE_VDPU2_PP]		= "VDPU2_PP",
++	[MPP_DEVICE_HEVC_DEC]		= "HEVC_DEC",
++	[MPP_DEVICE_RKVDEC]		= "RKVDEC",
++	[MPP_DEVICE_AVSPLUS_DEC]	= "AVSPLUS_DEC",
++	[MPP_DEVICE_RKVENC]		= "RKVENC",
++	[MPP_DEVICE_VEPU1]		= "VEPU1",
++	[MPP_DEVICE_VEPU2]		= "VEPU2",
++	[MPP_DEVICE_VEPU22]		= "VEPU22",
++	[MPP_DEVICE_IEP2]		= "IEP2",
++};
++
++const char *enc_info_item_name[ENC_INFO_BUTT] = {
++	[ENC_INFO_BASE]		= "null",
++	[ENC_INFO_WIDTH]	= "width",
++	[ENC_INFO_HEIGHT]	= "height",
++	[ENC_INFO_FORMAT]	= "format",
++	[ENC_INFO_FPS_IN]	= "fps_in",
++	[ENC_INFO_FPS_OUT]	= "fps_out",
++	[ENC_INFO_RC_MODE]	= "rc_mode",
++	[ENC_INFO_BITRATE]	= "bitrate",
++	[ENC_INFO_GOP_SIZE]	= "gop_size",
++	[ENC_INFO_FPS_CALC]	= "fps_calc",
++	[ENC_INFO_PROFILE]	= "profile",
++};
++
++#endif
++
+ static void mpp_free_task(struct kref *ref);
+ 
+ /* task queue schedule */
+@@ -1135,11 +1167,15 @@ static int mpp_dev_open(struct inode *inode, struct file *filp)
+ 	mutex_init(&session->done_lock);
+ 	INIT_LIST_HEAD(&session->pending_list);
+ 	INIT_LIST_HEAD(&session->done_list);
++	INIT_LIST_HEAD(&session->session_link);
+ 
+ 	init_waitqueue_head(&session->wait);
+ 	atomic_set(&session->task_count, 0);
+ 	atomic_set(&session->release_request, 0);
+ 
++	mutex_lock(&srv->session_lock);
++	list_add_tail(&session->session_link, &srv->session_list);
++	mutex_unlock(&srv->session_lock);
+ 	filp->private_data = (void *)session;
+ 
+ 	mpp_debug_leave();
+@@ -1184,6 +1220,9 @@ static int mpp_dev_release(struct inode *inode, struct file *filp)
+ 		mpp_dma_session_destroy(session->dma);
+ 		up_read(&mpp->iommu_info->rw_sem);
+ 	}
++	mutex_lock(&session->srv->session_lock);
++	list_del_init(&session->session_link);
++	mutex_unlock(&session->srv->session_lock);
+ 
+ 	kfree(session);
+ 	filp->private_data = NULL;
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index 9181947ad4dc..807a23f53978 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -97,6 +97,7 @@ enum MPP_DEV_COMMAND_TYPE {
+ 	MPP_CMD_RESET_SESSION		= MPP_CMD_CONTROL_BASE + 0,
+ 	MPP_CMD_TRANS_FD_TO_IOVA	= MPP_CMD_CONTROL_BASE + 1,
+ 	MPP_CMD_RELEASE_FD		= MPP_CMD_CONTROL_BASE + 2,
++	MPP_CMD_SEND_CODEC_INFO		= MPP_CMD_CONTROL_BASE + 3,
+ 
+ 	MPP_CMD_BUTT,
+ };
+@@ -123,6 +124,30 @@ enum MPP_RESET_TYPE {
+ 	RST_TYPE_BUTT,
+ };
+ 
++enum ENC_INFO_TYPE {
++	ENC_INFO_BASE		= 0,
++	ENC_INFO_WIDTH,
++	ENC_INFO_HEIGHT,
++	ENC_INFO_FORMAT,
++	ENC_INFO_FPS_IN,
++	ENC_INFO_FPS_OUT,
++	ENC_INFO_RC_MODE,
++	ENC_INFO_BITRATE,
++	ENC_INFO_GOP_SIZE,
++	ENC_INFO_FPS_CALC,
++	ENC_INFO_PROFILE,
++
++	ENC_INFO_BUTT,
++};
++
++enum ENC_INFO_FLAGS {
++	ENC_INFO_FLAG_NULL		= 0,
++	ENC_INFO_FLAG_NUMBER,
++	ENC_INFO_FLAG_STRING,
++
++	ENC_INFO_FLAG_BUTT,
++};
++
+ /* data common struct for parse out */
+ struct mpp_request {
+ 	__u32 cmd;
+@@ -179,6 +204,12 @@ struct reg_offset_info {
+ 	struct reg_offset_elem elem[MPP_MAX_REG_TRANS_NUM];
+ };
+ 
++struct codec_info_elem {
++	__u32 type;
++	__u32 flag;
++	__u64 data;
++};
++
+ struct mpp_clk_info {
+ 	struct clk *clk;
+ 
+@@ -274,6 +305,10 @@ struct mpp_session {
+ 	/* trans info set by user */
+ 	int trans_count;
+ 	u16 trans_table[MPP_MAX_REG_TRANS_NUM];
++	/* link to mpp_service session_list */
++	struct list_head session_link;
++	/* private data */
++	void *priv;
+ };
+ 
+ /* task state in work thread */
+@@ -365,6 +400,9 @@ struct mpp_service {
+ 	struct mpp_taskqueue *task_queues[MPP_DEVICE_BUTT];
+ 	u32 reset_group_cnt;
+ 	struct mpp_reset_group *reset_groups[MPP_DEVICE_BUTT];
++	/* lock for session list */
++	struct mutex session_lock;
++	struct list_head session_list;
+ };
+ 
+ /*
+@@ -419,9 +457,10 @@ struct mpp_dev_ops {
+ 		      struct mpp_task_msgs *msgs);
+ 	int (*free_task)(struct mpp_session *session,
+ 			 struct mpp_task *task);
+-	long (*ioctl)(struct mpp_session *session, struct mpp_request *req);
++	int (*ioctl)(struct mpp_session *session, struct mpp_request *req);
+ 	int (*init_session)(struct mpp_session *session);
+ 	int (*free_session)(struct mpp_session *session);
++	int (*dump_session)(struct mpp_session *session, struct seq_file *seq);
+ };
+ 
+ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+@@ -613,6 +652,11 @@ mpp_procfs_create_u32(const char *name, umode_t mode,
+ }
+ #endif
+ 
++#ifdef CONFIG_PROC_FS
++extern const char *mpp_device_name[MPP_DEVICE_BUTT];
++extern const char *enc_info_item_name[ENC_INFO_BUTT];
++#endif
++
+ /* workaround according hardware */
+ int px30_workaround_combo_init(struct mpp_dev *mpp);
+ int px30_workaround_combo_switch_grf(struct mpp_dev *mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 989cbab3c759..ba088583587c 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -20,10 +20,12 @@
+ #include <linux/types.h>
+ #include <linux/of_platform.h>
+ #include <linux/slab.h>
++#include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/proc_fs.h>
++#include <linux/nospec.h>
+ #include <soc/rockchip/pm_domains.h>
+ #include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+@@ -160,6 +162,17 @@ struct rkvenc_task {
+ 	struct mpp_request r_reqs[MPP_MAX_MSG_NUM];
+ };
+ 
++struct rkvenc_session_priv {
++	struct rw_semaphore rw_sem;
++	/* codec info from user */
++	struct {
++		/* show mode */
++		u32 flag;
++		/* item data */
++		u64 val;
++	} codec_info[ENC_INFO_BUTT];
++};
++
+ struct rkvenc_dev {
+ 	struct mpp_dev mpp;
+ 
+@@ -599,6 +612,76 @@ static int rkvenc_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
++static int rkvenc_control(struct mpp_session *session, struct mpp_request *req)
++{
++	switch (req->cmd) {
++	case MPP_CMD_SEND_CODEC_INFO: {
++		int i;
++		int cnt;
++		struct codec_info_elem elem;
++		struct rkvenc_session_priv *priv;
++
++		if (!session || !session->priv) {
++			mpp_err("session info null\n");
++			return -EINVAL;
++		}
++		priv = session->priv;
++
++		cnt = req->size / sizeof(elem);
++		mpp_debug(DEBUG_IOCTL, "codec info count %d\n", cnt);
++		for (i = 0; i < cnt; i++) {
++			if (copy_from_user(&elem, req->data + i * sizeof(elem), sizeof(elem))) {
++				mpp_err("copy_from_user failed\n");
++				continue;
++			}
++			if (elem.type > ENC_INFO_BASE && elem.type < ENC_INFO_BUTT &&
++			    elem.flag > ENC_INFO_FLAG_NULL && elem.flag < ENC_INFO_FLAG_BUTT) {
++				elem.type = array_index_nospec(elem.type, ENC_INFO_BUTT);
++				priv->codec_info[elem.type].flag = elem.flag;
++				priv->codec_info[elem.type].val = elem.data;
++			} else {
++				mpp_err("codec info invalid, type %d, flag %d\n",
++					elem.type, elem.flag);
++			}
++		}
++	} break;
++	default: {
++		mpp_err("unknown mpp ioctl cmd %x\n", req->cmd);
++	} break;
++	}
++
++	return 0;
++}
++
++static int rkvenc_free_session(struct mpp_session *session)
++{
++	if (session && session->priv) {
++		kfree(session->priv);
++		session->priv = NULL;
++	}
++
++	return 0;
++}
++
++static int rkvenc_init_session(struct mpp_session *session)
++{
++	struct rkvenc_session_priv *priv;
++
++	if (!session) {
++		mpp_err("session is null\n");
++		return -EINVAL;
++	}
++
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	init_rwsem(&priv->rw_sem);
++	session->priv = priv;
++
++	return 0;
++}
++
+ #ifdef CONFIG_PROC_FS
+ static int rkvenc_procfs_remove(struct mpp_dev *mpp)
+ {
+@@ -612,6 +695,71 @@ static int rkvenc_procfs_remove(struct mpp_dev *mpp)
+ 	return 0;
+ }
+ 
++static int rkvenc_dump_session(struct mpp_session *session, struct seq_file *seq)
++{
++	int i;
++	struct rkvenc_session_priv *priv = session->priv;
++
++	down_read(&priv->rw_sem);
++	/* item name */
++	seq_puts(seq, "------------------------------------------------------");
++	seq_puts(seq, "------------------------------------------------------\n");
++	seq_printf(seq, "|%8s|", (const char *)"session");
++	seq_printf(seq, "%8s|", (const char *)"device");
++	for (i = ENC_INFO_BASE; i < ENC_INFO_BUTT; i++) {
++		bool show = priv->codec_info[i].flag;
++
++		if (show)
++			seq_printf(seq, "%8s|", enc_info_item_name[i]);
++	}
++	seq_puts(seq, "\n");
++	/* item data*/
++	seq_printf(seq, "|%p|", session);
++	seq_printf(seq, "%8s|", mpp_device_name[session->device_type]);
++	for (i = ENC_INFO_BASE; i < ENC_INFO_BUTT; i++) {
++		u32 flag = priv->codec_info[i].flag;
++
++		if (!flag)
++			continue;
++		if (flag == ENC_INFO_FLAG_NUMBER) {
++			u32 data = priv->codec_info[i].val;
++
++			seq_printf(seq, "%8d|", data);
++		} else if (flag == ENC_INFO_FLAG_STRING) {
++			const char *name = (const char *)&priv->codec_info[i].val;
++
++			seq_printf(seq, "%8s|", name);
++		} else {
++			seq_printf(seq, "%8s|", (const char *)"null");
++		}
++	}
++	seq_puts(seq, "\n");
++	up_read(&priv->rw_sem);
++
++	return 0;
++}
++
++static int rkvenc_show_session_info(struct seq_file *seq, void *offset)
++{
++	struct mpp_session *session = NULL, *n;
++	struct mpp_dev *mpp = seq->private;
++
++	mutex_lock(&mpp->srv->session_lock);
++	list_for_each_entry_safe(session, n,
++				 &mpp->srv->session_list,
++				 session_link) {
++		if (session->device_type != MPP_DEVICE_RKVENC)
++			continue;
++		if (!session->priv)
++			continue;
++		if (mpp->dev_ops->dump_session)
++			mpp->dev_ops->dump_session(session, seq);
++	}
++	mutex_unlock(&mpp->srv->session_lock);
++
++	return 0;
++}
++
+ static int rkvenc_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+@@ -622,12 +770,16 @@ static int rkvenc_procfs_init(struct mpp_dev *mpp)
+ 		enc->procfs = NULL;
+ 		return -EIO;
+ 	}
++	/* for debug */
+ 	mpp_procfs_create_u32("aclk", 0644,
+ 			      enc->procfs, &enc->aclk_info.debug_rate_hz);
+ 	mpp_procfs_create_u32("clk_core", 0644,
+ 			      enc->procfs, &enc->core_clk_info.debug_rate_hz);
+ 	mpp_procfs_create_u32("session_buffers", 0644,
+ 			      enc->procfs, &mpp->session_max_buffers);
++	/* for show session info */
++	proc_create_single_data("session_info", 0644,
++				enc->procfs, rkvenc_show_session_info, mpp);
+ 
+ 	return 0;
+ }
+@@ -641,6 +793,11 @@ static inline int rkvenc_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
++
++static inline int rkvenc_dump_session(struct mpp_session *session, struct seq_file *seq)
++{
++	return 0;
++}
+ #endif
+ 
+ #ifdef CONFIG_PM_DEVFREQ
+@@ -1082,6 +1239,10 @@ static struct mpp_dev_ops rkvenc_dev_ops = {
+ 	.finish = rkvenc_finish,
+ 	.result = rkvenc_result,
+ 	.free_task = rkvenc_free_task,
++	.ioctl = rkvenc_control,
++	.init_session = rkvenc_init_session,
++	.free_session = rkvenc_free_session,
++	.dump_session = rkvenc_dump_session,
+ };
+ 
+ static const struct mpp_dev_var rkvenc_v1_data = {
+diff --git a/drivers/video/rockchip/mpp/mpp_service.c b/drivers/video/rockchip/mpp/mpp_service.c
+index a34c4335ea2a..fde84f465835 100644
+--- a/drivers/video/rockchip/mpp/mpp_service.c
++++ b/drivers/video/rockchip/mpp/mpp_service.c
+@@ -161,6 +161,32 @@ static int mpp_show_version(struct seq_file *seq, void *offset)
+ 	return 0;
+ }
+ 
++static int mpp_show_session_summary(struct seq_file *seq, void *offset)
++{
++	struct mpp_session *session = NULL, *n;
++	struct mpp_service *srv = seq->private;
++
++	mutex_lock(&srv->session_lock);
++	list_for_each_entry_safe(session, n,
++				 &srv->session_list,
++				 session_link) {
++		struct  mpp_dev *mpp;
++
++		if (!session->priv)
++			continue;
++
++		if (!session->mpp)
++			continue;
++		mpp = session->mpp;
++
++		if (mpp->dev_ops->dump_session)
++			mpp->dev_ops->dump_session(session, seq);
++	}
++	mutex_unlock(&srv->session_lock);
++
++	return 0;
++}
++
+ static int mpp_procfs_init(struct mpp_service *srv)
+ {
+ 	srv->procfs = proc_mkdir(MPP_SERVICE_NAME, NULL);
+@@ -172,6 +198,9 @@ static int mpp_procfs_init(struct mpp_service *srv)
+ 	if (srv->procfs)
+ 		proc_create_single_data("version", 0644, srv->procfs,
+ 					mpp_show_version, NULL);
++	/* for show session info */
++	proc_create_single_data("session_summary", 0644,
++				srv->procfs, mpp_show_session_summary, srv);
+ 
+ 	return 0;
+ }
+@@ -257,6 +286,8 @@ static int mpp_service_probe(struct platform_device *pdev)
+ 		dev_err(dev, "register %s device\n", MPP_SERVICE_NAME);
+ 		goto fail_register;
+ 	}
++	mutex_init(&srv->session_lock);
++	INIT_LIST_HEAD(&srv->session_list);
+ 	mpp_procfs_init(srv);
+ 
+ 	/* register sub drivers */
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index 76caada07f4e..73bb8cce5da5 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -16,9 +16,11 @@
+ #include <linux/types.h>
+ #include <linux/of_platform.h>
+ #include <linux/slab.h>
++#include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ #include <linux/regmap.h>
+ #include <linux/proc_fs.h>
++#include <linux/nospec.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_debug.h"
+@@ -96,6 +98,17 @@ struct vepu_task {
+ 	u32 pixels;
+ };
+ 
++struct vepu_session_priv {
++	struct rw_semaphore rw_sem;
++	/* codec info from user */
++	struct {
++		/* show mode */
++		u32 flag;
++		/* item data */
++		u64 val;
++	} codec_info[ENC_INFO_BUTT];
++};
++
+ struct vepu_dev {
+ 	struct mpp_dev mpp;
+ 
+@@ -405,6 +418,76 @@ static int vepu_free_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
++static int vepu_control(struct mpp_session *session, struct mpp_request *req)
++{
++	switch (req->cmd) {
++	case MPP_CMD_SEND_CODEC_INFO: {
++		int i;
++		int cnt;
++		struct codec_info_elem elem;
++		struct vepu_session_priv *priv;
++
++		if (!session || !session->priv) {
++			mpp_err("session info null\n");
++			return -EINVAL;
++		}
++		priv = session->priv;
++
++		cnt = req->size / sizeof(elem);
++		mpp_debug(DEBUG_IOCTL, "codec info count %d\n", cnt);
++		for (i = 0; i < cnt; i++) {
++			if (copy_from_user(&elem, req->data + i * sizeof(elem), sizeof(elem))) {
++				mpp_err("copy_from_user failed\n");
++				continue;
++			}
++			if (elem.type > ENC_INFO_BASE && elem.type < ENC_INFO_BUTT &&
++			    elem.flag > ENC_INFO_FLAG_NULL && elem.flag < ENC_INFO_FLAG_BUTT) {
++				elem.type = array_index_nospec(elem.type, ENC_INFO_BUTT);
++				priv->codec_info[elem.type].flag = elem.flag;
++				priv->codec_info[elem.type].val = elem.data;
++			} else {
++				mpp_err("codec info invalid, type %d, flag %d\n",
++					elem.type, elem.flag);
++			}
++		}
++	} break;
++	default: {
++		mpp_err("unknown mpp ioctl cmd %x\n", req->cmd);
++	} break;
++	}
++
++	return 0;
++}
++
++static int vepu_free_session(struct mpp_session *session)
++{
++	if (session && session->priv) {
++		kfree(session->priv);
++		session->priv = NULL;
++	}
++
++	return 0;
++}
++
++static int vepu_init_session(struct mpp_session *session)
++{
++	struct vepu_session_priv *priv;
++
++	if (!session) {
++		mpp_err("session is null\n");
++		return -EINVAL;
++	}
++
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	init_rwsem(&priv->rw_sem);
++	session->priv = priv;
++
++	return 0;
++}
++
+ #ifdef CONFIG_PROC_FS
+ static int vepu_procfs_remove(struct mpp_dev *mpp)
+ {
+@@ -418,6 +501,71 @@ static int vepu_procfs_remove(struct mpp_dev *mpp)
+ 	return 0;
+ }
+ 
++static int vepu_dump_session(struct mpp_session *session, struct seq_file *seq)
++{
++	int i;
++	struct vepu_session_priv *priv = session->priv;
++
++	down_read(&priv->rw_sem);
++	/* item name */
++	seq_puts(seq, "------------------------------------------------------");
++	seq_puts(seq, "------------------------------------------------------\n");
++	seq_printf(seq, "|%8s|", (const char *)"session");
++	seq_printf(seq, "%8s|", (const char *)"device");
++	for (i = ENC_INFO_BASE; i < ENC_INFO_BUTT; i++) {
++		bool show = priv->codec_info[i].flag;
++
++		if (show)
++			seq_printf(seq, "%8s|", enc_info_item_name[i]);
++	}
++	seq_puts(seq, "\n");
++	/* item data*/
++	seq_printf(seq, "|%p|", session);
++	seq_printf(seq, "%8s|", mpp_device_name[session->device_type]);
++	for (i = ENC_INFO_BASE; i < ENC_INFO_BUTT; i++) {
++		u32 flag = priv->codec_info[i].flag;
++
++		if (!flag)
++			continue;
++		if (flag == ENC_INFO_FLAG_NUMBER) {
++			u32 data = priv->codec_info[i].val;
++
++			seq_printf(seq, "%8d|", data);
++		} else if (flag == ENC_INFO_FLAG_STRING) {
++			const char *name = (const char *)&priv->codec_info[i].val;
++
++			seq_printf(seq, "%8s|", name);
++		} else {
++			seq_printf(seq, "%8s|", (const char *)"null");
++		}
++	}
++	seq_puts(seq, "\n");
++	up_read(&priv->rw_sem);
++
++	return 0;
++}
++
++static int vepu_show_session_info(struct seq_file *seq, void *offset)
++{
++	struct mpp_session *session = NULL, *n;
++	struct mpp_dev *mpp = seq->private;
++
++	mutex_lock(&mpp->srv->session_lock);
++	list_for_each_entry_safe(session, n,
++				 &mpp->srv->session_list,
++				 session_link) {
++		if (session->device_type != MPP_DEVICE_VEPU2)
++			continue;
++		if (!session->priv)
++			continue;
++		if (mpp->dev_ops->dump_session)
++			mpp->dev_ops->dump_session(session, seq);
++	}
++	mutex_unlock(&mpp->srv->session_lock);
++
++	return 0;
++}
++
+ static int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+@@ -432,6 +580,9 @@ static int vepu_procfs_init(struct mpp_dev *mpp)
+ 			      enc->procfs, &enc->aclk_info.debug_rate_hz);
+ 	mpp_procfs_create_u32("session_buffers", 0644,
+ 			      enc->procfs, &mpp->session_max_buffers);
++	/* for show session info */
++	proc_create_single_data("session_info", 0644,
++				enc->procfs, vepu_show_session_info, mpp);
+ 
+ 	return 0;
+ }
+@@ -445,6 +596,11 @@ static inline int vepu_procfs_init(struct mpp_dev *mpp)
+ {
+ 	return 0;
+ }
++
++static inline int vepu_dump_session(struct mpp_session *session, struct seq_file *seq)
++{
++	return 0;
++}
+ #endif
+ 
+ static int vepu_init(struct mpp_dev *mpp)
+@@ -607,6 +763,10 @@ static struct mpp_dev_ops vepu_v2_dev_ops = {
+ 	.finish = vepu_finish,
+ 	.result = vepu_result,
+ 	.free_task = vepu_free_task,
++	.ioctl = vepu_control,
++	.init_session = vepu_init_session,
++	.free_session = vepu_free_session,
++	.dump_session = vepu_dump_session,
+ };
+ 
+ static const struct mpp_dev_var vepu_v2_data = {
+-- 
+2.35.3
+

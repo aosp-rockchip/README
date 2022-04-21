@@ -1,0 +1,233 @@
+From 0d8540d2444c2374c28b8ab7de84a59ca044dc30 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 17 Dec 2020 17:55:10 +0800
+Subject: [PATCH] media: rockchip: ispp: vb2 dma sg for iommu enable
+
+Change-Id: If54554daf86b481bbadca636427ffb52c3ca4e67
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/Kconfig  |  1 +
+ drivers/media/platform/rockchip/ispp/common.c | 24 +++++++++++++++----
+ drivers/media/platform/rockchip/ispp/hw.c     |  5 ++++
+ drivers/media/platform/rockchip/ispp/hw.h     |  1 +
+ drivers/media/platform/rockchip/ispp/stats.c  | 11 +++++++--
+ drivers/media/platform/rockchip/ispp/stream.c | 15 ++++++++----
+ 6 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/Kconfig b/drivers/media/platform/rockchip/ispp/Kconfig
+index 0c8c0232fa00..f55c1ef3af5b 100644
+--- a/drivers/media/platform/rockchip/ispp/Kconfig
++++ b/drivers/media/platform/rockchip/ispp/Kconfig
+@@ -5,6 +5,7 @@ config VIDEO_ROCKCHIP_ISPP
+ 	depends on ARCH_ROCKCHIP || COMPILE_TEST
+ 	select VIDEOBUF2_DMA_CONTIG
+ 	select VIDEOBUF2_VMALLOC
++	select VIDEOBUF2_DMA_SG
+ 	default n
+ 	help
+ 	  Support for ISPP on the rockchip SoC.
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index 6cb39513d93d..305f4c00bd3c 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -8,8 +8,6 @@
+ #include "dev.h"
+ #include "regs.h"
+ 
+-static const struct vb2_mem_ops *g_ops = &vb2_dma_contig_memops;
+-
+ void rkispp_write(struct rkispp_device *dev, u32 reg, u32 val)
+ {
+ 	u32 *mem = dev->sw_base_addr + reg;
+@@ -68,6 +66,8 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
+ 	unsigned long attrs = buf->is_need_vaddr ? 0 : DMA_ATTR_NO_KERNEL_MAPPING;
++	const struct vb2_mem_ops *g_ops = dev->hw_dev->mem_ops;
++	struct sg_table  *sg_tbl;
+ 	void *mem_priv;
+ 	int ret = 0;
+ 
+@@ -76,6 +76,7 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 		goto err;
+ 	}
+ 
++	buf->size = PAGE_ALIGN(buf->size);
+ 	mem_priv = g_ops->alloc(dev->hw_dev->dev, attrs, buf->size,
+ 				DMA_BIDIRECTIONAL, GFP_KERNEL);
+ 	if (IS_ERR_OR_NULL(mem_priv)) {
+@@ -84,7 +85,12 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 	}
+ 
+ 	buf->mem_priv = mem_priv;
+-	buf->dma_addr = *((dma_addr_t *)g_ops->cookie(mem_priv));
++	if (dev->hw_dev->is_mmu) {
++		sg_tbl = (struct sg_table *)g_ops->cookie(mem_priv);
++		buf->dma_addr = sg_dma_address(sg_tbl->sgl);
++	} else {
++		buf->dma_addr = *((dma_addr_t *)g_ops->cookie(mem_priv));
++	}
+ 	if (!attrs)
+ 		buf->vaddr = g_ops->vaddr(mem_priv);
+ 	if (buf->is_need_dbuf) {
+@@ -111,6 +117,8 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ void rkispp_free_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
++	const struct vb2_mem_ops *g_ops = dev->hw_dev->mem_ops;
++
+ 	if (buf && buf->mem_priv) {
+ 		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 			 "%s buf:0x%x~0x%x\n", __func__,
+@@ -226,6 +234,7 @@ static int rkispp_find_regbuf_by_stat(struct rkispp_hw_dev *hw, struct rkisp_isp
+ 
+ static void rkispp_free_pool(struct rkispp_hw_dev *hw)
+ {
++	const struct vb2_mem_ops *g_ops = hw->mem_ops;
+ 	struct rkispp_isp_buf_pool *buf;
+ 	int i, j;
+ 
+@@ -254,7 +263,9 @@ static void rkispp_free_pool(struct rkispp_hw_dev *hw)
+ 
+ static int rkispp_init_pool(struct rkispp_hw_dev *hw, struct rkisp_ispp_buf *dbufs)
+ {
++	const struct vb2_mem_ops *g_ops = hw->mem_ops;
+ 	struct rkispp_isp_buf_pool *pool;
++	struct sg_table	 *sg_tbl;
+ 	int i, ret = 0;
+ 	void *mem;
+ 
+@@ -281,7 +292,12 @@ static int rkispp_init_pool(struct rkispp_hw_dev *hw, struct rkisp_ispp_buf *dbu
+ 		ret = g_ops->map_dmabuf(mem);
+ 		if (ret)
+ 			goto err;
+-		pool->dma[i] = *((dma_addr_t *)g_ops->cookie(mem));
++		if (hw->is_mmu) {
++			sg_tbl = (struct sg_table *)g_ops->cookie(mem);
++			pool->dma[i] = sg_dma_address(sg_tbl->sgl);
++		} else {
++			pool->dma[i] = *((dma_addr_t *)g_ops->cookie(mem));
++		}
+ 		if (rkispp_debug)
+ 			dev_info(hw->dev, "%s dma[%d]:0x%x\n",
+ 				 __func__, i, (u32)pool->dma[i]);
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+index b61f23352c61..e1e01cee0f8d 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.c
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -12,6 +12,8 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/pm_runtime.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-dma-sg.h>
+ 
+ #include "common.h"
+ #include "dev.h"
+@@ -286,9 +288,12 @@ static int rkispp_hw_probe(struct platform_device *pdev)
+ 	hw_dev->is_fec_ext = false;
+ 	hw_dev->is_mmu = is_iommu_enable(dev);
+ 	if (!hw_dev->is_mmu) {
++		hw_dev->mem_ops = &vb2_dma_contig_memops;
+ 		ret = of_reserved_mem_device_init(dev);
+ 		if (ret)
+ 			dev_warn(dev, "No reserved memory region assign to ispp\n");
++	} else {
++		hw_dev->mem_ops = &vb2_dma_sg_memops;
+ 	}
+ 
+ 	rkispp_register_fec(hw_dev);
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+index f17f1bc8a86a..16b555d1c3bd 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.h
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -48,6 +48,7 @@ struct rkispp_hw_dev {
+ 	struct mutex dev_lock;
+ 	spinlock_t buf_lock;
+ 	atomic_t refcnt;
++	const struct vb2_mem_ops *mem_ops;
+ 	bool is_mmu;
+ 	bool is_idle;
+ 	bool is_single;
+diff --git a/drivers/media/platform/rockchip/ispp/stats.c b/drivers/media/platform/rockchip/ispp/stats.c
+index c66cf02c86a0..6dff60f5cdf7 100644
+--- a/drivers/media/platform/rockchip/ispp/stats.c
++++ b/drivers/media/platform/rockchip/ispp/stats.c
+@@ -7,6 +7,7 @@
+ #include <media/videobuf2-core.h>
+ #include <media/videobuf2-vmalloc.h>	/* for ISP statistics */
+ #include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-dma-sg.h>
+ #include <media/v4l2-mc.h>
+ #include "dev.h"
+ #include "regs.h"
+@@ -213,7 +214,13 @@ static void rkispp_stats_vb2_buf_queue(struct vb2_buffer *vb)
+ 	struct rkispp_stats_vdev *stats_dev = vq->drv_priv;
+ 	unsigned long lock_flags = 0;
+ 
+-	buf->buff_addr[0] = vb2_dma_contig_plane_dma_addr(vb, 0);
++	if (stats_dev->dev->hw_dev->is_mmu) {
++		struct sg_table *sgt = vb2_dma_sg_plane_desc(vb, 0);
++
++		buf->buff_addr[0] = sg_dma_address(sgt->sgl);
++	} else {
++		buf->buff_addr[0] = vb2_dma_contig_plane_dma_addr(vb, 0);
++	}
+ 	spin_lock_irqsave(&stats_dev->irq_lock, lock_flags);
+ 	if (stats_dev->streamon &&
+ 	    !stats_dev->next_buf) {
+@@ -293,7 +300,7 @@ static int rkispp_stats_init_vb2_queue(struct vb2_queue *q,
+ 	q->io_modes = VB2_MMAP | VB2_USERPTR;
+ 	q->drv_priv = stats_vdev;
+ 	q->ops = &rkispp_stats_vb2_ops;
+-	q->mem_ops = &vb2_dma_contig_memops;
++	q->mem_ops = stats_vdev->dev->hw_dev->mem_ops;
+ 	q->buf_struct_size = sizeof(struct rkispp_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->lock = &stats_vdev->dev->iqlock;
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index b6f93462286c..f67a7b18fc67 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -10,6 +10,7 @@
+ #include <media/v4l2-mc.h>
+ #include <media/v4l2-subdev.h>
+ #include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-dma-sg.h>
+ #include <linux/rkisp1-config.h>
+ 
+ #include "dev.h"
+@@ -1365,12 +1366,18 @@ static void rkispp_buf_queue(struct vb2_buffer *vb)
+ 	struct capture_fmt *cap_fmt = &stream->out_cap_fmt;
+ 	unsigned long lock_flags = 0;
+ 	u32 height, size, offset;
++	struct sg_table *sgt;
+ 	int i;
+ 
+ 	memset(isppbuf->buff_addr, 0, sizeof(isppbuf->buff_addr));
+-	for (i = 0; i < cap_fmt->mplanes; i++)
+-		isppbuf->buff_addr[i] = vb2_dma_contig_plane_dma_addr(vb, i);
+-
++	for (i = 0; i < cap_fmt->mplanes; i++) {
++		if (stream->isppdev->hw_dev->is_mmu) {
++			sgt = vb2_dma_sg_plane_desc(vb, i);
++			isppbuf->buff_addr[i] = sg_dma_address(sgt->sgl);
++		} else {
++			isppbuf->buff_addr[i] = vb2_dma_contig_plane_dma_addr(vb, i);
++		}
++	}
+ 	/*
+ 	 * NOTE: plane_fmt[0].sizeimage is total size of all planes for single
+ 	 * memory plane formats, so calculate the size explicitly.
+@@ -1645,7 +1652,7 @@ static int rkispp_init_vb2_queue(struct vb2_queue *q,
+ 	q->io_modes = VB2_MMAP | VB2_DMABUF | VB2_USERPTR;
+ 	q->drv_priv = stream;
+ 	q->ops = &stream_vb2_ops;
+-	q->mem_ops = &vb2_dma_contig_memops;
++	q->mem_ops = stream->isppdev->hw_dev->mem_ops;
+ 	q->buf_struct_size = sizeof(struct rkispp_buffer);
+ 	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		q->min_buffers_needed = STREAM_IN_REQ_BUFS_MIN;
+-- 
+2.35.3
+

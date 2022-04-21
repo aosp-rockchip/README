@@ -1,0 +1,883 @@
+From 7e32b05fe373e32f9aa3350c7ba3923ff72e4118 Mon Sep 17 00:00:00 2001
+From: Jon Lin <jon.lin@rock-chips.com>
+Date: Tue, 28 May 2019 22:11:22 +0800
+Subject: [PATCH] drivers: rkflash: adjust rkflash_debug print
+
+unicom debug print of rkflash.
+
+Change-Id: I59a04f6fdc9219f33fb37723851e87c55ace1f86
+Signed-off-by: Jon Lin <jon.lin@rock-chips.com>
+---
+ drivers/rkflash/flash.c         | 189 +++++++++++++++++---------------
+ drivers/rkflash/rkflash_blk.c   |   5 +
+ drivers/rkflash/rkflash_debug.c | 111 ++++++++++++++++++-
+ drivers/rkflash/rkflash_debug.h |  81 +++-----------
+ drivers/rkflash/sfc_nand.c      |  54 ++++-----
+ drivers/rkflash/sfc_nor.c       |  30 ++---
+ drivers/rkflash/sfc_nor_mtd.c   |  16 +--
+ 7 files changed, 280 insertions(+), 206 deletions(-)
+
+diff --git a/drivers/rkflash/flash.c b/drivers/rkflash/flash.c
+index 40625cd84e85..e9758f034769 100644
+--- a/drivers/rkflash/flash.c
++++ b/drivers/rkflash/flash.c
+@@ -72,9 +72,9 @@ static void flash_read_id_raw(u8 cs, u8 *buf)
+ 
+ 	nandc_flash_de_cs(cs);
+ 	if (ptr[0] != 0xFF && ptr[0] && ptr[1] != 0xFF)
+-		PRINT_NANDC_E("No.%d FLASH ID:%x %x %x %x %x %x\n",
+-			      cs + 1, ptr[0], ptr[1], ptr[2],
+-			      ptr[3], ptr[4], ptr[5]);
++		rkflash_print_error("No.%d FLASH ID:%x %x %x %x %x %x\n",
++				    cs + 1, ptr[0], ptr[1], ptr[2],
++				    ptr[3], ptr[4], ptr[5]);
+ }
+ 
+ static void flash_bch_sel(u8 bits)
+@@ -167,8 +167,9 @@ static u32 flash_read_ecc(u8 cs)
+ 
+ static u32 flash_read_page_raw(u8 cs, u32 page_addr, u32 *p_data, u32 *p_spare)
+ {
+-	u32 error_ecc_bits;
++	u32 error_ecc_bits, ret;
+ 	u32 sec_per_page = nand_para.sec_per_page;
++	u32 nand_ecc = 0;
+ 
+ 	nandc_wait_flash_ready(cs);
+ 	nandc_flash_cs(cs);
+@@ -184,39 +185,48 @@ static u32 flash_read_page_raw(u8 cs, u32 page_addr, u32 *p_data, u32 *p_spare)
+ 
+ 	if (error_ecc_bits != NAND_STS_ECC_ERR) {
+ 		if (error_ecc_bits >= (u32)nand_para.ecc_bits - 3) {
+-			error_ecc_bits = NAND_STS_REFRESH;
++			ret = NAND_STS_REFRESH;
+ 		} else {
+-			error_ecc_bits = NAND_STS_OK;
++			ret = NAND_STS_OK;
+ 			if (g_nand_ecc_en) {
+-				u32 nand_ecc = flash_read_ecc(cs);
++				nand_ecc = flash_read_ecc(cs);
+ 
+ 				if (nand_ecc >= 6) {
+-					PRINT_NANDC_E("%s nand ecc %x ecc %d\n",
+-						      __func__, page_addr, nand_ecc);
+-					error_ecc_bits = NAND_STS_REFRESH;
++					rkflash_print_error("%s nand ecc %x ecc %d\n",
++							    __func__, page_addr, nand_ecc);
++					ret = NAND_STS_REFRESH;
+ 				}
+ 			}
+ 		}
++	} else {
++		ret = NAND_STS_ECC_ERR;
+ 	}
++	if (nand_ecc > 4 || error_ecc_bits > 4)
++		rkflash_print_info("%s %x %x nandc ecc= %d, internal ecc= %d\n",
++				   __func__, cs, page_addr, error_ecc_bits, nand_ecc);
+ 
+-	return error_ecc_bits;
++	return ret;
+ }
+ 
+ static u32 flash_read_page(u8 cs, u32 page_addr, u32 *p_data, u32 *p_spare)
+ {
+-	u32 ret, i;
++	u32 ret, i = 0;
+ 
+ 	ret = flash_read_page_raw(cs, page_addr, p_data, p_spare);
+ 	if (ret == NAND_STS_ECC_ERR) {
+-		for (i = 0; i < 50; i++) {
++		for (; i < 50; i++) {
+ 			ret = flash_read_page_raw(cs, page_addr, p_data, p_spare);
+ 			if (ret != NAND_STS_ECC_ERR) {
+ 				ret = NAND_STS_REFRESH;
+ 				break;
+ 			}
+ 		}
+-		PRINT_NANDC_E("flash_read_page %x err_ecc %d\n", page_addr, ret);
++		rkflash_print_error("%s %x err_ecc %d\n",
++				    __func__, page_addr, ret);
+ 	}
++	rkflash_print_dio("%s %x %x retry=%x\n",
++			   __func__, page_addr, p_data[0], i);
++
+ 	return ret;
+ }
+ 
+@@ -225,6 +235,7 @@ static u32 flash_prog_page(u8 cs, u32 page_addr, u32 *p_data, u32 *p_spare)
+ 	u32 status;
+ 	u32 sec_per_page = nand_para.sec_per_page;
+ 
++	rkflash_print_dio("%s %x %x\n", __func__, page_addr, p_data[0]);
+ 	nandc_wait_flash_ready(cs);
+ 	nandc_flash_cs(cs);
+ 	flash_prog_first_cmd(cs, page_addr);
+@@ -234,10 +245,10 @@ static u32 flash_prog_page(u8 cs, u32 page_addr, u32 *p_data, u32 *p_spare)
+ 	status = flash_read_status(cs, page_addr);
+ 	nandc_flash_de_cs(cs);
+ 	status &= 0x01;
+-	if (status) {
+-		PRINT_NANDC_I("%s addr=%x status=%x\n",
+-			      __func__, page_addr, status);
+-	}
++	if (status)
++		rkflash_print_info("%s addr=%x status=%x\n",
++				   __func__, page_addr, status);
++
+ 	return status;
+ }
+ 
+@@ -245,6 +256,7 @@ static u32 flash_erase_block(u8 cs, u32 page_addr)
+ {
+ 	u32 status;
+ 
++	rkflash_print_dio("%s %x\n", __func__, page_addr);
+ 	nandc_wait_flash_ready(cs);
+ 	nandc_flash_cs(cs);
+ 	flash_erase_cmd(cs, page_addr);
+@@ -252,10 +264,10 @@ static u32 flash_erase_block(u8 cs, u32 page_addr)
+ 	status = flash_read_status(cs, page_addr);
+ 	nandc_flash_de_cs(cs);
+ 	status &= 0x01;
+-	if (status) {
+-		PRINT_NANDC_I("%s pageadd=%x status=%x\n",
+-			      __func__, page_addr, status);
+-	}
++	if (status)
++		rkflash_print_info("%s pageadd=%x status=%x\n",
++				   __func__, page_addr, status);
++
+ 	return status;
+ }
+ 
+@@ -304,7 +316,7 @@ static s32 get_bad_blk_list(u16 *table, u32 die)
+ 		    bad_flag1 != 0xFF ||
+ 		    bad_flag2 != 0xFF) {
+ 			table[bad_cnt++] = blk;
+-			PRINT_NANDC_E("die[%d], bad_blk[%d]\n", die, blk);
++			rkflash_print_error("die[%d], bad_blk[%d]\n", die, blk);
+ 		}
+ 	}
+ 	return bad_cnt;
+@@ -334,7 +346,7 @@ static void flash_test(void)
+ 	pwrite = kzalloc(FLASH_PAGE_SIZE, GFP_KERNEL | GFP_DMA);
+ 	pread = kzalloc(FLASH_PAGE_SIZE, GFP_KERNEL | GFP_DMA);
+ 
+-	PRINT_NANDC_E("%s\n", __func__);
++	rkflash_print_error("%s\n", __func__);
+ 	bad_blk_num = 0;
+ 	bad_page_num = 0;
+ 	bad_cnt	= get_bad_blk_list(bad_blk_list, 0);
+@@ -347,7 +359,7 @@ static void flash_test(void)
+ 		if (i < bad_cnt)
+ 			continue;
+ 		is_bad_blk = 0;
+-		PRINT_NANDC_E("Flash prog block: %x\n", blk);
++		rkflash_print_error("Flash prog block: %x\n", blk);
+ 		flash_erase_block(0, blk * blk_addr);
+ 		for (page = 0; page < pages_num; page++) {
+ 			page_addr = blk * blk_addr + page;
+@@ -376,13 +388,13 @@ static void flash_test(void)
+ 			}
+ 			if (is_bad_blk) {
+ 				bad_page_num++;
+-				PRINT_NANDC_E("ERR:page %x, ret= %x\n",
+-					      page_addr,
+-					      ret);
+-				PRINT_NANDC_HEX("w data:", pwrite, 4, 512);
+-				PRINT_NANDC_HEX("w spare:", pspare_write, 4, 4);
+-				PRINT_NANDC_HEX("r data:", pread, 4, 512);
+-				PRINT_NANDC_HEX("r spare:", pspare_read, 4, 5);
++				rkflash_print_error("ERR:page %x, ret= %x\n",
++						    page_addr,
++						    ret);
++				rkflash_print_hex("w data:", pwrite, 4, 512);
++				rkflash_print_hex("w spare:", pspare_write, 4, 4);
++				rkflash_print_hex("r data:", pread, 4, 512);
++				rkflash_print_hex("r spare:", pspare_read, 4, 5);
+ 				while (1)
+ 					;
+ 			}
+@@ -391,10 +403,10 @@ static void flash_test(void)
+ 		if (is_bad_blk)
+ 			bad_blk_num++;
+ 	}
+-	PRINT_NANDC_E("bad_blk_num = %d, bad_page_num = %d\n",
+-		      bad_blk_num, bad_page_num);
++	rkflash_print_error("bad_blk_num = %d, bad_page_num = %d\n",
++			    bad_blk_num, bad_page_num);
+ 
+-	PRINT_NANDC_E("Flash Test Finish!!!\n");
++	rkflash_print_error("Flash Test Finish!!!\n");
+ 	kfree(pwrite);
+ 	kfree(pread);
+ 	while (1)
+@@ -417,58 +429,58 @@ static void flash_die_info_init(void)
+ 			nand_para.blk_per_plane;
+ }
+ 
+-static void nandc_flash_print_info(void)
++static void flash_rkflash_print_info(void)
+ {
+-	PRINT_NANDC_I("No.0 FLASH ID: %x %x %x %x %x %x\n",
+-		      nand_para.nand_id[0],
+-		      nand_para.nand_id[1],
+-		      nand_para.nand_id[2],
+-		      nand_para.nand_id[3],
+-		      nand_para.nand_id[4],
+-		      nand_para.nand_id[5]);
+-	PRINT_NANDC_I("die_per_chip: %x\n", nand_para.die_per_chip);
+-	PRINT_NANDC_I("sec_per_page: %x\n", nand_para.sec_per_page);
+-	PRINT_NANDC_I("page_per_blk: %x\n", nand_para.page_per_blk);
+-	PRINT_NANDC_I("cell: %x\n", nand_para.cell);
+-	PRINT_NANDC_I("plane_per_die: %x\n", nand_para.plane_per_die);
+-	PRINT_NANDC_I("blk_per_plane: %x\n", nand_para.blk_per_plane);
+-	PRINT_NANDC_I("TotleBlock: %x\n", g_totle_block);
+-	PRINT_NANDC_I("die gap: %x\n", nand_para.die_gap);
+-	PRINT_NANDC_I("lsb_mode: %x\n", nand_para.lsb_mode);
+-	PRINT_NANDC_I("read_retry_mode: %x\n", nand_para.read_retry_mode);
+-	PRINT_NANDC_I("ecc_bits: %x\n", nand_para.ecc_bits);
+-	PRINT_NANDC_I("Use ecc_bits: %x\n", g_nand_flash_ecc_bits);
+-	PRINT_NANDC_I("access_freq: %x\n", nand_para.access_freq);
+-	PRINT_NANDC_I("opt_mode: %x\n", nand_para.opt_mode);
+-
+-	PRINT_NANDC_I("Cache read enable: %x\n",
+-		      nand_para.operation_opt & NAND_CACHE_READ_EN ? 1 : 0);
+-	PRINT_NANDC_I("Cache random read enable: %x\n",
+-		      nand_para.operation_opt &
+-			NAND_CACHE_RANDOM_READ_EN ? 1 : 0);
+-	PRINT_NANDC_I("Cache prog enable: %x\n",
+-		      nand_para.operation_opt & NAND_CACHE_PROG_EN ? 1 : 0);
+-	PRINT_NANDC_I("multi read enable: %x\n",
+-		      nand_para.operation_opt & NAND_MULTI_READ_EN ? 1 : 0);
+-
+-	PRINT_NANDC_I("multi prog enable: %x\n",
+-		      nand_para.operation_opt & NAND_MULTI_PROG_EN ? 1 : 0);
+-	PRINT_NANDC_I("interleave enable: %x\n",
+-		      nand_para.operation_opt & NAND_INTERLEAVE_EN ? 1 : 0);
+-
+-	PRINT_NANDC_I("read retry enable: %x\n",
+-		      nand_para.operation_opt & NAND_READ_RETRY_EN ? 1 : 0);
+-	PRINT_NANDC_I("randomizer enable: %x\n",
+-		      nand_para.operation_opt & NAND_RANDOMIZER_EN ? 1 : 0);
+-
+-	PRINT_NANDC_I("SDR enable: %x\n",
+-		      nand_para.operation_opt & NAND_SDR_EN ? 1 : 0);
+-	PRINT_NANDC_I("ONFI enable: %x\n",
+-		      nand_para.operation_opt & NAND_ONFI_EN ? 1 : 0);
+-	PRINT_NANDC_I("TOGGLE enable: %x\n",
+-		      nand_para.operation_opt & NAND_TOGGLE_EN ? 1 : 0);
+-
+-	PRINT_NANDC_I("g_nand_idb_res_blk_num: %x\n", g_nand_idb_res_blk_num);
++	rkflash_print_info("No.0 FLASH ID: %x %x %x %x %x %x\n",
++			   nand_para.nand_id[0],
++			   nand_para.nand_id[1],
++			   nand_para.nand_id[2],
++			   nand_para.nand_id[3],
++			   nand_para.nand_id[4],
++			   nand_para.nand_id[5]);
++	rkflash_print_info("die_per_chip: %x\n", nand_para.die_per_chip);
++	rkflash_print_info("sec_per_page: %x\n", nand_para.sec_per_page);
++	rkflash_print_info("page_per_blk: %x\n", nand_para.page_per_blk);
++	rkflash_print_info("cell: %x\n", nand_para.cell);
++	rkflash_print_info("plane_per_die: %x\n", nand_para.plane_per_die);
++	rkflash_print_info("blk_per_plane: %x\n", nand_para.blk_per_plane);
++	rkflash_print_info("TotleBlock: %x\n", g_totle_block);
++	rkflash_print_info("die gap: %x\n", nand_para.die_gap);
++	rkflash_print_info("lsb_mode: %x\n", nand_para.lsb_mode);
++	rkflash_print_info("read_retry_mode: %x\n", nand_para.read_retry_mode);
++	rkflash_print_info("ecc_bits: %x\n", nand_para.ecc_bits);
++	rkflash_print_info("Use ecc_bits: %x\n", g_nand_flash_ecc_bits);
++	rkflash_print_info("access_freq: %x\n", nand_para.access_freq);
++	rkflash_print_info("opt_mode: %x\n", nand_para.opt_mode);
++
++	rkflash_print_info("Cache read enable: %x\n",
++			   nand_para.operation_opt & NAND_CACHE_READ_EN ? 1 : 0);
++	rkflash_print_info("Cache random read enable: %x\n",
++			   nand_para.operation_opt &
++			   NAND_CACHE_RANDOM_READ_EN ? 1 : 0);
++	rkflash_print_info("Cache prog enable: %x\n",
++			   nand_para.operation_opt & NAND_CACHE_PROG_EN ? 1 : 0);
++	rkflash_print_info("multi read enable: %x\n",
++			   nand_para.operation_opt & NAND_MULTI_READ_EN ? 1 : 0);
++
++	rkflash_print_info("multi prog enable: %x\n",
++			   nand_para.operation_opt & NAND_MULTI_PROG_EN ? 1 : 0);
++	rkflash_print_info("interleave enable: %x\n",
++			   nand_para.operation_opt & NAND_INTERLEAVE_EN ? 1 : 0);
++
++	rkflash_print_info("read retry enable: %x\n",
++			   nand_para.operation_opt & NAND_READ_RETRY_EN ? 1 : 0);
++	rkflash_print_info("randomizer enable: %x\n",
++			   nand_para.operation_opt & NAND_RANDOMIZER_EN ? 1 : 0);
++
++	rkflash_print_info("SDR enable: %x\n",
++			   nand_para.operation_opt & NAND_SDR_EN ? 1 : 0);
++	rkflash_print_info("ONFI enable: %x\n",
++			   nand_para.operation_opt & NAND_ONFI_EN ? 1 : 0);
++	rkflash_print_info("TOGGLE enable: %x\n",
++			   nand_para.operation_opt & NAND_TOGGLE_EN ? 1 : 0);
++
++	rkflash_print_info("g_nand_idb_res_blk_num: %x\n", g_nand_idb_res_blk_num);
+ }
+ 
+ static void ftl_flash_init(void)
+@@ -507,7 +519,7 @@ u32 nandc_flash_init(void __iomem *nandc_addr)
+ {
+ 	u32 cs;
+ 
+-	PRINT_NANDC_I("...%s enter...\n", __func__);
++	rkflash_print_info("...%s enter...\n", __func__);
+ 	g_nand_idb_res_blk_num = MAX_IDB_RESERVED_BLOCK;
+ 	g_nand_ecc_en = 0;
+ 
+@@ -557,8 +569,7 @@ u32 nandc_flash_init(void __iomem *nandc_addr)
+ 	}
+ 	flash_die_info_init();
+ 	flash_bch_sel(nand_para.ecc_bits);
+-	nandc_flash_print_info();
+-	/* flash_print_info(); */
++	flash_rkflash_print_info();
+ 	ftl_flash_init();
+ 
+ 	#if FLASH_STRESS_TEST_EN
+diff --git a/drivers/rkflash/rkflash_blk.c b/drivers/rkflash/rkflash_blk.c
+index 8ea8a44673cb..53539a97f2ba 100644
+--- a/drivers/rkflash/rkflash_blk.c
++++ b/drivers/rkflash/rkflash_blk.c
+@@ -29,6 +29,7 @@
+ 
+ #include "rkflash_api.h"
+ #include "rkflash_blk.h"
++#include "rkflash_debug.h"
+ #include "rk_sftl.h"
+ 
+ #include "../soc/rockchip/flash_vendor_storage.h"
+@@ -293,6 +294,8 @@ static int rkflash_xfer(struct flash_blk_dev *dev,
+ 		totle_read_data += nsector;
+ 		totle_read_count++;
+ 		mutex_lock(&g_flash_ops_mutex);
++		rkflash_print_bio("rkflash r sec= %lx, n_sec= %lx\n",
++				  start, nsector);
+ 		ret = g_boot_ops[g_flash_type]->read(start, nsector, buf);
+ 		mutex_unlock(&g_flash_ops_mutex);
+ 		if (ret)
+@@ -303,6 +306,8 @@ static int rkflash_xfer(struct flash_blk_dev *dev,
+ 		totle_write_data += nsector;
+ 		totle_write_count++;
+ 		mutex_lock(&g_flash_ops_mutex);
++		rkflash_print_bio("rkflash w sec= %lx, n_sec= %lx\n",
++				  start, nsector);
+ 		ret = g_boot_ops[g_flash_type]->write(start, nsector, buf);
+ 		mutex_unlock(&g_flash_ops_mutex);
+ 		if (ret)
+diff --git a/drivers/rkflash/rkflash_debug.c b/drivers/rkflash/rkflash_debug.c
+index e49d73f6c0fd..ce742b0382ef 100644
+--- a/drivers/rkflash/rkflash_debug.c
++++ b/drivers/rkflash/rkflash_debug.c
+@@ -2,6 +2,115 @@
+ 
+ /* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
+ 
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++
+ #include "rkflash_debug.h"
+ 
+-unsigned int rkflash_debug = PRINT_BIT_SFC | PRINT_BIT_NANDC;
++static unsigned int rkflash_debug;
++
++__printf(1, 2) int rkflash_print_dio(const char *fmt, ...)
++{
++	int nret = 0;
++#if PRINT_SWI_CON_IO
++	if (rkflash_debug & PRINT_BIT_CON_IO)  {
++		va_list args;
++
++		if (!fmt)
++			return nret;
++
++		va_start(args, fmt);
++		nret = vprintk(fmt, args);
++		va_end(args);
++	}
++#endif
++	return nret;
++}
++
++__printf(1, 2) int rkflash_print_bio(const char *fmt, ...)
++{
++	int nret = 0;
++#if PRINT_SWI_BLK_IO
++	if (rkflash_debug & PRINT_BIT_BLK_IO)  {
++		va_list args;
++
++		if (!fmt)
++			return nret;
++
++		va_start(args, fmt);
++		nret = vprintk(fmt, args);
++		va_end(args);
++	}
++#endif
++	return nret;
++}
++
++__printf(1, 2) int rkflash_print_info(const char *fmt, ...)
++{
++	int nret = 0;
++#if PRINT_SWI_INFO
++	va_list args;
++
++	if (!fmt)
++		return nret;
++
++	va_start(args, fmt);
++	nret = vprintk(fmt, args);
++	va_end(args);
++#endif
++	return nret;
++}
++
++__printf(1, 2) int rkflash_print_error(const char *fmt, ...)
++{
++	int nret = 0;
++#if PRINT_SWI_ERROR
++	va_list args;
++
++	if (!fmt)
++		return nret;
++
++	va_start(args, fmt);
++	nret = vprintk(fmt, args);
++	va_end(args);
++#endif
++	return nret;
++}
++
++void rkflash_print_hex(const char *s, const void *buf, int w, size_t len)
++{
++#if PRINT_SWI_ERROR
++	return print_hex_dump(KERN_WARNING, s, DUMP_PREFIX_OFFSET, 4, w,
++			      buf, (len) * w, 0);
++#endif
++}
++
++static int set_val(const char *val, const struct kernel_param *kp)
++{
++	char *tmp = kzalloc(8, GFP_KERNEL);
++
++	strncpy(tmp, val, 8);
++	if (!strncmp(tmp, "0", 1)) {
++		rkflash_debug = 0;
++	} else if (!strncmp(tmp, "blk_io", 6)) {
++		rkflash_debug |= PRINT_BIT_BLK_IO;
++	} else if (!strncmp(tmp, "con_io", 6)) {
++		rkflash_debug |= PRINT_BIT_CON_IO;
++	} else {
++		pr_info("input error, support 0, blk_io, con_io\n");
++		rkflash_debug = 0;
++	}
++	kfree(tmp);
++
++	return 0;
++}
++
++static struct kernel_param_ops rkflash_debug_param_ops = {
++	.set = set_val,
++	.get = param_get_uint,
++};
++
++module_param_cb(rkflash_debug, &rkflash_debug_param_ops, &rkflash_debug, 0644);
++MODULE_PARM_DESC(rkflash_debug, "config rkflash_debug module");
+diff --git a/drivers/rkflash/rkflash_debug.h b/drivers/rkflash/rkflash_debug.h
+index edd609c071d3..e260ca6a3a88 100644
+--- a/drivers/rkflash/rkflash_debug.h
++++ b/drivers/rkflash/rkflash_debug.h
+@@ -16,80 +16,27 @@
+ /*
+  * Printing-adding
+  */
+-extern unsigned int rkflash_debug;
++#define	PRINT_SWI_INFO		1
++#define	PRINT_SWI_ERROR		1
++#define PRINT_SWI_HEX		1
+ 
+-#define	PRINT_SWI_SFC_I		1
+-#define	PRINT_SWI_SFC_E		1
+-#define PRINT_SWI_SFC_HEX	1
+-
+-#define	PRINT_SWI_NANDC_I	1
+-#define	PRINT_SWI_NANDC_E	1
+-#define PRINT_SWI_NANDC_HEX	1
++#define	PRINT_SWI_CON_IO	1
++#define	PRINT_SWI_BLK_IO	1
+ 
+ /*
+- * Print switch, set var rkflash_debug corresponding bit to
+- * 1 if needed.
++ * Print switch, set var rkflash_debug corresponding bit to 1 if needed.
+  * I - info
+- * E - error
+- * HEX - multiline print
++ * IO - IO request about
+  */
+-#define	PRINT_BIT_SFC_I		BIT(0)
+-#define	PRINT_BIT_SFC_E		BIT(1)
+-#define PRINT_BIT_SFC_HEX	BIT(2)
+-#define	PRINT_BIT_SFC\
+-		(PRINT_BIT_SFC_E | PRINT_BIT_SFC_HEX)
+-
+-#define	PRINT_BIT_NANDC_I	BIT(4)
+-#define	PRINT_BIT_NANDC_E	BIT(5)
+-#define PRINT_BIT_NANDC_HEX	BIT(5)
+-#define	PRINT_BIT_NANDC\
+-		(PRINT_BIT_NANDC_E | PRINT_BIT_NANDC_HEX)
+-
+-#if (PRINT_SWI_SFC_I)
+-#define PRINT_SFC_I(...) {if (rkflash_debug & PRINT_BIT_SFC_I)\
+-				pr_info(__VA_ARGS__); }
+-#else
+-#define PRINT_SFC_I(...)
+-#endif
++#define	PRINT_BIT_CON_IO	BIT(0)
++#define	PRINT_BIT_BLK_IO	BIT(4)
+ 
+-#if (PRINT_SWI_SFC_E)
+-#define PRINT_SFC_E(...) {if (rkflash_debug & PRINT_BIT_SFC_E)\
+-				pr_info(__VA_ARGS__); }
+-#else
+-#define PRINT_SFC_E(...)
+-#endif
+-
+-#if (PRINT_SWI_SFC_HEX)
+-#define PRINT_SFC_HEX(s, buf, width, len)\
+-		rkflash_print_hex(s, buf, width, len)
+-#else
+-#define PRINT_SFC_HEX(s, buf, width, len)
+-#endif
+-
+-#if (PRINT_SWI_NANDC_I)
+-#define PRINT_NANDC_I(...) {if (rkflash_debug & PRINT_BIT_NANDC_I)\
+-				pr_info(__VA_ARGS__); }
+-#else
+-#define PRINT_NANDC_I(...)
+-#endif
+-
+-#if (PRINT_SWI_NANDC_E)
+-#define PRINT_NANDC_E(...) {if (rkflash_debug & PRINT_BIT_NANDC_E)\
+-				pr_info(__VA_ARGS__); }
+-#else
+-#define PRINT_NANDC_E(...)
+-#endif
+-
+-#if (PRINT_SWI_NANDC_HEX)
+-#define PRINT_NANDC_HEX(s, buf, width, len)\
+-		(rkflash_print_hex(s, buf, width, len))
+-#else
+-#define PRINT_NANDC_HEX(s, buf, width, len)
+-#endif
++__printf(1, 2) int rkflash_print_info(const char *fmt, ...);
++__printf(1, 2) int rkflash_print_error(const char *fmt, ...);
++void rkflash_print_hex(const char *s, const void *buf, int w, size_t len);
+ 
+-#define rkflash_print_hex(s, buf, w, len)\
+-		print_hex_dump(KERN_WARNING, s, DUMP_PREFIX_OFFSET,\
+-			       4, w, buf, (len) * w, 0)
++__printf(1, 2) int rkflash_print_dio(const char *fmt, ...);
++__printf(1, 2) int rkflash_print_bio(const char *fmt, ...);
+ 
+ #endif
+ 
+diff --git a/drivers/rkflash/sfc_nand.c b/drivers/rkflash/sfc_nand.c
+index 9e377c4d671c..db71efed4303 100644
+--- a/drivers/rkflash/sfc_nand.c
++++ b/drivers/rkflash/sfc_nand.c
+@@ -370,6 +370,7 @@ static u32 sfc_nand_erase_block(u8 cs, u32 addr)
+ 	union SFCCMD_DATA sfcmd;
+ 	u8 status;
+ 
++	rkflash_print_dio("%s %x\n", __func__, addr);
+ 	sfcmd.d32 = 0;
+ 	sfcmd.b.cmd = p_nand_info->block_erase_cmd;
+ 	sfcmd.b.addrbits = SFC_ADDR_24BITS;
+@@ -395,7 +396,7 @@ static u32 sfc_nand_prog_page(u8 cs, u32 addr, u32 *p_data, u32 *p_spare)
+ 	u32 spare_offs_2 = p_nand_info->spare_offs_2;
+ 	u32 data_size = sec_per_page * 512;
+ 
+-	PRINT_SFC_I("%s %x %x %x\n", __func__, addr, p_data[0], p_spare[0]);
++	rkflash_print_dio("%s %x %x\n", __func__, addr, p_data[0]);
+ 	memcpy(gp_page_buf, p_data, data_size);
+ 	ftl_memset(&gp_page_buf[data_size / 4], 0xff, sec_per_page * 16);
+ 	gp_page_buf[(data_size + spare_offs_1) / 4] = p_spare[0];
+@@ -448,7 +449,6 @@ static u32 sfc_nand_read_page(u8 cs, u32 addr, u32 *p_data, u32 *p_spare)
+ 	u32 sec_per_page = p_nand_info->sec_per_page;
+ 	u32 data_size = sec_per_page * 512;
+ 
+-	PRINT_SFC_I("%s %x %x %x\n", __func__, addr, p_data[0], p_spare[0]);
+ 	sfcmd.d32 = 0;
+ 	sfcmd.b.cmd = p_nand_info->page_read_cmd;
+ 	sfcmd.b.datasize = 0;
+@@ -481,15 +481,16 @@ static u32 sfc_nand_read_page(u8 cs, u32 addr, u32 *p_data, u32 *p_spare)
+ 		p_spare[2] = gp_page_buf[(data_size + spare_offs_1) / 4 + 1];
+ 		p_spare[3] = gp_page_buf[(data_size + spare_offs_2) / 4 + 1];
+ 	}
++	rkflash_print_dio("%s %x %x\n", __func__, addr, p_data[0]);
+ 	if (ret != SFC_OK)
+ 		return SFC_NAND_ECC_ERROR;
+ 
+ 	if (ecc_result != SFC_NAND_ECC_OK) {
+-		PRINT_SFC_E("%s[0x%x], ret=0x%x\n", __func__, addr, ecc_result);
++		rkflash_print_error("%s[0x%x], ret=0x%x\n", __func__, addr, ecc_result);
+ 		if (p_data)
+-			PRINT_SFC_HEX("data:", p_data, 4, 8);
++			rkflash_print_hex("data:", p_data, 4, 8);
+ 		if (p_spare)
+-			PRINT_SFC_HEX("spare:", p_spare, 4, 2);
++			rkflash_print_hex("spare:", p_spare, 4, 2);
+ 	}
+ 
+ 	return ecc_result;
+@@ -522,7 +523,7 @@ static int sfc_nand_get_bad_block_list(u16 *table, u32 die)
+ 	u32 *pread;
+ 	u32 *pspare_read;
+ 
+-	PRINT_SFC_E("%s\n", __func__);
++	rkflash_print_info("%s\n", __func__);
+ 	pread = ftl_malloc(2048);
+ 	pspare_read = ftl_malloc(8);
+ 	bad_cnt = 0;
+@@ -536,11 +537,12 @@ static int sfc_nand_get_bad_block_list(u16 *table, u32 die)
+ 		if (pread[0] != 0xFFFFFFFF ||
+ 		    pspare_read[0] != 0xFFFFFFFF) {
+ 			table[bad_cnt++] = blk;
+-			PRINT_SFC_E("die[%d], bad_blk[%d]\n", die, blk);
++			rkflash_print_error("die[%d], bad_blk[%d]\n", die, blk);
+ 		}
+ 	}
+ 	ftl_free(pread);
+ 	ftl_free(pspare_read);
++
+ 	return (int)bad_cnt;
+ }
+ 
+@@ -565,7 +567,7 @@ static void sfc_nand_test(void)
+ 	u32 blk_addr = 64;
+ 	u32 is_bad_blk = 0;
+ 
+-	PRINT_SFC_E("%s\n", __func__);
++	rkflash_print_info("%s\n", __func__);
+ 
+ 	bad_blk_num = 0;
+ 	bad_page_num = 0;
+@@ -579,7 +581,7 @@ static void sfc_nand_test(void)
+ 		if (i < bad_cnt)
+ 			continue;
+ 		is_bad_blk = 0;
+-		PRINT_SFC_E("Flash prog block: %x\n", blk);
++		rkflash_print_info("Flash prog block: %x\n", blk);
+ 		sfc_nand_erase_block(0, blk * blk_addr);
+ 		for (page = 0; page < pages_num; page++) {
+ 			page_addr = blk * blk_addr + page;
+@@ -608,20 +610,20 @@ static void sfc_nand_test(void)
+ 			}
+ 			if (is_bad_blk) {
+ 				bad_page_num++;
+-				PRINT_SFC_E("ERR:page%x, ret=%x\n",
+-					    page_addr, ret);
+-				PRINT_SFC_HEX("data:", pread, 4, 8);
+-				PRINT_SFC_HEX("spare:", pspare_read, 4, 2);
++				rkflash_print_error("ERR:page%x, ret=%x\n",
++						    page_addr, ret);
++				rkflash_print_hex("data:", pread, 4, 8);
++				rkflash_print_hex("spare:", pspare_read, 4, 2);
+ 			}
+ 		}
+ 		sfc_nand_erase_block(0, blk * blk_addr);
+ 		if (is_bad_blk)
+ 			bad_blk_num++;
+ 	}
+-	PRINT_SFC_E("bad_blk_num = %d, bad_page_num = %d\n",
+-		    bad_blk_num, bad_page_num);
++	rkflash_print_info("bad_blk_num = %d, bad_page_num = %d\n",
++		   bad_blk_num, bad_page_num);
+ 
+-	PRINT_SFC_E("Flash Test Finish!!!\n");
++	rkflash_print_info("Flash Test Finish!!!\n");
+ 	while (1)
+ 		;
+ }
+@@ -677,11 +679,11 @@ static int spi_nand_enable_QE(void)
+ 
+ u32 sfc_nand_init(void)
+ {
+-	PRINT_SFC_I("...%s enter...\n", __func__);
++	rkflash_print_info("...%s enter...\n", __func__);
+ 
+ 	sfc_nand_read_id_raw(id_byte);
+-	PRINT_SFC_E("sfc_nand id: %x %x %x\n",
+-		    id_byte[0], id_byte[1], id_byte[2]);
++	rkflash_print_info("sfc_nand id: %x %x %x\n",
++		   id_byte[0], id_byte[1], id_byte[2]);
+ 	if (id_byte[0] == 0xFF || id_byte[0] == 0x00)
+ 		return FTL_NO_FLASH;
+ 
+@@ -716,15 +718,15 @@ u32 sfc_nand_init(void)
+ 		u8 status;
+ 
+ 		sfc_nand_read_feature(0xA0, &status);
+-		PRINT_SFC_I("sfc_nand A0 = 0x%x\n", status);
++		rkflash_print_info("sfc_nand A0 = 0x%x\n", status);
+ 		sfc_nand_read_feature(0xB0, &status);
+-		PRINT_SFC_I("sfc_nand B0 = 0x%x\n", status);
++		rkflash_print_info("sfc_nand B0 = 0x%x\n", status);
+ 		sfc_nand_read_feature(0xC0, &status);
+-		PRINT_SFC_I("sfc_nand C0 = 0x%x\n", status);
+-		PRINT_SFC_I("read_lines = %x\n", sfc_nand_dev.read_lines);
+-		PRINT_SFC_I("prog_lines = %x\n", sfc_nand_dev.prog_lines);
+-		PRINT_SFC_I("page_read_cmd = %x\n", sfc_nand_dev.page_read_cmd);
+-		PRINT_SFC_I("page_prog_cmd = %x\n", sfc_nand_dev.page_prog_cmd);
++		rkflash_print_info("sfc_nand C0 = 0x%x\n", status);
++		rkflash_print_info("read_lines = %x\n", sfc_nand_dev.read_lines);
++		rkflash_print_info("prog_lines = %x\n", sfc_nand_dev.prog_lines);
++		rkflash_print_info("page_read_cmd = %x\n", sfc_nand_dev.page_read_cmd);
++		rkflash_print_info("page_prog_cmd = %x\n", sfc_nand_dev.page_prog_cmd);
+ 	}
+ 	ftl_flash_init();
+ 
+diff --git a/drivers/rkflash/sfc_nor.c b/drivers/rkflash/sfc_nor.c
+index b391657a7a72..f2d41f4ce8ca 100644
+--- a/drivers/rkflash/sfc_nor.c
++++ b/drivers/rkflash/sfc_nor.c
+@@ -146,7 +146,7 @@ static int snor_wait_busy(int timeout)
+ 
+ 		sfc_delay(1);
+ 	}
+-	PRINT_SFC_E("%s  error %x\n", __func__, timeout);
++	rkflash_print_error("%s  error %x\n", __func__, timeout);
+ 
+ 	return SFC_BUSY_TIMEOUT;
+ }
+@@ -431,8 +431,8 @@ int snor_read(struct SFNOR_DEV *p_dev, u32 sec, u32 n_sec, void *p_data)
+ 		len = size < SFC_MAX_IOSIZE ? size : SFC_MAX_IOSIZE;
+ 		ret = snor_read_data(p_dev, addr, p_buf, len);
+ 		if (ret != SFC_OK) {
+-			PRINT_SFC_E("snor_read_data %x ret= %x\n",
+-				    addr >> 9, ret);
++			rkflash_print_error("snor_read_data %x ret= %x\n",
++					    addr >> 9, ret);
+ 			goto out;
+ 		}
+ 
+@@ -470,8 +470,8 @@ int snor_write(struct SFNOR_DEV *p_dev, u32 sec, u32 n_sec, void *p_data)
+ 			ret = snor_erase(p_dev, sec << 9, (blk_size == 8) ?
+ 				ERASE_SECTOR : ERASE_BLOCK64K);
+ 			if (ret != SFC_OK) {
+-				PRINT_SFC_E("snor_erase %x ret= %x\n",
+-					    sec, ret);
++				rkflash_print_error("snor_erase %x ret= %x\n",
++						    sec, ret);
+ 				goto out;
+ 			}
+ 		}
+@@ -479,7 +479,7 @@ int snor_write(struct SFNOR_DEV *p_dev, u32 sec, u32 n_sec, void *p_data)
+ 		      (blk_size - offset) : n_sec;
+ 		ret = snor_prog(p_dev, sec << 9, p_buf, len << 9);
+ 		if (ret != SFC_OK) {
+-			PRINT_SFC_E("snor_prog %x ret= %x\n", sec, ret);
++			rkflash_print_error("snor_prog %x ret= %x\n", sec, ret);
+ 			goto out;
+ 		}
+ 		n_sec -= len;
+@@ -531,13 +531,13 @@ u32 snor_get_capacity(struct SFNOR_DEV *p_dev)
+ 
+ static void snor_print_spi_chip_info(struct SFNOR_DEV *p_dev)
+ {
+-	PRINT_SFC_I("addr_mode: %x\n", p_dev->addr_mode);
+-	PRINT_SFC_I("read_lines: %x\n", p_dev->read_lines);
+-	PRINT_SFC_I("prog_lines: %x\n", p_dev->prog_lines);
+-	PRINT_SFC_I("read_cmd: %x\n", p_dev->read_cmd);
+-	PRINT_SFC_I("prog_cmd: %x\n", p_dev->prog_cmd);
+-	PRINT_SFC_I("blk_erase_cmd: %x\n", p_dev->blk_erase_cmd);
+-	PRINT_SFC_I("sec_erase_cmd: %x\n", p_dev->sec_erase_cmd);
++	rkflash_print_info("addr_mode: %x\n", p_dev->addr_mode);
++	rkflash_print_info("read_lines: %x\n", p_dev->read_lines);
++	rkflash_print_info("prog_lines: %x\n", p_dev->prog_lines);
++	rkflash_print_info("read_cmd: %x\n", p_dev->read_cmd);
++	rkflash_print_info("prog_cmd: %x\n", p_dev->prog_cmd);
++	rkflash_print_info("blk_erase_cmd: %x\n", p_dev->blk_erase_cmd);
++	rkflash_print_info("sec_erase_cmd: %x\n", p_dev->sec_erase_cmd);
+ }
+ 
+ static struct flash_info *snor_get_flash_info(u8 *flash_id)
+@@ -577,8 +577,8 @@ int snor_init(struct SFNOR_DEV *p_dev)
+ 
+ 	memset(p_dev, 0, sizeof(struct SFNOR_DEV));
+ 	snor_read_id(id_byte);
+-	PRINT_SFC_E("sfc nor id: %x %x %x\n",
+-		    id_byte[0], id_byte[1], id_byte[2]);
++	rkflash_print_info("sfc nor id: %x %x %x\n",
++			   id_byte[0], id_byte[1], id_byte[2]);
+ 	if (0xFF == id_byte[0] || 0x00 == id_byte[0]) {
+ 		err = SFC_ERROR;
+ 		goto err_out;
+diff --git a/drivers/rkflash/sfc_nor_mtd.c b/drivers/rkflash/sfc_nor_mtd.c
+index a4d729be3526..7c95c6653582 100644
+--- a/drivers/rkflash/sfc_nor_mtd.c
++++ b/drivers/rkflash/sfc_nor_mtd.c
+@@ -43,8 +43,8 @@ static int sfc_erase_mtd(struct mtd_info *mtd, struct erase_info *instr)
+ 	if (len == p_dev->mtd.size) {
+ 		ret = snor_erase(p_dev, 0, CMD_CHIP_ERASE);
+ 		if (ret) {
+-			PRINT_SFC_E("snor_erase CHIP 0x%x ret=%d\n",
+-				    addr, ret);
++			rkflash_print_error("snor_erase CHIP 0x%x ret=%d\n",
++					    addr, ret);
+ 			instr->state = MTD_ERASE_FAILED;
+ 			mutex_unlock(&p_dev->lock);
+ 			return -EIO;
+@@ -53,8 +53,8 @@ static int sfc_erase_mtd(struct mtd_info *mtd, struct erase_info *instr)
+ 		while (len > 0) {
+ 			ret = snor_erase(p_dev, addr, ERASE_BLOCK64K);
+ 			if (ret) {
+-				PRINT_SFC_E("snor_erase 0x%x ret=%d\n",
+-					    addr, ret);
++				rkflash_print_error("snor_erase 0x%x ret=%d\n",
++						    addr, ret);
+ 				instr->state = MTD_ERASE_FAILED;
+ 				mutex_unlock(&p_dev->lock);
+ 				return -EIO;
+@@ -103,8 +103,8 @@ static int sfc_write_mtd(struct mtd_info *mtd, loff_t to, size_t len,
+ 		status = snor_prog_page(p_dev, addr, p_dev->dma_buf,
+ 					chunk + padding);
+ 		if (status != SFC_OK) {
+-			PRINT_SFC_E("snor_prog_page %x ret= %d\n",
+-				    addr, status);
++			rkflash_print_error("snor_prog_page %x ret= %d\n",
++					    addr, status);
+ 			*retlen = len - size;
+ 			mutex_unlock(&p_dev->lock);
+ 			return status;
+@@ -141,7 +141,7 @@ static int sfc_read_mtd(struct mtd_info *mtd, loff_t from, size_t len,
+ 		chunk = (size < NOR_PAGE_SIZE) ? size : NOR_PAGE_SIZE;
+ 		ret = snor_read_data(p_dev, addr, p_dev->dma_buf, chunk);
+ 		if (ret != SFC_OK) {
+-			PRINT_SFC_E("snor_read_data %x ret=%d\n", addr, ret);
++			rkflash_print_error("snor_read_data %x ret=%d\n", addr, ret);
+ 			*retlen = len - size;
+ 			mutex_unlock(&p_dev->lock);
+ 			return ret;
+@@ -189,7 +189,7 @@ int sfc_nor_mtd_init(struct SFNOR_DEV *p_dev)
+ 
+ 	p_dev->dma_buf = kmalloc(NOR_PAGE_SIZE, GFP_KERNEL | GFP_DMA);
+ 	if (!p_dev->dma_buf) {
+-		PRINT_SFC_E("kmalloc size=0x%x failed\n", NOR_PAGE_SIZE);
++		rkflash_print_error("kmalloc size=0x%x failed\n", NOR_PAGE_SIZE);
+ 		ret = -ENOMEM;
+ 		goto out;
+ 	}
+-- 
+2.35.3
+

@@ -1,0 +1,3127 @@
+From 54770505b2717045dad1b0bf63e5f27e43c9f991 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Mon, 27 Jul 2020 15:18:25 +0800
+Subject: [PATCH] media: rockchip: ispp: support multiple virtual device
+
+Change-Id: I6aab46395c6ac833318d181db1d0f988a075d305
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/hw.c      |   2 +-
+ .../media/platform/rockchip/isp/isp_ispp.h    |   2 +-
+ drivers/media/platform/rockchip/ispp/Makefile |   3 +-
+ drivers/media/platform/rockchip/ispp/common.c | 261 ++++++++--
+ drivers/media/platform/rockchip/ispp/common.h |  55 +--
+ drivers/media/platform/rockchip/ispp/dev.c    | 206 +-------
+ drivers/media/platform/rockchip/ispp/dev.h    |  22 +-
+ drivers/media/platform/rockchip/ispp/hw.c     | 338 +++++++++++++
+ drivers/media/platform/rockchip/ispp/hw.h     |  33 ++
+ drivers/media/platform/rockchip/ispp/ispp.c   |  96 +---
+ drivers/media/platform/rockchip/ispp/params.c | 293 ++++++------
+ drivers/media/platform/rockchip/ispp/regs.h   |  43 +-
+ drivers/media/platform/rockchip/ispp/stats.c  |   9 +-
+ drivers/media/platform/rockchip/ispp/stream.c | 444 +++++++++++-------
+ drivers/media/platform/rockchip/ispp/stream.h |  12 +-
+ 15 files changed, 1080 insertions(+), 739 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/ispp/hw.c
+ create mode 100644 drivers/media/platform/rockchip/ispp/hw.h
+
+diff --git a/drivers/media/platform/rockchip/isp/hw.c b/drivers/media/platform/rockchip/isp/hw.c
+index 4566b64f73ae..88aee2527273 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -720,7 +720,7 @@ static int __init rkisp_hw_drv_init(void)
+ 	ret = platform_driver_register(&rkisp_hw_drv);
+ 	if (ret)
+ 		return ret;
+-	return rkispp_plat_drv_init();
++	return rkispp_hw_drv_init();
+ }
+ 
+ module_init(rkisp_hw_drv_init);
+diff --git a/drivers/media/platform/rockchip/isp/isp_ispp.h b/drivers/media/platform/rockchip/isp/isp_ispp.h
+index 65740787ce5b..ecc1473d9741 100644
+--- a/drivers/media/platform/rockchip/isp/isp_ispp.h
++++ b/drivers/media/platform/rockchip/isp/isp_ispp.h
+@@ -61,7 +61,7 @@ struct rkisp_ispp_buf {
+ };
+ 
+ #if IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISP) && IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISPP)
+-int __init rkispp_plat_drv_init(void);
++int __init rkispp_hw_drv_init(void);
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_ROCKCHIP_ISP)
+diff --git a/drivers/media/platform/rockchip/ispp/Makefile b/drivers/media/platform/rockchip/ispp/Makefile
+index 915e3a763d2a..b8ed6800e43a 100644
+--- a/drivers/media/platform/rockchip/ispp/Makefile
++++ b/drivers/media/platform/rockchip/ispp/Makefile
+@@ -6,4 +6,5 @@ video_rkispp-objs += dev.o \
+ 		ispp.o \
+ 		stream.o \
+ 		params.o \
+-		stats.o
++		stats.o \
++		hw.o
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index b44737c945da..379faed79dd7 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -2,48 +2,69 @@
+ /* Copyright (C) 2019 Rockchip Electronics Co., Ltd */
+ 
+ #include <media/videobuf2-dma-contig.h>
+-#include <media/v4l2-mc.h>
++#include <linux/of_platform.h>
+ #include "dev.h"
+ #include "regs.h"
+ 
+-int rkispp_fh_open(struct file *filp)
++static const struct vb2_mem_ops *g_ops = &vb2_dma_contig_memops;
++
++void rkispp_write(struct rkispp_device *dev, u32 reg, u32 val)
+ {
+-	struct rkispp_stream *stream = video_drvdata(filp);
+-	struct rkispp_device *isppdev = stream->isppdev;
+-	int ret;
+-
+-	ret = v4l2_fh_open(filp);
+-	if (!ret) {
+-		ret = v4l2_pipeline_pm_use(&stream->vnode.vdev.entity, 1);
+-		if (ret < 0) {
+-			v4l2_err(&isppdev->v4l2_dev,
+-				 "pipeline power on failed %d\n", ret);
+-			vb2_fop_release(filp);
+-		}
+-	}
+-	return ret;
++	u32 *mem = dev->sw_base_addr + reg;
++	u32 *flag = dev->sw_base_addr + reg + ISPP_SW_REG_SIZE;
++
++	*mem = val;
++	*flag = SW_REG_CACHE;
++	if (dev->hw_dev->is_single)
++		writel(val, dev->hw_dev->base_addr + reg);
++}
++
++u32 rkispp_read(struct rkispp_device *dev, u32 reg)
++{
++	u32 val;
++
++	if (dev->hw_dev->is_single)
++		val = readl(dev->hw_dev->base_addr + reg);
++	else
++		val = *(u32 *)(dev->sw_base_addr + reg);
++	return val;
++}
++
++void rkispp_set_bits(struct rkispp_device *dev, u32 reg, u32 mask, u32 val)
++{
++	u32 tmp = rkispp_read(dev, reg) & ~mask;
++
++	rkispp_write(dev, reg, val | tmp);
++}
++
++void rkispp_clear_bits(struct rkispp_device *dev, u32 reg, u32 mask)
++{
++	u32 tmp = rkispp_read(dev, reg);
++
++	rkispp_write(dev, reg, tmp & ~mask);
+ }
+ 
+-int rkispp_fh_release(struct file *filp)
++void rkispp_update_regs(struct rkispp_device *dev, u32 start, u32 end)
+ {
+-	struct rkispp_stream *stream = video_drvdata(filp);
+-	struct rkispp_device *isppdev = stream->isppdev;
+-	int ret;
+-
+-	ret = vb2_fop_release(filp);
+-	if (!ret) {
+-		ret = v4l2_pipeline_pm_use(&stream->vnode.vdev.entity, 0);
+-		if (ret < 0)
+-			v4l2_err(&isppdev->v4l2_dev,
+-				 "pipeline power off failed %d\n", ret);
++	void __iomem *base = dev->hw_dev->base_addr;
++	u32 i;
++
++	if (end > ISPP_SW_REG_SIZE - 4) {
++		dev_err(dev->dev, "%s out of range\n", __func__);
++		return;
++	}
++	for (i = start; i <= end; i += 4) {
++		u32 *val = dev->sw_base_addr + i;
++		u32 *flag = dev->sw_base_addr + i + ISPP_SW_REG_SIZE;
++
++		if (*flag == SW_REG_CACHE)
++			writel(*val, base + i);
+ 	}
+-	return ret;
+ }
+ 
+ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
+-	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
+ 	unsigned long attrs = buf->is_need_vaddr ? 0 : DMA_ATTR_NO_KERNEL_MAPPING;
+ 	void *mem_priv;
+ 	int ret = 0;
+@@ -53,19 +74,19 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 		goto err;
+ 	}
+ 
+-	mem_priv = ops->alloc(dev->dev, attrs, buf->size,
+-			      DMA_BIDIRECTIONAL, GFP_KERNEL);
++	mem_priv = g_ops->alloc(dev->hw_dev->dev, attrs, buf->size,
++				DMA_BIDIRECTIONAL, GFP_KERNEL);
+ 	if (IS_ERR_OR_NULL(mem_priv)) {
+ 		ret = -ENOMEM;
+ 		goto err;
+ 	}
+ 
+ 	buf->mem_priv = mem_priv;
+-	buf->dma_addr = *((dma_addr_t *)ops->cookie(mem_priv));
++	buf->dma_addr = *((dma_addr_t *)g_ops->cookie(mem_priv));
+ 	if (!attrs)
+-		buf->vaddr = ops->vaddr(mem_priv);
++		buf->vaddr = g_ops->vaddr(mem_priv);
+ 	if (buf->is_need_dbuf)
+-		buf->dbuf = ops->get_dmabuf(mem_priv, O_RDWR);
++		buf->dbuf = g_ops->get_dmabuf(mem_priv, O_RDWR);
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "%s buf:0x%x~0x%x size:%d\n", __func__,
+ 		 (u32)buf->dma_addr, (u32)buf->dma_addr + buf->size, buf->size);
+@@ -78,15 +99,13 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ void rkispp_free_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
+-	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
+-
+ 	if (buf && buf->mem_priv) {
+ 		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 			 "%s buf:0x%x~0x%x\n", __func__,
+ 			 (u32)buf->dma_addr, (u32)buf->dma_addr + buf->size);
+ 		if (buf->dbuf)
+ 			dma_buf_put(buf->dbuf);
+-		ops->put(buf->mem_priv);
++		g_ops->put(buf->mem_priv);
+ 		buf->size = 0;
+ 		buf->dbuf = NULL;
+ 		buf->vaddr = NULL;
+@@ -95,3 +114,171 @@ void rkispp_free_buffer(struct rkispp_device *dev,
+ 		buf->is_need_vaddr = false;
+ 	}
+ }
++
++int rkispp_attach_hw(struct rkispp_device *ispp)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++	struct rkispp_hw_dev *hw;
++
++	np = of_parse_phandle(ispp->dev->of_node, "rockchip,hw", 0);
++	if (!np || !of_device_is_available(np)) {
++		dev_err(ispp->dev, "failed to get ispp hw node\n");
++		return -ENODEV;
++	}
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev) {
++		dev_err(ispp->dev, "failed to get ispp hw from node\n");
++		return -ENODEV;
++	}
++
++	hw = platform_get_drvdata(pdev);
++	if (!hw) {
++		dev_err(ispp->dev, "failed attach ispp hw\n");
++		return -EINVAL;
++	}
++
++	if (hw->dev_num)
++		hw->is_single = false;
++	ispp->dev_id = hw->dev_num;
++	hw->ispp[hw->dev_num] = ispp;
++	hw->dev_num++;
++	ispp->hw_dev = hw;
++	ispp->ispp_ver = hw->ispp_ver;
++
++	return 0;
++}
++
++static void rkispp_free_pool(struct rkispp_hw_dev *hw)
++{
++	struct rkispp_isp_buf_pool *buf;
++	int i, j;
++
++	if (atomic_read(&hw->refcnt))
++		return;
++
++	for (i = 0; i < RKISPP_BUF_POOL_MAX; i++) {
++		buf = &hw->pool[i];
++		if (!buf->dbufs)
++			break;
++		if (rkispp_debug)
++			dev_info(hw->dev, "%s dbufs[%d]:0x%p\n",
++				 __func__, i, buf->dbufs);
++		for (j = 0; j < GROUP_BUF_MAX; j++) {
++			if (buf->mem_priv[j]) {
++				g_ops->unmap_dmabuf(buf->mem_priv[j]);
++				g_ops->detach_dmabuf(buf->mem_priv[j]);
++				buf->mem_priv[j] = NULL;
++			}
++		}
++		buf->dbufs = NULL;
++	}
++}
++
++static int rkispp_init_pool(struct rkispp_hw_dev *hw, struct rkisp_ispp_buf *dbufs)
++{
++	struct rkispp_isp_buf_pool *pool;
++	int i, ret = 0;
++	void *mem;
++
++	/* init dma buf pool */
++	for (i = 0; i < RKISPP_BUF_POOL_MAX; i++) {
++		pool = &hw->pool[i];
++		if (!pool->dbufs)
++			break;
++	}
++	pool->dbufs = dbufs;
++	if (rkispp_debug)
++		dev_info(hw->dev, "%s dbufs[%d]:0x%p\n",
++			 __func__, i, dbufs);
++	for (i = 0; i < GROUP_BUF_MAX; i++) {
++		mem = g_ops->attach_dmabuf(hw->dev, dbufs->dbuf[i],
++			dbufs->dbuf[i]->size, DMA_BIDIRECTIONAL);
++		if (IS_ERR(mem)) {
++			ret = PTR_ERR(mem);
++			goto err;
++		}
++		pool->mem_priv[i] = mem;
++		ret = g_ops->map_dmabuf(mem);
++		if (ret)
++			goto err;
++		pool->dma[i] = *((dma_addr_t *)g_ops->cookie(mem));
++		if (rkispp_debug)
++			dev_info(hw->dev, "%s dma[%d]:0x%x\n",
++				 __func__, i, (u32)pool->dma[i]);
++	}
++	return ret;
++err:
++	rkispp_free_pool(hw);
++	return ret;
++}
++
++static void rkispp_queue_dmabuf(struct rkispp_hw_dev *hw, struct rkisp_ispp_buf *dbufs)
++{
++	struct list_head *list = &hw->list;
++	struct rkispp_device *ispp;
++	struct rkispp_stream_vdev *vdev;
++	struct rkisp_ispp_buf *buf = NULL;
++	unsigned long lock_flags = 0;
++	u32 val;
++
++	spin_lock_irqsave(&hw->buf_lock, lock_flags);
++	if (!dbufs)
++		hw->is_idle = true;
++	if (dbufs && list_empty(list) &&
++	    (hw->is_idle || hw->is_single)) {
++		/* ispp idle or handle same device */
++		buf = dbufs;
++	} else if (hw->is_idle && !list_empty(list)) {
++		/* ispp idle and handle first buf in list */
++		buf = list_first_entry(list,
++			struct rkisp_ispp_buf, list);
++		list_del(&buf->list);
++		if (dbufs)
++			list_add_tail(&dbufs->list, list);
++	} else if (dbufs) {
++		/* new buf into queue wait for handle */
++		list_add_tail(&dbufs->list, list);
++	}
++
++	if (buf) {
++		hw->is_idle = false;
++		hw->cur_dev_id = buf->index;
++		ispp = hw->ispp[buf->index];
++		vdev = &ispp->stream_vdev;
++		val = (vdev->module_ens & ISPP_MODULE_TNR) ? ISPP_MODULE_TNR : ISPP_MODULE_NR;
++		rkispp_module_work_event(ispp, buf, NULL, val, false);
++	}
++
++	spin_unlock_irqrestore(&hw->buf_lock, lock_flags);
++}
++
++int rkispp_event_handle(struct rkispp_device *ispp, u32 cmd, void *arg)
++{
++	struct rkispp_hw_dev *hw = ispp->hw_dev;
++	int ret = 0;
++
++	switch (cmd) {
++	case CMD_STREAM:
++		if (*(int *)arg)
++			atomic_inc(&hw->refcnt);
++		else
++			atomic_dec(&hw->refcnt);
++		break;
++	case CMD_INIT_POOL:
++		ret = rkispp_init_pool(hw, arg);
++		break;
++	case CMD_FREE_POOL:
++		rkispp_free_pool(hw);
++		break;
++	case CMD_QUEUE_DMABUF:
++		rkispp_queue_dmabuf(hw, arg);
++		break;
++	default:
++		ret = -EFAULT;
++	}
++
++	return ret;
++}
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index 2e008b2211f3..cc4a39d1fb85 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -21,8 +21,27 @@
+ #define RKISPP_MIN_WIDTH	66
+ #define RKISPP_MIN_HEIGHT	258
+ 
++#define RKISPP_BUF_POOL_MAX	RKISP_ISPP_BUF_MAX
++
+ struct rkispp_device;
+ 
++enum rkispp_ver {
++	ISPP_V10 = 0x00,
++};
++
++enum rkispp_event_cmd {
++	CMD_STREAM,
++	CMD_INIT_POOL,
++	CMD_FREE_POOL,
++	CMD_QUEUE_DMABUF,
++};
++
++struct rkispp_isp_buf_pool {
++	struct rkisp_ispp_buf *dbufs;
++	void *mem_priv[GROUP_BUF_MAX];
++	dma_addr_t dma[GROUP_BUF_MAX];
++};
++
+ /* One structure per video node */
+ struct rkispp_vdev_node {
+ 	struct vb2_queue buf_queue;
+@@ -53,8 +72,6 @@ struct rkispp_dummy_buffer {
+ 	bool is_need_dbuf;
+ };
+ 
+-extern int rkispp_debug;
+-
+ static inline struct rkispp_vdev_node *vdev_to_node(struct video_device *vdev)
+ {
+ 	return container_of(vdev, struct rkispp_vdev_node, vdev);
+@@ -77,35 +94,19 @@ static inline struct vb2_queue *to_vb2_queue(struct file *file)
+ 	return &vnode->buf_queue;
+ }
+ 
+-static inline void rkispp_write(void __iomem *addr, u32 val)
+-{
+-	writel(val, addr);
+-}
+-
+-static inline u32 rkispp_read(void __iomem *addr)
+-{
+-	return readl(addr);
+-}
+-
+-static inline void rkispp_set_bits(void __iomem *addr, u32 bit_mask, u32 val)
+-{
+-	u32 tmp = rkispp_read(addr) & ~bit_mask;
+-
+-	rkispp_write(addr, val | tmp);
+-}
+-
+-static inline void rkispp_clear_bits(void __iomem *addr, u32 bit_mask)
+-{
+-	u32 val = rkispp_read(addr);
+-
+-	rkispp_write(addr, val & ~bit_mask);
+-}
++extern int rkispp_debug;
++extern struct platform_driver rkispp_plat_drv;
+ 
+-int rkispp_fh_open(struct file *filp);
+-int rkispp_fh_release(struct file *filp);
++void rkispp_write(struct rkispp_device *dev, u32 reg, u32 val);
++void rkispp_set_bits(struct rkispp_device *dev, u32 reg, u32 mask, u32 val);
++u32 rkispp_read(struct rkispp_device *dev, u32 reg);
++void rkispp_clear_bits(struct rkispp_device *dev, u32 reg, u32 mask);
++void rkispp_update_regs(struct rkispp_device *dev, u32 start, u32 end);
+ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf);
+ void rkispp_free_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf);
+ 
++int rkispp_attach_hw(struct rkispp_device *ispp);
++int rkispp_event_handle(struct rkispp_device *ispp, u32 cmd, void *arg);
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 3aa37c417859..847534752ae5 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -23,19 +23,6 @@
+ 
+ #define RKISPP_VERNO_LEN 10
+ 
+-struct ispp_irqs_data {
+-	const char *name;
+-	irqreturn_t (*irq_hdl)(int irq, void *ctx);
+-};
+-
+-struct ispp_match_data {
+-	int clks_num;
+-	const char * const *clks;
+-	enum rkispp_ver ispp_ver;
+-	struct ispp_irqs_data *irqs;
+-	int num_irqs;
+-};
+-
+ int rkispp_debug;
+ module_param_named(debug, rkispp_debug, int, 0644);
+ MODULE_PARM_DESC(debug, "Debug level (0-3)");
+@@ -52,24 +39,6 @@ static char rkispp_version[RKISPP_VERNO_LEN];
+ module_param_string(version, rkispp_version, RKISPP_VERNO_LEN, 0444);
+ MODULE_PARM_DESC(version, "version number");
+ 
+-static inline bool is_iommu_enable(struct device *dev)
+-{
+-	struct device_node *iommu;
+-
+-	iommu = of_parse_phandle(dev->of_node, "iommus", 0);
+-	if (!iommu) {
+-		dev_info(dev, "no iommu attached, using non-iommu buffers\n");
+-		return false;
+-	} else if (!of_device_is_available(iommu)) {
+-		dev_info(dev, "iommu is disabled, using non-iommu buffers\n");
+-		of_node_put(iommu);
+-		return false;
+-	}
+-	of_node_put(iommu);
+-
+-	return true;
+-}
+-
+ static void get_remote_node_dev(struct rkispp_device *ispp_dev)
+ {
+ 	struct device *dev = ispp_dev->dev;
+@@ -221,88 +190,19 @@ static int rkispp_register_platform_subdevs(struct rkispp_device *ispp_dev)
+ 	return ret;
+ }
+ 
+-static void rkispp_disable_sys_clk(struct rkispp_device *ispp_dev)
+-{
+-	int i;
+-
+-	for (i = 0; i < ispp_dev->clks_num; i++)
+-		clk_disable_unprepare(ispp_dev->clks[i]);
+-}
+-
+-static int rkispp_enable_sys_clk(struct rkispp_device *ispp_dev)
+-{
+-	int i, ret = -EINVAL;
+-
+-	ispp_dev->isp_mode = rkisp_ispp_mode;
+-	ispp_dev->stream_sync = rkispp_stream_sync;
+-	for (i = 0; i < ispp_dev->clks_num; i++) {
+-		ret = clk_prepare_enable(ispp_dev->clks[i]);
+-		if (ret < 0)
+-			goto err;
+-	}
+-
+-	return 0;
+-err:
+-	for (--i; i >= 0; --i)
+-		clk_disable_unprepare(ispp_dev->clks[i]);
+-	return ret;
+-}
+-
+-static irqreturn_t rkispp_irq_hdl(int irq, void *ctx)
+-{
+-	struct device *dev = ctx;
+-	struct rkispp_device *ispp_dev = dev_get_drvdata(dev);
+-	void __iomem *base = ispp_dev->base_addr;
+-	unsigned int mis_val;
+-
+-	spin_lock(&ispp_dev->irq_lock);
+-	mis_val = readl(base + RKISPP_CTRL_INT_STA);
+-	writel(mis_val, base + RKISPP_CTRL_INT_CLR);
+-	spin_unlock(&ispp_dev->irq_lock);
+-
+-	if (mis_val)
+-		rkispp_isr(mis_val, ispp_dev);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static const char * const rv1126_ispp_clks[] = {
+-	"aclk_ispp",
+-	"hclk_ispp",
+-	"clk_ispp",
+-};
+-
+-static struct ispp_irqs_data rv1126_ispp_irqs[] = {
+-	{"ispp_irq", rkispp_irq_hdl},
+-	{"fec_irq", rkispp_irq_hdl},
+-};
+-
+-static const struct ispp_match_data rv1126_ispp_match_data = {
+-	.clks = rv1126_ispp_clks,
+-	.clks_num = ARRAY_SIZE(rv1126_ispp_clks),
+-	.irqs = rv1126_ispp_irqs,
+-	.num_irqs = ARRAY_SIZE(rv1126_ispp_irqs),
+-	.ispp_ver = ISPP_V10,
+-};
+-
+ static const struct of_device_id rkispp_plat_of_match[] = {
+ 	{
+-		.compatible = "rockchip,rv1126-rkispp",
+-		.data = &rv1126_ispp_match_data,
++		.compatible = "rockchip,rv1126-rkispp-vir",
+ 	},
+ 	{},
+ };
+ 
+ static int rkispp_plat_probe(struct platform_device *pdev)
+ {
+-	const struct of_device_id *match;
+-	const struct ispp_match_data *match_data;
+-	struct device_node *node = pdev->dev.of_node;
+ 	struct device *dev = &pdev->dev;
+ 	struct v4l2_device *v4l2_dev;
+ 	struct rkispp_device *ispp_dev;
+-	struct resource *res;
+-	int i, ret, irq;
++	int ret;
+ 
+ 	sprintf(rkispp_version, "v%02x.%02x.%02x",
+ 		RKISPP_DRIVER_VERSION >> 16,
+@@ -311,82 +211,33 @@ static int rkispp_plat_probe(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "rkispp driver version: %s\n", rkispp_version);
+ 
+-	match = of_match_node(rkispp_plat_of_match, node);
+-	if (IS_ERR(match))
+-		return PTR_ERR(match);
+-
+ 	ispp_dev = devm_kzalloc(dev, sizeof(*ispp_dev), GFP_KERNEL);
+ 	if (!ispp_dev)
+ 		return -ENOMEM;
++	ispp_dev->sw_base_addr = devm_kzalloc(dev, ISPP_SW_MAX_SIZE, GFP_KERNEL);
++	if (!ispp_dev->sw_base_addr)
++		return -ENOMEM;
+ 
+ 	dev_set_drvdata(dev, ispp_dev);
+ 	ispp_dev->dev = dev;
+-	match_data = match->data;
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(dev, "get resource failed\n");
+-		return -EINVAL;
+-	}
+-	ispp_dev->base_addr = devm_ioremap_resource(dev, res);
+-	if (PTR_ERR(ispp_dev->base_addr) == -EBUSY) {
+-		resource_size_t offset = res->start;
+-		resource_size_t size = resource_size(res);
+-
+-		ispp_dev->base_addr = devm_ioremap(dev, offset, size);
+-	}
+-	if (IS_ERR(ispp_dev->base_addr)) {
+-		dev_err(dev, "ioremap failed\n");
+-		return PTR_ERR(ispp_dev->base_addr);
+-	}
+-
+-	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ,
+-					   match_data->irqs[0].name);
+-	if (res) {
+-		/* there are irq names in dts */
+-		for (i = 0; i < match_data->num_irqs; i++) {
+-			irq = platform_get_irq_byname(pdev,
+-						      match_data->irqs[i].name);
+-			if (irq < 0) {
+-				dev_err(dev, "no irq %s in dts\n",
+-					match_data->irqs[i].name);
+-				return irq;
+-			}
+-			ret = devm_request_irq(dev, irq,
+-					       match_data->irqs[i].irq_hdl,
+-					       IRQF_SHARED,
+-					       dev_driver_string(dev),
+-					       dev);
+-			if (ret < 0) {
+-				dev_err(dev, "request %s failed: %d\n",
+-					match_data->irqs[i].name, ret);
+-				return ret;
+-			}
+-		}
+-	}
+ 
+-	for (i = 0; i < match_data->clks_num; i++) {
+-		struct clk *clk = devm_clk_get(dev, match_data->clks[i]);
+-
+-		if (IS_ERR(clk))
+-			dev_warn(dev, "failed to get %s\n",
+-				 match_data->clks[i]);
+-		ispp_dev->clks[i] = clk;
+-	}
+-	ispp_dev->clks_num = match_data->clks_num;
+-	ispp_dev->ispp_ver = match_data->ispp_ver;
++	ret = rkispp_attach_hw(ispp_dev);
++	if (ret)
++		return ret;
+ 
++	sprintf(ispp_dev->name, "%s%d",
++		DRIVER_NAME, ispp_dev->dev_id);
++	ispp_dev->irq_hdl = rkispp_isr;
+ 	mutex_init(&ispp_dev->apilock);
+ 	mutex_init(&ispp_dev->iqlock);
+-	spin_lock_init(&ispp_dev->irq_lock);
+ 	init_waitqueue_head(&ispp_dev->sync_onoff);
+ 
+-	strlcpy(ispp_dev->media_dev.model, "rkispp",
++	strlcpy(ispp_dev->media_dev.model, ispp_dev->name,
+ 		sizeof(ispp_dev->media_dev.model));
+ 	ispp_dev->media_dev.dev = &pdev->dev;
+ 	v4l2_dev = &ispp_dev->v4l2_dev;
+ 	v4l2_dev->mdev = &ispp_dev->media_dev;
+-	strlcpy(v4l2_dev->name, "rkispp", sizeof(v4l2_dev->name));
++	strlcpy(v4l2_dev->name, ispp_dev->name, sizeof(v4l2_dev->name));
+ 	v4l2_ctrl_handler_init(&ispp_dev->ctrl_handler, 5);
+ 	v4l2_dev->ctrl_handler = &ispp_dev->ctrl_handler;
+ 
+@@ -406,13 +257,6 @@ static int rkispp_plat_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_unreg_media_dev;
+ 
+-	if (!is_iommu_enable(dev)) {
+-		ret = of_reserved_mem_device_init(dev);
+-		if (ret)
+-			v4l2_warn(v4l2_dev,
+-				  "No reserved memory region assign to ispp\n");
+-	}
+-
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	return 0;
+@@ -438,6 +282,7 @@ static int rkispp_plat_remove(struct platform_device *pdev)
+ 	media_device_unregister(&ispp_dev->media_dev);
+ 	v4l2_device_unregister(&ispp_dev->v4l2_dev);
+ 	mutex_destroy(&ispp_dev->apilock);
++	mutex_destroy(&ispp_dev->iqlock);
+ 	return 0;
+ }
+ 
+@@ -445,16 +290,20 @@ static int __maybe_unused rkispp_runtime_suspend(struct device *dev)
+ {
+ 	struct rkispp_device *ispp_dev = dev_get_drvdata(dev);
+ 
+-	rkispp_disable_sys_clk(ispp_dev);
+-	return 0;
++	if (atomic_dec_return(&ispp_dev->hw_dev->power_cnt))
++		return 0;
++	return pm_runtime_put(ispp_dev->hw_dev->dev);
+ }
+ 
+ static int __maybe_unused rkispp_runtime_resume(struct device *dev)
+ {
+ 	struct rkispp_device *ispp_dev = dev_get_drvdata(dev);
+ 
+-	rkispp_enable_sys_clk(ispp_dev);
+-	return 0;
++	ispp_dev->isp_mode = rkisp_ispp_mode;
++	ispp_dev->stream_sync = rkispp_stream_sync;
++	if (atomic_inc_return(&ispp_dev->hw_dev->power_cnt) > 1)
++		return 0;
++	return pm_runtime_get_sync(ispp_dev->hw_dev->dev);
+ }
+ 
+ static const struct dev_pm_ops rkispp_plat_pm_ops = {
+@@ -464,7 +313,7 @@ static const struct dev_pm_ops rkispp_plat_pm_ops = {
+ 			   rkispp_runtime_resume, NULL)
+ };
+ 
+-static struct platform_driver rkispp_plat_drv = {
++struct platform_driver rkispp_plat_drv = {
+ 	.driver = {
+ 		.name = DRIVER_NAME,
+ 		.of_match_table = of_match_ptr(rkispp_plat_of_match),
+@@ -473,15 +322,8 @@ static struct platform_driver rkispp_plat_drv = {
+ 	.probe = rkispp_plat_probe,
+ 	.remove = rkispp_plat_remove,
+ };
++EXPORT_SYMBOL(rkispp_plat_drv);
+ 
+-#if IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISP) && IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISPP)
+-int __init rkispp_plat_drv_init(void)
+-{
+-	return platform_driver_register(&rkispp_plat_drv);
+-}
+-#else
+-module_platform_driver(rkispp_plat_drv);
+-#endif
+ MODULE_AUTHOR("Rockchip Camera/ISP team");
+ MODULE_DESCRIPTION("Rockchip ISPP platform driver");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/media/platform/rockchip/ispp/dev.h b/drivers/media/platform/rockchip/ispp/dev.h
+index a9f4e7e13742..c35b08ee939a 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.h
++++ b/drivers/media/platform/rockchip/ispp/dev.h
+@@ -8,6 +8,7 @@
+ #include "params.h"
+ #include "stream.h"
+ #include "stats.h"
++#include "hw.h"
+ 
+ #define DRIVER_NAME			"rkispp"
+ #define II_VDEV_NAME DRIVER_NAME	"_input_image"
+@@ -16,12 +17,6 @@
+ #define S1_VDEV_NAME DRIVER_NAME	"_scale1"
+ #define S2_VDEV_NAME DRIVER_NAME	"_scale2"
+ 
+-#define ISPP_MAX_BUS_CLK 4
+-
+-enum rkispp_ver {
+-	ISPP_V10 = 0x00,
+-};
+-
+ enum rkispp_input {
+ 	INP_INVAL = 0,
+ 	INP_ISP,
+@@ -29,18 +24,14 @@ enum rkispp_input {
+ };
+ 
+ struct rkispp_device {
++	char name[128];
+ 	struct device *dev;
+-	int irq;
+-	int clks_num;
+-	struct clk *clks[ISPP_MAX_BUS_CLK];
+-	void __iomem *base_addr;
+-	struct iommu_domain *domain;
+-	struct vb2_alloc_ctx *alloc_ctx;
+-
++	void *sw_base_addr;
+ 	struct media_device media_dev;
+ 	struct v4l2_device v4l2_dev;
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 
++	struct rkispp_hw_dev *hw_dev;
+ 	struct rkispp_subdev ispp_sdev;
+ 	struct rkispp_stream_vdev stream_vdev;
+ 	struct rkispp_params_vdev params_vdev;
+@@ -51,11 +42,12 @@ struct rkispp_device {
+ 	struct mutex apilock;
+ 	/* mutex to serialize the calls of iq */
+ 	struct mutex iqlock;
+-	/* lock for fec and ispp irq */
+-	spinlock_t irq_lock;
+ 	enum rkispp_input inp;
++	u32 dev_id;
+ 	u32 isp_mode;
+ 	wait_queue_head_t sync_onoff;
+ 	bool stream_sync;
++
++	void (*irq_hdl)(u32 mis, struct rkispp_device *dev);
+ };
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+new file mode 100644
+index 000000000000..9535d4675f76
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -0,0 +1,338 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2020 Rockchip Electronics Co., Ltd */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/of_platform.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/pm_runtime.h>
++
++#include "common.h"
++#include "dev.h"
++#include "hw.h"
++#include "regs.h"
++
++/*
++ * rkispp_hw share hardware resource with rkispp virtual device
++ * rkispp_device rkispp_device rkispp_device rkispp_device
++ *       |             |             |             |
++ *       \             |             |             /
++ *        -----------------------------------------
++ *                           |
++ *                       rkispp_hw
++ */
++
++struct irqs_data {
++	const char *name;
++	irqreturn_t (*irq_hdl)(int irq, void *ctx);
++};
++
++struct match_data {
++	int clks_num;
++	const char * const *clks;
++	enum rkispp_ver ispp_ver;
++	struct irqs_data *irqs;
++	int num_irqs;
++};
++
++/* using default value if reg no write for multi device */
++static void default_sw_reg_flag(struct rkispp_device *dev)
++{
++	u32 reg[] = {
++		RKISPP_TNR_CTRL,
++		RKISPP_TNR_CORE_CTRL,
++		RKISPP_NR_CTRL,
++		RKISPP_NR_UVNR_CTRL_PARA,
++		RKISPP_SHARP_CTRL,
++		RKISPP_SHARP_CORE_CTRL,
++		RKISPP_SCL0_CTRL,
++		RKISPP_SCL1_CTRL,
++		RKISPP_SCL2_CTRL,
++		RKISPP_ORB_CORE_CTRL,
++		RKISPP_FEC_CTRL,
++		RKISPP_FEC_CORE_CTRL
++	};
++	u32 i, *flag;
++
++	for (i = 0; i < ARRAY_SIZE(reg); i++) {
++		flag = dev->sw_base_addr + reg[i] + ISPP_SW_REG_SIZE;
++		*flag = 0xffffffff;
++	}
++}
++
++static inline bool is_iommu_enable(struct device *dev)
++{
++	struct device_node *iommu;
++
++	iommu = of_parse_phandle(dev->of_node, "iommus", 0);
++	if (!iommu) {
++		dev_info(dev, "no iommu attached, using non-iommu buffers\n");
++		return false;
++	} else if (!of_device_is_available(iommu)) {
++		dev_info(dev, "iommu is disabled, using non-iommu buffers\n");
++		of_node_put(iommu);
++		return false;
++	}
++	of_node_put(iommu);
++
++	return true;
++}
++
++static void disable_sys_clk(struct rkispp_hw_dev *dev)
++{
++	int i;
++
++	for (i = 0; i < dev->clks_num; i++)
++		clk_disable_unprepare(dev->clks[i]);
++}
++
++static int enable_sys_clk(struct rkispp_hw_dev *dev)
++{
++	int i, ret = -EINVAL;
++
++	for (i = 0; i < dev->clks_num; i++) {
++		ret = clk_prepare_enable(dev->clks[i]);
++		if (ret < 0)
++			goto err;
++	}
++
++	return 0;
++err:
++	for (--i; i >= 0; --i)
++		clk_disable_unprepare(dev->clks[i]);
++	return ret;
++}
++
++static irqreturn_t irq_hdl(int irq, void *ctx)
++{
++	struct device *dev = ctx;
++	struct rkispp_hw_dev *hw_dev = dev_get_drvdata(dev);
++	struct rkispp_device *ispp = hw_dev->ispp[hw_dev->cur_dev_id];
++	void __iomem *base = hw_dev->base_addr;
++	unsigned int mis_val;
++
++	spin_lock(&hw_dev->irq_lock);
++	mis_val = readl(base + RKISPP_CTRL_INT_STA);
++	writel(mis_val, base + RKISPP_CTRL_INT_CLR);
++	spin_unlock(&hw_dev->irq_lock);
++
++	if (mis_val)
++		ispp->irq_hdl(mis_val, ispp);
++
++	return IRQ_HANDLED;
++}
++
++static const char * const rv1126_ispp_clks[] = {
++	"aclk_ispp",
++	"hclk_ispp",
++	"clk_ispp",
++};
++
++static struct irqs_data rv1126_ispp_irqs[] = {
++	{"ispp_irq", irq_hdl},
++	{"fec_irq", irq_hdl},
++};
++
++static const struct match_data rv1126_ispp_match_data = {
++	.clks = rv1126_ispp_clks,
++	.clks_num = ARRAY_SIZE(rv1126_ispp_clks),
++	.irqs = rv1126_ispp_irqs,
++	.num_irqs = ARRAY_SIZE(rv1126_ispp_irqs),
++	.ispp_ver = ISPP_V10,
++};
++
++static const struct of_device_id rkispp_hw_of_match[] = {
++	{
++		.compatible = "rockchip,rv1126-rkispp",
++		.data = &rv1126_ispp_match_data,
++	},
++	{},
++};
++
++static int rkispp_hw_probe(struct platform_device *pdev)
++{
++	const struct of_device_id *match;
++	const struct match_data *match_data;
++	struct device_node *node = pdev->dev.of_node;
++	struct device *dev = &pdev->dev;
++	struct rkispp_hw_dev *hw_dev;
++	struct resource *res;
++	int i, ret, irq;
++
++	match = of_match_node(rkispp_hw_of_match, node);
++	if (IS_ERR(match))
++		return PTR_ERR(match);
++
++	hw_dev = devm_kzalloc(dev, sizeof(*hw_dev), GFP_KERNEL);
++	if (!hw_dev)
++		return -ENOMEM;
++
++	dev_set_drvdata(dev, hw_dev);
++	hw_dev->dev = dev;
++	match_data = match->data;
++	hw_dev->max_in.w = 0;
++	hw_dev->max_in.h = 0;
++	hw_dev->max_in.fps = 0;
++	of_property_read_u32_array(node, "max-input", &hw_dev->max_in.w, 3);
++	dev_info(dev, "max input:%dx%d@%dfps\n",
++		 hw_dev->max_in.w, hw_dev->max_in.h, hw_dev->max_in.fps);
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "get resource failed\n");
++		ret = -EINVAL;
++		goto err;
++	}
++	hw_dev->base_addr = devm_ioremap_resource(dev, res);
++	if (PTR_ERR(hw_dev->base_addr) == -EBUSY) {
++		resource_size_t offset = res->start;
++		resource_size_t size = resource_size(res);
++
++		hw_dev->base_addr = devm_ioremap(dev, offset, size);
++	}
++	if (IS_ERR(hw_dev->base_addr)) {
++		dev_err(dev, "ioremap failed\n");
++		ret = PTR_ERR(hw_dev->base_addr);
++		goto err;
++	}
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ,
++					   match_data->irqs[0].name);
++	if (res) {
++		/* there are irq names in dts */
++		for (i = 0; i < match_data->num_irqs; i++) {
++			irq = platform_get_irq_byname(pdev,
++						      match_data->irqs[i].name);
++			if (irq < 0) {
++				dev_err(dev, "no irq %s in dts\n",
++					match_data->irqs[i].name);
++				ret = irq;
++				goto err;
++			}
++			ret = devm_request_irq(dev, irq,
++					       match_data->irqs[i].irq_hdl,
++					       IRQF_SHARED,
++					       dev_driver_string(dev),
++					       dev);
++			if (ret < 0) {
++				dev_err(dev, "request %s failed: %d\n",
++					match_data->irqs[i].name, ret);
++				goto err;
++			}
++		}
++	}
++
++	for (i = 0; i < match_data->clks_num; i++) {
++		struct clk *clk = devm_clk_get(dev, match_data->clks[i]);
++
++		if (IS_ERR(clk)) {
++			dev_err(dev, "failed to get %s\n",
++				match_data->clks[i]);
++			ret = PTR_ERR(clk);
++			goto err;
++		}
++		hw_dev->clks[i] = clk;
++	}
++	hw_dev->clks_num = match_data->clks_num;
++
++	hw_dev->dev_num = 0;
++	hw_dev->cur_dev_id = 0;
++	hw_dev->ispp_ver = match_data->ispp_ver;
++	mutex_init(&hw_dev->dev_lock);
++	spin_lock_init(&hw_dev->irq_lock);
++	spin_lock_init(&hw_dev->buf_lock);
++	atomic_set(&hw_dev->refcnt, 0);
++	atomic_set(&hw_dev->power_cnt, 0);
++	INIT_LIST_HEAD(&hw_dev->list);
++	hw_dev->is_idle = true;
++	hw_dev->is_single = true;
++	if (!is_iommu_enable(dev)) {
++		ret = of_reserved_mem_device_init(dev);
++		if (ret)
++			dev_warn(dev, "No reserved memory region assign to ispp\n");
++	}
++
++	pm_runtime_enable(&pdev->dev);
++
++	return platform_driver_register(&rkispp_plat_drv);
++err:
++	return ret;
++}
++
++static int rkispp_hw_remove(struct platform_device *pdev)
++{
++	struct rkispp_hw_dev *hw_dev = platform_get_drvdata(pdev);
++
++	pm_runtime_disable(&pdev->dev);
++	mutex_destroy(&hw_dev->dev_lock);
++	return 0;
++}
++
++static int __maybe_unused rkispp_runtime_suspend(struct device *dev)
++{
++	struct rkispp_hw_dev *hw_dev = dev_get_drvdata(dev);
++
++	writel(0, hw_dev->base_addr + RKISPP_CTRL_INT_MSK);
++	writel(GLB_SOFT_RST_ALL, hw_dev->base_addr + RKISPP_CTRL_RESET);
++	disable_sys_clk(hw_dev);
++	return 0;
++}
++
++static int __maybe_unused rkispp_runtime_resume(struct device *dev)
++{
++	struct rkispp_hw_dev *hw_dev = dev_get_drvdata(dev);
++	void __iomem *base = hw_dev->base_addr;
++	int i;
++
++	enable_sys_clk(hw_dev);
++
++	writel(SW_SCL_BYPASS, base + RKISPP_SCL0_CTRL);
++	writel(SW_SCL_BYPASS, base + RKISPP_SCL1_CTRL);
++	writel(SW_SCL_BYPASS, base + RKISPP_SCL2_CTRL);
++	writel(OTHER_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
++	writel(GATE_DIS_ALL, base + RKISPP_CTRL_CLKGATE);
++	writel(SW_SHP_DMA_DIS, base + RKISPP_SHARP_CORE_CTRL);
++	writel(SW_FEC2DDR_DIS, base + RKISPP_FEC_CORE_CTRL);
++	writel(0xfffffff, base + RKISPP_CTRL_INT_MSK);
++	writel(GATE_DIS_NR, base + RKISPP_CTRL_CLKGATE);
++
++	for (i = 0; i < hw_dev->dev_num; i++) {
++		void *buf = hw_dev->ispp[i]->sw_base_addr;
++
++		memset(buf, 0, ISPP_SW_MAX_SIZE);
++		memcpy_fromio(buf, base, ISPP_SW_REG_SIZE);
++		default_sw_reg_flag(hw_dev->ispp[i]);
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops rkispp_hw_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
++	SET_RUNTIME_PM_OPS(rkispp_runtime_suspend,
++			   rkispp_runtime_resume, NULL)
++};
++
++static struct platform_driver rkispp_hw_drv = {
++	.driver = {
++		.name = "rkispp_hw",
++		.of_match_table = of_match_ptr(rkispp_hw_of_match),
++		.pm = &rkispp_hw_pm_ops,
++	},
++	.probe = rkispp_hw_probe,
++	.remove = rkispp_hw_remove,
++};
++
++#if IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISP) && IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISPP)
++int __init rkispp_hw_drv_init(void)
++{
++	return platform_driver_register(&rkispp_hw_drv);
++}
++#else
++module_platform_driver(rkispp_hw_drv);
++#endif
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+new file mode 100644
+index 000000000000..cce69f0a5808
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2020 Rockchip Electronics Co., Ltd. */
++
++#ifndef _RKISPP_HW_H
++#define _RKISPP_HW_H
++
++#include "../isp/isp_ispp.h"
++
++#define ISPP_MAX_BUS_CLK 4
++
++struct rkispp_hw_dev {
++	struct device *dev;
++	void __iomem *base_addr;
++	struct clk *clks[ISPP_MAX_BUS_CLK];
++	struct rkispp_device *ispp[DEV_MAX];
++	struct rkispp_isp_buf_pool pool[RKISPP_BUF_POOL_MAX];
++	struct max_input max_in;
++	struct list_head list;
++	int clks_num;
++	int dev_num;
++	int cur_dev_id;
++	enum rkispp_ver	ispp_ver;
++	/* lock for irq */
++	spinlock_t irq_lock;
++	/* lock for multi dev */
++	struct mutex dev_lock;
++	spinlock_t buf_lock;
++	atomic_t refcnt;
++	atomic_t power_cnt;
++	bool is_idle;
++	bool is_single;
++};
++#endif
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index a2c1d8d91736..e4f74db43135 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -12,27 +12,6 @@
+ #include "dev.h"
+ #include "regs.h"
+ 
+-void rkispp_free_pool(struct rkispp_stream_vdev *vdev)
+-{
+-	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
+-	struct rkispp_isp_buf_pool *buf;
+-	int i, j;
+-
+-	for (i = 0; i < RKISPP_BUF_POOL_MAX; i++) {
+-		buf = &vdev->pool[i];
+-		if (!buf->dbufs)
+-			break;
+-		for (j = 0; j < GROUP_BUF_MAX; j++) {
+-			if (buf->mem_priv[j]) {
+-				ops->unmap_dmabuf(buf->mem_priv[j]);
+-				ops->detach_dmabuf(buf->mem_priv[j]);
+-				buf->mem_priv[j] = NULL;
+-			}
+-		}
+-		buf->dbufs = NULL;
+-	}
+-}
+-
+ u32 cal_fec_mesh(u32 width, u32 height, u32 mode)
+ {
+ 	u32 mesh_size, mesh_left_height;
+@@ -271,13 +250,16 @@ static int rkispp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 	v4l2_dbg(1, rkispp_debug, &ispp_sdev->dev->v4l2_dev,
+ 		 "s_stream on:%d\n", on);
+ 
+-	if (on)
++	if (on) {
+ 		ispp_sdev->state = ISPP_START;
++		rkispp_event_handle(dev, CMD_STREAM, &ispp_sdev->state);
++	}
+ 	ret = v4l2_subdev_call(ispp_sdev->remote_sd,
+ 			       video, s_stream, on);
+ 	if ((on && ret) || (!on && !ret)) {
+ 		ispp_sdev->state = ISPP_STOP;
+-		rkispp_free_pool(&dev->stream_vdev);
++		rkispp_event_handle(dev, CMD_STREAM, &ispp_sdev->state);
++		rkispp_event_handle(dev, CMD_FREE_POOL, NULL);
+ 	}
+ 	return ret;
+ }
+@@ -285,65 +267,28 @@ static int rkispp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ static int rkispp_sd_s_rx_buffer(struct v4l2_subdev *sd,
+ 				 void *buf, unsigned int *size)
+ {
+-	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
+ 	struct rkispp_subdev *ispp_sdev = v4l2_get_subdevdata(sd);
+ 	struct rkispp_device *dev = ispp_sdev->dev;
+-	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	struct rkisp_ispp_buf *dbufs = buf;
+-	struct rkispp_isp_buf_pool *pool;
+-	u32 i, val = (vdev->module_ens & ISPP_MODULE_TNR) ?
+-			ISPP_MODULE_TNR : ISPP_MODULE_NR;
+-	int ret = 0;
+-	void *mem;
++	u32 cmd = CMD_INIT_POOL;
+ 
+ 	/* size isn't using now */
+-	if (!dbufs)
++	if (!buf)
+ 		return -EINVAL;
+ 
+-	if (ispp_sdev->state == ISPP_START) {
+-		rkispp_module_work_event(dev, dbufs, NULL, val, false);
+-		return ret;
+-	}
++	if (ispp_sdev->state == ISPP_START)
++		cmd = CMD_QUEUE_DMABUF;
+ 
+-	/* init dma buf pool */
+-	for (i = 0; i < RKISPP_BUF_POOL_MAX; i++) {
+-		pool = &vdev->pool[i];
+-		if (!pool->dbufs)
+-			break;
+-	}
+-	pool->dbufs = dbufs;
+-	for (i = 0; i < GROUP_BUF_MAX; i++) {
+-		mem = ops->attach_dmabuf(dev->dev, dbufs->dbuf[i],
+-			dbufs->dbuf[i]->size, DMA_BIDIRECTIONAL);
+-		if (IS_ERR(mem)) {
+-			ret = PTR_ERR(mem);
+-			goto err;
+-		}
+-		pool->mem_priv[i] = mem;
+-		ret = ops->map_dmabuf(mem);
+-		if (ret)
+-			goto err;
+-		pool->dma[i] = *((dma_addr_t *)ops->cookie(mem));
+-		v4l2_dbg(1, rkispp_debug, sd,
+-			 "dma[%d]:0x%x\n", i, pool->dma[i]);
+-	}
+-	return 0;
+-err:
+-	rkispp_free_pool(vdev);
+-	return ret;
++	return rkispp_event_handle(dev, cmd, buf);
+ }
+ 
+ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ {
+ 	struct rkispp_subdev *ispp_sdev = v4l2_get_subdevdata(sd);
+ 	struct rkispp_device *ispp_dev = ispp_sdev->dev;
+-	void __iomem *base = ispp_dev->base_addr;
+-	struct iommu_domain *domain;
+ 	int ret;
+ 
+ 	v4l2_dbg(1, rkispp_debug, &ispp_dev->v4l2_dev,
+ 		 "s_power on:%d\n", on);
+-
+ 	if (on) {
+ 		ret = pm_runtime_get_sync(ispp_dev->dev);
+ 		if (ret < 0) {
+@@ -353,16 +298,6 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 			return ret;
+ 		}
+ 		atomic_set(&ispp_sdev->frm_sync_seq, 0);
+-		writel(SW_SCL_BYPASS, base + RKISPP_SCL0_CTRL);
+-		writel(SW_SCL_BYPASS, base + RKISPP_SCL1_CTRL);
+-		writel(SW_SCL_BYPASS, base + RKISPP_SCL2_CTRL);
+-		writel(OTHER_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+-		writel(SW_SHP_DMA_DIS, base + RKISPP_SHARP_CORE_CTRL);
+-		writel(SW_FEC2DDR_DIS, base + RKISPP_FEC_CORE_CTRL);
+-		writel(0xfffffff, base + RKISPP_CTRL_INT_MSK);
+-		writel(GATE_DIS_ALL, base + RKISPP_CTRL_CLKGATE);
+-		usleep_range(100, 120);
+-		writel(GATE_DIS_NR, base + RKISPP_CTRL_CLKGATE);
+ 		if (ispp_dev->inp == INP_ISP) {
+ 			struct v4l2_subdev_format fmt;
+ 			struct v4l2_subdev_selection sel;
+@@ -399,15 +334,6 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 			}
+ 		}
+ 	} else {
+-		writel(0, ispp_dev->base_addr + RKISPP_CTRL_INT_MSK);
+-		rkispp_soft_reset(ispp_dev->base_addr);
+-		domain = iommu_get_domain_for_dev(ispp_dev->dev);
+-		if (domain) {
+-#ifdef CONFIG_IOMMU_API
+-			domain->ops->detach_dev(domain, ispp_dev->dev);
+-			domain->ops->attach_dev(domain, ispp_dev->dev);
+-#endif
+-		}
+ 		if (ispp_dev->inp == INP_ISP)
+ 			v4l2_subdev_call(ispp_sdev->remote_sd, core, s_power, 0);
+ 		ret = pm_runtime_put(ispp_dev->dev);
+@@ -465,7 +391,7 @@ int rkispp_register_subdev(struct rkispp_device *dev,
+ 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	sd->entity.ops = &rkispp_sd_media_ops;
+ 	snprintf(sd->name, sizeof(sd->name), "rkispp-subdev");
+-
++	sd->entity.function = MEDIA_ENT_F_PROC_VIDEO_COMPOSER;
+ 	ispp_sdev->pads[RKISPP_PAD_SINK].flags =
+ 		MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
+ 	ispp_sdev->pads[RKISPP_PAD_SINK_PARAMS].flags = MEDIA_PAD_FL_SINK;
+diff --git a/drivers/media/platform/rockchip/ispp/params.c b/drivers/media/platform/rockchip/ispp/params.c
+index 1905f9aa3713..ffa9dfad3483 100644
+--- a/drivers/media/platform/rockchip/ispp/params.c
++++ b/drivers/media/platform/rockchip/ispp/params.c
+@@ -46,34 +46,33 @@ static inline size_t get_input_size(struct rkispp_params_vdev *params_vdev)
+ static void tnr_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_tnr_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+ 	u32 i, val;
+ 
+ 	val = arg->opty_en << 2 | arg->optc_en << 3 |
+ 		arg->gain_en << 4;
+-	rkispp_set_bits(base + RKISPP_TNR_CORE_CTRL,
++	rkispp_set_bits(params_vdev->dev, RKISPP_TNR_CORE_CTRL,
+ 			SW_TNR_OPTY_EN | SW_TNR_OPTC_EN |
+ 			SW_TNR_GLB_GAIN_EN, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->pk0_y, arg->pk1_y,
+ 		arg->pk0_c, arg->pk1_c);
+-	rkispp_write(base + RKISPP_TNR_CORE_PK0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_PK0, val);
+ 
+ 	val = ISPP_PACK_2SHORT(arg->glb_gain_cur, arg->glb_gain_nxt);
+-	rkispp_write(base + RKISPP_TNR_CORE_GLB_GAIN, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GLB_GAIN, val);
+ 	val = ISPP_PACK_2SHORT(arg->glb_gain_cur_div, arg->glb_gain_cur_sqrt);
+-	rkispp_write(base + RKISPP_TNR_CORE_GLB_GAIN_DIV, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GLB_GAIN_DIV, val);
+ 
+ 	for (i = 0; i < TNR_SIGMA_CURVE_SIZE - 1; i += 2)
+-		rkispp_write(base + RKISPP_TNR_CORE_SIG_Y01 + i * 2,
++		rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SIG_Y01 + i * 2,
+ 			ISPP_PACK_2SHORT(arg->sigma_y[i], arg->sigma_y[i + 1]));
+-	rkispp_write(base + RKISPP_TNR_CORE_SIG_Y10, arg->sigma_y[16]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SIG_X18,
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SIG_Y10, arg->sigma_y[16]);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SIG_X18,
+ 		ISPP_PACK_4BIT(arg->sigma_x[0], arg->sigma_x[1],
+ 			arg->sigma_x[2], arg->sigma_x[3],
+ 			arg->sigma_x[4], arg->sigma_x[5],
+ 			arg->sigma_x[6], arg->sigma_x[7]));
+-	rkispp_write(base + RKISPP_TNR_CORE_SIG_X910,
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SIG_X910,
+ 		ISPP_PACK_4BIT(arg->sigma_x[8], arg->sigma_x[9],
+ 			arg->sigma_x[10], arg->sigma_x[11],
+ 			arg->sigma_x[12], arg->sigma_x[13],
+@@ -81,240 +80,236 @@ static void tnr_config(struct rkispp_params_vdev *params_vdev,
+ 
+ 	for (i = 0; i < TNR_LUMA_CURVE_SIZE; i += 2) {
+ 		val = ISPP_PACK_2SHORT(arg->luma_curve[i], arg->luma_curve[i + 1]);
+-		rkispp_write(base + RKISPP_TNR_CORE_LUMACURVE_Y01 + i * 2, val);
++		rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_LUMACURVE_Y01 + i * 2, val);
+ 	}
+ 
+ 	val = ISPP_PACK_2SHORT(arg->txt_th0_y, arg->txt_th1_y);
+-	rkispp_write(base + RKISPP_TNR_CORE_TH_Y, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_TH_Y, val);
+ 	val = ISPP_PACK_2SHORT(arg->txt_th0_c, arg->txt_th1_c);
+-	rkispp_write(base + RKISPP_TNR_CORE_TH_C, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_TH_C, val);
+ 	val = ISPP_PACK_2SHORT(arg->txt_thy_dlt, arg->txt_thc_dlt);
+-	rkispp_write(base + RKISPP_TNR_CORE_TH_DLT, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_TH_DLT, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_y0[0], arg->gfcoef_y0[1],
+ 		arg->gfcoef_y0[2], arg->gfcoef_y0[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_Y0_0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_Y0_0, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_y0[4], arg->gfcoef_y0[5], 0, 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_Y0_1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_Y0_1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_y1[0], arg->gfcoef_y1[1],
+ 		arg->gfcoef_y1[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_Y1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_Y1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_y2[0], arg->gfcoef_y2[1],
+ 		arg->gfcoef_y2[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_Y2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_Y2, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_y3[0], arg->gfcoef_y3[1],
+ 		arg->gfcoef_y3[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_Y3, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_Y3, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yg0[0], arg->gfcoef_yg0[1],
+ 		arg->gfcoef_yg0[2], arg->gfcoef_yg0[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YG0_0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YG0_0, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yg0[4], arg->gfcoef_yg0[5], 0, 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YG0_1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YG0_1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yg1[0], arg->gfcoef_yg1[1],
+ 		arg->gfcoef_yg1[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YG1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YG1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yg2[0], arg->gfcoef_yg2[1],
+ 		arg->gfcoef_yg2[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YG2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YG2, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yg3[0], arg->gfcoef_yg3[1],
+ 		arg->gfcoef_yg3[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YG3, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YG3, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yl0[0], arg->gfcoef_yl0[1],
+ 		arg->gfcoef_yl0[2], arg->gfcoef_yl0[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YL0_0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YL0_0, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yl0[4], arg->gfcoef_yl0[5], 0, 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YL0_1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YL0_1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yl1[0], arg->gfcoef_yl1[1],
+ 		arg->gfcoef_yl1[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YL1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_yl2[0], arg->gfcoef_yl2[1],
+ 		arg->gfcoef_yl2[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_YL2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_YL2, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cg0[0], arg->gfcoef_cg0[1],
+ 		arg->gfcoef_cg0[2], arg->gfcoef_cg0[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CG0_0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CG0_0, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cg0[4], arg->gfcoef_cg0[5], 0, 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CG0_1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CG0_1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cg1[0], arg->gfcoef_cg1[1],
+ 		arg->gfcoef_cg1[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CG1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CG1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cg2[0], arg->gfcoef_cg2[1],
+ 		arg->gfcoef_cg2[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CG2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CG2, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cl0[0], arg->gfcoef_cl0[1],
+ 		arg->gfcoef_cl0[2], arg->gfcoef_cl0[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CL0_0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CL0_0, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cl0[4], arg->gfcoef_cl0[5], 0, 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CL0_1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CL0_1, val);
+ 	val = ISPP_PACK_4BYTE(arg->gfcoef_cl1[0], arg->gfcoef_cl1[1],
+ 		arg->gfcoef_cl1[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_GFCOEF_CL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_GFCOEF_CL1, val);
+ 
+ 	val = ISPP_PACK_2SHORT(arg->scale_yg[0], arg->scale_yg[1]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_YG01, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_YG01, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_yg[2], arg->scale_yg[3]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_YG23, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_YG23, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_yl[0], arg->scale_yl[1]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_YL01, val);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_YL2, arg->scale_yl[2]);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_YL01, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_YL2, arg->scale_yl[2]);
+ 	val = ISPP_PACK_2SHORT(arg->scale_cg[0], arg->scale_y2cg[0]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CG0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CG0, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_cg[1], arg->scale_y2cg[1]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CG1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CG1, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_cg[2], arg->scale_y2cg[2]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CG2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CG2, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_cl[0], arg->scale_y2cl[0]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CL0, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CL0, val);
+ 	val = ISPP_PACK_2SHORT(arg->scale_cl[1], arg->scale_y2cl[1]);
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CL1, val);
+ 	val = arg->scale_y2cl[2] << 16;
+-	rkispp_write(base + RKISPP_TNR_CORE_SCALE_CL2, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_SCALE_CL2, val);
+ 	val = ISPP_PACK_4BYTE(arg->weight_y[0], arg->weight_y[1],
+ 		arg->weight_y[2], 0);
+-	rkispp_write(base + RKISPP_TNR_CORE_WEIGHT, val);
++	rkispp_write(params_vdev->dev, RKISPP_TNR_CORE_WEIGHT, val);
+ }
+ 
+ static void tnr_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+-
+-	rkispp_set_bits(base + RKISPP_TNR_CORE_CTRL, SW_TNR_EN, en);
++	rkispp_set_bits(params_vdev->dev, RKISPP_TNR_CORE_CTRL, SW_TNR_EN, en);
+ }
+ 
+ static void nr_config(struct rkispp_params_vdev *params_vdev,
+ 		      struct rkispp_nr_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+ 	u32 i, val;
+ 
+-	rkispp_write(base + RKISPP_NR_UVNR_GAIN_1SIGMA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_GAIN_1SIGMA,
+ 		arg->uvnr_gain_1sigma);
+-	rkispp_write(base + RKISPP_NR_UVNR_GAIN_OFFSET,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_GAIN_OFFSET,
+ 		arg->uvnr_gain_offset);
+ 	val = ISPP_PACK_4BYTE(arg->uvnr_gain_uvgain[0],
+ 		arg->uvnr_gain_uvgain[1], arg->uvnr_gain_t2gen,
+ 		arg->uvnr_gain_iso);
+-	rkispp_write(base + RKISPP_NR_UVNR_GAIN_GBLGAIN, val);
+-	rkispp_write(base + RKISPP_NR_UVNR_T1GEN_M3ALPHA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_GAIN_GBLGAIN, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T1GEN_M3ALPHA,
+ 		arg->uvnr_t1gen_m3alpha);
+-	rkispp_write(base + RKISPP_NR_UVNR_T1FLT_MODE,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T1FLT_MODE,
+ 		arg->uvnr_t1flt_mode);
+-	rkispp_write(base + RKISPP_NR_UVNR_T1FLT_MSIGMA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T1FLT_MSIGMA,
+ 		arg->uvnr_t1flt_msigma);
+-	rkispp_write(base + RKISPP_NR_UVNR_T1FLT_WTP,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T1FLT_WTP,
+ 		arg->uvnr_t1flt_wtp);
+ 	for (i = 0; i < NR_UVNR_T1FLT_WTQ_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->uvnr_t1flt_wtq[i],
+ 			arg->uvnr_t1flt_wtq[i + 1], arg->uvnr_t1flt_wtq[i + 2],
+ 			arg->uvnr_t1flt_wtq[i + 3]);
+-		rkispp_write(base + RKISPP_NR_UVNR_T1FLT_WTQ0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T1FLT_WTQ0 + i, val);
+ 	}
+-	rkispp_write(base + RKISPP_NR_UVNR_T2GEN_M3ALPHA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2GEN_M3ALPHA,
+ 		arg->uvnr_t2gen_m3alpha);
+-	rkispp_write(base + RKISPP_NR_UVNR_T2GEN_MSIGMA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2GEN_MSIGMA,
+ 		arg->uvnr_t2gen_msigma);
+-	rkispp_write(base + RKISPP_NR_UVNR_T2GEN_WTP,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2GEN_WTP,
+ 		arg->uvnr_t2gen_wtp);
+ 	val = ISPP_PACK_4BYTE(arg->uvnr_t2gen_wtq[0],
+ 		arg->uvnr_t2gen_wtq[1], arg->uvnr_t2gen_wtq[2],
+ 		arg->uvnr_t2gen_wtq[3]);
+-	rkispp_write(base + RKISPP_NR_UVNR_T2GEN_WTQ, val);
+-	rkispp_write(base + RKISPP_NR_UVNR_T2FLT_MSIGMA,
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2GEN_WTQ, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2FLT_MSIGMA,
+ 		arg->uvnr_t2flt_msigma);
+ 	val = ISPP_PACK_4BYTE(arg->uvnr_t2flt_wtp,
+ 		arg->uvnr_t2flt_wt[0], arg->uvnr_t2flt_wt[1],
+ 		arg->uvnr_t2flt_wt[2]);
+-	rkispp_write(base + RKISPP_NR_UVNR_T2FLT_WT, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_UVNR_T2FLT_WT, val);
+ 
+ 	val = ISPP_PACK_4BIT(arg->ynr_sgm_dx[0], arg->ynr_sgm_dx[1],
+ 		arg->ynr_sgm_dx[2], arg->ynr_sgm_dx[3],
+ 		arg->ynr_sgm_dx[4], arg->ynr_sgm_dx[5],
+ 		arg->ynr_sgm_dx[6], arg->ynr_sgm_dx[7]);
+-	rkispp_write(base + RKISPP_NR_YNR_SGM_DX_1_8, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_SGM_DX_1_8, val);
+ 	val = ISPP_PACK_4BIT(arg->ynr_sgm_dx[8], arg->ynr_sgm_dx[9],
+ 		arg->ynr_sgm_dx[10], arg->ynr_sgm_dx[11],
+ 		arg->ynr_sgm_dx[12], arg->ynr_sgm_dx[13],
+ 		arg->ynr_sgm_dx[14], arg->ynr_sgm_dx[15]);
+-	rkispp_write(base + RKISPP_NR_YNR_SGM_DX_9_16, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_SGM_DX_9_16, val);
+ 
+ 	for (i = 0; i < NR_YNR_SGM_Y_SIZE - 1; i += 2) {
+-		rkispp_write(base + RKISPP_NR_YNR_LSGM_Y_0_1 + i * 2,
++		rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LSGM_Y_0_1 + i * 2,
+ 			ISPP_PACK_2SHORT(arg->ynr_lsgm_y[i], arg->ynr_lsgm_y[i + 1]));
+ 
+-		rkispp_write(base + RKISPP_NR_YNR_HSGM_Y_0_1 + i * 2,
++		rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HSGM_Y_0_1 + i * 2,
+ 			ISPP_PACK_2SHORT(arg->ynr_hsgm_y[i], arg->ynr_hsgm_y[i + 1]));
+ 	}
+-	rkispp_write(base + RKISPP_NR_YNR_LSGM_Y_16, arg->ynr_lsgm_y[16]);
+-	rkispp_write(base + RKISPP_NR_YNR_HSGM_Y_16, arg->ynr_hsgm_y[16]);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LSGM_Y_16, arg->ynr_lsgm_y[16]);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HSGM_Y_16, arg->ynr_hsgm_y[16]);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lci[0], arg->ynr_lci[1],
+ 		arg->ynr_lci[2], arg->ynr_lci[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_LCI, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LCI, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lgain_min[0], arg->ynr_lgain_min[1],
+ 		arg->ynr_lgain_min[2], arg->ynr_lgain_min[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_LGAIN_DIRE_MIN, val);
+-	rkispp_write(base + RKISPP_NR_YNR_IGAIN_DIRE_MAX, arg->ynr_lgain_max);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LGAIN_DIRE_MIN, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_IGAIN_DIRE_MAX, arg->ynr_lgain_max);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lmerge_bound, arg->ynr_lmerge_ratio, 0, 0);
+-	rkispp_write(base + RKISPP_NR_YNR_LMERGE, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LMERGE, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lweit_flt[0], arg->ynr_lweit_flt[1],
+ 		arg->ynr_lweit_flt[2], arg->ynr_lweit_flt[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_LWEIT_FLT, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LWEIT_FLT, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_hlci[0], arg->ynr_hlci[1],
+ 		arg->ynr_hlci[2], arg->ynr_hlci[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_HLCI, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HLCI, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lhci[0], arg->ynr_lhci[1],
+ 		arg->ynr_lhci[2], arg->ynr_lhci[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_LHCI, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LHCI, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_hhci[0], arg->ynr_hhci[1],
+ 		arg->ynr_hhci[2], arg->ynr_hhci[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_HHCI, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HHCI, val);
+ 	val = ISPP_PACK_4BYTE(arg->ynr_hgain_sgm[0], arg->ynr_hgain_sgm[1],
+ 		arg->ynr_hgain_sgm[2], arg->ynr_hgain_sgm[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_HGAIN_SGM, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HGAIN_SGM, val);
+ 
+ 	for (i = 0; i < NR_YNR_HWEIT_D_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->ynr_hweit_d[i], arg->ynr_hweit_d[i + 1],
+ 			arg->ynr_hweit_d[i + 2], arg->ynr_hweit_d[i + 3]);
+-		rkispp_write(base + RKISPP_NR_YNR_HWEIT_D0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HWEIT_D0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < NR_YNR_HGRAD_Y_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->ynr_hgrad_y[i], arg->ynr_hgrad_y[i + 1],
+ 			arg->ynr_hgrad_y[i + 2], arg->ynr_hgrad_y[i + 3]);
+-		rkispp_write(base + RKISPP_NR_YNR_HGRAD_Y0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HGRAD_Y0 + i, val);
+ 	}
+ 
+ 	val = ISPP_PACK_2SHORT(arg->ynr_hweit[0], arg->ynr_hweit[1]);
+-	rkispp_write(base + RKISPP_NR_YNR_HWEIT_1_2, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HWEIT_1_2, val);
+ 	val = ISPP_PACK_2SHORT(arg->ynr_hweit[2], arg->ynr_hweit[3]);
+-	rkispp_write(base + RKISPP_NR_YNR_HWEIT_3_4, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HWEIT_3_4, val);
+ 
+-	rkispp_write(base + RKISPP_NR_YNR_HMAX_ADJUST, arg->ynr_hmax_adjust);
+-	rkispp_write(base + RKISPP_NR_YNR_HSTRENGTH, arg->ynr_hstrength);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HMAX_ADJUST, arg->ynr_hmax_adjust);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HSTRENGTH, arg->ynr_hstrength);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lweit_cmp[0], arg->ynr_lweit_cmp[1], 0, 0);
+-	rkispp_write(base + RKISPP_NR_YNR_LWEIT_CMP, val);
+-	rkispp_write(base + RKISPP_NR_YNR_LMAXGAIN_LV4, arg->ynr_lmaxgain_lv4);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LWEIT_CMP, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_LMAXGAIN_LV4, arg->ynr_lmaxgain_lv4);
+ 
+ 	for (i = 0; i < NR_YNR_HSTV_Y_SIZE - 1; i += 2) {
+ 		val = ISPP_PACK_2SHORT(arg->ynr_hstv_y[i], arg->ynr_hstv_y[i + 1]);
+-		rkispp_write(base + RKISPP_NR_YNR_HSTV_Y_0_1 + i * 2, val);
++		rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HSTV_Y_0_1 + i * 2, val);
+ 	}
+-	rkispp_write(base + RKISPP_NR_YNR_HSTV_Y_16, arg->ynr_hstv_y[16]);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_HSTV_Y_16, arg->ynr_hstv_y[16]);
+ 
+ 	val = ISPP_PACK_2SHORT(arg->ynr_st_scale[0], arg->ynr_st_scale[1]);
+-	rkispp_write(base + RKISPP_NR_YNR_ST_SCALE_LV1_LV2, val);
+-	rkispp_write(base + RKISPP_NR_YNR_ST_SCALE_LV3, arg->ynr_st_scale[2]);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_ST_SCALE_LV1_LV2, val);
++	rkispp_write(params_vdev->dev, RKISPP_NR_YNR_ST_SCALE_LV3, arg->ynr_st_scale[2]);
+ }
+ 
+ static void nr_enable(struct rkispp_params_vdev *params_vdev, bool en,
+ 		      struct rkispp_nr_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+ 	u8 big_en, nobig_en;
+ 	u32 val;
+ 
+@@ -331,7 +326,7 @@ static void nr_enable(struct rkispp_params_vdev *params_vdev, bool en,
+ 	if (en)
+ 		val |= SW_NR_EN;
+ 
+-	rkispp_set_bits(base + RKISPP_NR_UVNR_CTRL_PARA,
++	rkispp_set_bits(params_vdev->dev, RKISPP_NR_UVNR_CTRL_PARA,
+ 			SW_UVNR_STEP1_ON | SW_UVNR_STEP2_ON |
+ 			SW_NR_GAIN_BYPASS | SW_UVNR_NOBIG_EN |
+ 			SW_UVNR_BIG_EN | SW_NR_EN, val);
+@@ -340,146 +335,145 @@ static void nr_enable(struct rkispp_params_vdev *params_vdev, bool en,
+ static void shp_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_sharp_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+ 	u32 i, val;
+ 
+-	rkispp_set_bits(base + RKISPP_SHARP_CTRL, SW_SHP_WR_ROT_MODE(3),
++	rkispp_set_bits(params_vdev->dev, RKISPP_SHARP_CTRL,
++			SW_SHP_WR_ROT_MODE(3),
+ 			SW_SHP_WR_ROT_MODE(arg->rotation));
+ 
+-	rkispp_write(base + RKISPP_SHARP_SC_DOWN,
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_SC_DOWN,
+ 		(arg->scl_down_v & 0x1) << 1 | (arg->scl_down_h & 0x1));
+ 
+-	rkispp_write(base + RKISPP_SHARP_TILE_IDX,
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_TILE_IDX,
+ 		(arg->tile_ycnt & 0x1F) << 8 | (arg->tile_xcnt & 0xFF));
+ 
+-	rkispp_write(base + RKISPP_SHARP_HBF_FACTOR, arg->hbf_ratio |
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_HBF_FACTOR, arg->hbf_ratio |
+ 		arg->ehf_th << 16 | arg->pbf_ratio << 24);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_TH, arg->edge_thed |
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_TH, arg->edge_thed |
+ 		arg->dir_min << 8 | arg->smoth_th4 << 16);
+ 	val = ISPP_PACK_2SHORT(arg->l_alpha, arg->g_alpha);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_ALPHA, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_ALPHA, val);
+ 	val = ISPP_PACK_4BYTE(arg->pbf_k[0], arg->pbf_k[1], arg->pbf_k[2], 0);
+-	rkispp_write(base + RKISPP_SHARP_PBF_KERNEL, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_PBF_KERNEL, val);
+ 	val = ISPP_PACK_4BYTE(arg->mrf_k[0], arg->mrf_k[1], arg->mrf_k[2], arg->mrf_k[3]);
+-	rkispp_write(base + RKISPP_SHARP_MRF_KERNEL0, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_MRF_KERNEL0, val);
+ 	val = ISPP_PACK_4BYTE(arg->mrf_k[4], arg->mrf_k[5], 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_MRF_KERNEL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_MRF_KERNEL1, val);
+ 
+ 	for (i = 0; i < SHP_MBF_KERNEL_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->mbf_k[i], arg->mbf_k[i + 1],
+ 			arg->mbf_k[i + 2], arg->mbf_k[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_MBF_KERNEL0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_MBF_KERNEL0 + i, val);
+ 	}
+ 
+ 	val = ISPP_PACK_4BYTE(arg->hrf_k[0], arg->hrf_k[1], arg->hrf_k[2], arg->hrf_k[3]);
+-	rkispp_write(base + RKISPP_SHARP_HRF_KERNEL0, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_HRF_KERNEL0, val);
+ 	val = ISPP_PACK_4BYTE(arg->hrf_k[4], arg->hrf_k[5], 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_HRF_KERNEL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_HRF_KERNEL1, val);
+ 	val = ISPP_PACK_4BYTE(arg->hbf_k[0], arg->hbf_k[1], arg->hbf_k[2], 0);
+-	rkispp_write(base + RKISPP_SHARP_HBF_KERNEL, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_HBF_KERNEL, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->eg_coef[0], arg->eg_coef[1], arg->eg_coef[2], 0);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_COEF, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_COEF, val);
+ 	val = ISPP_PACK_4BYTE(arg->eg_smoth[0], arg->eg_smoth[1], arg->eg_smoth[2], 0);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_SMOTH, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_SMOTH, val);
+ 	val = ISPP_PACK_4BYTE(arg->eg_gaus[0], arg->eg_gaus[1], arg->eg_gaus[2], arg->eg_gaus[3]);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_GAUS0, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_GAUS0, val);
+ 	val = ISPP_PACK_4BYTE(arg->eg_gaus[4], arg->eg_gaus[5], 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_EDGE_GAUS1, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_GAUS1, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->dog_k[0], arg->dog_k[1], arg->dog_k[2], arg->dog_k[3]);
+-	rkispp_write(base + RKISPP_SHARP_DOG_KERNEL0, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_DOG_KERNEL0, val);
+ 	val = ISPP_PACK_4BYTE(arg->dog_k[4], arg->dog_k[5], 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_DOG_KERNEL1, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_DOG_KERNEL1, val);
+ 	val = ISPP_PACK_4BYTE(arg->lum_point[0], arg->lum_point[1],
+ 		arg->lum_point[2], arg->lum_point[3]);
+-	rkispp_write(base + RKISPP_SHARP_LUM_POINT0, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_LUM_POINT0, val);
+ 	val = ISPP_PACK_4BYTE(arg->lum_point[4], arg->lum_point[5], 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_LUM_POINT1, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_LUM_POINT1, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->pbf_shf_bits, arg->mbf_shf_bits, arg->hbf_shf_bits, 0);
+-	rkispp_write(base + RKISPP_SHARP_SHF_BITS, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_SHF_BITS, val);
+ 
+ 	for (i = 0; i < SHP_SIGMA_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->pbf_sigma[i], arg->pbf_sigma[i + 1],
+ 			arg->pbf_sigma[i + 2], arg->pbf_sigma[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_PBF_SIGMA_INV0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_PBF_SIGMA_INV0 + i, val);
+ 		val = ISPP_PACK_4BYTE(arg->mbf_sigma[i], arg->mbf_sigma[i + 1],
+ 			arg->mbf_sigma[i + 2], arg->mbf_sigma[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_MBF_SIGMA_INV0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_MBF_SIGMA_INV0 + i, val);
+ 		val = ISPP_PACK_4BYTE(arg->hbf_sigma[i], arg->hbf_sigma[i + 1],
+ 			arg->hbf_sigma[i + 2], arg->hbf_sigma[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_HBF_SIGMA_INV0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_HBF_SIGMA_INV0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < SHP_LUM_CLP_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->lum_clp_m[i], arg->lum_clp_m[i + 1],
+ 			arg->lum_clp_m[i + 2], arg->lum_clp_m[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_LUM_CLP_M0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_LUM_CLP_M0 + i, val);
+ 		val = ISPP_PACK_4BYTE(arg->lum_clp_h[i], arg->lum_clp_h[i + 1],
+ 			arg->lum_clp_h[i + 2], arg->lum_clp_h[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_LUM_CLP_H0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_LUM_CLP_H0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < SHP_LUM_MIN_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->lum_min_m[i], arg->lum_min_m[i + 1],
+ 			arg->lum_min_m[i + 2], arg->lum_min_m[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_LUM_MIN_M0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_LUM_MIN_M0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < SHP_EDGE_LUM_THED_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->edge_lum_thed[i], arg->edge_lum_thed[i + 1],
+ 			arg->edge_lum_thed[i + 2], arg->edge_lum_thed[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_EDGE_LUM_THED0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_EDGE_LUM_THED0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < SHP_CLAMP_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->clamp_pos[i], arg->clamp_pos[i + 1],
+ 			arg->clamp_pos[i + 2], arg->clamp_pos[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_CLAMP_POS_DOG0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_CLAMP_POS_DOG0 + i, val);
+ 		val = ISPP_PACK_4BYTE(arg->clamp_neg[i], arg->clamp_neg[i + 1],
+ 			arg->clamp_neg[i + 2], arg->clamp_neg[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_CLAMP_NEG_DOG0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_CLAMP_NEG_DOG0 + i, val);
+ 	}
+ 
+ 	for (i = 0; i < SHP_DETAIL_ALPHA_SIZE; i += 4) {
+ 		val = ISPP_PACK_4BYTE(arg->detail_alpha[i], arg->detail_alpha[i + 1],
+ 			arg->detail_alpha[i + 2], arg->detail_alpha[i + 3]);
+-		rkispp_write(base + RKISPP_SHARP_DETAIL_ALPHA_DOG0 + i, val);
++		rkispp_write(params_vdev->dev, RKISPP_SHARP_DETAIL_ALPHA_DOG0 + i, val);
+ 	}
+ 
+ 	val = ISPP_PACK_2SHORT(arg->rfl_ratio, arg->rfh_ratio);
+-	rkispp_write(base + RKISPP_SHARP_RF_RATIO, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_RF_RATIO, val);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->m_ratio, arg->h_ratio, 0, 0);
+-	rkispp_write(base + RKISPP_SHARP_GRAD_RATIO, val);
++	rkispp_write(params_vdev->dev, RKISPP_SHARP_GRAD_RATIO, val);
+ }
+ 
+ static void shp_enable(struct rkispp_params_vdev *params_vdev, bool en,
+ 		       struct rkispp_sharp_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+ 	u32 ens = params_vdev->dev->stream_vdev.module_ens;
+ 	u32 val;
+ 
+ 	if (en && !(ens & ISPP_MODULE_FEC)) {
+-		rkispp_set_bits(base + RKISPP_SCL0_CTRL,
++		rkispp_set_bits(params_vdev->dev, RKISPP_SCL0_CTRL,
+ 				SW_SCL_FIRST_MODE, SW_SCL_FIRST_MODE);
+-		rkispp_set_bits(base + RKISPP_SCL1_CTRL,
++		rkispp_set_bits(params_vdev->dev, RKISPP_SCL1_CTRL,
+ 				SW_SCL_FIRST_MODE, SW_SCL_FIRST_MODE);
+-		rkispp_set_bits(base + RKISPP_SCL2_CTRL,
++		rkispp_set_bits(params_vdev->dev, RKISPP_SCL2_CTRL,
+ 				SW_SCL_FIRST_MODE, SW_SCL_FIRST_MODE);
+ 	} else {
+-		rkispp_clear_bits(base + RKISPP_SCL0_CTRL, SW_SCL_FIRST_MODE);
+-		rkispp_clear_bits(base + RKISPP_SCL1_CTRL, SW_SCL_FIRST_MODE);
+-		rkispp_clear_bits(base + RKISPP_SCL2_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL0_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL1_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL2_CTRL, SW_SCL_FIRST_MODE);
+ 	}
+ 
+ 	val = arg->alpha_adp_en << 1 | arg->yin_flt_en << 3 |
+ 	      arg->edge_avg_en << 4;
+ 	if (en)
+ 		val |= SW_SHP_EN;
+-	rkispp_set_bits(base + RKISPP_SHARP_CORE_CTRL,
++	rkispp_set_bits(params_vdev->dev, RKISPP_SHARP_CORE_CTRL,
+ 			SW_SHP_ALPHA_ADP_EN | SW_SHP_YIN_FLT_EN |
+ 			SW_SHP_EDGE_AVG_EN | SW_SHP_EN, val);
+ }
+@@ -489,7 +483,6 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ {
+ 	struct rkispp_device *dev = params_vdev->dev;
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	void __iomem *base = dev->base_addr;
+ 	struct rkispp_dummy_buffer *buf;
+ 	u32 val;
+ 
+@@ -503,13 +496,13 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 	val = 0;
+ 	if (arg->mesh_density)
+ 		val = SW_MESH_DENSITY;
+-	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_MESH_DENSITY, val);
++	rkispp_set_bits(params_vdev->dev, RKISPP_FEC_CORE_CTRL, SW_MESH_DENSITY, val);
+ 
+-	rkispp_write(base + RKISPP_FEC_MESH_SIZE, arg->mesh_size);
++	rkispp_write(params_vdev->dev, RKISPP_FEC_MESH_SIZE, arg->mesh_size);
+ 
+ 	val = (arg->crop_height & 0x1FFFF) << 14 |
+ 	      (arg->crop_width & 0x1FFFF) << 1 | (arg->crop_en & 0x01);
+-	rkispp_write(base + RKISPP_FEC_CROP, val);
++	rkispp_write(params_vdev->dev, RKISPP_FEC_CROP, val);
+ 
+ 	buf = &vdev->fec_buf.mesh_xint;
+ 	memcpy(buf->vaddr, &arg->meshxi[0], arg->mesh_size * sizeof(u16));
+@@ -523,30 +516,24 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 
+ static void fec_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+-
+ 	if (en) {
+-		rkispp_clear_bits(base + RKISPP_SCL0_CTRL, SW_SCL_FIRST_MODE);
+-		rkispp_clear_bits(base + RKISPP_SCL1_CTRL, SW_SCL_FIRST_MODE);
+-		rkispp_clear_bits(base + RKISPP_SCL2_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL0_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL1_CTRL, SW_SCL_FIRST_MODE);
++		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL2_CTRL, SW_SCL_FIRST_MODE);
+ 	}
+-	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_FEC_EN, en);
++	rkispp_set_bits(params_vdev->dev, RKISPP_FEC_CORE_CTRL, SW_FEC_EN, en);
+ }
+ 
+ static void orb_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_orb_config *arg)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+-
+-	rkispp_write(base + RKISPP_ORB_LIMIT_VALUE, arg->limit_value & 0xFF);
+-	rkispp_write(base + RKISPP_ORB_MAX_FEATURE, arg->max_feature & 0x1FFFFF);
++	rkispp_write(params_vdev->dev, RKISPP_ORB_LIMIT_VALUE, arg->limit_value & 0xFF);
++	rkispp_write(params_vdev->dev, RKISPP_ORB_MAX_FEATURE, arg->max_feature & 0x1FFFFF);
+ }
+ 
+ static void orb_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ {
+-	void __iomem *base = params_vdev->dev->base_addr;
+-
+-	rkispp_set_bits(base + RKISPP_ORB_CORE_CTRL, SW_ORB_EN, en);
++	rkispp_set_bits(params_vdev->dev, RKISPP_ORB_CORE_CTRL, SW_ORB_EN, en);
+ }
+ 
+ static int rkispp_params_enum_fmt_meta_out(struct file *file, void *priv,
+@@ -802,7 +789,7 @@ rkispp_params_init_vb2_queue(struct vb2_queue *q,
+ 	q->buf_struct_size = sizeof(struct rkispp_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->lock = &params_vdev->dev->iqlock;
+-	q->dev = params_vdev->dev->dev;
++	q->dev = params_vdev->dev->hw_dev->dev;
+ 
+ 	return vb2_queue_init(q);
+ }
+diff --git a/drivers/media/platform/rockchip/ispp/regs.h b/drivers/media/platform/rockchip/ispp/regs.h
+index fb1131844a5e..c48cf2966b03 100644
+--- a/drivers/media/platform/rockchip/ispp/regs.h
++++ b/drivers/media/platform/rockchip/ispp/regs.h
+@@ -4,6 +4,9 @@
+ #ifndef _RKISPP_REGS_H
+ #define _RKISPP_REGS_H
+ 
++#define ISPP_SW_REG_SIZE		0x0d00
++#define ISPP_SW_MAX_SIZE		(ISPP_SW_REG_SIZE * 2)
++
+ /* registers */
+ #define RKISPP_CTRL			0x0000
+ #define RKISPP_CTRL_STRT		(RKISPP_CTRL + 0x0000)
+@@ -501,44 +504,4 @@
+ /* ORB_CORE_CTRL */
+ #define SW_ORB_EN			BIT(0)
+ 
+-static inline void rkispp_soft_reset(void __iomem *base)
+-{
+-	writel(GLB_SOFT_RST_ALL, base + RKISPP_CTRL_RESET);
+-}
+-
+-static inline void set_y_addr(struct rkispp_stream *stream, u32 val)
+-{
+-	void __iomem *base = stream->isppdev->base_addr;
+-
+-	writel(val, base + stream->config->reg.cur_y_base);
+-}
+-
+-static inline void set_uv_addr(struct rkispp_stream *stream, u32 val)
+-{
+-	void __iomem *base = stream->isppdev->base_addr;
+-
+-	writel(val, base + stream->config->reg.cur_uv_base);
+-}
+-
+-static inline void set_vir_stride(struct rkispp_stream *stream, u32 val)
+-{
+-	void __iomem *base = stream->isppdev->base_addr;
+-
+-	writel(val, base + stream->config->reg.cur_vir_stride);
+-}
+-
+-static inline void set_scl_factor(struct rkispp_stream *stream, u32 val)
+-{
+-	void __iomem *base = stream->isppdev->base_addr;
+-
+-	writel(val, base + stream->config->reg.factor);
+-}
+-
+-static inline void set_ctrl(struct rkispp_stream *stream, u32 val)
+-{
+-	void __iomem *base = stream->isppdev->base_addr;
+-
+-	writel(val, base + stream->config->reg.ctrl);
+-}
+-
+ #endif /* _RKISPP_REGS_H */
+diff --git a/drivers/media/platform/rockchip/ispp/stats.c b/drivers/media/platform/rockchip/ispp/stats.c
+index e3251c1cb6a9..ec540b9ee74e 100644
+--- a/drivers/media/platform/rockchip/ispp/stats.c
++++ b/drivers/media/platform/rockchip/ispp/stats.c
+@@ -17,13 +17,12 @@
+ 
+ static void update_addr(struct rkispp_stats_vdev *stats_vdev)
+ {
+-	void __iomem *base = stats_vdev->dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy_buf;
+ 	u32 addr;
+ 
+ 	if (stats_vdev->next_buf) {
+ 		addr = stats_vdev->next_buf->buff_addr[0];
+-		writel(addr, base + RKISPP_ORB_WR_BASE);
++		rkispp_write(stats_vdev->dev, RKISPP_ORB_WR_BASE, addr);
+ 	}
+ 
+ 	if (!stats_vdev->next_buf) {
+@@ -31,13 +30,13 @@ static void update_addr(struct rkispp_stats_vdev *stats_vdev)
+ 		if (!dummy_buf->mem_priv)
+ 			return;
+ 
+-		writel(dummy_buf->dma_addr, base + RKISPP_ORB_WR_BASE);
++		rkispp_write(stats_vdev->dev, RKISPP_ORB_WR_BASE, dummy_buf->dma_addr);
+ 	}
+ }
+ 
+ static int rkispp_stats_frame_end(struct rkispp_stats_vdev *stats_vdev)
+ {
+-	void __iomem *base = stats_vdev->dev->base_addr;
++	void __iomem *base = stats_vdev->dev->hw_dev->base_addr;
+ 	struct rkispp_device *dev = stats_vdev->dev;
+ 	struct rkispp_buffer *curr_buf;
+ 	struct rkispp_stats_buffer *cur_stat_buf;
+@@ -309,7 +308,7 @@ static int rkispp_stats_init_vb2_queue(struct vb2_queue *q,
+ 	q->buf_struct_size = sizeof(struct rkispp_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->lock = &stats_vdev->dev->iqlock;
+-	q->dev = stats_vdev->dev->dev;
++	q->dev = stats_vdev->dev->hw_dev->dev;
+ 
+ 	return vb2_queue_init(q);
+ }
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 669e9f1426ef..0274861ec468 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -7,6 +7,7 @@
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-fh.h>
+ #include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
+ #include <media/v4l2-subdev.h>
+ #include <media/videobuf2-dma-contig.h>
+ #include <linux/rkisp1-config.h>
+@@ -172,6 +173,26 @@ static struct stream_config scl2_config = {
+ 	},
+ };
+ 
++static void set_y_addr(struct rkispp_stream *stream, u32 val)
++{
++	rkispp_write(stream->isppdev, stream->config->reg.cur_y_base, val);
++}
++
++static void set_uv_addr(struct rkispp_stream *stream, u32 val)
++{
++	rkispp_write(stream->isppdev, stream->config->reg.cur_uv_base, val);
++}
++
++static void set_vir_stride(struct rkispp_stream *stream, u32 val)
++{
++	rkispp_write(stream->isppdev, stream->config->reg.cur_vir_stride, val);
++}
++
++static void set_scl_factor(struct rkispp_stream *stream, u32 val)
++{
++	rkispp_write(stream->isppdev, stream->config->reg.factor, val);
++}
++
+ static int fcc_xysubs(u32 fcc, u32 *xsubs, u32 *ysubs)
+ {
+ 	switch (fcc) {
+@@ -254,7 +275,6 @@ static void update_mi(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	void __iomem *base = dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy_buf;
+ 	u32 val;
+ 
+@@ -283,12 +303,10 @@ static void update_mi(struct rkispp_stream *stream)
+ 	}
+ 
+ 	v4l2_dbg(2, rkispp_debug, &stream->isppdev->v4l2_dev,
+-		 "%s stream:%d CUR(Y:0x%x UV:0x%x) SHD(Y:0x%x UV:0x%x)\n",
++		 "%s stream:%d Y:0x%x UV:0x%x\n",
+ 		 __func__, stream->id,
+-		 readl(base + stream->config->reg.cur_y_base),
+-		 readl(base + stream->config->reg.cur_uv_base),
+-		 readl(base + stream->config->reg.cur_y_base_shd),
+-		 readl(base + stream->config->reg.cur_uv_base_shd));
++		 rkispp_read(dev, stream->config->reg.cur_y_base),
++		 rkispp_read(dev, stream->config->reg.cur_uv_base));
+ }
+ 
+ static int rkispp_frame_end(struct rkispp_stream *stream)
+@@ -333,14 +351,14 @@ static int rkispp_frame_end(struct rkispp_stream *stream)
+ 	return 0;
+ }
+ 
+-static void *get_pool_buf(struct rkispp_stream_vdev *vdev,
++static void *get_pool_buf(struct rkispp_device *dev,
+ 			  struct rkisp_ispp_buf *dbufs)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < RKISPP_BUF_POOL_MAX; i++)
+-		if (vdev->pool[i].dbufs == dbufs)
+-			return &vdev->pool[i];
++		if (dev->hw_dev->pool[i].dbufs == dbufs)
++			return &dev->hw_dev->pool[i];
+ 
+ 	return NULL;
+ }
+@@ -396,8 +414,11 @@ static void tnr_free_buf(struct rkispp_device *dev)
+ 		list_add_tail(&vdev->tnr.nxt_rd->list, list);
+ 		vdev->tnr.nxt_rd = NULL;
+ 	}
+-	while (!list_empty(list))
+-		get_list_buf(list, true);
++	while (!list_empty(list)) {
++		dbufs = get_list_buf(list, true);
++		v4l2_subdev_call(dev->ispp_sdev.remote_sd,
++				 video, s_rx_buffer, dbufs, NULL);
++	}
+ 
+ 	list = &vdev->tnr.list_wr;
+ 	if (vdev->tnr.cur_wr) {
+@@ -420,7 +441,7 @@ static int tnr_init_buf(struct rkispp_device *dev,
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkisp_ispp_buf *dbufs;
+ 	struct rkispp_dummy_buffer *buf;
+-	int i, j, ret, cnt = RKISP_ISPP_BUF_MAX;
++	int i, j, ret, cnt = RKISPP_BUF_MAX;
+ 
+ 	if (dev->inp == INP_ISP && dev->isp_mode & ISP_ISPP_QUICK)
+ 		cnt = 1;
+@@ -466,13 +487,14 @@ static int tnr_init_buf(struct rkispp_device *dev,
+ 
+ static int config_tnr(struct rkispp_device *dev)
+ {
++	struct rkispp_hw_dev *hw = dev->hw_dev;
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+-	void __iomem *base = dev->base_addr;
+ 	int ret, mult = 1;
+ 	u32 width, height, fmt;
+ 	u32 pic_size, gain_size;
+ 	u32 addr_offs, w, h, val;
++	u32 max_w, max_h;
+ 
+ 	vdev = &dev->stream_vdev;
+ 	vdev->tnr.is_end = true;
+@@ -492,8 +514,10 @@ static int config_tnr(struct rkispp_device *dev)
+ 
+ 	width = dev->ispp_sdev.out_fmt.width;
+ 	height = dev->ispp_sdev.out_fmt.height;
+-	w = (fmt & FMT_FBC) ? ALIGN(width, 16) : width;
+-	h = (fmt & FMT_FBC) ? ALIGN(height, 16) : height;
++	max_w = hw->max_in.w ? hw->max_in.w : width;
++	max_h = hw->max_in.h ? hw->max_in.h : height;
++	w = (fmt & FMT_FBC) ? ALIGN(max_w, 16) : max_w;
++	h = (fmt & FMT_FBC) ? ALIGN(max_h, 16) : max_h;
+ 	addr_offs = (fmt & FMT_FBC) ? w * h >> 4 : w * h;
+ 	pic_size = (fmt & FMT_YUV422) ? w * h * 2 : w * h * 3 >> 1;
+ 	vdev->tnr.uv_offset = addr_offs;
+@@ -510,42 +534,42 @@ static int config_tnr(struct rkispp_device *dev)
+ 			return ret;
+ 		if (dev->inp == INP_ISP &&
+ 		    dev->isp_mode & ISP_ISPP_QUICK) {
+-			rkispp_set_bits(base + RKISPP_CTRL_QUICK,
++			rkispp_set_bits(dev, RKISPP_CTRL_QUICK,
+ 					GLB_QUICK_MODE_MASK,
+ 					GLB_QUICK_MODE(0));
+ 
+ 			val = vdev->pool[0].dma[GROUP_BUF_PIC];
+-			writel(val, base + RKISPP_TNR_CUR_Y_BASE);
+-			writel(val + addr_offs, base + RKISPP_TNR_CUR_UV_BASE);
++			rkispp_write(dev, RKISPP_TNR_CUR_Y_BASE, val);
++			rkispp_write(dev, RKISPP_TNR_CUR_UV_BASE, val + addr_offs);
+ 
+ 			val = vdev->pool[0].dma[GROUP_BUF_GAIN];
+-			writel(val, base + RKISPP_TNR_GAIN_CUR_Y_BASE);
++			rkispp_write(dev, RKISPP_TNR_GAIN_CUR_Y_BASE, val);
+ 
+ 			if (vdev->tnr.is_3to1) {
+ 				val = vdev->pool[1].dma[GROUP_BUF_PIC];
+-				writel(val, base + RKISPP_TNR_NXT_Y_BASE);
+-				writel(val + addr_offs, base + RKISPP_TNR_NXT_UV_BASE);
++				rkispp_write(dev, RKISPP_TNR_NXT_Y_BASE, val);
++				rkispp_write(dev, RKISPP_TNR_NXT_UV_BASE, val + addr_offs);
+ 				val = vdev->pool[1].dma[GROUP_BUF_GAIN];
+-				writel(val, base + RKISPP_TNR_GAIN_NXT_Y_BASE);
++				rkispp_write(dev, RKISPP_TNR_GAIN_NXT_Y_BASE, val);
+ 			}
+ 		}
+ 
+ 		val = vdev->tnr.buf.gain_kg.dma_addr;
+-		writel(val, base + RKISPP_TNR_GAIN_KG_Y_BASE);
++		rkispp_write(dev, RKISPP_TNR_GAIN_KG_Y_BASE, val);
+ 
+ 		val = vdev->tnr.buf.wr[0][GROUP_BUF_PIC].dma_addr;
+-		writel(val, base + RKISPP_TNR_WR_Y_BASE);
+-		writel(val + addr_offs, base + RKISPP_TNR_WR_UV_BASE);
++		rkispp_write(dev, RKISPP_TNR_WR_Y_BASE, val);
++		rkispp_write(dev, RKISPP_TNR_WR_UV_BASE, val + addr_offs);
+ 		if (vdev->tnr.buf.iir.mem_priv)
+ 			val = vdev->tnr.buf.iir.dma_addr;
+-		writel(val, base + RKISPP_TNR_IIR_Y_BASE);
+-		writel(val + addr_offs, base + RKISPP_TNR_IIR_UV_BASE);
++		rkispp_write(dev, RKISPP_TNR_IIR_Y_BASE, val);
++		rkispp_write(dev, RKISPP_TNR_IIR_UV_BASE, val + addr_offs);
+ 
+ 		val = vdev->tnr.buf.wr[0][GROUP_BUF_GAIN].dma_addr;
+-		writel(val, base + RKISPP_TNR_GAIN_WR_Y_BASE);
++		rkispp_write(dev, RKISPP_TNR_GAIN_WR_Y_BASE, val);
+ 
+-		writel(ALIGN(width * mult, 16) >> 2, base + RKISPP_TNR_WR_VIR_STRIDE);
+-		writel(fmt << 4 | SW_TNR_1ST_FRM, base + RKISPP_TNR_CTRL);
++		rkispp_write(dev, RKISPP_TNR_WR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++		rkispp_write(dev, RKISPP_TNR_CTRL, fmt << 4 | SW_TNR_1ST_FRM);
+ 	}
+ 
+ 	if (stream) {
+@@ -556,38 +580,29 @@ static int config_tnr(struct rkispp_device *dev)
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_TNR_CUR_UV_BASE_SHD;
+ 	}
+ 
+-	rkispp_set_bits(base + RKISPP_TNR_CTRL, FMT_RD_MASK, fmt);
++	rkispp_set_bits(dev, RKISPP_TNR_CTRL, FMT_RD_MASK, fmt);
+ 	if (fmt & FMT_FBC) {
+-		writel(0, base + RKISPP_TNR_CUR_VIR_STRIDE);
+-		writel(0, base + RKISPP_TNR_IIR_VIR_STRIDE);
+-		writel(0, base + RKISPP_TNR_NXT_VIR_STRIDE);
++		rkispp_write(dev, RKISPP_TNR_CUR_VIR_STRIDE, 0);
++		rkispp_write(dev, RKISPP_TNR_IIR_VIR_STRIDE, 0);
++		rkispp_write(dev, RKISPP_TNR_NXT_VIR_STRIDE, 0);
+ 	} else {
+-		writel(ALIGN(width * mult, 16) >> 2,
+-			base + RKISPP_TNR_CUR_VIR_STRIDE);
+-		writel(ALIGN(width * mult, 16) >> 2,
+-			base + RKISPP_TNR_IIR_VIR_STRIDE);
+-		writel(ALIGN(width * mult, 16) >> 2,
+-			base + RKISPP_TNR_NXT_VIR_STRIDE);
+-	}
+-	rkispp_set_bits(base + RKISPP_TNR_CORE_CTRL, SW_TNR_MODE,
++		rkispp_write(dev, RKISPP_TNR_CUR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++		rkispp_write(dev, RKISPP_TNR_IIR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++		rkispp_write(dev, RKISPP_TNR_NXT_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++	}
++	rkispp_set_bits(dev, RKISPP_TNR_CORE_CTRL, SW_TNR_MODE,
+ 			vdev->tnr.is_3to1 ? SW_TNR_MODE : 0);
+-	writel(ALIGN(width, 64) >> 4,
+-		base + RKISPP_TNR_GAIN_CUR_VIR_STRIDE);
+-	writel(ALIGN(width, 64) >> 4,
+-		base + RKISPP_TNR_GAIN_NXT_VIR_STRIDE);
+-	writel(ALIGN(width, 16) * 6,
+-		base + RKISPP_TNR_GAIN_KG_VIR_STRIDE);
+-	writel(ALIGN(width, 64) >> 4,
+-		base + RKISPP_TNR_GAIN_WR_VIR_STRIDE);
+-
+-	writel(height << 16 | width,
+-		base + RKISPP_CTRL_TNR_SIZE);
++	rkispp_write(dev, RKISPP_TNR_GAIN_CUR_VIR_STRIDE, ALIGN(width, 64) >> 4);
++	rkispp_write(dev, RKISPP_TNR_GAIN_NXT_VIR_STRIDE, ALIGN(width, 64) >> 4);
++	rkispp_write(dev, RKISPP_TNR_GAIN_KG_VIR_STRIDE, ALIGN(width, 16) * 6);
++	rkispp_write(dev, RKISPP_TNR_GAIN_WR_VIR_STRIDE, ALIGN(width, 64) >> 4);
++	rkispp_write(dev, RKISPP_CTRL_TNR_SIZE, height << 16 | width);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "%s size:%dx%d ctrl:0x%x core_ctrl:0x%x\n",
+ 		 __func__, width, height,
+-		 readl(base + RKISPP_TNR_CTRL),
+-		 readl(base + RKISPP_TNR_CORE_CTRL));
++		 rkispp_read(dev, RKISPP_TNR_CTRL),
++		 rkispp_read(dev, RKISPP_TNR_CORE_CTRL));
+ 	return 0;
+ }
+ 
+@@ -627,7 +642,7 @@ static int nr_init_buf(struct rkispp_device *dev, u32 size)
+ 	int i, ret, cnt = 1;
+ 
+ 	if (vdev->module_ens & ISPP_MODULE_FEC)
+-		cnt = RKISP_ISPP_BUF_MAX;
++		cnt = RKISPP_BUF_MAX;
+ 	else if (dev->inp == INP_ISP &&
+ 		 !(dev->isp_mode & ISP_ISPP_QUICK))
+ 		cnt = 0;
+@@ -659,12 +674,13 @@ static int nr_init_buf(struct rkispp_device *dev, u32 size)
+ 
+ static int config_nr_shp(struct rkispp_device *dev)
+ {
++	struct rkispp_hw_dev *hw = dev->hw_dev;
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+-	void __iomem *base = dev->base_addr;
+ 	u32 width, height, fmt;
+ 	u32 pic_size, addr_offs;
+ 	u32 w, h, val;
++	u32 max_w, max_h;
+ 	int ret, mult = 1;
+ 
+ 	vdev = &dev->stream_vdev;
+@@ -681,9 +697,17 @@ static int config_nr_shp(struct rkispp_device *dev)
+ 
+ 	width = dev->ispp_sdev.out_fmt.width;
+ 	height = dev->ispp_sdev.out_fmt.height;
+-	w = (fmt & FMT_FBC) ? ALIGN(width, 16) : width;
+-	h = (fmt & FMT_FBC) ? ALIGN(height, 16) : height;
+-	addr_offs = (fmt & FMT_FBC) ? w * h >> 4 : w * h;
++	w = width;
++	h = height;
++	max_w = hw->max_in.w ? hw->max_in.w : w;
++	max_h = hw->max_in.h ? hw->max_in.h : h;
++	if (fmt & FMT_FBC) {
++		max_w = ALIGN(max_w, 16);
++		max_h = ALIGN(max_h, 16);
++		w = ALIGN(w, 16);
++		h = ALIGN(h, 16);
++	}
++	addr_offs = (fmt & FMT_FBC) ? max_w * max_h >> 4 : max_w * max_h;
+ 	pic_size = (fmt & FMT_YUV422) ? w * h * 2 : w * h * 3 >> 1;
+ 	vdev->nr.uv_offset = addr_offs;
+ 	if (fmt & FMT_FBC)
+@@ -697,28 +721,27 @@ static int config_nr_shp(struct rkispp_device *dev)
+ 		return ret;
+ 
+ 	if (vdev->module_ens & ISPP_MODULE_TNR) {
+-		writel(readl(base + RKISPP_TNR_WR_Y_BASE),
+-			base + RKISPP_NR_ADDR_BASE_Y);
+-		writel(readl(base + RKISPP_TNR_WR_UV_BASE),
+-			base + RKISPP_NR_ADDR_BASE_UV);
+-		writel(readl(base + RKISPP_TNR_GAIN_WR_Y_BASE),
+-			base + RKISPP_NR_ADDR_BASE_GAIN);
+-		rkispp_set_bits(base + RKISPP_CTRL_QUICK, 0, GLB_NR_SD32_TNR);
++		rkispp_write(dev, RKISPP_NR_ADDR_BASE_Y,
++			     rkispp_read(dev, RKISPP_TNR_WR_Y_BASE));
++		rkispp_write(dev, RKISPP_NR_ADDR_BASE_UV,
++			     rkispp_read(dev, RKISPP_TNR_WR_UV_BASE));
++		rkispp_write(dev, RKISPP_NR_ADDR_BASE_GAIN,
++			     rkispp_read(dev, RKISPP_TNR_GAIN_WR_Y_BASE));
++		rkispp_set_bits(dev, RKISPP_CTRL_QUICK, 0, GLB_NR_SD32_TNR);
+ 	} else {
+ 		/* tnr need to set same format with nr in the fbc mode */
+-		rkispp_set_bits(base + RKISPP_TNR_CTRL,
+-				FMT_RD_MASK, fmt);
++		rkispp_set_bits(dev, RKISPP_TNR_CTRL, FMT_RD_MASK, fmt);
+ 		if (dev->inp == INP_ISP) {
+-			rkispp_set_bits(base + RKISPP_CTRL_QUICK,
++			rkispp_set_bits(dev, RKISPP_CTRL_QUICK,
+ 					GLB_QUICK_MODE_MASK,
+ 					GLB_QUICK_MODE(2));
+ 
+ 			val = vdev->pool[0].dma[GROUP_BUF_PIC];
+-			writel(val, base + RKISPP_NR_ADDR_BASE_Y);
+-			writel(val + addr_offs, base + RKISPP_NR_ADDR_BASE_UV);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_Y, val);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_UV, val + addr_offs);
+ 			val = vdev->pool[0].dma[GROUP_BUF_GAIN];
+-			writel(val, base + RKISPP_NR_ADDR_BASE_GAIN);
+-			rkispp_clear_bits(base + RKISPP_CTRL_QUICK, GLB_NR_SD32_TNR);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_GAIN, val);
++			rkispp_clear_bits(dev, RKISPP_CTRL_QUICK, GLB_NR_SD32_TNR);
+ 		} else if (stream) {
+ 			stream->config->frame_end_id = NR_INT;
+ 			stream->config->reg.cur_y_base = RKISPP_NR_ADDR_BASE_Y;
+@@ -728,45 +751,44 @@ static int config_nr_shp(struct rkispp_device *dev)
+ 		}
+ 	}
+ 
+-	rkispp_clear_bits(base + RKISPP_CTRL_QUICK, GLB_FEC2SCL_EN);
++	rkispp_clear_bits(dev, RKISPP_CTRL_QUICK, GLB_FEC2SCL_EN);
+ 	if (vdev->module_ens & ISPP_MODULE_FEC) {
+ 		addr_offs = width * height;
+ 		vdev->fec.uv_offset = addr_offs;
+ 		val = vdev->nr.buf.wr[0].dma_addr;
+-		writel(val, base + RKISPP_SHARP_WR_Y_BASE);
++		rkispp_write(dev, RKISPP_SHARP_WR_Y_BASE, val);
+ 		val += addr_offs;
+-		writel(val, base + RKISPP_SHARP_WR_UV_BASE);
+-		writel(ALIGN(width * mult, 16) >> 2,
+-		       base + RKISPP_SHARP_WR_VIR_STRIDE);
+-		rkispp_set_bits(base + RKISPP_SHARP_CTRL,
++		rkispp_write(dev, RKISPP_SHARP_WR_UV_BASE, val);
++		rkispp_write(dev, RKISPP_SHARP_WR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++		rkispp_set_bits(dev, RKISPP_SHARP_CTRL,
+ 				SW_SHP_WR_FORMAT_MASK, fmt & (~FMT_FBC));
+-		rkispp_clear_bits(base + RKISPP_SHARP_CORE_CTRL, SW_SHP_DMA_DIS);
++		rkispp_clear_bits(dev, RKISPP_SHARP_CORE_CTRL, SW_SHP_DMA_DIS);
+ 	}
+ 
+ 	val = vdev->nr.buf.tmp_yuv.dma_addr;
+-	writel(val, base + RKISPP_SHARP_TMP_YUV_BASE);
++	rkispp_write(dev, RKISPP_SHARP_TMP_YUV_BASE, val);
+ 
+ 	/* fix to use new nr algorithm */
+-	rkispp_set_bits(base + RKISPP_NR_CTRL, NR_NEW_ALGO, NR_NEW_ALGO);
+-	rkispp_set_bits(base + RKISPP_NR_CTRL, FMT_RD_MASK, fmt);
++	rkispp_set_bits(dev, RKISPP_NR_CTRL, NR_NEW_ALGO, NR_NEW_ALGO);
++	rkispp_set_bits(dev, RKISPP_NR_CTRL, FMT_RD_MASK, fmt);
+ 	if (fmt & FMT_FBC) {
+-		writel(0, base + RKISPP_NR_VIR_STRIDE);
+-		writel(ALIGN(height, 16), base + RKISPP_FBC_VIR_HEIGHT);
++		rkispp_write(dev, RKISPP_NR_VIR_STRIDE, 0);
++		rkispp_write(dev, RKISPP_FBC_VIR_HEIGHT, max_h);
+ 	} else {
+-		writel(ALIGN(width * mult, 16) >> 2, base + RKISPP_NR_VIR_STRIDE);
++		rkispp_write(dev, RKISPP_NR_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
+ 	}
+-	writel(ALIGN(width, 64) >> 4, base + RKISPP_NR_VIR_STRIDE_GAIN);
+-	writel(height << 16 | width, base + RKISPP_CTRL_SIZE);
++	rkispp_write(dev, RKISPP_NR_VIR_STRIDE_GAIN, ALIGN(width, 64) >> 4);
++	rkispp_write(dev, RKISPP_CTRL_SIZE, height << 16 | width);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "%s size:%dx%d\n"
+ 		 "nr ctrl:0x%x ctrl_para:0x%x\n"
+ 		 "shp ctrl:0x%x core_ctrl:0x%x\n",
+ 		 __func__, width, height,
+-		 readl(base + RKISPP_NR_CTRL),
+-		 readl(base + RKISPP_NR_UVNR_CTRL_PARA),
+-		 readl(base + RKISPP_SHARP_CTRL),
+-		 readl(base + RKISPP_SHARP_CORE_CTRL));
++		 rkispp_read(dev, RKISPP_NR_CTRL),
++		 rkispp_read(dev, RKISPP_NR_UVNR_CTRL_PARA),
++		 rkispp_read(dev, RKISPP_SHARP_CTRL),
++		 rkispp_read(dev, RKISPP_SHARP_CORE_CTRL));
+ 	return 0;
+ }
+ 
+@@ -790,7 +812,7 @@ static int config_fec(struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *buf;
+ 	u32 width, height, fmt, mult = 1;
+ 	u32 mesh_size;
+@@ -815,10 +837,10 @@ static int config_fec(struct rkispp_device *dev)
+ 		mult = 2;
+ 
+ 	if (vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
+-		writel(readl(base + RKISPP_SHARP_WR_Y_BASE),
+-			base + RKISPP_FEC_RD_Y_BASE);
+-		writel(readl(base + RKISPP_SHARP_WR_UV_BASE),
+-			base + RKISPP_FEC_RD_UV_BASE);
++		rkispp_write(dev, RKISPP_FEC_RD_Y_BASE,
++			     rkispp_read(dev, RKISPP_SHARP_WR_Y_BASE));
++		rkispp_write(dev, RKISPP_FEC_RD_UV_BASE,
++			     rkispp_read(dev, RKISPP_SHARP_WR_UV_BASE));
+ 	} else if (stream) {
+ 		stream->config->frame_end_id = FEC_INT;
+ 		stream->config->reg.cur_y_base = RKISPP_FEC_RD_Y_BASE;
+@@ -834,7 +856,7 @@ static int config_fec(struct rkispp_device *dev)
+ 	ret = rkispp_allow_buffer(dev, buf);
+ 	if (ret < 0)
+ 		goto err;
+-	writel(buf->dma_addr, base + RKISPP_FEC_MESH_XINT_BASE);
++	rkispp_write(base, RKISPP_FEC_MESH_XINT_BASE, buf->dma_addr);
+ 
+ 	buf = &vdev->fec_buf.mesh_yint;
+ 	buf->is_need_vaddr = true;
+@@ -842,7 +864,7 @@ static int config_fec(struct rkispp_device *dev)
+ 	ret = rkispp_allow_buffer(dev, buf);
+ 	if (ret < 0)
+ 		goto err;
+-	writel(buf->dma_addr, base + RKISPP_FEC_MESH_YINT_BASE);
++	rkispp_write(dev, RKISPP_FEC_MESH_YINT_BASE, buf->dma_addr);
+ 
+ 	buf = &vdev->fec_buf.mesh_xfra;
+ 	buf->is_need_vaddr = true;
+@@ -850,7 +872,7 @@ static int config_fec(struct rkispp_device *dev)
+ 	ret = rkispp_allow_buffer(dev, buf);
+ 	if (ret < 0)
+ 		goto err;
+-	writel(buf->dma_addr, base + RKISPP_FEC_MESH_XFRA_BASE);
++	rkispp_write(dev, RKISPP_FEC_MESH_XFRA_BASE, buf->dma_addr);
+ 
+ 	buf = &vdev->fec_buf.mesh_yfra;
+ 	buf->is_need_vaddr = true;
+@@ -858,17 +880,17 @@ static int config_fec(struct rkispp_device *dev)
+ 	ret = rkispp_allow_buffer(dev, buf);
+ 	if (ret < 0)
+ 		goto err;
+-	writel(buf->dma_addr, base + RKISPP_FEC_MESH_YFRA_BASE);
++	rkispp_write(dev, RKISPP_FEC_MESH_YFRA_BASE, buf->dma_addr);
+ 
+-	rkispp_set_bits(base + RKISPP_FEC_CTRL, FMT_RD_MASK, fmt);
+-	writel(ALIGN(width * mult, 16) >> 2, base + RKISPP_FEC_RD_VIR_STRIDE);
+-	writel(height << 16 | width, base + RKISPP_FEC_PIC_SIZE);
+-	rkispp_set_bits(base + RKISPP_CTRL_QUICK, 0, GLB_FEC2SCL_EN);
++	rkispp_set_bits(dev, RKISPP_FEC_CTRL, FMT_RD_MASK, fmt);
++	rkispp_write(dev, RKISPP_FEC_RD_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
++	rkispp_write(dev, RKISPP_FEC_PIC_SIZE, height << 16 | width);
++	rkispp_set_bits(dev, RKISPP_CTRL_QUICK, 0, GLB_FEC2SCL_EN);
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "%s size:%dx%d ctrl:0x%x core_ctrl:0x%x\n",
+ 		 __func__, width, height,
+-		 readl(base + RKISPP_FEC_CTRL),
+-		 readl(base + RKISPP_FEC_CORE_CTRL));
++		 rkispp_read(dev, RKISPP_FEC_CTRL),
++		 rkispp_read(dev, RKISPP_FEC_CORE_CTRL));
+ 	return 0;
+ err:
+ 	fec_free_buf(dev);
+@@ -953,7 +975,7 @@ static int start_ii(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	u32 i, module;
+ 
+ 	writel(ALL_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+@@ -987,7 +1009,6 @@ static int is_stopped_ii(struct rkispp_stream *stream)
+ static int config_mb(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+-	void __iomem *base = dev->base_addr;
+ 	u32 i, limit_range, mult = 1;
+ 
+ 	for (i = ISPP_MODULE_FEC; i > 0; i = i >> 1) {
+@@ -1006,7 +1027,7 @@ static int config_mb(struct rkispp_stream *stream)
+ 		stream->config->reg.cur_vir_stride = RKISPP_TNR_WR_VIR_STRIDE;
+ 		stream->config->reg.cur_y_base_shd = RKISPP_TNR_WR_Y_BASE_SHD;
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_TNR_WR_UV_BASE_SHD;
+-		rkispp_set_bits(base + RKISPP_TNR_CTRL, FMT_WR_MASK,
++		rkispp_set_bits(dev, RKISPP_TNR_CTRL, FMT_WR_MASK,
+ 				SW_TNR_1ST_FRM | stream->out_cap_fmt.wr_fmt << 4);
+ 		break;
+ 	case ISPP_MODULE_NR:
+@@ -1019,10 +1040,10 @@ static int config_mb(struct rkispp_stream *stream)
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_SHARP_WR_UV_BASE_SHD;
+ 		limit_range = (stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
+ 			0 : SW_SHP_WR_YUV_LIMIT;
+-		rkispp_set_bits(base + RKISPP_SHARP_CTRL,
++		rkispp_set_bits(dev, RKISPP_SHARP_CTRL,
+ 				SW_SHP_WR_YUV_LIMIT | SW_SHP_WR_FORMAT_MASK,
+ 				limit_range | stream->out_cap_fmt.wr_fmt);
+-		rkispp_clear_bits(base + RKISPP_SHARP_CORE_CTRL, SW_SHP_DMA_DIS);
++		rkispp_clear_bits(dev, RKISPP_SHARP_CORE_CTRL, SW_SHP_DMA_DIS);
+ 		break;
+ 	default:
+ 		stream->config->frame_end_id = FEC_INT;
+@@ -1033,11 +1054,11 @@ static int config_mb(struct rkispp_stream *stream)
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_FEC_WR_UV_BASE_SHD;
+ 		limit_range = (stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
+ 			0 : SW_FEC_WR_YUV_LIMIT;
+-		rkispp_set_bits(base + RKISPP_FEC_CTRL, SW_FEC_WR_YUV_LIMIT | FMT_WR_MASK,
++		rkispp_set_bits(dev, RKISPP_FEC_CTRL, SW_FEC_WR_YUV_LIMIT | FMT_WR_MASK,
+ 				limit_range | stream->out_cap_fmt.wr_fmt << 4);
+-		writel((stream->out_fmt.height << 16) | stream->out_fmt.width,
+-			base + RKISPP_FEC_PIC_SIZE);
+-		rkispp_clear_bits(base + RKISPP_FEC_CORE_CTRL, SW_FEC2DDR_DIS);
++		rkispp_write(dev, RKISPP_FEC_PIC_SIZE,
++			     stream->out_fmt.height << 16 | stream->out_fmt.width);
++		rkispp_clear_bits(dev, RKISPP_FEC_CORE_CTRL, SW_FEC2DDR_DIS);
+ 	}
+ 	if (stream->out_cap_fmt.wr_fmt & FMT_YUYV)
+ 		mult = 2;
+@@ -1053,13 +1074,13 @@ static int is_stopped_mb(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	u32 val;
+ 
+ 	if (vdev->module_ens & ISPP_MODULE_FEC) {
+ 		/* close dma write immediately */
+-		rkispp_clear_bits(base + RKISPP_FEC_CTRL, FMT_FBC << 4);
+-		rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL,
++		rkispp_clear_bits(dev, RKISPP_FEC_CTRL, FMT_FBC << 4);
++		rkispp_set_bits(dev, RKISPP_FEC_CORE_CTRL,
+ 				0, SW_FEC2DDR_DIS);
+ 	} else if (vdev->module_ens &
+ 		   (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
+@@ -1069,8 +1090,8 @@ static int is_stopped_mb(struct rkispp_stream *stream)
+ 			writel(val, base + RKISPP_SHARP_WR_Y_BASE);
+ 			writel(val, base + RKISPP_SHARP_WR_UV_BASE);
+ 		} else {
+-			rkispp_clear_bits(base + RKISPP_SHARP_CTRL, FMT_FBC);
+-			rkispp_set_bits(base + RKISPP_SHARP_CORE_CTRL,
++			rkispp_clear_bits(dev, RKISPP_SHARP_CTRL, FMT_FBC);
++			rkispp_set_bits(dev, RKISPP_SHARP_CORE_CTRL,
+ 					0, SW_SHP_DMA_DIS);
+ 		}
+ 	}
+@@ -1107,7 +1128,6 @@ static int limit_check_mb(struct rkispp_stream *stream,
+ static int config_scl(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+-	void __iomem *base = dev->base_addr;
+ 	const struct capture_fmt *fmt = &stream->out_cap_fmt;
+ 	u32 in_width = dev->ispp_sdev.out_fmt.width;
+ 	u32 in_height = dev->ispp_sdev.out_fmt.height;
+@@ -1130,30 +1150,32 @@ static int config_scl(struct rkispp_stream *stream)
+ 		((fmt->fourcc != V4L2_PIX_FMT_GREY) ? 0 : SW_SCL_WR_UV_DIS) |
+ 		((stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
+ 		 0 : SW_SCL_WR_YUV_LIMIT);
+-	rkispp_set_bits(base + stream->config->reg.ctrl, mask, val);
++	rkispp_set_bits(dev, stream->config->reg.ctrl, mask, val);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "scl%d ctrl:0x%x stride:0x%x factor:0x%x\n",
+ 		 stream->id - STREAM_S0,
+-		 readl(base + stream->config->reg.ctrl),
+-		 readl(base + stream->config->reg.cur_vir_stride),
+-		 readl(base + stream->config->reg.factor));
++		 rkispp_read(dev, stream->config->reg.ctrl),
++		 rkispp_read(dev, stream->config->reg.cur_vir_stride),
++		 rkispp_read(dev, stream->config->reg.factor));
+ 	return 0;
+ }
+ 
+ static void stop_scl(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+-	void __iomem *base = dev->base_addr;
+ 
+-	rkispp_clear_bits(base + stream->config->reg.ctrl, SW_SCL_ENABLE);
++	rkispp_clear_bits(dev, stream->config->reg.ctrl, SW_SCL_ENABLE);
+ }
+ 
+ static int is_stopped_scl(struct rkispp_stream *stream)
+ {
+-	void __iomem *base = stream->isppdev->base_addr;
++	struct rkispp_device *dev = stream->isppdev;
++	u32 val = SW_SCL_ENABLE;
+ 
+-	return !(readl(base + stream->config->reg.ctrl) & SW_SCL_ENABLE_SHD);
++	if (dev->hw_dev->is_single)
++		val = SW_SCL_ENABLE_SHD;
++	return !(rkispp_read(dev, stream->config->reg.ctrl) & val);
+ }
+ 
+ static int limit_check_scl(struct rkispp_stream *stream,
+@@ -1447,35 +1469,43 @@ static int start_isp(struct rkispp_device *dev)
+ 		return 0;
+ 	}
+ 
++	mutex_lock(&dev->hw_dev->dev_lock);
++
+ 	mode.work_mode = dev->isp_mode;
++	mode.max_in = dev->hw_dev->max_in;
+ 	mode.buf_num = (dev->isp_mode & ISP_ISPP_QUICK) ?
+-			1 : RKISP_ISPP_BUF_MAX;
++			1 : RKISPP_BUF_MAX;
++	i = 1;
+ 	if ((vdev->module_ens & ISPP_MODULE_TNR_3TO1) == ISPP_MODULE_TNR_3TO1)
+-		mode.buf_num += 1;
++		i++;
++	mode.buf_num += i * dev->hw_dev->dev_num;
+ 	ret = v4l2_subdev_call(ispp_sdev->remote_sd, core, ioctl,
+ 			       RKISP_ISPP_CMD_SET_MODE, &mode);
+ 	if (ret)
+-		return ret;
++		goto err;
+ 
+ 	ret = config_modules(dev);
+ 	if (ret) {
+-		rkispp_free_pool(vdev);
++		rkispp_event_handle(dev, CMD_FREE_POOL, NULL);
+ 		mode.work_mode = ISP_ISPP_INIT_FAIL;
+ 		v4l2_subdev_call(ispp_sdev->remote_sd, core, ioctl,
+ 				 RKISP_ISPP_CMD_SET_MODE, &mode);
+-		return ret;
++		goto err;
+ 	}
+-	writel(ALL_FORCE_UPD, dev->base_addr + RKISPP_CTRL_UPDATE);
++	if (dev->hw_dev->is_single)
++		writel(ALL_FORCE_UPD, dev->hw_dev->base_addr + RKISPP_CTRL_UPDATE);
+ 	for (i = STREAM_MB; i < STREAM_MAX; i++) {
+ 		stream = &vdev->stream[i];
+ 		if (stream->streaming)
+ 			stream->is_upd = true;
+ 	}
+ 	if (dev->isp_mode & ISP_ISPP_QUICK)
+-		rkispp_set_bits(dev->base_addr + RKISPP_CTRL_QUICK,
+-				0, GLB_QUICK_EN);
+-	return v4l2_subdev_call(&dev->ispp_sdev.sd,
+-				video, s_stream, true);
++		rkispp_set_bits(dev, RKISPP_CTRL_QUICK, 0, GLB_QUICK_EN);
++
++	ret = v4l2_subdev_call(&ispp_sdev->sd, video, s_stream, true);
++err:
++	mutex_unlock(&dev->hw_dev->dev_lock);
++	return ret;
+ }
+ 
+ static int rkispp_start_streaming(struct vb2_queue *queue,
+@@ -1566,7 +1596,7 @@ static int rkispp_init_vb2_queue(struct vb2_queue *q,
+ 		q->min_buffers_needed = STREAM_OUT_REQ_BUFS_MIN;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->lock = &stream->isppdev->apilock;
+-	q->dev = stream->isppdev->dev;
++	q->dev = stream->isppdev->hw_dev->dev;
+ 
+ 	return vb2_queue_init(q);
+ }
+@@ -1673,6 +1703,40 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 
+ /************************* v4l2_file_operations***************************/
+ 
++static int rkispp_fh_open(struct file *filp)
++{
++	struct rkispp_stream *stream = video_drvdata(filp);
++	struct rkispp_device *isppdev = stream->isppdev;
++	int ret;
++
++	ret = v4l2_fh_open(filp);
++	if (!ret) {
++		ret = v4l2_pipeline_pm_use(&stream->vnode.vdev.entity, 1);
++		if (ret < 0) {
++			v4l2_err(&isppdev->v4l2_dev,
++				 "pipeline power on failed %d\n", ret);
++			vb2_fop_release(filp);
++		}
++	}
++	return ret;
++}
++
++static int rkispp_fh_release(struct file *filp)
++{
++	struct rkispp_stream *stream = video_drvdata(filp);
++	struct rkispp_device *isppdev = stream->isppdev;
++	int ret;
++
++	ret = vb2_fop_release(filp);
++	if (!ret) {
++		ret = v4l2_pipeline_pm_use(&stream->vnode.vdev.entity, 0);
++		if (ret < 0)
++			v4l2_err(&isppdev->v4l2_dev,
++				 "pipeline power off failed %d\n", ret);
++	}
++	return ret;
++}
++
+ static const struct v4l2_file_operations rkispp_fops = {
+ 	.open = rkispp_fh_open,
+ 	.release = rkispp_fh_release,
+@@ -1832,7 +1896,7 @@ static void fec_work_event(struct rkispp_device *dev,
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
+ 	struct list_head *list = &vdev->fec.list_rd;
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	unsigned long lock_flags = 0;
+ 	bool is_start = false, is_quick = false;
+@@ -1878,9 +1942,9 @@ static void fec_work_event(struct rkispp_device *dev,
+ 	if (vdev->fec.cur_rd && vdev->fec.is_end) {
+ 		dummy = vdev->fec.cur_rd;
+ 		val = dummy->dma_addr;
+-		writel(val, base + RKISPP_FEC_RD_Y_BASE);
++		rkispp_write(dev, RKISPP_FEC_RD_Y_BASE, val);
+ 		val += vdev->fec.uv_offset;
+-		writel(val, base + RKISPP_FEC_RD_UV_BASE);
++		rkispp_write(dev, RKISPP_FEC_RD_UV_BASE, val);
+ 		is_start = true;
+ 	}
+ 
+@@ -1899,6 +1963,8 @@ static void fec_work_event(struct rkispp_device *dev,
+ 				vdev->fec.cur_rd->timestamp;
+ 			atomic_set(&dev->ispp_sdev.frm_sync_seq, seq);
+ 		}
++		if (!dev->hw_dev->is_single)
++			rkispp_update_regs(dev, RKISPP_FEC, RKISPP_FEC_CROP);
+ 		writel(FEC_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+ 		v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+ 			 "FEC start seq:%d | Y_SHD rd:0x%x\n",
+@@ -1916,7 +1982,7 @@ static void nr_work_event(struct rkispp_device *dev,
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *buf_to_fec = NULL;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	struct v4l2_subdev *sd = NULL;
+@@ -2004,27 +2070,27 @@ static void nr_work_event(struct rkispp_device *dev,
+ 			dbuf = vdev->nr.cur_rd->dbuf[GROUP_BUF_PIC];
+ 			dummy = dbuf_to_dummy(dbuf, &vdev->tnr.buf.iir, size);
+ 			val = dummy->dma_addr;
+-			writel(val, base + RKISPP_NR_ADDR_BASE_Y);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_Y, val);
+ 			val += vdev->nr.uv_offset;
+-			writel(val, base + RKISPP_NR_ADDR_BASE_UV);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_UV, val);
+ 
+-			if (readl(base + RKISPP_TNR_CORE_CTRL) & SW_TNR_EN_SHD) {
++			if (rkispp_read(dev, RKISPP_TNR_CORE_CTRL) & SW_TNR_EN) {
+ 				dbuf = vdev->nr.cur_rd->dbuf[GROUP_BUF_GAIN];
+ 				dummy = dbuf_to_dummy(dbuf, &vdev->tnr.buf.iir, size);
+ 				val = dummy->dma_addr;
+-				writel(val, base + RKISPP_NR_ADDR_BASE_GAIN);
++				rkispp_write(dev, RKISPP_NR_ADDR_BASE_GAIN, val);
+ 			}
+ 		} else {
+ 			struct rkispp_isp_buf_pool *buf;
+ 
+-			buf = get_pool_buf(vdev, vdev->nr.cur_rd);
++			buf = get_pool_buf(dev, vdev->nr.cur_rd);
+ 			val = buf->dma[GROUP_BUF_PIC];
+-			writel(val, base + RKISPP_NR_ADDR_BASE_Y);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_Y, val);
+ 			val += vdev->nr.uv_offset;
+-			writel(val, base + RKISPP_NR_ADDR_BASE_UV);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_UV, val);
+ 
+ 			val = buf->dma[GROUP_BUF_GAIN];
+-			writel(val, base + RKISPP_NR_ADDR_BASE_GAIN);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_GAIN, val);
+ 		}
+ 		is_start = true;
+ 	}
+@@ -2038,9 +2104,9 @@ static void nr_work_event(struct rkispp_device *dev,
+ 	if (vdev->nr.cur_wr && is_start) {
+ 		dummy = vdev->nr.cur_wr;
+ 		val = dummy->dma_addr;
+-		writel(val, base + RKISPP_SHARP_WR_Y_BASE);
++		rkispp_write(base, RKISPP_SHARP_WR_Y_BASE, val);
+ 		val += vdev->fec.uv_offset;
+-		writel(val, base + RKISPP_SHARP_WR_UV_BASE);
++		rkispp_write(dev, RKISPP_SHARP_WR_UV_BASE, val);
+ 	}
+ 
+ 	if (is_start) {
+@@ -2060,6 +2126,8 @@ static void nr_work_event(struct rkispp_device *dev,
+ 			}
+ 		}
+ 
++		if (!dev->hw_dev->is_single)
++			rkispp_update_regs(dev, RKISPP_NR, RKISPP_ORB_MAX_FEATURE);
+ 		writel(OTHER_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+ 
+ 		v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+@@ -2095,7 +2163,7 @@ static void tnr_work_event(struct rkispp_device *dev,
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
+-	void __iomem *base = dev->base_addr;
++	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	struct v4l2_subdev *sd = NULL;
+ 	struct list_head *list;
+@@ -2121,6 +2189,8 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			/* tnr read buf return to isp */
+ 			v4l2_subdev_call(sd, video, s_rx_buffer,
+ 				 vdev->tnr.cur_rd, NULL);
++			if (vdev->tnr.cur_rd == vdev->tnr.nxt_rd)
++				vdev->tnr.nxt_rd = NULL;
+ 			vdev->tnr.cur_rd = NULL;
+ 		}
+ 
+@@ -2139,7 +2209,7 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 		vdev->tnr.nxt_rd = buf_rd;
+ 		/* first buf for 3to1 using twice */
+ 		if (!is_3to1 ||
+-		    (readl(base + RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM))
++		    (rkispp_read(dev, RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM))
+ 			vdev->tnr.cur_rd = vdev->tnr.nxt_rd;
+ 	} else if (vdev->tnr.is_end && !list_empty(list)) {
+ 		/* tnr read buf from list
+@@ -2173,33 +2243,33 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 	if (vdev->tnr.cur_rd && vdev->tnr.nxt_rd && vdev->tnr.is_end) {
+ 		struct rkispp_isp_buf_pool *buf;
+ 
+-		buf = get_pool_buf(vdev, vdev->tnr.cur_rd);
++		buf = get_pool_buf(dev, vdev->tnr.cur_rd);
+ 		val = buf->dma[GROUP_BUF_PIC];
+-		writel(val, base + RKISPP_TNR_CUR_Y_BASE);
++		rkispp_write(dev, RKISPP_TNR_CUR_Y_BASE, val);
+ 		val += vdev->tnr.uv_offset;
+-		writel(val, base + RKISPP_TNR_CUR_UV_BASE);
++		rkispp_write(dev, RKISPP_TNR_CUR_UV_BASE, val);
+ 
+ 		val = buf->dma[GROUP_BUF_GAIN];
+-		writel(val, base + RKISPP_TNR_GAIN_CUR_Y_BASE);
+-		if (readl(base + RKISPP_TNR_CORE_CTRL) & SW_TNR_EN) {
+-			rkispp_set_bits(base + RKISPP_CTRL_QUICK, 0,
++		rkispp_write(dev, RKISPP_TNR_GAIN_CUR_Y_BASE, val);
++		if (rkispp_read(dev, RKISPP_TNR_CORE_CTRL) & SW_TNR_EN) {
++			rkispp_set_bits(dev, RKISPP_CTRL_QUICK, 0,
+ 					GLB_NR_SD32_TNR);
+ 		} else {
+-			rkispp_clear_bits(base + RKISPP_CTRL_QUICK,
++			rkispp_clear_bits(dev, RKISPP_CTRL_QUICK,
+ 					  GLB_NR_SD32_TNR);
+-			writel(val, base + RKISPP_NR_ADDR_BASE_GAIN);
++			rkispp_write(dev, RKISPP_NR_ADDR_BASE_GAIN, val);
+ 		}
+ 		if (is_3to1) {
+-			buf = get_pool_buf(vdev, vdev->tnr.nxt_rd);
++			buf = get_pool_buf(dev, vdev->tnr.nxt_rd);
+ 			val = buf->dma[GROUP_BUF_PIC];
+-			writel(val, base + RKISPP_TNR_NXT_Y_BASE);
++			rkispp_write(dev, RKISPP_TNR_NXT_Y_BASE, val);
+ 			val += vdev->tnr.uv_offset;
+-			writel(val, base + RKISPP_TNR_NXT_UV_BASE);
++			rkispp_write(dev, RKISPP_TNR_NXT_UV_BASE, val);
+ 
+ 			val = buf->dma[GROUP_BUF_GAIN];
+-			writel(val, base + RKISPP_TNR_GAIN_NXT_Y_BASE);
++			rkispp_write(dev, RKISPP_TNR_GAIN_NXT_Y_BASE, val);
+ 
+-			if (readl(base + RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM)
++			if (rkispp_read(dev, RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM)
+ 				vdev->tnr.cur_rd = NULL;
+ 		}
+ 		is_start = true;
+@@ -2214,14 +2284,14 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 		dbuf = vdev->tnr.cur_wr->dbuf[GROUP_BUF_PIC];
+ 		dummy = dbuf_to_dummy(dbuf, &vdev->tnr.buf.iir, size);
+ 		val = dummy->dma_addr;
+-		writel(val, base + RKISPP_TNR_WR_Y_BASE);
++		rkispp_write(dev, RKISPP_TNR_WR_Y_BASE, val);
+ 		val += vdev->tnr.uv_offset;
+-		writel(val, base + RKISPP_TNR_WR_UV_BASE);
++		rkispp_write(dev, RKISPP_TNR_WR_UV_BASE, val);
+ 
+ 		dbuf = vdev->tnr.cur_wr->dbuf[GROUP_BUF_GAIN];
+ 		dummy = dbuf_to_dummy(dbuf, &vdev->tnr.buf.iir, size);
+ 		val = dummy->dma_addr;
+-		writel(val, base + RKISPP_TNR_GAIN_WR_Y_BASE);
++		rkispp_write(dev, RKISPP_TNR_GAIN_WR_Y_BASE, val);
+ 	}
+ 
+ 	if (is_start) {
+@@ -2236,6 +2306,8 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			}
+ 		}
+ 
++		if (!dev->hw_dev->is_single)
++			rkispp_update_regs(dev, RKISPP_CTRL, RKISPP_TNR_CORE_WEIGHT);
+ 		writel(TNR_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+ 
+ 		v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+@@ -2246,10 +2318,10 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			 readl(base + RKISPP_TNR_WR_Y_BASE_SHD));
+ 
+ 		/* iir using previous tnr write frame */
+-		writel(readl(base + RKISPP_TNR_WR_Y_BASE),
+-			base + RKISPP_TNR_IIR_Y_BASE);
+-		writel(readl(base + RKISPP_TNR_WR_UV_BASE),
+-			base + RKISPP_TNR_IIR_UV_BASE);
++		rkispp_write(dev, RKISPP_TNR_IIR_Y_BASE,
++			     rkispp_read(dev, RKISPP_TNR_WR_Y_BASE));
++		rkispp_write(dev, RKISPP_TNR_IIR_UV_BASE,
++			     rkispp_read(dev, RKISPP_TNR_WR_UV_BASE));
+ 		writel(TNR_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->tnr.is_end = false;
+ 	}
+@@ -2260,6 +2332,16 @@ void rkispp_module_work_event(struct rkispp_device *dev,
+ 			      void *buf_rd, void *buf_wr,
+ 			      u32 module, bool is_isr)
+ {
++	bool is_fec_en = (dev->stream_vdev.module_ens & ISPP_MODULE_FEC);
++
++	if (is_isr && !buf_rd && !buf_wr &&
++	    ((is_fec_en && module == ISPP_MODULE_FEC) ||
++	     (!is_fec_en && module == ISPP_MODULE_NR)))
++		rkispp_event_handle(dev, CMD_QUEUE_DMABUF, NULL);
++
++	if (dev->ispp_sdev.state == ISPP_STOP)
++		return;
++
+ 	if (module & ISPP_MODULE_TNR)
+ 		tnr_work_event(dev, buf_rd, buf_wr, is_isr);
+ 	else if (module & ISPP_MODULE_NR)
+@@ -2272,7 +2354,6 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream;
+-	void __iomem *base = dev->base_addr;
+ 	u32 i, err_mask = NR_LOST_ERR | TNR_LOST_ERR |
+ 		UVNR_MONITOR_ERR | FBCH_EMPTY_NR |
+ 		FBCH_EMPTY_TNR | FBCD_DEC_ERR_NR |
+@@ -2294,9 +2375,8 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 	rkispp_stats_isr(&dev->stats_vdev, mis_val);
+ 
+ 	if (mis_val & TNR_INT)
+-		if (readl(base + RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM)
+-			rkispp_clear_bits(base + RKISPP_TNR_CTRL,
+-					  SW_TNR_1ST_FRM);
++		if (rkispp_read(dev, RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM)
++			rkispp_clear_bits(dev, RKISPP_TNR_CTRL, SW_TNR_1ST_FRM);
+ 
+ 	for (i = 0; i < STREAM_MAX; i++) {
+ 		stream = &vdev->stream[i];
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 5bcc69111289..ec968e565f68 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -6,7 +6,6 @@
+ 
+ #include "common.h"
+ 
+-#define RKISPP_BUF_POOL_MAX (RKISP_ISPP_BUF_MAX + 1)
+ struct rkispp_stream;
+ 
+ /*
+@@ -76,21 +75,15 @@ enum stream_type {
+ 
+ /* internal using buf */
+ 
+-struct rkispp_isp_buf_pool {
+-	struct rkisp_ispp_buf *dbufs;
+-	void *mem_priv[GROUP_BUF_MAX];
+-	dma_addr_t dma[GROUP_BUF_MAX];
+-};
+-
+ struct in_tnr_buf {
+ 	struct rkispp_dummy_buffer iir;
+ 	struct rkispp_dummy_buffer gain_kg;
+-	struct rkispp_dummy_buffer wr[RKISP_ISPP_BUF_MAX][GROUP_BUF_MAX];
++	struct rkispp_dummy_buffer wr[RKISPP_BUF_MAX][GROUP_BUF_MAX];
+ };
+ 
+ struct in_nr_buf {
+ 	struct rkispp_dummy_buffer tmp_yuv;
+-	struct rkispp_dummy_buffer wr[RKISP_ISPP_BUF_MAX];
++	struct rkispp_dummy_buffer wr[RKISPP_BUF_MAX];
+ };
+ 
+ struct tnr_module {
+@@ -185,7 +178,6 @@ struct rkispp_stream_vdev {
+ 	u32 irq_ends;
+ };
+ 
+-void rkispp_free_pool(struct rkispp_stream_vdev *vdev);
+ void rkispp_module_work_event(struct rkispp_device *dev,
+ 			      void *buf_rd, void *buf_wr,
+ 			      u32 module, bool is_isr);
+-- 
+2.35.3
+

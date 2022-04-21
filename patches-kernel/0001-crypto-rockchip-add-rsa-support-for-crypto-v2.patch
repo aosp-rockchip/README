@@ -1,0 +1,1520 @@
+From b44600d4ddb3abb8b006d8db6598b6d56ededdbf Mon Sep 17 00:00:00 2001
+From: Lin Jinhan <troy.lin@rock-chips.com>
+Date: Fri, 12 Jun 2020 09:45:30 +0800
+Subject: [PATCH] crypto: rockchip - add rsa support for crypto v2
+
+Change-Id: Ia12748b5f72060b6fef07dd5866f607e5ad163aa
+Signed-off-by: Lin Jinhan <troy.lin@rock-chips.com>
+---
+ drivers/crypto/rockchip/Makefile              |   5 +-
+ drivers/crypto/rockchip/rk_crypto_bignum.c    | 130 ++++
+ drivers/crypto/rockchip/rk_crypto_bignum.h    |  27 +
+ drivers/crypto/rockchip/rk_crypto_core.c      |   9 +
+ drivers/crypto/rockchip/rk_crypto_core.h      |  18 +
+ drivers/crypto/rockchip/rk_crypto_v2.h        |  11 +-
+ .../crypto/rockchip/rk_crypto_v2_akcipher.c   | 302 ++++++++
+ drivers/crypto/rockchip/rk_crypto_v2_pka.c    | 660 ++++++++++++++++++
+ drivers/crypto/rockchip/rk_crypto_v2_reg.h    | 141 +++-
+ 9 files changed, 1266 insertions(+), 37 deletions(-)
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_bignum.c
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_bignum.h
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v2_pka.c
+
+diff --git a/drivers/crypto/rockchip/Makefile b/drivers/crypto/rockchip/Makefile
+index 845015028947..f1a9162729ff 100644
+--- a/drivers/crypto/rockchip/Makefile
++++ b/drivers/crypto/rockchip/Makefile
+@@ -4,4 +4,7 @@ rk_crypto-objs := rk_crypto_core.o \
+ 		  rk_crypto_v1_ahash.o \
+ 		  rk_crypto_v1_ablkcipher.o \
+ 		  rk_crypto_v2_ablkcipher.o \
+-		  rk_crypto_v2_ahash.o
++		  rk_crypto_v2_ahash.o \
++		  rk_crypto_v2_akcipher.o \
++		  rk_crypto_v2_pka.o \
++		  rk_crypto_bignum.o
+diff --git a/drivers/crypto/rockchip/rk_crypto_bignum.c b/drivers/crypto/rockchip/rk_crypto_bignum.c
+new file mode 100644
+index 000000000000..690c2fdf58ba
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_bignum.c
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * bignum support for Rockchip crypto
++ *
++ * Copyright (c) 2020 Rockchip Electronics Co., Ltd.
++ *
++ * Author: Lin Jinhan <troy.lin@rock-chips.com>
++ *
++ */
++#include <linux/slab.h>
++
++#include "rk_crypto_bignum.h"
++
++#define DEFAULT_ENDIAN		RK_BG_LITTILE_ENDIAN
++
++#define BYTES2WORDS(bytes)	(round_up((bytes), sizeof(u32)) / sizeof(u32))
++#define WORDS2BYTES(words)	((words) * sizeof(u32))
++#define RK_WORD_SIZE		32
++
++static void rk_reverse_memcpy(void *dst, const void *src, u32 size)
++{
++	char *_dst = (char *)dst, *_src = (char *)src;
++	u32 i;
++
++	if (!dst || !src || !size)
++		return;
++
++	for (i = 0; i < size; ++i)
++		_dst[size - i - 1] = _src[i];
++}
++
++struct rk_bignum *rk_bn_alloc(u32 max_size)
++{
++	struct rk_bignum *bn;
++
++	bn = kzalloc(sizeof(*bn), GFP_KERNEL);
++	if (!bn)
++		return NULL;
++
++	bn->data = kzalloc(round_up(max_size, sizeof(u32)), GFP_KERNEL);
++	if (!bn->data) {
++		kfree(bn);
++		return NULL;
++	}
++
++	bn->n_words = BYTES2WORDS(max_size);
++
++	return bn;
++}
++
++void rk_bn_free(struct rk_bignum *bn)
++{
++	if (!bn)
++		return;
++
++	if (bn->data) {
++		memset(bn->data, 0x00, WORDS2BYTES(bn->n_words));
++		kfree(bn->data);
++	}
++
++	kfree(bn);
++}
++
++int rk_bn_set_data(struct rk_bignum *bn, const u8 *data, u32 size, enum bignum_endian endian)
++{
++	if (!bn || !data)
++		return -EINVAL;
++
++	if (BYTES2WORDS(size) > bn->n_words)
++		return -EINVAL;
++
++	if (endian == DEFAULT_ENDIAN)
++		memcpy(bn->data, data, size);
++	else
++		rk_reverse_memcpy(bn->data, data, size);
++
++	return 0;
++}
++
++int rk_bn_get_data(const struct rk_bignum *bn, u8 *data, u32 size, enum bignum_endian endian)
++{
++	if (!bn || !data)
++		return -EINVAL;
++
++	if (size < WORDS2BYTES(bn->n_words))
++		return -EINVAL;
++
++	memset(data, 0x00, size);
++
++	if (endian == DEFAULT_ENDIAN)
++		memcpy(data + size - WORDS2BYTES(bn->n_words), bn->data, bn->n_words);
++	else
++		rk_reverse_memcpy(data + size - WORDS2BYTES(bn->n_words),
++				  bn->data, WORDS2BYTES(bn->n_words));
++
++	return 0;
++}
++
++u32 rk_bn_get_size(const struct rk_bignum *bn)
++{
++	if (!bn)
++		return 0;
++
++	return WORDS2BYTES(bn->n_words);
++}
++
++/*
++ * @brief  Returns the index of the highest 1 in |bn|.
++ * @param  bn: the point of input data bignum.
++ * @return The index starts at 0 for the least significant bit.
++ *         If src == zero, it will return -1
++ */
++int rk_bn_highest_bit(const struct rk_bignum *bn)
++{
++	u32 w;
++	u32 b;
++
++	if (!bn || !bn->data || !bn->n_words)
++		return -1;
++
++	w = bn->data[bn->n_words - 1];
++
++	for (b = 0; b < RK_WORD_SIZE; b++) {
++		w >>= 1;
++		if (w == 0)
++			break;
++	}
++
++	return (int)(bn->n_words - 1) * RK_WORD_SIZE + b;
++}
+diff --git a/drivers/crypto/rockchip/rk_crypto_bignum.h b/drivers/crypto/rockchip/rk_crypto_bignum.h
+new file mode 100644
+index 000000000000..780aa87661eb
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_bignum.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2020 Rockchip Electronics Co., Ltd. */
++
++#ifndef __RK_CRYPTO_BIGNUM_H__
++#define __RK_CRYPTO_BIGNUM_H__
++
++enum bignum_endian {
++	RK_BG_BIG_ENDIAN,
++	RK_BG_LITTILE_ENDIAN
++};
++
++/**
++ * struct rk_bignum - crypto bignum struct.
++ */
++struct rk_bignum {
++	u32 n_words;
++	u32 *data;
++};
++
++struct rk_bignum *rk_bn_alloc(u32 max_size);
++void rk_bn_free(struct rk_bignum *bn);
++int rk_bn_set_data(struct rk_bignum *bn, const u8 *data, u32 size, enum bignum_endian endian);
++int rk_bn_get_data(const struct rk_bignum *bn, u8 *data, u32 size, enum bignum_endian endian);
++u32 rk_bn_get_size(const struct rk_bignum *bn);
++int rk_bn_highest_bit(const struct rk_bignum *src);
++
++#endif
+diff --git a/drivers/crypto/rockchip/rk_crypto_core.c b/drivers/crypto/rockchip/rk_crypto_core.c
+index d26787e34d3d..48fbdf9edeba 100644
+--- a/drivers/crypto/rockchip/rk_crypto_core.c
++++ b/drivers/crypto/rockchip/rk_crypto_core.c
+@@ -315,6 +315,8 @@ static int rk_crypto_register(struct rk_crypto_info *crypto_info)
+ 			err = crypto_register_alg(&tmp_algs->alg.crypto);
+ 		} else if (tmp_algs->type == ALG_TYPE_HASH || tmp_algs->type == ALG_TYPE_HMAC) {
+ 			err = crypto_register_ahash(&tmp_algs->alg.hash);
++		} else if (tmp_algs->type == ALG_TYPE_ASYM) {
++			err = crypto_register_akcipher(&tmp_algs->alg.asym);
+ 		} else {
+ 			continue;
+ 		}
+@@ -335,6 +337,8 @@ static int rk_crypto_register(struct rk_crypto_info *crypto_info)
+ 			crypto_unregister_alg(&tmp_algs->alg.crypto);
+ 		else if (tmp_algs->type == ALG_TYPE_HASH || tmp_algs->type == ALG_TYPE_HMAC)
+ 			crypto_unregister_ahash(&tmp_algs->alg.hash);
++		else if (tmp_algs->type == ALG_TYPE_ASYM)
++			crypto_unregister_akcipher(&tmp_algs->alg.asym);
+ 	}
+ 	return err;
+ }
+@@ -353,6 +357,8 @@ static void rk_crypto_unregister(struct rk_crypto_info *crypto_info)
+ 			crypto_unregister_alg(&tmp_algs->alg.crypto);
+ 		else if (tmp_algs->type == ALG_TYPE_HASH || tmp_algs->type == ALG_TYPE_HMAC)
+ 			crypto_unregister_ahash(&tmp_algs->alg.hash);
++		else if (tmp_algs->type == ALG_TYPE_ASYM)
++			crypto_unregister_akcipher(&tmp_algs->alg.asym);
+ 	}
+ }
+ 
+@@ -411,6 +417,8 @@ static struct rk_crypto_tmp *crypto_v2_algs[] = {
+ 	&rk_v2_ahash_hmac_sha512,	/* hmac(sha512) */
+ 	&rk_v2_ahash_hmac_md5,		/* hmac(md5) */
+ 	&rk_v2_ahash_hmac_sm3,		/* hmac(sm3) */
++
++	&rk_v2_asym_rsa,		/* rsa */
+ };
+ 
+ static char *px30_algs_name[] = {
+@@ -427,6 +435,7 @@ static char *rv1126_algs_name[] = {
+ 	"ecb(des3_ede)", "cbc(des3_ede)", "cfb(des3_ede)", "ofb(des3_ede)",
+ 	"sha1", "sha256", "sha512", "md5", "sm3",
+ 	"hmac(sha1)", "hmac(sha256)", "hmac(sha512)", "hmac(md5)", "hmac(sm3)",
++	"rsa"
+ };
+ 
+ static const struct rk_crypto_soc_data px30_soc_data =
+diff --git a/drivers/crypto/rockchip/rk_crypto_core.h b/drivers/crypto/rockchip/rk_crypto_core.h
+index 1b19a3d22e0d..f6e85733cfc8 100644
+--- a/drivers/crypto/rockchip/rk_crypto_core.h
++++ b/drivers/crypto/rockchip/rk_crypto_core.h
+@@ -12,12 +12,16 @@
+ #include <crypto/sha.h>
+ #include <crypto/sm3.h>
+ #include <crypto/sm4.h>
++#include <crypto/internal/akcipher.h>
+ #include <crypto/internal/hash.h>
++#include <crypto/internal/rsa.h>
+ #include <crypto/internal/skcipher.h>
+ #include <linux/interrupt.h>
+ #include <linux/delay.h>
+ #include <linux/clk.h>
+ 
++#include "rk_crypto_bignum.h"
++
+ #define RK_CRYPTO_PRIORITY		300
+ 
+ struct rk_crypto_soc_data {
+@@ -109,10 +113,19 @@ struct rk_cipher_ctx {
+ 	struct crypto_skcipher		*fallback_tfm;
+ };
+ 
++struct rk_rsa_ctx {
++	struct rk_bignum *n;
++	struct rk_bignum *e;
++	struct rk_bignum *d;
++
++	struct rk_crypto_info		*dev;
++};
++
+ enum alg_type {
+ 	ALG_TYPE_HASH,
+ 	ALG_TYPE_HMAC,
+ 	ALG_TYPE_CIPHER,
++	ALG_TYPE_ASYM,
+ };
+ 
+ struct rk_crypto_tmp {
+@@ -120,6 +133,7 @@ struct rk_crypto_tmp {
+ 	union {
+ 		struct crypto_alg	crypto;
+ 		struct ahash_alg	hash;
++		struct akcipher_alg	asym;
+ 	} alg;
+ 	enum alg_type			type;
+ 	u32				algo;
+@@ -295,9 +309,13 @@ enum rk_cipher_mode {
+ 					 __func__, __LINE__, ##__VA_ARGS__)
+ #define CRYPTO_MSG(format, ...) pr_err("[%s, %05d]-msg:" format "\n", \
+ 				       __func__, __LINE__, ##__VA_ARGS__)
++#define CRYPTO_DUMPHEX(var_name, data, len) print_hex_dump(KERN_CONT, (var_name), \
++							   DUMP_PREFIX_OFFSET, \
++							   16, 1, (data), (len), false)
+ #else
+ #define CRYPTO_TRACE(format, ...)
+ #define CRYPTO_MSG(format, ...)
++#define CRYPTO_DUMPHEX(var_name, data, len)
+ #endif
+ 
+ #endif
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2.h b/drivers/crypto/rockchip/rk_crypto_v2.h
+index 49d7b6cf56a7..76253ea34728 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v2.h
++++ b/drivers/crypto/rockchip/rk_crypto_v2.h
+@@ -59,7 +59,16 @@ extern struct rk_crypto_tmp rk_v2_ahash_hmac_sha256;
+ extern struct rk_crypto_tmp rk_v2_ahash_hmac_sha512;
+ extern struct rk_crypto_tmp rk_v2_ahash_hmac_sm3;
+ 
++extern struct rk_crypto_tmp rk_v2_asym_rsa;
++
+ int rk_hw_crypto_v2_init(struct device *dev, void *hw_info);
+ void rk_hw_crypto_v2_deinit(struct device *dev, void *hw_info);
+-#endif
+ 
++void rk_pka_set_crypto_base(void __iomem *base);
++
++int rk_pka_expt_mod(struct rk_bignum *in,
++		    struct rk_bignum *e,
++		    struct rk_bignum *n,
++		    struct rk_bignum *out);
++
++#endif
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c b/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
+new file mode 100644
+index 000000000000..02c4cea9dfdb
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * RSA acceleration support for Rockchip crypto v2
++ *
++ * Copyright (c) 2020 Rockchip Electronics Co., Ltd.
++ *
++ * Author: Lin Jinhan <troy.lin@rock-chips.com>
++ *
++ * Some ideas are from marvell/cesa.c and s5p-sss.c driver.
++ */
++
++#include <linux/slab.h>
++
++#include "rk_crypto_core.h"
++#include "rk_crypto_v2.h"
++#include "rk_crypto_v2_reg.h"
++
++#define BG_WORDS2BYTES(words)	((words) * sizeof(u32))
++#define BG_BYTES2WORDS(bytes)	(((bytes) + sizeof(u32) - 1) / sizeof(u32))
++
++static void rk_rsa_adjust_rsa_key(struct rsa_key *key)
++{
++	if (key->n_sz && key->n && !key->n[0]) {
++		key->n++;
++		key->n_sz--;
++	}
++
++	if (key->e_sz && key->e && !key->e[0]) {
++		key->e++;
++		key->e_sz--;
++	}
++
++	if (key->d_sz && key->d && !key->d[0]) {
++		key->d++;
++		key->d_sz--;
++	}
++}
++
++static void rk_rsa_clear_ctx(struct rk_rsa_ctx *ctx)
++{
++	/* Free the old key if any */
++	rk_bn_free(ctx->n);
++	ctx->n = NULL;
++
++	rk_bn_free(ctx->e);
++	ctx->e = NULL;
++
++	rk_bn_free(ctx->d);
++	ctx->d = NULL;
++}
++
++static int rk_rsa_setkey(struct crypto_akcipher *tfm, const void *key,
++			 unsigned int keylen, bool private)
++{
++	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct rsa_key rsa_key;
++	int ret = -ENOMEM;
++
++	rk_rsa_clear_ctx(ctx);
++
++	memset(&rsa_key, 0x00, sizeof(rsa_key));
++
++	if (private)
++		ret = rsa_parse_priv_key(&rsa_key, key, keylen);
++	else
++		ret = rsa_parse_pub_key(&rsa_key, key, keylen);
++
++	if (ret < 0)
++		goto error;
++
++	rk_rsa_adjust_rsa_key(&rsa_key);
++
++	ctx->n = rk_bn_alloc(rsa_key.n_sz);
++	if (!ctx->n)
++		goto error;
++
++	ctx->e = rk_bn_alloc(rsa_key.e_sz);
++	if (!ctx->e)
++		goto error;
++
++	rk_bn_set_data(ctx->n, rsa_key.n, rsa_key.n_sz, RK_BG_BIG_ENDIAN);
++	rk_bn_set_data(ctx->e, rsa_key.e, rsa_key.e_sz, RK_BG_BIG_ENDIAN);
++
++	CRYPTO_DUMPHEX("n = ", ctx->n->data, BG_WORDS2BYTES(ctx->n->n_words));
++	CRYPTO_DUMPHEX("e = ", ctx->e->data, BG_WORDS2BYTES(ctx->e->n_words));
++
++	if (private) {
++		ctx->d = rk_bn_alloc(rsa_key.d_sz);
++		if (!ctx->d)
++			goto error;
++
++		rk_bn_set_data(ctx->d, rsa_key.d, rsa_key.d_sz, RK_BG_BIG_ENDIAN);
++
++		CRYPTO_DUMPHEX("d = ", ctx->d->data, BG_WORDS2BYTES(ctx->d->n_words));
++	}
++
++	return 0;
++error:
++	rk_rsa_clear_ctx(ctx);
++	return ret;
++}
++
++static unsigned int rk_rsa_max_size(struct crypto_akcipher *tfm)
++{
++	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	CRYPTO_TRACE();
++
++	return rk_bn_get_size(ctx->n);
++}
++
++static int rk_rsa_setpubkey(struct crypto_akcipher *tfm, const void *key,
++			    unsigned int keylen)
++{
++	CRYPTO_TRACE();
++
++	return rk_rsa_setkey(tfm, key, keylen, false);
++}
++
++static int rk_rsa_setprivkey(struct crypto_akcipher *tfm, const void *key,
++			     unsigned int keylen)
++{
++	CRYPTO_TRACE();
++
++	return rk_rsa_setkey(tfm, key, keylen, true);
++}
++
++static int rk_rsa_calc(struct akcipher_request *req, bool encypt)
++{
++	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
++	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct rk_bignum *in = NULL, *out = NULL;
++	u32 key_byte_size;
++	u8 *tmp_buf = NULL;
++	int ret = -ENOMEM;
++
++	CRYPTO_TRACE();
++
++	if (unlikely(!ctx->n || !ctx->e))
++		return -EINVAL;
++
++	if (!encypt && !ctx->d)
++		return -EINVAL;
++
++	key_byte_size = rk_bn_get_size(ctx->n);
++
++	if (req->dst_len < key_byte_size) {
++		req->dst_len = key_byte_size;
++		return -EOVERFLOW;
++	}
++
++	in = rk_bn_alloc(key_byte_size);
++	if (!in)
++		goto exit;
++
++	out = rk_bn_alloc(key_byte_size);
++	if (!in)
++		goto exit;
++
++	tmp_buf = kzalloc(key_byte_size, GFP_KERNEL);
++	if (!tmp_buf)
++		goto exit;
++
++	if (!sg_copy_to_buffer(req->src, sg_nents(req->src), tmp_buf, req->src_len)) {
++		dev_err(ctx->dev->dev, "[%s:%d] sg copy err\n",
++			__func__, __LINE__);
++		ret =  -EINVAL;
++		goto exit;
++	}
++
++	ret = rk_bn_set_data(in, tmp_buf, req->src_len, RK_BG_BIG_ENDIAN);
++	if (ret)
++		goto exit;
++
++	CRYPTO_DUMPHEX("in = ", in->data, BG_WORDS2BYTES(in->n_words));
++
++	if (encypt)
++		ret = rk_pka_expt_mod(in, ctx->e, ctx->n, out);
++	else
++		ret = rk_pka_expt_mod(in, ctx->d, ctx->n, out);
++	if (ret)
++		goto exit;
++
++	CRYPTO_DUMPHEX("out = ", out->data, BG_WORDS2BYTES(out->n_words));
++
++	ret = rk_bn_get_data(out, tmp_buf, key_byte_size, RK_BG_BIG_ENDIAN);
++	if (ret)
++		goto exit;
++
++	CRYPTO_DUMPHEX("tmp_buf = ", tmp_buf, key_byte_size);
++
++	if (!sg_copy_from_buffer(req->dst, sg_nents(req->dst), tmp_buf, key_byte_size)) {
++		dev_err(ctx->dev->dev, "[%s:%d] sg copy err\n",
++			__func__, __LINE__);
++		ret =  -EINVAL;
++		goto exit;
++	}
++
++	req->dst_len = key_byte_size;
++
++	CRYPTO_TRACE("ret = %d", ret);
++exit:
++	kfree(tmp_buf);
++
++	rk_bn_free(in);
++	rk_bn_free(out);
++
++	return ret;
++}
++
++static int rk_rsa_enc(struct akcipher_request *req)
++{
++	CRYPTO_TRACE();
++
++	return rk_rsa_calc(req, true);
++}
++
++static int rk_rsa_dec(struct akcipher_request *req)
++{
++	CRYPTO_TRACE();
++
++	return rk_rsa_calc(req, false);
++}
++
++static int rk_rsa_start(struct rk_crypto_info *dev)
++{
++	CRYPTO_TRACE();
++
++	return -ENOSYS;
++}
++
++static int rk_rsa_crypto_rx(struct rk_crypto_info *dev)
++{
++	CRYPTO_TRACE();
++
++	return -ENOSYS;
++}
++
++static void rk_rsa_complete(struct crypto_async_request *base, int err)
++{
++	if (base->complete)
++		base->complete(base, err);
++}
++
++static int rk_rsa_init_tfm(struct crypto_akcipher *tfm)
++{
++	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct akcipher_alg *alg = __crypto_akcipher_alg(tfm->base.__crt_alg);
++	struct rk_crypto_tmp *algt;
++
++	CRYPTO_TRACE();
++
++	algt = container_of(alg, struct rk_crypto_tmp, alg.asym);
++
++	ctx->dev = algt->dev;
++	ctx->dev->align_size = crypto_tfm_alg_alignmask(&tfm->base) + 1;
++	ctx->dev->start = rk_rsa_start;
++	ctx->dev->update = rk_rsa_crypto_rx;
++	ctx->dev->complete = rk_rsa_complete;
++
++	ctx->dev->enable_clk(ctx->dev);
++
++	rk_pka_set_crypto_base(ctx->dev->reg);
++
++	return 0;
++}
++
++static void rk_rsa_exit_tfm(struct crypto_akcipher *tfm)
++{
++	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	CRYPTO_TRACE();
++
++	ctx->dev->disable_clk(ctx->dev);
++
++	rk_rsa_clear_ctx(ctx);
++}
++
++struct rk_crypto_tmp rk_v2_asym_rsa = {
++	.name = "rsa",
++	.type = ALG_TYPE_ASYM,
++	.alg.asym = {
++		.encrypt = rk_rsa_enc,
++		.decrypt = rk_rsa_dec,
++		.sign = rk_rsa_dec,
++		.verify = rk_rsa_enc,
++		.set_pub_key = rk_rsa_setpubkey,
++		.set_priv_key = rk_rsa_setprivkey,
++		.max_size = rk_rsa_max_size,
++		.init = rk_rsa_init_tfm,
++		.exit = rk_rsa_exit_tfm,
++		.reqsize = 64,
++		.base = {
++			.cra_name = "rsa",
++			.cra_driver_name = "rsa-rk",
++			.cra_priority = RK_CRYPTO_PRIORITY,
++			.cra_module = THIS_MODULE,
++			.cra_ctxsize = sizeof(struct rk_rsa_ctx),
++		},
++	},
++};
++
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_pka.c b/drivers/crypto/rockchip/rk_crypto_v2_pka.c
+new file mode 100644
+index 000000000000..70affa1f72f9
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v2_pka.c
+@@ -0,0 +1,660 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2020 Rockchip Electronics Co., Ltd.
++ */
++
++#include <linux/iopoll.h>
++
++#include "rk_crypto_core.h"
++#include "rk_crypto_v2.h"
++#include "rk_crypto_v2_reg.h"
++
++#define PKA_WORDS2BITS(words)		((words) * 32)
++#define PKA_BITS2WORDS(bits)		(((bits) + 31) / 32)
++
++#define PKA_WORDS2BYTES(words)		((words) * 4)
++#define PKA_BYTES2BITS(bytes)		((bytes) * 8)
++
++/* PKA length set */
++enum {
++	PKA_EXACT_LEN_ID = 0,
++	PKA_CALC_LEN_ID,
++	PKA_USED_LEN_MAX,
++};
++
++/********************* Private MACRO Definition ******************************/
++#define PKA_POLL_PERIOD_US	1000
++#define PKA_POLL_TIMEOUT_US	1000000
++
++#define PKA_MAX_CALC_BITS	4096
++#define PKA_MAX_CALC_WORDS	PKA_BITS2WORDS(PKA_MAX_CALC_BITS)
++
++/* PKA N_NP_T0_T1 register default (reset) value: N=0, NP=1, T0=30, T1=31 */
++#define PKA_N  0UL
++#define PKA_NP 1UL
++#define PKA_T0 30UL		/*tmp reg */
++#define PKA_T1 31UL		/*tmp reg */
++#define PKA_TMP_REG_CNT		2
++
++#define PKA_N_NP_T0_T1_REG_DEFAULT \
++				(PKA_N	<< CRYPTO_N_VIRTUAL_ADDR_SHIFT	| \
++				 PKA_NP << CRYPTO_NP_VIRTUAL_ADDR_SHIFT | \
++				 PKA_T0 << CRYPTO_T0_VIRTUAL_ADDR_SHIFT | \
++				 PKA_T1 << CRYPTO_T1_VIRTUAL_ADDR_SHIFT)
++
++#define RES_DISCARD 0x3F
++
++/* values for defining, that PKA entry is not in use */
++#define PKA_ADDR_NOT_USED	0xFFC
++
++/* Machine Opcodes definitions (according to HW CRS ) */
++
++enum pka_opcode {
++	PKA_OPCODE_ADD = 0x04,
++	PKA_OPCODE_SUB,
++	PKA_OPCODE_MOD_ADD,
++	PKA_OPCODE_MOD_SUB,
++	PKA_OPCODE_AND,
++	PKA_OPCODE_OR,
++	PKA_OPCODE_XOR,
++	PKA_OPCODE_SHR0 = 0x0C,
++	PKA_OPCODE_SHR1,
++	PKA_OPCODE_SHL0,
++	PKA_OPCODE_SHL1,
++	PKA_OPCODE_LMUL,
++	PKA_OPCODE_MOD_MUL,
++	PKA_OPCODE_MOD_MUL_NR,
++	PKA_OPCODE_MOD_EXP,
++	PKA_OPCODE_DIV,
++	PKA_OPCODE_MOD_INV,
++	PKA_OPCODE_MOD_DIV,
++	PKA_OPCODE_HMUL,
++	PKA_OPCODE_TERMINATE,
++};
++
++#define PKA_CLK_ENABLE()
++#define PKA_CLK_DISABLE()
++
++#define PKA_READ(offset)	readl_relaxed((crypto_base) + (offset))
++#define PKA_WRITE(val, offset)	writel_relaxed((val), (crypto_base) + (offset))
++
++#define PKA_BIGNUM_WORDS(x)	(rk_bn_get_size(x) / sizeof(u32))
++
++#define PKA_RAM_FOR_PKA()	PKA_WRITE((CRYPTO_RAM_PKA_RDY << CRYPTO_WRITE_MASK_SHIFT) | \
++					  CRYPTO_RAM_PKA_RDY, CRYPTO_RAM_CTL)
++
++#define PKA_RAM_FOR_CPU()	do { \
++	PKA_WRITE((CRYPTO_RAM_PKA_RDY << CRYPTO_WRITE_MASK_SHIFT), CRYPTO_RAM_CTL); \
++	while ((PKA_READ(CRYPTO_RAM_ST) & 0x01) != CRYPTO_CLK_RAM_RDY) \
++		cpu_relax(); \
++} while (0)
++
++#define PKA_GET_SRAM_ADDR(addr)	((void *)(crypto_base + CRYPTO_SRAM_BASE + (addr)))
++
++/*************************************************************************
++ * Macros for calling PKA operations (names according to operation issue *
++ *************************************************************************/
++
++/*--------------------------------------*/
++/* 1.  ADD - SUBTRACT operations	*/
++/*--------------------------------------*/
++/* Add:  res =  op_a + op_b */
++#define RK_PKA_ADD(op_a, op_b, res)	pka_exec_op(PKA_OPCODE_ADD, PKA_CALC_LEN_ID, \
++						    0, (op_a), 0, (op_b), 0, (res), 0)
++
++/* Clr:  res =  op_a & 0  - clears the operand A. */
++#define RK_PKA_CLR(op_a)		pka_exec_op(PKA_OPCODE_AND, PKA_CALC_LEN_ID, \
++						    0, (op_a), 1, 0x00, 0, (op_a), 0)
++
++/* Copy: OpDest =  OpSrc || 0 */
++#define RK_PKA_COPY(op_dest, op_src)	pka_exec_op(PKA_OPCODE_OR, PKA_CALC_LEN_ID, \
++						    0, (op_src), 1, 0x00, 0, (op_dest), 0)
++
++/* Set0: res =  op_a || 1  : set bit0 = 1, other bits are not changed */
++#define RK_PKA_SET_0(op_a, res)	pka_exec_op(PKA_OPCODE_OR, PKA_CALC_LEN_ID, \
++						    0, (op_a), 1, 0x01, 0, (res), 0)
++
++/*----------------------------------------------*/
++/* 3.  SHIFT  operations */
++/*----------------------------------------------*/
++/* SHL0: res =  op_a << (S+1) :
++ * shifts left operand A by S+1 bits, insert 0 to right most bits
++ */
++#define RK_PKA_SHL0(op_a, S, res)	pka_exec_op(PKA_OPCODE_SHL0, PKA_CALC_LEN_ID, \
++						    0, (op_a), 0, (S), 0, (res), 0)
++
++/* SHL1:  res =  op_a << (S+1) :
++ * shifts left operand A by S+1 bits, insert 1 to right most bits
++ */
++#define RK_PKA_SHL1(op_a, S, res)	pka_exec_op(PKA_OPCODE_SHL1, PKA_CALC_LEN_ID, \
++						    0, (op_a), 0, (S), 0, (res), 0)
++
++/*--------------------------------------------------------------*/
++/*  2.  Multiplication and other operations    */
++/*      Note: See notes to RK_PKAExecOperation */
++/*--------------------------------------------------------------*/
++
++/*      ModExp:  res =	op_a ** op_b  mod N - modular exponentiation */
++#define RK_PKA_MOD_EXP(op_a, op_b, res)			    \
++			pka_exec_op(PKA_OPCODE_MOD_EXP, PKA_EXACT_LEN_ID, 0, (op_a), \
++				    0, (op_b), 0, (res), 0)
++
++/*      Divide:  res =	op_a / op_b , op_a = op_a mod op_b - division, */
++#define RK_PKA_DIV(op_a, op_b, res)	pka_exec_op(PKA_OPCODE_DIV, PKA_CALC_LEN_ID, \
++						    0, (op_a), 0, (op_b), 0, (res), 0)
++
++/*      Terminate  - special operation, which allows HOST access */
++/*      to PKA data memory registers after end of PKA operations */
++#define RK_PKA_TERMINATE()	pka_exec_op(PKA_OPCODE_TERMINATE, 0, 0, 0, 0, 0, 0, 0, 0)
++
++/********************* Private Variable Definition ***************************/
++static void __iomem *crypto_base;
++
++static void pka_word_memcpy(u32 *dst, u32 *src, u32 size)
++{
++	u32 i;
++
++	for (i = 0; i < size; i++)
++		dst[i] = src[i];
++}
++
++static void pka_word_memset(u32 *buff, u32 val, u32 size)
++{
++	u32 i;
++
++	for (i = 0; i < size; i++)
++		buff[i] = val;
++}
++
++static int pka_wait_pipe_rdy(void)
++{
++	u32 reg_val = 0;
++
++	return readl_poll_timeout(crypto_base + CRYPTO_PKA_PIPE_RDY, reg_val,
++				  reg_val, PKA_POLL_PERIOD_US, PKA_POLL_TIMEOUT_US);
++}
++
++static int pka_wait_done(void)
++{
++	u32 reg_val = 0;
++
++	return readl_poll_timeout(crypto_base + CRYPTO_PKA_DONE, reg_val,
++				  reg_val, PKA_POLL_PERIOD_US, PKA_POLL_TIMEOUT_US);
++}
++
++static u32 pka_check_status(u32 mask)
++{
++	u32 status;
++
++	pka_wait_done();
++	status = PKA_READ(CRYPTO_PKA_STATUS);
++	status = status & mask;
++
++	return !!status;
++}
++static void pka_set_len_words(u32 words, u32 index)
++{
++	PKA_WRITE(PKA_WORDS2BITS(words), CRYPTO_PKA_L0 + index * sizeof(u32));
++}
++
++static u32 pka_get_len_words(u32 index)
++{
++	pka_wait_done();
++	return PKA_BITS2WORDS(PKA_READ(CRYPTO_PKA_L0 + (index) * sizeof(u32)));
++}
++
++static void pka_set_map_addr(u32 addr, u32 index)
++{
++	PKA_WRITE(addr, CRYPTO_MEMORY_MAP0 + sizeof(u32) * index);
++}
++
++static u32 pka_get_map_addr(u32 index)
++{
++	pka_wait_done();
++	return PKA_READ(CRYPTO_MEMORY_MAP0 + sizeof(u32) * (index));
++}
++
++static u32 pka_make_full_opcode(u32 opcode, u32 len_id,
++				u32 is_a_immed, u32 op_a,
++				u32 is_b_immed, u32 op_b,
++				u32 res_discard, u32 res,
++				u32 tag)
++{
++	u32 full_opcode;
++
++	full_opcode = ((opcode & 31)     << CRYPTO_OPCODE_CODE_SHIFT	|
++		       (len_id & 7)      << CRYPTO_OPCODE_LEN_SHIFT	|
++		       (is_a_immed & 1)  << CRYPTO_OPCODE_A_IMMED_SHIFT	|
++		       (op_a & 31)       << CRYPTO_OPCODE_A_SHIFT	|
++		       (is_b_immed & 1)  << CRYPTO_OPCODE_B_IMMED_SHIFT	|
++		       (op_b & 31)       << CRYPTO_OPCODE_B_SHIFT	|
++		       (res_discard & 1) << CRYPTO_OPCODE_R_DIS_SHIFT	|
++		       (res & 31)        << CRYPTO_OPCODE_R_SHIFT	|
++		       (tag & 31)        << CRYPTO_OPCODE_TAG_SHIFT);
++
++	return full_opcode;
++}
++
++static void pka_load_data(u32 addr, u32 *data, u32 size_words)
++{
++	pka_wait_done();
++
++	PKA_RAM_FOR_CPU();
++	pka_word_memcpy(PKA_GET_SRAM_ADDR(addr), data, size_words);
++	PKA_RAM_FOR_PKA();
++}
++
++static void pka_clr_mem(u32 addr, u32 size_words)
++{
++	pka_wait_done();
++
++	PKA_RAM_FOR_CPU();
++	pka_word_memset(PKA_GET_SRAM_ADDR(addr), 0x00, size_words);
++	PKA_RAM_FOR_PKA();
++}
++
++static void pka_read_data(u32 addr, u32 *data, u32 size_words)
++{
++	pka_wait_done();
++
++	PKA_RAM_FOR_CPU();
++	pka_word_memcpy(data, PKA_GET_SRAM_ADDR(addr), size_words);
++	PKA_RAM_FOR_PKA();
++}
++
++static int pka_exec_op(enum pka_opcode opcode, u8 len_id,
++		       u8 is_a_immed, u8 op_a, u8 is_b_immed, u8 op_b,
++		       u8 res_discard, u8 res, u8 tag)
++{
++	int ret = 0;
++	u32 full_opcode;
++
++	if (res == RES_DISCARD) {
++		res_discard = 1;
++		res = 0;
++	}
++
++	full_opcode = pka_make_full_opcode(opcode, len_id,
++					   is_a_immed, op_a,
++					   is_b_immed, op_b,
++					   res_discard, res, tag);
++
++	/* write full opcode into PKA CRYPTO_OPCODE register */
++	PKA_WRITE(full_opcode, CRYPTO_OPCODE);
++
++	/*************************************************/
++	/* finishing operations for different cases      */
++	/*************************************************/
++	switch (opcode) {
++	case PKA_OPCODE_DIV:
++		/* for Div operation check, that op_b != 0*/
++		if (pka_check_status(CRYPTO_PKA_DIV_BY_ZERO))
++			goto end;
++		break;
++	case PKA_OPCODE_TERMINATE:
++		/* wait for PKA done bit */
++		ret = pka_wait_done();
++		break;
++	default:
++		/* wait for PKA pipe ready bit */
++		ret = pka_wait_pipe_rdy();
++	}
++end:
++	return ret;
++}
++
++static int pk_int_len_tbl(u32 exact_size_words, u32 calc_size_words)
++{
++	u32 i;
++
++	/* clear all length reg */
++	for (i = 0; i < CRYPTO_LEN_REG_NUM; i++)
++		pka_set_len_words(0, i);
++
++	/* Case of default settings */
++	/* write exact size into first table entry */
++	pka_set_len_words(exact_size_words, PKA_EXACT_LEN_ID);
++
++	/* write size with extra word into tab[1] = tab[0] + 32 */
++	pka_set_len_words(calc_size_words, PKA_CALC_LEN_ID);
++
++	return 0;
++}
++
++static int pka_int_map_tbl(u32 *regs_cnt, u32 max_size_words)
++{
++	u32 i;
++	u32 cur_addr = 0;
++	u32 max_size_bytes, default_regs_cnt;
++
++	max_size_bytes = PKA_WORDS2BYTES(max_size_words);
++	default_regs_cnt =
++		min_t(u32, CRYPTO_MAP_REG_NUM, CRYPTO_SRAM_SIZE / max_size_bytes);
++
++	/* clear all address */
++	for (i = 0; i < CRYPTO_MAP_REG_NUM; i++)
++		pka_set_map_addr(PKA_ADDR_NOT_USED, i);
++
++	/* set addresses of N,NP and user requested registers (excluding 2 temp registers T0,T1) */
++	for (i = 0; i < default_regs_cnt - PKA_TMP_REG_CNT; i++, cur_addr += max_size_bytes)
++		pka_set_map_addr(cur_addr, i);
++
++	/* set addresses of 2 temp registers: T0=30, T1=31 */
++	pka_set_map_addr(cur_addr, PKA_T0);
++	cur_addr += max_size_bytes;
++	pka_set_map_addr(cur_addr, PKA_T1);
++
++	/* output maximal count of allowed registers */
++	*regs_cnt = default_regs_cnt;
++
++	/* set default virtual addresses of N,NP,T0,T1 registers into N_NP_T0_T1_Reg */
++	PKA_WRITE((u32)PKA_N_NP_T0_T1_REG_DEFAULT, CRYPTO_N_NP_T0_T1_ADDR);
++
++	return 0;
++}
++
++static int pka_clear_regs_block(u8 first_reg, u8 regs_cnt)
++{
++	u32 i;
++	u32 size_words;
++	int cnt_tmps = 0;
++	u32 user_reg_num = CRYPTO_MAP_REG_NUM - PKA_TMP_REG_CNT;
++
++	/* calculate size_words of register in words */
++	size_words = pka_get_len_words(PKA_CALC_LEN_ID);
++
++	if (first_reg + regs_cnt > user_reg_num) {
++		cnt_tmps = min_t(u8, (regs_cnt + first_reg - user_reg_num), PKA_TMP_REG_CNT);
++		regs_cnt = user_reg_num;
++	} else {
++		cnt_tmps = PKA_TMP_REG_CNT;
++	}
++
++	/* clear ordinary registers */
++	for (i = first_reg; i < regs_cnt; i++)
++		RK_PKA_CLR(i);
++
++	pka_wait_done();
++
++	/* clear PKA temp registers (without PKA operations) */
++	if (cnt_tmps > 0) {
++		pka_clr_mem(pka_get_map_addr(PKA_T0), size_words);
++		if (cnt_tmps > 1)
++			pka_clr_mem(pka_get_map_addr(PKA_T1), size_words);
++
++	}
++
++	return 0;
++}
++
++static int pka_init(u32 exact_size_words)
++{
++	int ret;
++	u32 regs_cnt = 0;
++	u32 calc_size_words = exact_size_words + 1;
++
++	PKA_CLK_ENABLE();
++	PKA_RAM_FOR_PKA();
++
++	if (exact_size_words > PKA_MAX_CALC_WORDS)
++		return -1;
++
++	ret = pk_int_len_tbl(exact_size_words, calc_size_words);
++	if (ret)
++		goto exit;
++
++	ret = pka_int_map_tbl(&regs_cnt, calc_size_words);
++	if (ret)
++		goto exit;
++
++	/* clean PKA data memory */
++	pka_clear_regs_block(0, regs_cnt - PKA_TMP_REG_CNT);
++
++	/* clean temp PKA registers 30,31 */
++	pka_clr_mem(pka_get_map_addr(PKA_T0), calc_size_words);
++	pka_clr_mem(pka_get_map_addr(PKA_T1), calc_size_words);
++
++exit:
++	return ret;
++}
++
++static void pka_finish(void)
++{
++	RK_PKA_TERMINATE();
++	PKA_CLK_DISABLE();
++}
++
++static void pka_copy_bn_into_reg(u8 dst_reg, struct rk_bignum *bn)
++{
++	u32 cur_addr;
++	u32 size_words, bn_words;
++
++	RK_PKA_TERMINATE();
++
++	bn_words = PKA_BIGNUM_WORDS(bn);
++	size_words = pka_get_len_words(PKA_CALC_LEN_ID);
++	cur_addr = pka_get_map_addr(dst_reg);
++
++	pka_load_data(cur_addr, bn->data, bn_words);
++	cur_addr += PKA_WORDS2BYTES(bn_words);
++
++	pka_clr_mem(cur_addr, size_words - bn_words);
++}
++
++static void pka_copy_bn_from_reg(struct rk_bignum *bn, u32 size_words, u8 src_reg)
++{
++	PKA_WRITE(0, CRYPTO_OPCODE);
++	pka_read_data(pka_get_map_addr(src_reg), bn->data, size_words);
++}
++
++/***********	pka_div_bignum function		**********************/
++/**
++ * @brief The function divides long number A*(2^S) by B:
++ *		  res =  A*(2^S) / B,  remainder A = A*(2^S) % B.
++ *	  where: A,B - are numbers of size, which is not grate than,
++ *	  maximal operands size,
++ *	  and B > 2^S;
++ *		 S	- exponent of binary factor of A.
++ *		 ^	- exponentiation operator.
++ *
++ *	  The function algorithm:
++ *
++ *	  1. Let nWords = S/32; nBits = S % 32;
++ *	  2. Set res = 0, r_t1 = op_a;
++ *	  3. for(i=0; i<=nWords; i++) do:
++ *		  3.1. if(i < nWords )
++ *				 s1 = 32;
++ *			else
++ *				 s1 = nBits;
++ *		  3.2. r_t1 = r_t1 << s1;
++ *		  3.3. call PKA_div for calculating the quotient and remainder:
++ *			r_t2 = floor(r_t1/op_b) //quotient;
++ *			r_t1 = r_t1 % op_b	//remainder (is in r_t1 register);
++ *		  3.4. res = (res << s1) + r_t2;
++ *		 end do;
++ *	  4. Exit.
++ *
++ *	  Assuming:
++ *			- 5 PKA registers are used: op_a, op_b, res, r_t1, r_t2.
++ *			- The registers sizes and mapping tables are set on
++ *			  default mode according to operands size.
++ *			- The PKA clocks are initialized.
++ *	  NOTE !   Operand op_a shall be overwritten by remainder.
++ *
++ * @param[in] len_id	- ID of operation size (modSize+32).
++ * @param[in] op_a	- Operand A: virtual register pointer of A.
++ * @param[in] S		- exponent of binary factor of A.
++ * @param[in] op_b	- Operand B: virtual register pointer of B.
++ * @param[in] res	- Virtual register pointer for result quotient.
++ * @param[in] r_t1	- Virtual pointer to remainder.
++ * @param[in] r_t2	- Virtual pointer of temp register.
++ *
++ * @return int - On success 0 is returned:
++ *
++ */
++static int pka_div_bignum(u8 op_a, u32 s, u8 op_b, u8 res, u8 r_t1, u8 r_t2)
++{
++	u8 s1;
++	u32 i;
++	u32 n_bits, n_words;
++
++	/* calculate shifting parameters (words and bits ) */
++	n_words = ((u32)s + 31) / 32;
++	n_bits = (u32)s % 32;
++
++	/* copy operand op_a (including extra word) into temp reg r_t1 */
++	RK_PKA_COPY(r_t1, op_a);
++
++	/* set res = 0 (including extra word) */
++	RK_PKA_CLR(res);
++
++	/*----------------------------------------------------*/
++	/* Step 1.	Shifting and dividing loop	      */
++	/*----------------------------------------------------*/
++	for (i = 0; i < n_words; i++) {
++		/* 3.1 set shift value s1  */
++		s1 = i > 0 ? 32 : n_bits;
++
++		/* 3.2. shift: r_t1 = r_t1 * 2**s1 (in code (s1-1),
++		 * because PKA performs s+1 shifts)
++		 */
++		if (s1 > 0)
++			RK_PKA_SHL0(r_t1 /*op_a*/, (s1 - 1) /*s*/, r_t1 /*res*/);
++
++		/* 3.3. perform PKA_OPCODE_MOD_DIV for calculating a quotient
++		 * r_t2 = floor(r_t1 / N)
++		 * and remainder r_t1 = r_t1 % op_b
++		 */
++		RK_PKA_DIV(r_t1 /*op_a*/, op_b /*B*/, r_t2 /*res*/);
++
++		/* 3.4. res = res * 2**s1 + res;   */
++		if (s1 > 0)
++			RK_PKA_SHL0(res /*op_a*/, (s1 - 1) /*s*/, res /*res*/);
++
++		RK_PKA_ADD(res /*op_a*/, r_t2 /*op_b*/, res /*res*/);
++	}
++
++	pka_wait_done();
++
++	return 0;
++}  /* END OF pka_div_bignum */
++
++static u32 pka_calc_and_init_np(struct rk_bignum *bn, u8 r_t0, u8 r_t1, u8 r_t2)
++{
++	int ret;
++	u32 i;
++	u32 s;
++	u32 mod_size_bits;
++	u32 num_bits, num_words;
++
++	/* Set s = 132 */
++	s = 132;
++
++	mod_size_bits = PKA_BYTES2BITS(rk_bn_get_size(bn));
++
++	CRYPTO_TRACE("size_bits = %u", mod_size_bits);
++
++	/* copy modulus N into r0 register */
++	pka_copy_bn_into_reg(PKA_N, bn);
++
++	/*--------------------------------------------------------------*/
++	/* Step 1,2. Set registers: Set op_a = 2^(sizeN+32)		*/
++	/*	 Registers using: 0 - N (is set in register 0,		*/
++	/*	 1 - NP, temp regs: r_t0 (A), r_t1, r_t2.		*/
++	/*	 len_id: 0 - exact size, 1 - exact+32 bit		*/
++	/*--------------------------------------------------------------*/
++
++	/* set register r_t0 = 0 */
++	RK_PKA_CLR(r_t0);
++
++	/* calculate bit position of said bit in the word */
++	num_bits = mod_size_bits % 32;
++	num_words = mod_size_bits / 32;
++
++	CRYPTO_TRACE("num_bits = %u, num_words = %u, size_bits = %u",
++		     num_bits, num_words, mod_size_bits);
++
++	/* set 1 into register r_t0 */
++	RK_PKA_SET_0(r_t0 /*op_a*/, r_t0 /*res*/);
++
++	/* shift 1 to num_bits+31 position */
++	if (num_bits > 0)
++		RK_PKA_SHL0(r_t0 /*op_a*/, num_bits - 1 /*s*/, r_t0 /*res*/);
++
++	/* shift to word position */
++	for (i = 0; i < num_words; i++)
++		RK_PKA_SHL0(r_t0 /*op_a*/, 31 /*s*/, r_t0 /*res*/);
++
++	/*--------------------------------------------------------------*/
++	/* Step 3.	Dividing:  PKA_NP = (r_t0 * 2**s) / N		*/
++	/*--------------------------------------------------------------*/
++	ret = pka_div_bignum(r_t0, s, PKA_N, PKA_NP, r_t1, r_t2);
++
++	return ret;
++}  /* END OF pka_calc_and_init_np */
++
++/********************* Public Function Definition ****************************/
++
++void rk_pka_set_crypto_base(void __iomem *base)
++{
++	crypto_base = base;
++}
++
++/**
++ * @brief  calculate exp mod. out = in ^ e mod n
++ * @param  in: the point of input data bignum.
++ * @param  e: the point of exponent bignum.
++ * @param  n: the point of modulus bignum.
++ * @param  out: the point of outputs bignum.
++ * @param  pTmp: the point of tmpdata bignum.
++ * @return 0 for success
++ */
++int rk_pka_expt_mod(struct rk_bignum *in,
++		    struct rk_bignum *e,
++		    struct rk_bignum *n,
++		    struct rk_bignum *out)
++{
++	int ret = -1;
++	u32 max_word_size;
++	u8 r_in = 2, r_e = 3, r_out = 4;
++	u8 r_t0 = 2, r_t1 = 3, r_t2 = 4;
++
++	if (!in || !e || !n || !out || PKA_BIGNUM_WORDS(n) == 0)
++		return -1;
++
++	max_word_size = PKA_BIGNUM_WORDS(n);
++
++	ret = pka_init(max_word_size);
++	if (ret) {
++		CRYPTO_TRACE("pka_init error\n");
++		goto exit;
++	}
++
++	/* calculate NP by initialization PKA for modular operations */
++	ret = pka_calc_and_init_np(n, r_t0, r_t1, r_t2);
++	if (ret) {
++		CRYPTO_TRACE("pka_calc_and_init_np error\n");
++		goto exit;
++	}
++
++	pka_clear_regs_block(r_in, 3);
++
++	pka_copy_bn_into_reg(r_in, in);
++	pka_copy_bn_into_reg(r_e, e);
++	pka_copy_bn_into_reg(PKA_N, n);
++
++	ret = RK_PKA_MOD_EXP(r_in, r_e, r_out);
++	if (ret) {
++		CRYPTO_TRACE("RK_PKA_MOD_EXP error\n");
++		goto exit;
++	}
++
++	pka_copy_bn_from_reg(out, max_word_size, r_out);
++
++exit:
++	pka_clear_regs_block(0, 5);
++	pka_clear_regs_block(30, 2);
++	pka_finish();
++
++	return ret;
++}
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_reg.h b/drivers/crypto/rockchip/rk_crypto_v2_reg.h
+index d48889dcc05b..2dacde671bff 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v2_reg.h
++++ b/drivers/crypto/rockchip/rk_crypto_v2_reg.h
+@@ -6,7 +6,6 @@
+ #define __RK_CRYPTO_V2_REG_H__
+ 
+ #define _SBF(s, v)			((v) << (s))
+-#define _BIT(b)				_SBF(b, 1)
+ 
+ #define CRYPTO_WRITE_MASK_SHIFT		(16)
+ #define CRYPTO_WRITE_MASK_ALL		((0xffffu << CRYPTO_WRITE_MASK_SHIFT))
+@@ -15,41 +14,41 @@
+ 
+ /* Crypto control registers*/
+ #define CRYPTO_CLK_CTL			0x0000
+-#define CRYPTO_AUTO_CLKGATE_EN		_BIT(0)
++#define CRYPTO_AUTO_CLKGATE_EN		BIT(0)
+ 
+ #define CRYPTO_RST_CTL			0x0004
+-#define CRYPTO_SW_PKA_RESET		_BIT(2)
+-#define CRYPTO_SW_RNG_RESET		_BIT(1)
+-#define CRYPTO_SW_CC_RESET		_BIT(0)
++#define CRYPTO_SW_PKA_RESET		BIT(2)
++#define CRYPTO_SW_RNG_RESET		BIT(1)
++#define CRYPTO_SW_CC_RESET		BIT(0)
+ 
+ /* Crypto DMA control registers*/
+ #define CRYPTO_DMA_INT_EN		0x0008
+-#define CRYPTO_ZERO_ERR_INT_EN		_BIT(6)
+-#define CRYPTO_LIST_ERR_INT_EN		_BIT(5)
+-#define CRYPTO_SRC_ERR_INT_EN		_BIT(4)
+-#define CRYPTO_DST_ERR_INT_EN		_BIT(3)
+-#define CRYPTO_SRC_ITEM_INT_EN		_BIT(2)
+-#define CRYPTO_DST_ITEM_DONE_INT_EN	_BIT(1)
+-#define CRYPTO_LIST_DONE_INT_EN		_BIT(0)
++#define CRYPTO_ZERO_ERR_INT_EN		BIT(6)
++#define CRYPTO_LIST_ERR_INT_EN		BIT(5)
++#define CRYPTO_SRC_ERR_INT_EN		BIT(4)
++#define CRYPTO_DST_ERR_INT_EN		BIT(3)
++#define CRYPTO_SRC_ITEM_INT_EN		BIT(2)
++#define CRYPTO_DST_ITEM_DONE_INT_EN	BIT(1)
++#define CRYPTO_LIST_DONE_INT_EN		BIT(0)
+ 
+ #define CRYPTO_DMA_INT_ST		0x000C
+-#define CRYPTO_ZERO_LEN_INT_ST		_BIT(6)
+-#define CRYPTO_LIST_ERR_INT_ST		_BIT(5)
+-#define CRYPTO_SRC_ERR_INT_ST		_BIT(4)
+-#define CRYPTO_DST_ERR_INT_ST		_BIT(3)
+-#define CRYPTO_SRC_ITEM_DONE_INT_ST	_BIT(2)
+-#define CRYPTO_DST_ITEM_DONE_INT_ST	_BIT(1)
+-#define CRYPTO_LIST_DONE_INT_ST		_BIT(0)
++#define CRYPTO_ZERO_LEN_INT_ST		BIT(6)
++#define CRYPTO_LIST_ERR_INT_ST		BIT(5)
++#define CRYPTO_SRC_ERR_INT_ST		BIT(4)
++#define CRYPTO_DST_ERR_INT_ST		BIT(3)
++#define CRYPTO_SRC_ITEM_DONE_INT_ST	BIT(2)
++#define CRYPTO_DST_ITEM_DONE_INT_ST	BIT(1)
++#define CRYPTO_LIST_DONE_INT_ST		BIT(0)
+ 
+ #define CRYPTO_DMA_CTL			0x0010
+-#define CRYPTO_DMA_RESTART		_BIT(1)
+-#define CRYPTO_DMA_START		_BIT(0)
++#define CRYPTO_DMA_RESTART		BIT(1)
++#define CRYPTO_DMA_START		BIT(0)
+ 
+ /* DMA LIST Start Address Register */
+ #define CRYPTO_DMA_LLI_ADDR		0x0014
+ 
+ #define CRYPTO_DMA_ST			0x0018
+-#define CRYPTO_DMA_BUSY			_BIT(0)
++#define CRYPTO_DMA_BUSY			BIT(0)
+ 
+ #define CRYPTO_DMA_STATE		0x001C
+ #define CRYPTO_LLI_IDLE_STATE		_SBF(4, 0x00)
+@@ -74,8 +73,8 @@
+ #define CRYPTO_DMA_ITEM_ID		0x002C
+ 
+ #define CRYPTO_FIFO_CTL			0x0040
+-#define CRYPTO_DOUT_BYTESWAP		_BIT(1)
+-#define CRYPTO_DOIN_BYTESWAP		_BIT(0)
++#define CRYPTO_DOUT_BYTESWAP		BIT(1)
++#define CRYPTO_DOIN_BYTESWAP		BIT(0)
+ 
+ /* Block Cipher Control Register */
+ #define CRYPTO_BC_CTL			0x0044
+@@ -97,8 +96,8 @@
+ #define CRYPTO_BC_128_bit_key		_SBF(2, 0x00)
+ #define CRYPTO_BC_192_bit_key		_SBF(2, 0x01)
+ #define CRYPTO_BC_256_bit_key		_SBF(2, 0x02)
+-#define CRYPTO_BC_DECRYPT		_BIT(1)
+-#define CRYPTO_BC_ENABLE		_BIT(0)
++#define CRYPTO_BC_DECRYPT		BIT(1)
++#define CRYPTO_BC_ENABLE		BIT(0)
+ 
+ /* Hash Control Register */
+ #define CRYPTO_HASH_CTL			0x0048
+@@ -111,16 +110,16 @@
+ #define CRYPTO_SHA384			_SBF(4, 0x09)
+ #define CRYPTO_SHA512_224		_SBF(4, 0x0A)
+ #define CRYPTO_SHA512_256		_SBF(4, 0x0B)
+-#define CRYPTO_HMAC_ENABLE		_BIT(3)
+-#define CRYPTO_HW_PAD_ENABLE		_BIT(2)
+-#define CRYPTO_HASH_SRC_SEL		_BIT(1)
+-#define CRYPTO_HASH_ENABLE		_BIT(0)
++#define CRYPTO_HMAC_ENABLE		BIT(3)
++#define CRYPTO_HW_PAD_ENABLE		BIT(2)
++#define CRYPTO_HASH_SRC_SEL		BIT(1)
++#define CRYPTO_HASH_ENABLE		BIT(0)
+ 
+ /* Cipher Status Register */
+ #define CRYPTO_CIPHER_ST		0x004C
+-#define CRYPTO_OTP_KEY_VALID		_BIT(2)
+-#define CRYPTO_HASH_BUSY		_BIT(1)
+-#define CRYPTO_BLOCK_CIPHER_BUSY	_BIT(0)
++#define CRYPTO_OTP_KEY_VALID		BIT(2)
++#define CRYPTO_HASH_BUSY		BIT(1)
++#define CRYPTO_BLOCK_CIPHER_BUSY	BIT(0)
+ 
+ #define CRYPTO_CIPHER_STATE		0x0050
+ #define CRYPTO_HASH_IDLE_STATE		_SBF(10, 0x01)
+@@ -240,9 +239,81 @@
+ #define CRYPTO_HASH_DOUT_15     0x03dc
+ 
+ #define CRYPTO_HASH_VALID       0x03e4
+-#define CRYPTO_HASH_IS_VALID	_BIT(0)
++#define CRYPTO_HASH_IS_VALID	BIT(0)
+ 
+-#define CRYPTO_CLK_NUM	(4)
++#define	CRYPTO_RAM_CTL			0x0480
++#define	CRYPTO_RAM_PKA_RDY		BIT(0)
++
++#define	CRYPTO_RAM_ST			0x0484
++#define	CRYPTO_CLK_RAM_RDY		BIT(0)
++#define	CRYPTO_CLK_RAM_RDY_MASK		BIT(0)
++
++#define	CRYPTO_DEBUG_CTL		0x04a0
++#define	CRYPTO_DEBUG_MODE		BIT(0)
++
++#define	CRYPTO_DEBUG_ST			0x04a4
++#define	CRYPTO_PKA_DEBUG_CLK_EN		BIT(0)
++
++#define	CRYPTO_DEBUG_MONITOR		0x04a8
++
++/* MAP0 ~ MAP31 */
++#define	CRYPTO_MEMORY_MAP0		0x00800
++#define CRYPTO_MAP_REG_NUM		32
++
++#define	CRYPTO_OPCODE			0x00880
++#define	CRYPTO_OPCODE_TAG_SHIFT		0
++#define	CRYPTO_OPCODE_R_SHIFT		6
++#define CRYPTO_OPCODE_R_DIS_SHIFT	11
++#define	CRYPTO_OPCODE_B_SHIFT		12
++#define CRYPTO_OPCODE_B_IMMED_SHIFT	17
++#define	CRYPTO_OPCODE_A_SHIFT		18
++#define CRYPTO_OPCODE_A_IMMED_SHIFT	23
++#define	CRYPTO_OPCODE_LEN_SHIFT		24
++#define	CRYPTO_OPCODE_CODE_SHIFT	27
++
++#define	CRYPTO_N_NP_T0_T1_ADDR		0x00884
++#define	CRYPTO_N_VIRTUAL_ADDR_SHIFT	0
++#define	CRYPTO_N_VIRTUAL_ADDR_MASK	0x0000001f
++#define	CRYPTO_NP_VIRTUAL_ADDR_SHIFT	5
++#define	CRYPTO_NP_VIRTUAL_ADDR_MASK	0x000003e0
++#define	CRYPTO_T0_VIRTUAL_ADDR_SHIFT	10
++#define	CRYPTO_T0_VIRTUAL_ADDR_MASK	0x00007c00
++#define	CRYPTO_T1_VIRTUAL_ADDR_SHIFT	15
++#define	CRYPTO_T1_VIRTUAL_ADDR_MASK	0x000f8000
++
++#define	CRYPTO_PKA_STATUS		0x00888
++#define	CRYPTO_PKA_PIPE_IS_RDY		BIT(0)
++#define	CRYPTO_PKA_BUSY			BIT(1)
++#define	CRYPTO_PKA_ALU_OUT_ZERO		BIT(2)
++#define	CRYPTO_PKA_ALU_MODOVRFLW	BIT(3)
++#define	CRYPTO_PKA_DIV_BY_ZERO		BIT(4)
++#define	CRYPTO_PKA_ALU_CARRY		BIT(5)
++#define	CRYPTO_PKA_ALU_SIGN_OUT		BIT(6)
++#define	CRYPTO_PKA_MODINV_OF_ZERO	BIT(7)
++#define	CRYPTO_PKA_CPU_BUSY		BIT(8)
++#define	CRYPTO_PKA_OPCODE_STATUS_SHIFT	9
++#define	CRYPTO_PKA_OPCODE_STATUS_MASK	0x00003e00
++#define	CRYPTO_PKA_TAG_STATUS_SHIFT	14
++#define	CRYPTO_PKA_TAG_STATUS_MASK	0x0003c000
++
++#define	CRYPTO_PKA_SW_RESET		0x0088C
++
++/* PKA_L0 ~ PKA_L7 */
++#define	CRYPTO_PKA_L0			0x00890
++#define CRYPTO_LEN_REG_NUM		8
++
++#define	CRYPTO_PKA_PIPE_RDY		0x008B0
++#define	CRYPTO_PKA_DONE			0x008B4
++#define	CRYPTO_PKA_MON_SELECT		0x008B8
++#define	CRYPTO_PKA_DEBUG_REG_EN		0x008BC
++#define	CRYPTO_DEBUG_CNT_ADDR		0x008C0
++#define	CRYPTO_DEBUG_EXT_ADDR		0x008C4
++#define	CRYPTO_PKA_DEBUG_HALT		0x008C8
++#define	CRYPTO_PKA_MON_READ		0x008D0
++#define	CRYPTO_PKA_INT_ENA		0x008D4
++#define	CRYPTO_PKA_INT_ST		0x008D8
++#define	CRYPTO_SRAM_BASE		0x01000
++#define	CRYPTO_SRAM_SIZE		0x01000
+ 
+ enum endian_mode {
+ 	BIG_ENDIAN = 0,
+-- 
+2.35.3
+

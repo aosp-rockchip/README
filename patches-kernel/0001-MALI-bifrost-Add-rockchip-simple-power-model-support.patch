@@ -1,0 +1,296 @@
+From 6fc2a5c0280c93479dc7ca1c912974a4f8d64740 Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Tue, 5 Jan 2021 09:51:25 +0800
+Subject: [PATCH] MALI: bifrost: Add rockchip simple-power-model support
+
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+Change-Id: I721c0f247c81b63a1590c9001ad481837f15f15e
+---
+ .../bifrost/backend/gpu/mali_kbase_devfreq.c  | 80 +++++++++++++++----
+ .../gpu/arm/bifrost/mali_kbase_core_linux.c   |  2 +-
+ drivers/gpu/arm/bifrost/mali_kbase_defs.h     |  1 +
+ .../backend/gpu/mali_kbase_devfreq.c          | 79 ++++++++++++++----
+ .../bifrost_for_linux/mali_kbase_core_linux.c |  2 +-
+ .../arm/bifrost_for_linux/mali_kbase_defs.h   |  1 +
+ 6 files changed, 131 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+index aa39a83151ce..ff561d180247 100644
+--- a/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost/backend/gpu/mali_kbase_devfreq.c
+@@ -46,6 +46,7 @@
+ #define dev_pm_opp_find_freq_ceil opp_find_freq_ceil
+ #define dev_pm_opp_find_freq_floor opp_find_freq_floor
+ #endif /* Linux >= 3.13 */
++#include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+ #include <soc/rockchip/rockchip_system_monitor.h>
+ 
+@@ -642,8 +643,22 @@ static void kbase_devfreq_work_term(struct kbase_device *kbdev)
+ #endif
+ }
+ 
++static unsigned long kbase_devfreq_get_static_power(struct devfreq *devfreq,
++						    unsigned long voltage)
++{
++	struct device *dev = devfreq->dev.parent;
++	struct kbase_device *kbdev = dev_get_drvdata(dev);
++
++	return rockchip_ipa_get_static_power(kbdev->model_data, voltage);
++}
++
++static struct devfreq_cooling_power kbase_cooling_power = {
++	.get_static_power = &kbase_devfreq_get_static_power,
++};
++
+ int kbase_devfreq_init(struct kbase_device *kbdev)
+ {
++	struct devfreq_cooling_power *kbase_dcp = &kbase_cooling_power;
+ 	struct device_node *np = kbdev->dev->of_node;
+ 	struct devfreq_dev_profile *dp;
+ 	struct dev_pm_opp *opp;
+@@ -735,22 +750,53 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
+ 		kbdev->mdev_info = NULL;
+ 	}
+ #ifdef CONFIG_DEVFREQ_THERMAL
+-	err = kbase_ipa_init(kbdev);
+-	if (err) {
+-		dev_err(kbdev->dev, "IPA initialization failed\n");
+-		goto cooling_failed;
+-	}
++	if (of_find_compatible_node(kbdev->dev->of_node, NULL,
++				    "simple-power-model")) {
++		of_property_read_u32(kbdev->dev->of_node,
++				     "dynamic-power-coefficient",
++				     (u32 *)&kbase_dcp->dyn_power_coeff);
++		kbdev->model_data = rockchip_ipa_power_model_init(kbdev->dev,
++								  "gpu_leakage");
++		if (IS_ERR_OR_NULL(kbdev->model_data)) {
++			kbdev->model_data = NULL;
++			dev_err(kbdev->dev, "failed to initialize power model\n");
++		} else if (kbdev->model_data->dynamic_coefficient) {
++			kbase_dcp->dyn_power_coeff =
++				kbdev->model_data->dynamic_coefficient;
++		}
++		if (!kbase_dcp->dyn_power_coeff) {
++			err = -EINVAL;
++			dev_err(kbdev->dev, "failed to get dynamic-coefficient\n");
++			goto cooling_failed;
++		}
+ 
+-	kbdev->devfreq_cooling = of_devfreq_cooling_register_power(
+-			kbdev->dev->of_node,
+-			kbdev->devfreq,
+-			&kbase_ipa_power_model_ops);
+-	if (IS_ERR_OR_NULL(kbdev->devfreq_cooling)) {
+-		err = PTR_ERR(kbdev->devfreq_cooling);
+-		dev_err(kbdev->dev,
+-			"Failed to register cooling device (%d)\n",
+-			err);
+-		goto cooling_failed;
++		kbdev->devfreq_cooling =
++			of_devfreq_cooling_register_power(kbdev->dev->of_node,
++							  kbdev->devfreq,
++							  kbase_dcp);
++		if (IS_ERR(kbdev->devfreq_cooling)) {
++			err = PTR_ERR(kbdev->devfreq_cooling);
++			dev_err(kbdev->dev, "failed to register cooling device\n");
++			goto cooling_failed;
++		}
++	} else {
++		err = kbase_ipa_init(kbdev);
++		if (err) {
++			dev_err(kbdev->dev, "IPA initialization failed\n");
++			goto cooling_failed;
++		}
++
++		kbdev->devfreq_cooling = of_devfreq_cooling_register_power(
++				kbdev->dev->of_node,
++				kbdev->devfreq,
++				&kbase_ipa_power_model_ops);
++		if (IS_ERR(kbdev->devfreq_cooling)) {
++			err = PTR_ERR(kbdev->devfreq_cooling);
++			dev_err(kbdev->dev,
++				"Failed to register cooling device (%d)\n",
++				err);
++			goto cooling_failed;
++		}
+ 	}
+ #endif
+ 
+@@ -782,7 +828,9 @@ void kbase_devfreq_term(struct kbase_device *kbdev)
+ 	if (kbdev->devfreq_cooling)
+ 		devfreq_cooling_unregister(kbdev->devfreq_cooling);
+ 
+-	kbase_ipa_term(kbdev);
++	if (!kbdev->model_data)
++		kbase_ipa_term(kbdev);
++	kfree(kbdev->model_data);
+ #endif
+ 
+ 	devfreq_unregister_opp_notifier(kbdev->dev, kbdev->devfreq);
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+index 4b84baba48d7..8d4aac98584f 100644
+--- a/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost/mali_kbase_core_linux.c
+@@ -4455,7 +4455,7 @@ int kbase_device_debugfs_init(struct kbase_device *kbdev)
+ 
+ #ifdef CONFIG_MALI_BIFROST_DEVFREQ
+ #ifdef CONFIG_DEVFREQ_THERMAL
+-	if (kbdev->devfreq)
++	if (kbdev->devfreq && !kbdev->model_data)
+ 		kbase_ipa_debugfs_init(kbdev);
+ #endif /* CONFIG_DEVFREQ_THERMAL */
+ #endif /* CONFIG_MALI_BIFROST_DEVFREQ */
+diff --git a/drivers/gpu/arm/bifrost/mali_kbase_defs.h b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+index 19bff5aa989d..980cf09500ef 100755
+--- a/drivers/gpu/arm/bifrost/mali_kbase_defs.h
++++ b/drivers/gpu/arm/bifrost/mali_kbase_defs.h
+@@ -997,6 +997,7 @@ struct kbase_device {
+ 	int num_opps;
+ 	struct kbasep_pm_metrics last_devfreq_metrics;
+ 	struct monitor_dev_info *mdev_info;
++	struct ipa_power_model_data *model_data;
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+ 	struct kbase_devfreq_queue_info devfreq_queue;
+ #endif
+diff --git a/drivers/gpu/arm/bifrost_for_linux/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/bifrost_for_linux/backend/gpu/mali_kbase_devfreq.c
+index 991eea08df9a..003af36d8fe2 100644
+--- a/drivers/gpu/arm/bifrost_for_linux/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/bifrost_for_linux/backend/gpu/mali_kbase_devfreq.c
+@@ -43,6 +43,7 @@
+ #define dev_pm_opp_find_freq_floor opp_find_freq_floor
+ #endif /* Linux >= 3.13 */
+ 
++#include <soc/rockchip/rockchip_ipa.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+ #include <soc/rockchip/rockchip_system_monitor.h>
+ 
+@@ -321,6 +322,19 @@ static int kbase_devfreq_init_core_mask_table(struct kbase_device *kbdev)
+ 	return 0;
+ }
+ 
++static unsigned long kbase_devfreq_get_static_power(struct devfreq *devfreq,
++						    unsigned long voltage)
++{
++	struct device *dev = devfreq->dev.parent;
++	struct kbase_device *kbdev = dev_get_drvdata(dev);
++
++	return rockchip_ipa_get_static_power(kbdev->model_data, voltage);
++}
++
++static struct devfreq_cooling_power kbase_cooling_power = {
++	.get_static_power = &kbase_devfreq_get_static_power,
++};
++
+ int kbase_devfreq_init(struct kbase_device *kbdev)
+ {
+ 	struct device_node *np = kbdev->dev->of_node;
+@@ -388,22 +402,53 @@ int kbase_devfreq_init(struct kbase_device *kbdev)
+ 		kbdev->mdev_info = NULL;
+ 	}
+ #ifdef CONFIG_DEVFREQ_THERMAL
+-	err = kbase_ipa_init(kbdev);
+-	if (err) {
+-		dev_err(kbdev->dev, "IPA initialization failed\n");
+-		goto cooling_failed;
+-	}
++	if (of_find_compatible_node(kbdev->dev->of_node, NULL,
++				    "simple-power-model")) {
++		of_property_read_u32(kbdev->dev->of_node,
++				     "dynamic-power-coefficient",
++				     (u32 *)&kbase_dcp->dyn_power_coeff);
++		kbdev->model_data = rockchip_ipa_power_model_init(kbdev->dev,
++								  "gpu_leakage");
++		if (IS_ERR_OR_NULL(kbdev->model_data)) {
++			kbdev->model_data = NULL;
++			dev_err(kbdev->dev, "failed to initialize power model\n");
++		} else if (kbdev->model_data->dynamic_coefficient) {
++			kbase_dcp->dyn_power_coeff =
++				kbdev->model_data->dynamic_coefficient;
++		}
++		if (!kbase_dcp->dyn_power_coeff) {
++			dev_err(kbdev->dev, "failed to get dynamic-coefficient\n");
++			err = -EINVAL;
++			goto cooling_failed;
++		}
+ 
+-	kbdev->devfreq_cooling = of_devfreq_cooling_register_power(
+-			kbdev->dev->of_node,
+-			kbdev->devfreq,
+-			&kbase_ipa_power_model_ops);
+-	if (IS_ERR_OR_NULL(kbdev->devfreq_cooling)) {
+-		err = PTR_ERR(kbdev->devfreq_cooling);
+-		dev_err(kbdev->dev,
+-			"Failed to register cooling device (%d)\n",
+-			err);
+-		goto cooling_failed;
++		kbdev->devfreq_cooling =
++			of_devfreq_cooling_register_power(kbdev->dev->of_node,
++							  kbdev->devfreq,
++							  kbase_dcp);
++		if (IS_ERR(kbdev->devfreq_cooling)) {
++			dev_err(kbdev->dev, "failed to register cooling device\n");
++			err = PTR_ERR(kbdev->devfreq_cooling);
++			goto cooling_failed;
++		}
++	} else {
++		err = kbase_ipa_init(kbdev);
++		if (err) {
++			dev_err(kbdev->dev, "IPA initialization failed\n");
++			goto cooling_failed;
++		}
++
++		kbdev->devfreq_cooling = of_devfreq_cooling_register_power(
++				kbdev->dev->of_node,
++				kbdev->devfreq,
++				&kbase_ipa_power_model_ops);
++		if (IS_ERR(kbdev->devfreq_cooling)) {
++			err = PTR_ERR(kbdev->devfreq_cooling);
++			dev_err(kbdev->dev,
++				"Failed to register cooling device (%d)\n",
++				err);
++			goto cooling_failed;
++		}
+ 	}
+ #endif
+ 
+@@ -433,7 +478,9 @@ void kbase_devfreq_term(struct kbase_device *kbdev)
+ 	if (kbdev->devfreq_cooling)
+ 		devfreq_cooling_unregister(kbdev->devfreq_cooling);
+ 
+-	kbase_ipa_term(kbdev);
++	if (!kbdev->model_data)
++		kbase_ipa_term(kbdev);
++	kfree(kbdev->model_data);
+ #endif
+ 
+ 	devfreq_unregister_opp_notifier(kbdev->dev, kbdev->devfreq);
+diff --git a/drivers/gpu/arm/bifrost_for_linux/mali_kbase_core_linux.c b/drivers/gpu/arm/bifrost_for_linux/mali_kbase_core_linux.c
+index b15fc1f2b8d1..347fee2643bb 100644
+--- a/drivers/gpu/arm/bifrost_for_linux/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/bifrost_for_linux/mali_kbase_core_linux.c
+@@ -4135,7 +4135,7 @@ static int kbase_device_debugfs_init(struct kbase_device *kbdev)
+ 
+ #ifdef CONFIG_MALI_BIFROST_DEVFREQ
+ #ifdef CONFIG_DEVFREQ_THERMAL
+-	if (kbdev->inited_subsys & inited_devfreq)
++	if ((kbdev->inited_subsys & inited_devfreq) && !kbdev->model_data)
+ 		kbase_ipa_debugfs_init(kbdev);
+ #endif /* CONFIG_DEVFREQ_THERMAL */
+ #endif /* CONFIG_MALI_BIFROST_DEVFREQ */
+diff --git a/drivers/gpu/arm/bifrost_for_linux/mali_kbase_defs.h b/drivers/gpu/arm/bifrost_for_linux/mali_kbase_defs.h
+index 727c263aa586..73721f5da139 100644
+--- a/drivers/gpu/arm/bifrost_for_linux/mali_kbase_defs.h
++++ b/drivers/gpu/arm/bifrost_for_linux/mali_kbase_defs.h
+@@ -1127,6 +1127,7 @@ struct kbase_device {
+ 	struct kbase_devfreq_opp *opp_table;
+ 	int num_opps;
+ 	struct monitor_dev_info *mdev_info;
++	struct ipa_power_model_data *model_data;
+ #ifdef CONFIG_DEVFREQ_THERMAL
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0)
+ 	struct devfreq_cooling_device *devfreq_cooling;
+-- 
+2.35.3
+

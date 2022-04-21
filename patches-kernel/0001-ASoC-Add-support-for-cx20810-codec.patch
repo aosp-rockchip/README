@@ -1,0 +1,764 @@
+From c634371a6c765e7057c3c168eafe9c663b010b9b Mon Sep 17 00:00:00 2001
+From: Wenping Zhang <wenping.zhang@rock-chips.com>
+Date: Wed, 5 Apr 2017 11:58:09 +0800
+Subject: [PATCH] ASoC: Add support for cx20810 codec
+
+Change-Id: I659ab6c426304ca1ebb1b0469984d821c9fa276d
+Signed-off-by: Wenping Zhang <wenping.zhang@rock-chips.com>
+---
+ sound/soc/codecs/Kconfig          |   8 +
+ sound/soc/codecs/Makefile         |   2 +
+ sound/soc/codecs/cx20810.c        | 176 ++++++++++
+ sound/soc/codecs/cx20810_config.h | 518 ++++++++++++++++++++++++++++++
+ 4 files changed, 704 insertions(+)
+ create mode 100644 sound/soc/codecs/cx20810.c
+ create mode 100644 sound/soc/codecs/cx20810_config.h
+
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index f1a57061d989..a6ac14935374 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -438,6 +438,14 @@ config SND_SOC_CX20442
+ config SND_SOC_CX2072X
+ 	tristate "CX2072X CODEC"
+ 
++config SND_SOC_CX20810
++	tristate "CX20810 is a voice capture ic."
++	depends on I2C
++	help
++	  Say Y here if you have a CX20810 ic and want to enable
++	  support for the built-in.
++	  If unsure, say N.
++
+ config SND_SOC_JZ4740_CODEC
+ 	select REGMAP_MMIO
+ 	tristate
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 83fe9409683d..f4cb89f21e7a 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -49,6 +49,7 @@ snd-soc-cs42xx8-i2c-objs := cs42xx8-i2c.o
+ snd-soc-cs4349-objs := cs4349.o
+ snd-soc-cx20442-objs := cx20442.o
+ snd-soc-cx2072x-objs := cx2072x.o
++snd-soc-cx20810-objs := cx20810.o
+ snd-soc-da7210-objs := da7210.o
+ snd-soc-da7213-objs := da7213.o
+ snd-soc-da7219-objs := da7219.o da7219-aad.o
+@@ -257,6 +258,7 @@ obj-$(CONFIG_SND_SOC_CS42XX8_I2C) += snd-soc-cs42xx8-i2c.o
+ obj-$(CONFIG_SND_SOC_CS4349)	+= snd-soc-cs4349.o
+ obj-$(CONFIG_SND_SOC_CX20442)	+= snd-soc-cx20442.o
+ obj-$(CONFIG_SND_SOC_CX2072X)	+= snd-soc-cx2072x.o
++obj-$(CONFIG_SND_SOC_CX20810)	+= snd-soc-cx20810.o
+ obj-$(CONFIG_SND_SOC_DA7210)	+= snd-soc-da7210.o
+ obj-$(CONFIG_SND_SOC_DA7213)	+= snd-soc-da7213.o
+ obj-$(CONFIG_SND_SOC_DA7219)	+= snd-soc-da7219.o
+diff --git a/sound/soc/codecs/cx20810.c b/sound/soc/codecs/cx20810.c
+new file mode 100644
+index 000000000000..7a69d50629ce
+--- /dev/null
++++ b/sound/soc/codecs/cx20810.c
+@@ -0,0 +1,176 @@
++/*
++ * Driver for CX2081X voice capture IC.
++ *
++ * Copyright: Conexant Systems.
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/interrupt.h>
++#include <linux/ioport.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/timer.h>
++#include <linux/jiffies.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++
++#include <linux/of_gpio.h>
++#include <linux/gpio.h>
++
++#include "cx20810_config.h"
++
++static int i2c_send_array(struct i2c_client *client,
++			  const char *buf, int length)
++{
++	int i, nwrite;
++	struct device *dev = &client->dev;
++
++	for (i = 0; i < (length / 2); i++) {
++		nwrite = i2c_master_send(client, buf + i * 2, 2);
++		if (nwrite != 2) {
++			dev_err(dev, "i2c send configs error!/n");
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static int cx20810_set_mode(struct device *dev, int mode, int index)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	int ret;
++	char *param;
++	int length;
++
++	switch (mode) {
++	case CX20810_NORMAL_MODE:
++		param = codec_config_param_normal_mode;
++		length = sizeof(codec_config_param_normal_mode);
++		break;
++	case CX20810_NORMAL_MODE2:
++		param = codec_config_param_normal_mode2;
++		length = sizeof(codec_config_param_normal_mode2);
++		break;
++	case CX20810_NORMAL_MODE_SIMPLE:
++		param = codec_config_param_normal_mode_simple;
++		length = sizeof(codec_config_param_normal_mode_simple);
++		break;
++	case CX20810_48K_16BIT_MODE:
++		param = codec_config_param_48k_16bit_mode;
++		length = sizeof(codec_config_param_48k_16bit_mode);
++		break;
++	case CX20810_96K_16BIT_MODE:
++		param = codec_config_param_96k_16bit_mode;
++		length = sizeof(codec_config_param_96k_16bit_mode);
++		break;
++	case CX20810_NIRMAL_MODE_CODEC3:
++		param = codec3_config_param_normal_mode;
++		length = sizeof(codec3_config_param_normal_mode);
++		break;
++	case CX20810_NIRMAL_MODE_CODEC3_SIMPLE:
++		param = codec3_config_param_normal_mode_simple;
++		length = sizeof(codec3_config_param_normal_mode_simple);
++		break;
++	default:
++		dev_err(dev, "Illegal mode.\n");
++		return 0;
++	}
++
++	ret = i2c_send_array(client,	param, length);
++	if (ret != 0) {
++		dev_err(dev, "cx2081x send configs failed!\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++/*  initial cx20810 */
++static void cx20810_init(struct device *dev, int index, int mode)
++{
++	if (cx20810_set_mode(dev, mode, index) < 0)
++		dev_err(dev, "cx20810 set mode fail.\n");
++}
++
++static const struct of_device_id of_cx2081x_match[] = {
++	{ .compatible = "conexant,cx20810" },
++	{ .compatible = "conexant,cx20811" },
++	{},
++};
++
++MODULE_DEVICE_TABLE(of, of_cx2081x_match);
++
++static int cx2081x_probe(struct i2c_client *client,
++			 const struct i2c_device_id *id)
++{
++	const struct of_device_id *match;
++	struct device *dev = &client->dev;
++	struct gpio_desc *reset_gpio;
++
++	if (dev->of_node) {
++		match = of_match_device(of_cx2081x_match, dev);
++		if (!match) {
++			dev_err(dev, "Failed to find matching dt id\n");
++			return -EINVAL;
++		}
++	}
++
++	reset_gpio = gpiod_get_optional(dev,
++					"reset", GPIOD_OUT_LOW);
++	if (IS_ERR(reset_gpio)) {
++		int error = PTR_ERR(reset_gpio);
++
++		dev_err(dev, "Failed to request RESET gpio: %d\n", error);
++	} else {
++		gpiod_set_value(reset_gpio, 0);
++		mdelay(10);
++		gpiod_set_value(reset_gpio, 1);
++		/*
++		 * we found there are possibilities download configs through
++		 * i2c failed, some delay can fix it.
++		 */
++		mdelay(10);
++	}
++
++	cx20810_init(dev, 0, CX20810_NORMAL_MODE);
++	if (!IS_ERR(reset_gpio))
++		gpiod_put(reset_gpio);
++
++	return 0;
++}
++
++static const struct i2c_device_id cx2081x_id[] = {
++	{"cx20810"},
++	{"cx20811"},
++	{}
++};
++
++MODULE_DEVICE_TABLE(i2c, cx20810_id);
++
++static struct i2c_driver cx2081x_driver = {
++	.driver         = {
++		.name   = "cx2081x",
++		.of_match_table = of_cx2081x_match,
++	},
++	.probe          = cx2081x_probe,
++	.id_table       = cx2081x_id,
++};
++
++module_i2c_driver(cx2081x_driver);
++
++MODULE_AUTHOR("Timothy");
++MODULE_DESCRIPTION("I2C device cx20810 loader");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/codecs/cx20810_config.h b/sound/soc/codecs/cx20810_config.h
+new file mode 100644
+index 000000000000..eacf3ac12b8c
+--- /dev/null
++++ b/sound/soc/codecs/cx20810_config.h
+@@ -0,0 +1,518 @@
++/*
++ * Driver for CX2081X voice capture IC.
++ *
++ * Copyright: Conexant Systems.
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef CX20810_CONFIG_H_
++#define CX20810_CONFIG_H_
++
++enum {
++	CX20810_NORMAL_MODE = 0,
++	CX20810_NORMAL_MODE2,
++	CX20810_NORMAL_MODE_SIMPLE,
++	CX20810_NIRMAL_MODE_CODEC3,
++	CX20810_NIRMAL_MODE_CODEC3_SIMPLE,
++	CX20810_96K_16BIT_MODE,
++	CX20810_48K_16BIT_MODE,
++};
++
++static char codec_config_param_normal_mode[] = {
++/*
++ * I2S Master mode, LeftJustified 1bit delay
++ * 48k_24bit MSB first, Frame Length 64bit
++ * 12.288Mhz MClk, bclk,48K* 64 , 3.072Mhz
++ * set up PLL, 12.288 Mhz mclk feed to PLL
++ */
++#if 1
++	0x80, 0x03, /* MCLK is an input */
++	0x08, 0x20, /* MCLK !gated */
++	0x60, 0x04, /* Bypass PLL */
++	0x09, 0x03, /* Use MLCK directly */
++	/* end pll setting */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x2D, /* Enable VREF @ 2.8V (5V) or 2.6V (3.3V) */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x78, 0x6D, /* Enable Analog LDO */
++	0x7A, 0x01, /* Enable VREFP */
++
++	/* Setup I2S */
++	0x16, 0x00, /* Use DC Filters for ADCs */
++	0x0c, 0x3B, /* Enable I2S-TX and set Master Mode, enable ADC3/4 FIFO */
++	0x83, 0x00, /* Configure LRCK and BCLK as outputs */
++
++	0x30, 0x14, /* 7 wire mode,24-bit sample size,// Normal mode */
++	0x31, 0x07, /* Set 64 cycle per frame TX */
++	0x33, 0x1F, /*  TX WS ,32 cycle */
++	0x35, 0xA8, /* Lj 1bit delay,  enable TX1,2 */
++
++	0x0A, 0x03, /* Set TX divisor is Source Clock / 4 (Bclk,3.072Mhz) */
++	0x0A, 0x83, /* Enable divisor */
++
++	/* Setup ADCs and clocks */
++
++	/*
++	 * if using 20/16/12/8/4 dB gain, set register
++	 * 0x28/0x20/0x18/0x10/0x08
++	 */
++	0xBC, 0x28, /* ADC1 8dB Gain */
++	0xBD, 0x28, /* ADC2 8dB Gain */
++	0xBE, 0x28, /* ADC3 8dB Gain */
++	0xBF, 0x28, /* ADC4 8dB Gain */
++
++	0x10, 0x00, /* Disable all ADC clocks */
++	0x11, 0x00, /* Disable all ADC clocks and Mixer */
++	0x10, 0x1F, /* Enable all ADC clocks and ADC digital */
++	0x11, 0x4F, /* Enable all ADCs and set 48kHz sample rate */
++	0x10, 0x5F, /* Enable all ADC clocks, ADC digital and ADC Mic Clock Gate */
++
++	/*
++	 *0xA0 , 0x0F ,// ADC1, Mute PGA, enable AAF/ADC/PGA
++	 *0xA7 , 0x0F ,// ADC2, Mute PGA, enable AAF/ADC/PGA
++	 *0xAE , 0x0F ,// ADC3, Mute PGA, enable AAF/ADC/PGA
++	 *0xB5 , 0x0F ,// ADC4, Mute PGA, enable AAF/ADC/PGA
++	 */
++
++	0xA0, 0x07, /* ADC1 !Mute */
++	0xA7, 0x07, /* ADC2 !Mute */
++	0xAE, 0x07, /* ADC3 !Mute */
++	0xB5, 0x07, /* ADC4 !Mute */
++#else
++	/* I2S slave mode */
++	0x0F, 0x03, /* RST */
++	0x0F, 0x03, /* repeat write is let chip has more time to RST */
++	0x0F, 0x03,
++	0x0F, 0x03,
++
++	0x0F, 0x00, /* release reset */
++
++	0x78, 0x39, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x78, 0x79, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79, /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x7A, 0x01,
++	0x01, 0x01,
++
++	0xA0, 0x07, /* ADC bias EN */
++	0xA7, 0x07,
++	0xAE, 0x07,
++	0xB5, 0x07,
++
++	0xBC, 0x3C, /* 0x28 20dB 0x34 26dB */
++	0xBD, 0x3C,
++	0xBE, 0x3C,
++	0xBF, 0x3C,
++
++	0x30, 0x14, /* 14 24bit 0a 16bit */
++	0x31, 0x07, /* frame (n+1)*8 bit 32+32=64 */
++	0x32, 0x07, /*  */
++	0x33, 0x1F, /* sys width 32 clk */
++	0x34, 0x1F,
++	0x35, 0xAC, /* TX right justified and revert i2s1+i2s2 */
++	0x36, 0x00, /* config for right justified ignored. */
++	0x37, 0x00, /* RX left justified. */
++	0x38, 0x00, /* config for right justified ignored. */
++	0x39, 0x08, /* ADC12 0n DATA1.ADC34 On DATA2 */
++	0x3A, 0x00, /* Slot1 */
++	0x3B, 0x00, /* slot2 */
++	0x3C, 0x00, /* slot3 */
++	0x3D, 0x00, /* slot4 */
++	0x3E, 0x1F, /* slot4 */
++
++	0x16, 0x00, /* Use DC Filter for ADCs */
++
++	0x80, 0x03, /* MCLK */
++	0x81, 0x01, /* LRCLK BCLK RX Pull down */
++	0x82, 0x3F, /* LRCLK BCLK RX */
++	0x83, 0x0F, /* LRCLK BCLK */
++
++	0x0F, 0x01,  /* RST,clears DSP,audio data interface values */
++	0x0F, 0x01,  /* repeat write is let chip has more time to RST */
++	0x0F, 0x01,
++	0x0F, 0x01,
++
++	0x08, 0x00, /* disable MCLK to chip   */
++	0x0C, 0x0A, /* Clocks gated  */
++	0x09, 0x02,
++
++	0x0F, 0x00, /* clear RST  */
++	/* enable MCLK to chip */
++	/*  0x08, 0x30, */
++	/*  0x08, 0x38, */
++	0x08, 0x20,
++	0x09, 0x03,
++
++	0x10, 0x00,  /* Disable all ADC clocks */
++	0x11, 0x10,  /* Disable all ADC and Mixer */
++	0x10, 0x1F,  /* Enable all ADC clocks and ADC digital */
++	0x11, 0x4F,  /* Enable all ADC and set 48k sample rate */
++	0x10, 0x5F,  /* Enable all ADC clocks,
++					ADC digital and ADC Mic Clock Gate */
++#endif
++};
++
++static char codec_config_param_normal_mode2[] = {
++	0x0F, 0x03,  /* RST  */
++	0x0F, 0x03,  /* repeat write is let chip has more time to RST */
++	0x0F, 0x03,
++	0x0F, 0x03,
++
++	0x0F, 0x00, /* release reset */
++
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x7A, 0x01,
++	0x01, 0x01,
++
++	0xA0, 0x07, /* ADC bias EN */
++	0xA7, 0x07,
++	0xAE, 0x07,
++	0xB5, 0x07,
++
++	0xBC, 0x24, /* 0x28 20dB 0x34 26dB */
++	0xBD, 0x24,
++	0xBE, 0x24,
++	0xBF, 0x24,
++
++	0x30, 0x14, /* 14 24bit 0a 16bit */
++	0x31, 0x07, /* frame (n+1)*8 bit 32+32=64 */
++	0x32, 0x07, /*  */
++	0x33, 0x1F, /* sys width 32 clk */
++	0x34, 0x1F,
++	0x35, 0xAC, /* TX right justified and revert i2s1+i2s2 */
++	0x36, 0x00, /* config for right justified ignored. */
++	0x37, 0x00, /* RX left justified. */
++	0x38, 0x00, /* config for right justified ignored. */
++	0x39, 0x08, /* ADC12 0n DATA1.ADC34 On DATA2 */
++	0x3A, 0x00, /* Slot1 */
++	0x3B, 0x00, /* slot2 */
++	0x3C, 0x00, /* slot3 */
++	0x3D, 0x00, /* slot4 */
++	0x3E, 0x1F, /* slot4 */
++
++	0x16, 0x00, /* Use DC Filter for ADCs */
++
++	0x80, 0x03, /* MCLK */
++	0x81, 0x01, /* LRCLK BCLK RX Pull down */
++	0x82, 0x3F, /* LRCLK BCLK RX */
++	0x83, 0x0F, /* LRCLK BCLK */
++
++#if 0
++	/*  PLL config */
++
++	0x08, 0x00, /*  disable MCLK */
++
++	0x09, 0x40, /*  I2S TX Bit Clock */
++
++	0x60, 0xF8,  /* reset and Disable PLL1 */
++
++	0x61, 0xDF, /*  */
++	0x62, 0x01,
++	0x63, 0x01,
++	/*  {0x64, 0x90}, */
++	/*  {0x65, 0x24}, */
++	0x66, 0x80,
++	0x67, 0x02,
++	/*  {0x68, 0x0}, */
++	/*  {0x69, 0x0}, */
++
++	/* enable PLL1 */
++	0x60, 0xFB, /* delay for PLL locked */
++	0x60, 0xFB,
++	0x60, 0xFB,
++	0x60, 0xFB,
++	0x60, 0xFB,
++	0x60, 0xFB,
++
++	/* end PLL config */
++#endif
++
++	0x0F, 0x01,  /* RST,clears DSP,audio data interface values */
++	0x0F, 0x01,  /* repeat write is let chip has more time to RST */
++	0x0F, 0x01,
++	0x0F, 0x01,
++
++	0x08, 0x00, /* disable MCLK to chip */
++	0x0C, 0x0A, /* Clocks gated  */
++	0x09, 0x02,
++
++	0x0F, 0x00, /* clear RST  */
++	/*  0x08, 0x30, */
++	/* enable MCLK to chip */
++	/*  0x08, 0x38, */
++	0x08, 0x20,
++	0x09, 0x03,
++
++	0x10, 0x00, /* Disable all ADC clocks */
++	0x11, 0x10, /* Disable all ADC and Mixer */
++	0x10, 0x1F, /* Enable all ADC clocks and ADC digital */
++	0x11, 0x4F, /* Enable all ADC and set 48k sample rate */
++	0x10, 0x5F, /* Enable all ADC clocks,
++				   ADC digital and ADC Mic Clock Gate */
++
++};
++
++static char codec_config_param_normal_mode_simple[] = {
++	/*  mic pga 增益 */
++	/*  4通道录音工具 */
++	0xBC, 0x28, /*  0x28 20dB 0x34 26dB */
++	0xBD, 0x28,
++	0xBE, 0x28,
++	0xBF, 0x28,
++
++	0x60, 0x04,
++	0x66, 0x00,
++	0x67, 0x02,
++
++	/* PAD配置 */
++	0x80, 0x03, /*  MCLK 为输入 */
++	0x83, 0x0F, /*  LRCLK BCLK 为输入脚，TX1 TX2为输出脚 */
++
++	/*  MCLK 作为输入 */
++	/* 0x08, 0x30, */
++	/* MCLK divisor 生效 */
++	/* 0x08, 0x38, */
++	0x08, 0x20, /*  MCLK 作为输入 12.288MHz */
++	0x09, 0x03, /*  选MCLK作为PLL输入源 */
++	0x0a, 0x0b,
++	0x0a, 0x8b,
++	0x0C, 0x0A, /*  RT clock disable, TX clock enable,
++					enable clock to ADC3/4 */
++
++	/*  I2S */
++	/* Tx sample size:16bit, Normal mode */
++	/* 0x30, 0x0A, */
++	0x30, 0x14, /*  Tx sample size:24bit, Normal mode */
++	0x35, 0xA2, /*  left justified, enable I2S-1 and I2S-2 */
++
++	0x10, 0x00,
++	0x11, 0x00,
++	0x10, 0x1F,
++	0x11, 0x1F, /*  ADC 96k, enables all ADCs */
++	0x16, 0x00,
++	0x10, 0x5F,
++
++};
++
++static char codec3_config_param_normal_mode[] = {
++	/* POWER */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x39,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++	0x78, 0x79,  /* PLLEN = 1 ABIASEN IOBUFEN REFIMP = 11 3KR */
++
++	0x7A, 0x01,
++	0x01, 0x01,
++
++	/*  Analog ADC Control */
++	/*  MIcIn PGA A0,A7,AE,B5 [5:4] ctrl_rcm,
++	 *  [1] enable [3] mute [7] bypass */
++	/*  模拟部分电源 */
++	0xA0, 0x07, /* ADC bias EN */
++	0xA7, 0x07,
++	0xAE, 0x07,
++	0xB5, 0x07,
++
++	/*  mic pga 增益 */
++	/*  4通道录音工具 */
++	0xBC, 0x06, /*  0x28 20dB 0x34 26dB */
++	0xBD, 0x06,
++	0xBE, 0x0C,
++	0xBF, 0x14,
++
++	0x60, 0x04,
++	0x66, 0x00,
++	0x67, 0x02,
++
++	/* PAD配置 */
++	0x80, 0x03, /*  MCLK 为输入 */
++	0x83, 0x0F, /*  LRCLK BCLK 为输入脚，TX1 TX2为输出脚 */
++
++	/* MCLK 作为输入 */
++	/* 0x08, 0x30, */
++	/* MCLK divisor 生效 */
++	/* 0x08, 0x38, */
++	0x08, 0x20, /*  MCLK 作为输入 12.288MHz */
++	0x09, 0x03, /*  选MCLK作为PLL输入源 */
++	0x0a, 0x0b,
++	0x0a, 0x8b,
++	0x0C, 0x0A, /* RT clock disable, TX clock enable,
++		       enable clock to ADC3/4 */
++
++	/*  I2S */
++	/*  Tx sample size:16bit, Normal mode */
++	/* 0x30, 0x0A, */
++	0x30, 0x14, /*  Tx sample size:24bit, Normal mode */
++	0x35, 0xA2, /*  left justified, enable I2S-1 and I2S-2 */
++
++	0x10, 0x00,
++	0x11, 0x00,
++	0x10, 0x1F,
++	0x11, 0x1F, /*  ADC 96k, enables all ADCs */
++	0x16, 0x00,
++	0x10, 0x5F,
++
++};
++
++static char codec3_config_param_normal_mode_simple[] = {
++	/* mic pga 增益 */
++	/* 4通道录音工具 */
++	0xBC, 0x28,/* 0x28 20dB 0x34 26dB */
++	0xBD, 0x28,
++	0xBE, 0x28,
++	0xBF, 0x28,
++
++	0x60, 0x04,
++	0x66, 0x00,
++	0x67, 0x02,
++
++	/* PAD配置 */
++	0x80, 0x03,/*  MCLK 为输入 */
++	0x83, 0x0F,/*  LRCLK BCLK 为输入脚，TX1 TX2为输出脚 */
++
++	/* MCLK 作为输入 */
++	/* 0x08, 0x30, */
++	/* MCLK divisor 生效 */
++	/* 0x08, 0x38, */
++	0x08, 0x20,/*  MCLK 作为输入 12.288MHz */
++	0x09, 0x03,/*  选MCLK作为PLL输入源 */
++	0x0a, 0x0b,
++	0x0a, 0x8b,
++	0x0C, 0x0A,/* RT clock disable, TX clock enable,
++		      enable clock to ADC3/4 */
++
++	/*  I2S */
++	/* Tx sample size:16bit, Normal mode */
++	/* 0x30, 0x0A, */
++	0x30, 0x14,/* Tx sample size:24bit, Normal mode */
++	0x35, 0xA2,/* left justified, enable I2S-1 and I2S-2 */
++
++	0x10, 0x00,
++	0x11, 0x00,
++	0x10, 0x1F,
++	0x11, 0x1F,/* ADC 96k, enables all ADCs */
++	0x16, 0x00,
++	0x10, 0x5F,
++};
++
++static char codec_config_param_48k_16bit_mode[] = {
++	/*  mic pga 增益 */
++	/*  4通道录音工具 */
++	0xBC, 29 << 1,/*  0x28 20dB 0x34 26dB */
++	0xBD, 29 << 1,
++	0xBE, 29 << 1,
++	0xBF, 29 << 1,
++
++	0x60, 0x04,
++	0x66, 0x00,
++	0x67, 0x02,
++
++	/* PAD配置 */
++	0x80, 0x03,/*  MCLK 为输入 */
++	0x83, 0x0F,/*  LRCLK BCLK 为输入脚，TX1 TX2为输出脚 */
++
++	/* MCLK 作为输入 */
++	/* 0x08, 0x30, */
++	/* MCLK divisor 生效 */
++	/* 0x08, 0x38, */
++	0x08, 0x20,/*  MCLK 作为输入 12.288MHz */
++	0x09, 0x03,/* 选MCLK作为PLL输入源 */
++	0x0a, 0x03,
++	0x0a, 0x83,
++	0x0C, 0x0A,/* RT clock disable, TX clock enable,
++		      enable clock to ADC3/4 */
++
++	/*  I2S */
++	0x30, 0x0A,/*  Tx sample size:16bit, Normal mode */
++	/* Tx sample size:24bit, Normal mode */
++	/* 0x30, 0x14, */
++	0x35, 0xA2,/*  left justified, enable I2S-1 and I2S-2 */
++
++	0x10, 0x00,
++	0x11, 0x00,
++	0x10, 0x1F,
++	0x11, 0x4F,/*  ADC 96k, enables all ADCs */
++	0x16, 0x00,
++	0x10, 0x5F,
++};
++
++static char codec_config_param_96k_16bit_mode[] = {
++	/*  mic pga 增益 */
++	/*  4通道录音工具 */
++	0xBC, 29 << 1,/*  0x28 20dB 0x34 26dB */
++	0xBD, 29 << 1,
++	0xBE, 29 << 1,
++	0xBF, 29 << 1,
++
++	0x60, 0x04,
++	0x66, 0x00,
++	0x67, 0x02,
++
++	/* PAD配置 */
++	0x80, 0x03,/*  MCLK 为输入 */
++	0x83, 0x0F,/*  LRCLK BCLK 为输入脚，TX1 TX2为输出脚 */
++
++	/* MCLK 作为输入 */
++	/* 0x08, 0x30, */
++	/* MCLK divisor 生效 */
++	/* 0x08, 0x38, */
++	0x08, 0x20,/*  MCLK 作为输入 12.288MHz */
++	0x09, 0x03,/*  选MCLK作为PLL输入源 */
++	0x0a, 0x01,
++	0x0a, 0x81,
++	0x0C, 0x0A,/* RT clock disable, TX clock enable,
++		      enable clock to ADC3/4 */
++
++	/*  I2S */
++	0x30, 0x0A,/* Tx sample size:16bit, Normal mode */
++	/* Tx sample size:24bit, Normal mode */
++	/* 0x30, 0x14, */
++	0x35, 0xA2,/* left justified, enable I2S-1 and I2S-2 */
++
++	0x10, 0x00,
++	0x11, 0x00,
++	0x10, 0x1F,
++	0x11, 0x5F,/* ADC 96k, enables all ADCs */
++	0x16, 0x00,
++	0x10, 0x5F,
++};
++#endif /* CX20810_CONFIG_H_ */
+-- 
+2.35.3
+

@@ -1,0 +1,110 @@
+From a73f42850a136586bfde3a42c500021db5c2d471 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Thu, 25 Feb 2021 11:21:33 +0800
+Subject: [PATCH] usb: dwc3: core: fix NULL pointer dereference when plug out
+ otg host
+
+When do hot plug test on RK3566 Tablet with Type-C to Type-A receptacle.
+The dwc3 driver may receive the EXTCON_USB_HOST notifier with disconnect
+state twice occasionally, then it do dwc3_host_exit() repeatedly and cause
+panic issue with the following log:
+
+[  260.793245] xhci-hcd xhci-hcd.4.auto: remove, state 4
+[  260.796706] xhci-hcd xhci-hcd.4.auto: USB bus 2 deregistered
+[  260.797889] xhci-hcd xhci-hcd.4.auto: remove, state 1
+[  261.286875] xhci-hcd xhci-hcd.4.auto: USB bus 1 deregistered
+[  261.289416] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000070
+[  261.290353] Mem abort info:
+[  261.290624]   ESR = 0x96000005
+[  261.290911]   Exception class = DABT (current EL), IL = 32 bits
+[  261.291501]   SET = 0, FnV = 0
+[  261.291785]   EA = 0, S1PTW = 0
+[  261.292065] Data abort info:
+[  261.292323]   ISV = 0, ISS = 0x00000005
+[  261.292660]   CM = 0, WnR = 0
+[  261.293009] user pgtable: 4k pages, 39-bit VAs, pgdp = 000000005d271f4e
+[  261.293610] [0000000000000070] pgd=0000000000000000, pud=0000000000000000
+[  261.294221] Internal error: Oops: 96000005 [#1] PREEMPT SMP
+[  261.294726] Modules linked in: rknpu
+[  261.295059] Process kworker/0:3 (pid: 1785, stack limit = 0x000000006a077ac4)
+[  261.295693] CPU: 0 PID: 1785 Comm: kworker/0:3 Not tainted 4.19.161 #52
+[  261.296276] Hardware name: Rockchip RK3566 RK817 TABLET LP4X Board (DT)
+[  261.296892] Workqueue: events_freezable __dwc3_set_mode
+[  261.297371] pstate: 60c00009 (nZCv daif +PAN +UAO)
+[  261.297817] pc : kernfs_find_ns+0x24/0x118
+[  261.298186] lr : kernfs_find_and_get_ns+0x3c/0x60
+[  261.298607] sp : ffffff800f90bbd0
+...
+[  261.411635]
+[  261.411780] Call trace:
+[  261.412026]  kernfs_find_ns+0x24/0x118
+[  261.412366]  kernfs_find_and_get_ns+0x3c/0x60
+[  261.412757]  sysfs_unmerge_group+0x20/0x60
+[  261.413125]  dpm_sysfs_remove+0x3c/0x78
+[  261.413471]  device_del+0x98/0x3f8
+[  261.413778]  platform_device_del+0x2c/0xa8
+[  261.414139]  platform_device_unregister+0x14/0x30
+[  261.414561]  dwc3_host_exit+0x78/0x90
+[  261.414893]  __dwc3_set_mode+0x39c/0x3a0
+[  261.415250]  process_one_work+0x1a0/0x418
+[  261.415611]  worker_thread+0x32c/0x3e0
+[  261.415950]  kthread+0x12c/0x158
+[  261.416247]  ret_from_fork+0x10/0x18
+
+This patch checks the drd_connected status before handle
+disconnect process for host to avoid duplicating unregister
+platform device.
+
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+Change-Id: I815d800febea89dbf1f5f84eba8efd9e910e3e9a
+---
+ drivers/usb/dwc3/core.c | 26 ++++++++++++++------------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 7ff9c0b4bbe4..db379f936e7d 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -270,16 +270,18 @@ static void __dwc3_set_mode(struct work_struct *work)
+ disconnect:
+ 		switch (dwc->current_dr_role) {
+ 		case DWC3_GCTL_PRTCAP_HOST:
+-			/*
+-			 * We set device mode to disable otg-vbus supply and
+-			 * enable vbus detect for inno USB2PHY.
+-			 */
+-			phy_set_mode(dwc->usb2_generic_phy,
+-				     PHY_MODE_USB_DEVICE);
+-			phy_set_mode(dwc->usb3_generic_phy,
+-				     PHY_MODE_USB_DEVICE);
+-			phy_power_off(dwc->usb3_generic_phy);
+-			dwc3_host_exit(dwc);
++			if (dwc->drd_connected) {
++				/*
++				 * Set device mode to disable otg-vbus supply
++				 * and enable vbus detect for inno USB2PHY.
++				 */
++				phy_set_mode(dwc->usb2_generic_phy,
++					     PHY_MODE_USB_DEVICE);
++				phy_set_mode(dwc->usb3_generic_phy,
++					     PHY_MODE_USB_DEVICE);
++				phy_power_off(dwc->usb3_generic_phy);
++				dwc3_host_exit(dwc);
++			}
+ 			break;
+ 		case DWC3_GCTL_PRTCAP_DEVICE:
+ 			break;
+@@ -291,8 +293,8 @@ static void __dwc3_set_mode(struct work_struct *work)
+ 		}
+ 
+ 		/*
+-		 * We should set drd_connected true before runtime_suspend to
+-		 * enable reset assert.
++		 * We should set drd_connected to false before
++		 * runtime_suspend to enable reset assert.
+ 		 */
+ 		dwc->drd_connected = false;
+ 		pm_runtime_put_sync_suspend(dwc->dev);
+-- 
+2.35.3
+

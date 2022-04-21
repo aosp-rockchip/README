@@ -1,0 +1,359 @@
+From 8a68b9361bd661ab6c643a5fe4364c4d575c36b8 Mon Sep 17 00:00:00 2001
+From: Wu Liang feng <wulf@rock-chips.com>
+Date: Fri, 8 Sep 2017 15:29:35 +0800
+Subject: [PATCH] usb: dwc_otg_310: hcd: fix a race condition between queue and
+ dequeue
+
+In the current urb enqueue process, it doesn't use
+spinlock protect qtd init, this may cause urb dequeue
+to access the qtd unexpectedly and cause kernel panic
+with the following log:
+
+Unable to handle kernel NULL pointer dereference at virtual address 00000024
+pgd = c0004000
+[00000024] *pgd=00000000
+Internal error: Oops: 817 [#1] PREEMPT SMP ARM
+Modules linked in: drmboot(PO)
+CPU: 1 PID: 623 Comm: wakeWordAgent Tainted: P           O 3.10.104 #64
+task: cee05f80 ti: cefaa000 task.ti: cefaa000
+PC is at dwc_otg_hcd_urb_dequeue+0x90/0x12c
+LR is at urb_dequeue+0x70/0xb8
+...
+[<c0447af8>] (dwc_otg_hcd_urb_dequeue+0x90/0x12c) from [<c04497c4>] (urb_dequeue+0x70/0xb8)
+[<c04497c4>] (urb_dequeue+0x70/0xb8) from [<c0417144>] (usb_hcd_unlink_urb+0x84/0xa4)
+[<c0417144>] (usb_hcd_unlink_urb+0x84/0xa4) from [<c051dedc>] (deactivate_urbs+0xa4/0xc8)
+[<c051dedc>] (deactivate_urbs+0xa4/0xc8) from [<c051eeb0>] (snd_usb_endpoint_stop+0x2c/0x3c)
+[<c051eeb0>] (snd_usb_endpoint_stop+0x2c/0x3c) from [<c0525c78>] (stop_endpoints+0x48/0x64)
+[<c0525c78>] (stop_endpoints+0x48/0x64) from [<c0525ce0>] (snd_usb_substream_capture_trigger+0x4c/0xa0)
+[<c0525ce0>] (snd_usb_substream_capture_trigger+0x4c/0xa0) from [<c05128b8>] (snd_pcm_do_stop+0x4c/0x54)
+[<c05128b8>] (snd_pcm_do_stop+0x4c/0x54) from [<c0512190>] (snd_pcm_action_single+0x38/0x64)
+[<c0512190>] (snd_pcm_action_single+0x38/0x64) from [<c0512360>] (snd_pcm_drop+0x68/0xb8)
+[<c0512360>] (snd_pcm_drop+0x68/0xb8) from [<c0512d7c>] (snd_pcm_release_substream.part.11+0xc/0x90)
+[<c0512d7c>] (snd_pcm_release_substream.part.11+0xc/0x90) from [<c0512e48>] (snd_pcm_release+0x30/0x7c)
+[<c0512e48>] (snd_pcm_release+0x30/0x7c) from [<c0108d1c>] (__fput+0xe8/0x1e4)
+
+This patch uses spinlock to protect qtd init when do urb
+enqueue to avoid race condition between queue and dequeue.
+
+Change-Id: I88fac18530cd0a52a5d9b604880d162ff2793ca7
+Signed-off-by: Wu Liang feng <wulf@rock-chips.com>
+---
+ drivers/usb/dwc_otg_310/dwc_otg_hcd.c       | 59 ++++++++++++++-------
+ drivers/usb/dwc_otg_310/dwc_otg_hcd.h       |  2 -
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_if.h    |  3 +-
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c | 55 ++++++++++++-------
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c | 24 ++-------
+ 5 files changed, 79 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+index 2129de2ace3c..01ef21b8ec62 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+@@ -521,11 +521,9 @@ void dwc_otg_hcd_stop(dwc_otg_hcd_t *hcd)
+ 
+ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t *hcd,
+ 			    dwc_otg_hcd_urb_t *dwc_otg_urb, void **ep_handle,
+-			    int atomic_alloc)
++			    dwc_otg_qtd_t *qtd)
+ {
+-	dwc_irqflags_t flags;
+ 	int retval = 0;
+-	dwc_otg_qtd_t *qtd;
+ 	gintmsk_data_t intr_mask = {.d32 = 0 };
+ 
+ 	if (!hcd->flags.b.port_connect_status) {
+@@ -534,37 +532,38 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t *hcd,
+ 		return -DWC_E_NO_DEVICE;
+ 	}
+ 
+-	qtd = dwc_otg_hcd_qtd_create(dwc_otg_urb, atomic_alloc);
+-	if (qtd == NULL) {
++	if (!qtd) {
+ 		DWC_ERROR("DWC OTG HCD URB Enqueue failed creating QTD\n");
+ 		return -DWC_E_NO_MEMORY;
+ 	}
+-	DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+-	retval =
+-	    dwc_otg_hcd_qtd_add(qtd, hcd, (dwc_otg_qh_t **) ep_handle, 1);
+ 
++	dwc_otg_hcd_qtd_init(qtd, dwc_otg_urb);
++
++	retval = dwc_otg_hcd_qtd_add(qtd, hcd,
++				     (dwc_otg_qh_t **)ep_handle, 1);
+ 	if (retval < 0) {
+-		DWC_ERROR("DWC OTG HCD URB Enqueue failed adding QTD. "
+-			  "Error status %d\n", retval);
+-		dwc_otg_hcd_qtd_free(qtd);
++		DWC_ERROR("Enqueue failed adding QTD status %d\n", retval);
++		return retval;
+ 	}
++
+ 	intr_mask.d32 =
+ 	    DWC_READ_REG32(&hcd->core_if->core_global_regs->gintmsk);
+ 	if (!intr_mask.b.sofintr && retval == 0) {
+ 		dwc_otg_transaction_type_e tr_type;
+-		if ((qtd->qh->ep_type == UE_BULK)
+-		    && !(qtd->urb->flags & URB_GIVEBACK_ASAP)) {
+-			/* Do not schedule SG transactions until qtd has URB_GIVEBACK_ASAP set */
+-			retval = 0;
+-			goto out;
+-		}
++		if ((qtd->qh->ep_type == UE_BULK) &&
++		    !(qtd->urb->flags & URB_GIVEBACK_ASAP))
++			/*
++			 * Do not schedule SG transactions until
++			 * qtd has URB_GIVEBACK_ASAP set.
++			 */
++			return 0;
++
+ 		tr_type = dwc_otg_hcd_select_transactions(hcd);
+ 		if (tr_type != DWC_OTG_TRANSACTION_NONE) {
+ 			dwc_otg_hcd_queue_transactions(hcd, tr_type);
+ 		}
+ 	}
+-out:
+-	DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
++
+ 	return retval;
+ }
+ 
+@@ -578,9 +577,17 @@ int dwc_otg_hcd_urb_dequeue(dwc_otg_hcd_t *hcd,
+ 	if (!urb_qtd) {
+ 		DWC_PRINTF("%s error: urb_qtd is %p dwc_otg_urb %p!!!\n",
+ 			   __func__, urb_qtd, dwc_otg_urb);
+-		return 0;
++		return -EINVAL;
+ 	}
++
+ 	qh = urb_qtd->qh;
++	if (!qh) {
++		DWC_PRINTF("## Urb QTD QH is NULL ##\n");
++		return -EINVAL;
++	}
++
++	dwc_otg_urb->priv = NULL;
++
+ #ifdef DEBUG
+ 	if (CHK_DEBUG_LEVEL(DBG_HCDV | DBG_HCD_URB)) {
+ 		if (urb_qtd->in_process) {
+@@ -629,6 +636,8 @@ int dwc_otg_hcd_endpoint_disable(dwc_otg_hcd_t *hcd, void *ep_handle,
+ 	dwc_otg_qh_t *qh = (dwc_otg_qh_t *) ep_handle;
+ 	int retval = 0;
+ 	dwc_irqflags_t flags;
++	dwc_otg_hc_regs_t *hc_regs = NULL;
++	hcchar_data_t hcchar;
+ 
+ 	if (retry < 0) {
+ 		retval = -DWC_E_INVALID;
+@@ -649,6 +658,16 @@ int dwc_otg_hcd_endpoint_disable(dwc_otg_hcd_t *hcd, void *ep_handle,
+ 		DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+ 	}
+ 
++	if (!DWC_CIRCLEQ_EMPTY(&qh->qtd_list) && hc_regs) {
++		hcchar.d32 = DWC_READ_REG32(&hc_regs->hcchar);
++		if (hcchar.b.chen) {
++			hcchar.b.chdis = 1;
++			DWC_WRITE_REG32(&hc_regs->hcchar,
++					hcchar.d32);
++			dwc_otg_hc_cleanup(hcd->core_if, qh->channel);
++		}
++	}
++
+ 	dwc_otg_hcd_qh_remove(hcd, qh);
+ 
+ 	DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd.h b/drivers/usb/dwc_otg_310/dwc_otg_hcd.h
+index 8d667cfeb362..410e3da02237 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd.h
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd.h
+@@ -639,8 +639,6 @@ static inline dwc_otg_qh_t *dwc_otg_hcd_qh_alloc(int atomic_alloc)
+ 		return (dwc_otg_qh_t *) DWC_ALLOC(sizeof(dwc_otg_qh_t));
+ }
+ 
+-extern dwc_otg_qtd_t *dwc_otg_hcd_qtd_create(dwc_otg_hcd_urb_t *urb,
+-					     int atomic_alloc);
+ extern void dwc_otg_hcd_qtd_init(dwc_otg_qtd_t *qtd, dwc_otg_hcd_urb_t *urb);
+ extern int dwc_otg_hcd_qtd_add(dwc_otg_qtd_t *qtd, dwc_otg_hcd_t *dwc_otg_hcd,
+ 			       dwc_otg_qh_t **qh, int atomic_alloc);
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_if.h b/drivers/usb/dwc_otg_310/dwc_otg_hcd_if.h
+index 3b406d8008eb..3f98cdb11808 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_if.h
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_if.h
+@@ -40,6 +40,7 @@
+  * This file defines DWC_OTG HCD Core API.
+  */
+ 
++struct dwc_otg_qtd;
+ struct dwc_otg_hcd;
+ typedef struct dwc_otg_hcd dwc_otg_hcd_t;
+ 
+@@ -340,7 +341,7 @@ extern uint32_t dwc_otg_hcd_urb_get_iso_desc_actual_length(dwc_otg_hcd_urb_t *
+  */
+ extern int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t *dwc_otg_hcd,
+ 				   dwc_otg_hcd_urb_t *dwc_otg_urb,
+-				   void **ep_handle, int atomic_alloc);
++				   void **ep_handle, struct dwc_otg_qtd *qtd);
+ 
+ /** De-queue the specified URB
+  *
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
+index 40a446a140a1..99b7f1adcbba 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
+@@ -980,6 +980,7 @@ static int urb_enqueue(struct usb_hcd *hcd,
+ #endif
+ 	dwc_otg_hcd_t *dwc_otg_hcd = hcd_to_dwc_otg_hcd(hcd);
+ 	dwc_otg_hcd_urb_t *dwc_otg_urb;
++	dwc_otg_qtd_t *qtd;
+ 	int i;
+ 	int alloc_bandwidth = 0;
+ 	uint8_t ep_type = 0;
+@@ -1086,18 +1087,23 @@ static int urb_enqueue(struct usb_hcd *hcd,
+ 
+ 	urb->hcpriv = dwc_otg_urb;
+ 
++	qtd = dwc_otg_hcd_qtd_alloc(mem_flags == GFP_ATOMIC ? 1 : 0);
++	if (!qtd) {
++		retval = -ENOMEM;
++		goto fail1;
++	}
++
+ 	DWC_SPINLOCK_IRQSAVE(dwc_otg_hcd->lock, &irq_flags);
+ 	retval = usb_hcd_link_urb_to_ep(hcd, urb);
+-	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, irq_flags);
+ 	if (retval)
+-		goto fail1;
++		goto fail2;
+ 
+-	retval = dwc_otg_hcd_urb_enqueue(dwc_otg_hcd, dwc_otg_urb, &ep->hcpriv,
+-					 mem_flags == GFP_ATOMIC ? 1 : 0);
++	retval = dwc_otg_hcd_urb_enqueue(dwc_otg_hcd, dwc_otg_urb,
++					 &ep->hcpriv, qtd);
+ 	if (retval) {
+ 		if (retval == -DWC_E_NO_DEVICE)
+ 			retval = -ENODEV;
+-		goto fail2;
++		goto fail3;
+ 	}
+ 
+ 	if (alloc_bandwidth) {
+@@ -1105,13 +1111,16 @@ static int urb_enqueue(struct usb_hcd *hcd,
+ 				       (dwc_otg_hcd, ep->hcpriv), urb);
+ 	}
+ 
++	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, irq_flags);
++
+ 	return 0;
+-fail2:
+-	/*  */
+-	DWC_SPINLOCK_IRQSAVE(dwc_otg_hcd->lock, &irq_flags);
++fail3:
+ 	dwc_otg_urb->priv = NULL;
+ 	usb_hcd_unlink_urb_from_ep(hcd, urb);
++fail2:
+ 	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, irq_flags);
++	dwc_otg_hcd_qtd_free(qtd);
++	qtd = NULL;
+ fail1:
+ 	urb->hcpriv = NULL;
+ 	DWC_FREE(dwc_otg_urb);
+@@ -1139,36 +1148,42 @@ static int urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 	}
+ #endif
+ 
+-	if (!urb) {
+-		DWC_PRINTF("%s error: urb is %p!!!\n", __func__, urb);
+-		return 0;
+-	}
+-
+ 	DWC_SPINLOCK_IRQSAVE(dwc_otg_hcd->lock, &flags);
++
+ 	rc = usb_hcd_check_unlink_urb(hcd, urb, status);
+-	if (rc) {
+-		DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, flags);
+-		return rc;
++	if (rc)
++		goto out;
++
++	if (!urb->hcpriv) {
++		DWC_PRINTF("## urb->hcpriv is NULL ##\n");
++		goto out;
+ 	}
+ 
+-	dwc_otg_hcd_urb_dequeue(dwc_otg_hcd, urb->hcpriv);
++	rc = dwc_otg_hcd_urb_dequeue(dwc_otg_hcd, urb->hcpriv);
++
++	usb_hcd_unlink_urb_from_ep(hcd, urb);
++
+ 	DWC_FREE(urb->hcpriv);
+ 	urb->hcpriv = NULL;
+-	usb_hcd_unlink_urb_from_ep(hcd, urb);
+-	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, flags);
+ 
++	DWC_SPINUNLOCK(dwc_otg_hcd->lock);
+ 	/* Higher layer software sets URB status. */
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
+ 	usb_hcd_giveback_urb(hcd, urb);
+ #else
+ 	usb_hcd_giveback_urb(hcd, urb, status);
+ #endif
++	DWC_SPINLOCK(dwc_otg_hcd->lock);
++
+ 	if (CHK_DEBUG_LEVEL(DBG_HCDV | DBG_HCD_URB)) {
+ 		DWC_PRINTF("Called usb_hcd_giveback_urb()\n");
+ 		DWC_PRINTF("  urb->status = %d\n", urb->status);
+ 	}
+ 
+-	return 0;
++out:
++	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, flags);
++
++	return rc;
+ }
+ 
+ /* Frees resources in the DWC_otg controller related to a given endpoint. Also
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
+index 5f3a4ec23c6d..8816160156e6 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
+@@ -293,6 +293,9 @@ dwc_otg_qh_t *dwc_otg_hcd_qh_create(dwc_otg_hcd_t *hcd,
+ {
+ 	dwc_otg_qh_t *qh;
+ 
++	if (!urb->priv)
++		return NULL;
++
+ 	/* Allocate memory */
+ 	/** @todo add memflags argument */
+ 	qh = dwc_otg_hcd_qh_alloc(atomic_alloc);
+@@ -634,27 +637,6 @@ void dwc_otg_hcd_qh_deactivate(dwc_otg_hcd_t *hcd, dwc_otg_qh_t *qh,
+ 	}
+ }
+ 
+-/**
+- * This function allocates and initializes a QTD.
+- *
+- * @param urb The URB to create a QTD from.  Each URB-QTD pair will end up
+- * 	      pointing to each other so each pair should have a unique correlation.
+- * @param atomic_alloc Flag to do atomic alloc if needed
+- *
+- * @return Returns pointer to the newly allocated QTD, or NULL on error. */
+-dwc_otg_qtd_t *dwc_otg_hcd_qtd_create(dwc_otg_hcd_urb_t *urb, int atomic_alloc)
+-{
+-	dwc_otg_qtd_t *qtd;
+-
+-	qtd = dwc_otg_hcd_qtd_alloc(atomic_alloc);
+-	if (qtd == NULL) {
+-		return NULL;
+-	}
+-
+-	dwc_otg_hcd_qtd_init(qtd, urb);
+-	return qtd;
+-}
+-
+ /**
+  * Initializes a QTD structure.
+  *
+-- 
+2.35.3
+

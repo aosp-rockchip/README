@@ -1,0 +1,166 @@
+From a9fa42d377d7ffef5e0b51b910cb447eb474c27d Mon Sep 17 00:00:00 2001
+From: "david.wu" <david.wu@rock-chips.com>
+Date: Fri, 20 Jan 2017 15:03:39 +0800
+Subject: [PATCH] pwm: rockchip: add individual clocks supported for APB and
+ function
+
+New PWM module provides two individual clocks for APB bus clock
+and function clock.
+
+Change-Id: I0c262472c5d8b0c527c5a0a8d66b4512ac66f2ce
+Signed-off-by: david.wu <david.wu@rock-chips.com>
+---
+ .../devicetree/bindings/pwm/pwm-rockchip.txt  |  9 +++-
+ drivers/pwm/pwm-rockchip.c                    | 53 ++++++++++++++++---
+ 2 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/pwm/pwm-rockchip.txt b/Documentation/devicetree/bindings/pwm/pwm-rockchip.txt
+index e248859825ec..2a860b445b2d 100644
+--- a/Documentation/devicetree/bindings/pwm/pwm-rockchip.txt
++++ b/Documentation/devicetree/bindings/pwm/pwm-rockchip.txt
+@@ -5,9 +5,16 @@ Required properties:
+    "rockchip,rk2928-pwm": found on RK29XX,RK3066 and RK3188 SoCs
+    "rockchip,rk3288-pwm": found on RK3288 SoC
+    "rockchip,vop-pwm": found integrated in VOP on RK3288 SoC
++   "rockchip,rk3328-pwm", "rockchip,rk3288-pwm": found on RK3328 SoC
+    "rockchip,rk3399-pwm", "rockchip,rk3288-pwm": found on RK3399 SoC
+  - reg: physical base address and length of the controller's registers
+- - clocks: phandle and clock specifier of the PWM reference clock
++ - clocks: See ../clock/clock-bindings.txt
++   - For older hardware (rk2928, rk3066, rk3188, rk3228, rk3288, rk3399):
++     - There is one clock that's used both to derive the functional clock
++       for the device and as the bus clock.
++   - For newer hardware (rk3328): specified by name
++     - "pwm": This is used to derive the functional clock.
++     - "pclk": This is the bus clock.
+  - #pwm-cells: must be 2 (rk2928) or 3 (rk3288). See pwm.txt in this directory
+    for a description of the cell format.
+ 
+diff --git a/drivers/pwm/pwm-rockchip.c b/drivers/pwm/pwm-rockchip.c
+index 3227426ca894..88f9226471b9 100644
+--- a/drivers/pwm/pwm-rockchip.c
++++ b/drivers/pwm/pwm-rockchip.c
+@@ -34,6 +34,7 @@
+ struct rockchip_pwm_chip {
+ 	struct pwm_chip chip;
+ 	struct clk *clk;
++	struct clk *pclk;
+ 	const struct rockchip_pwm_data *data;
+ 	void __iomem *base;
+ };
+@@ -123,7 +124,7 @@ static int rockchip_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	do_div(div, pc->data->prescaler * NSEC_PER_SEC);
+ 	duty = div;
+ 
+-	ret = clk_enable(pc->clk);
++	ret = clk_enable(pc->pclk);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -131,7 +132,7 @@ static int rockchip_pwm_config(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	writel(duty, pc->base + pc->data->regs.duty);
+ 	writel(0, pc->base + pc->data->regs.cntr);
+ 
+-	clk_disable(pc->clk);
++	clk_disable(pc->pclk);
+ 
+ #ifdef CONFIG_FB_ROCKCHIP
+ 	if (!pc->data->regs.ctrl) {
+@@ -163,6 +164,9 @@ static int rockchip_pwm_enable(struct pwm_chip *chip, struct pwm_device *pwm)
+ 	int ret;
+ 
+ 	ret = clk_enable(pc->clk);
++	if (ret)
++		return ret;
++	ret = clk_enable(pc->pclk);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -177,6 +181,7 @@ static void rockchip_pwm_disable(struct pwm_chip *chip, struct pwm_device *pwm)
+ 
+ 	pc->data->set_enable(chip, pwm, false);
+ 
++	clk_disable(pc->pclk);
+ 	clk_disable(pc->clk);
+ }
+ 
+@@ -245,7 +250,7 @@ static int rockchip_pwm_probe(struct platform_device *pdev)
+ 	const struct of_device_id *id;
+ 	struct rockchip_pwm_chip *pc;
+ 	struct resource *r;
+-	int ret;
++	int ret, count;
+ 
+ 	id = of_match_device(rockchip_pwm_dt_ids, &pdev->dev);
+ 	if (!id)
+@@ -261,13 +266,38 @@ static int rockchip_pwm_probe(struct platform_device *pdev)
+ 	if (IS_ERR(pc->base))
+ 		return PTR_ERR(pc->base);
+ 
+-	pc->clk = devm_clk_get(&pdev->dev, NULL);
+-	if (IS_ERR(pc->clk))
+-		return PTR_ERR(pc->clk);
++	pc->clk = devm_clk_get(&pdev->dev, "pwm");
++	count = of_property_count_strings(pdev->dev.of_node, "clock-names");
++	if (count == 2)
++		pc->pclk = devm_clk_get(&pdev->dev, "pclk");
++	else
++		pc->pclk = pc->clk;
++
++	if (IS_ERR(pc->clk)) {
++		ret = PTR_ERR(pc->clk);
++		if (ret != -EPROBE_DEFER)
++			dev_err(&pdev->dev, "Can't get pwm clk: %d\n", ret);
++		return ret;
++	}
++
++	if (IS_ERR(pc->pclk)) {
++		ret = PTR_ERR(pc->pclk);
++		if (ret != -EPROBE_DEFER)
++			dev_err(&pdev->dev, "Can't get pclk: %d\n", ret);
++		return ret;
++	}
+ 
+ 	ret = clk_prepare(pc->clk);
+-	if (ret)
++	if (ret) {
++		dev_err(&pdev->dev, "Can't prepare pwm clk: %d\n", ret);
+ 		return ret;
++	}
++
++	ret = clk_prepare(pc->pclk);
++	if (ret) {
++		dev_err(&pdev->dev, "Can't prepare pclk: %d\n", ret);
++		goto err_clk;
++	}
+ 
+ 	platform_set_drvdata(pdev, pc);
+ 
+@@ -286,8 +316,16 @@ static int rockchip_pwm_probe(struct platform_device *pdev)
+ 	if (ret < 0) {
+ 		clk_unprepare(pc->clk);
+ 		dev_err(&pdev->dev, "pwmchip_add() failed: %d\n", ret);
++		goto err_pclk;
+ 	}
+ 
++	return 0;
++
++err_pclk:
++	clk_unprepare(pc->pclk);
++err_clk:
++	clk_unprepare(pc->clk);
++
+ 	return ret;
+ }
+ 
+@@ -295,6 +333,7 @@ static int rockchip_pwm_remove(struct platform_device *pdev)
+ {
+ 	struct rockchip_pwm_chip *pc = platform_get_drvdata(pdev);
+ 
++	clk_unprepare(pc->pclk);
+ 	clk_unprepare(pc->clk);
+ 
+ 	return pwmchip_remove(&pc->chip);
+-- 
+2.35.3
+

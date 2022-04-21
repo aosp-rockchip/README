@@ -1,0 +1,95 @@
+From 50989710745f2fa6198e7fe96703e04f4fd5d4cf Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Mon, 17 Jul 2017 20:10:46 +0800
+Subject: [PATCH] usb: dwc_otg_310: fix bad unlock balance issue
+
+There is a bad unlock balance issue in the following case:
+1. Use micro USB 2.0 interface;
+2. Vbus 5v is always powered on;
+3. Wait until DWC2 completes initialization, and then plug
+   in OTG to Host cable;
+4. Plug out the OTG cable, and then we will reproduce this
+   issue, and we'll get the following log if we enable the
+   kernel lock debugging.
+
+=====================================
+[ BUG: bad unlock balance detected! ]
+4.4.71 #303 Not tainted
+-------------------------------------
+swapper/0/0 is trying to release lock (&(sl)->rlock) at:
+[<c0795848>] dwc_otg_pcd_suspend_cb+0x20/0x48
+but there are no more locks to release!
+
+other info that might help us debug this:
+1 lock held by swapper/0/0:
+
+stack backtrace:
+CPU: 0 PID: 0 Comm: swapper/0 Not tainted 4.4.71 #303
+Hardware name: Rockchip (Device Tree)
+[<c0110018>] (unwind_backtrace) from [<c010c04c>] (show_stack+0x10/0x14)
+[<c010c04c>] (show_stack) from [<c0423e28>] (dump_stack+0x9c/0xd4)
+[<c0423e28>] (dump_stack) from [<c021803c>] (print_unlock_imbalance_bug.part.7+0x8c/0xb8)
+[<c021803c>] (print_unlock_imbalance_bug.part.7) from [<c018ce74>] (lock_release+0x284/0x54c)
+[<c018ce74>] (lock_release) from [<c0c0e03c>] (_raw_spin_unlock+0x18/0x54)
+[<c0c0e03c>] (_raw_spin_unlock) from [<c0795848>] (dwc_otg_pcd_suspend_cb+0x20/0x48)
+[<c0795848>] (dwc_otg_pcd_suspend_cb) from [<c0792cc4>] (dwc_otg_handle_usb_suspend_intr+0x68/0x37c)
+[<c0792cc4>] (dwc_otg_handle_usb_suspend_intr) from [<c079329c>] (dwc_otg_handle_common_intr+0x2c4/0xd58)
+[<c079329c>] (dwc_otg_handle_common_intr) from [<c0786a18>] (dwc_otg_common_irq+0xc/0x18)
+[<c0786a18>] (dwc_otg_common_irq) from [<c0199e48>] (handle_irq_event_percpu+0x188/0x4d4)
+[<c0199e48>] (handle_irq_event_percpu) from [<c019a1cc>] (handle_irq_event+0x38/0x5c)
+[<c019a1cc>] (handle_irq_event) from [<c019d654>] (handle_fasteoi_irq+0xa8/0x124)
+[<c019d654>] (handle_fasteoi_irq) from [<c0199454>] (generic_handle_irq+0x18/0x28)
+[<c0199454>] (generic_handle_irq) from [<c0199754>] (__handle_domain_irq+0x88/0xb0)
+[<c0199754>] (__handle_domain_irq) from [<c01014b4>] (gic_handle_irq+0x4c/0x94)
+[<c01014b4>] (gic_handle_irq) from [<c010cbb8>] (__irq_svc+0x58/0x98)
+
+It's because that when plug in OTG to host cable, the
+core_if->lock will be initialized to hcd->lock (check_id()->
+id_status_change()->cil_hcd_start()->dwc_otg_hcd_reinit()),
+so we should release core_if->lock before call cil_pcd_suspend()
+rather than release the pcd->lock inside of callback function.
+
+Change-Id: I1e32f37c701d1a8d741947b6bf385c1bbcb6da78
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c | 5 ++++-
+ drivers/usb/dwc_otg_310/dwc_otg_pcd.c      | 5 +----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+index 2ffba2c54d33..0a29f41c0347 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+@@ -1202,8 +1202,11 @@ int32_t dwc_otg_handle_usb_suspend_intr(dwc_otg_core_if_t *core_if)
+ 			DWC_DEBUGPL(DBG_ANY, "disconnect?\n");
+ 		}
+ #endif
+-		/* PCD callback for suspend. Release the lock inside of callback function */
++		/* PCD callback for suspend */
++		DWC_SPINUNLOCK(core_if->lock);
+ 		cil_pcd_suspend(core_if);
++		DWC_SPINLOCK(core_if->lock);
++
+ 		if (core_if->power_down == 2) {
+ 			dcfg.d32 =
+ 			    DWC_READ_REG32(&core_if->dev_if->dev_global_regs->
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_pcd.c b/drivers/usb/dwc_otg_310/dwc_otg_pcd.c
+index 21af8a00e9c7..884b77f666f5 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_pcd.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_pcd.c
+@@ -198,11 +198,8 @@ static int32_t dwc_otg_pcd_suspend_cb(void *p)
+ {
+ 	dwc_otg_pcd_t *pcd = (dwc_otg_pcd_t *) p;
+ 
+-	if (pcd->fops->suspend) {
+-		DWC_SPINUNLOCK(pcd->lock);
++	if (pcd->fops->suspend)
+ 		pcd->fops->suspend(pcd);
+-		DWC_SPINLOCK(pcd->lock);
+-	}
+ 
+ 	return 1;
+ }
+-- 
+2.35.3
+

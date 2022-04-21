@@ -1,0 +1,149 @@
+From 4ec40689cc89c8a0816d196d99c6bb3cb0145831 Mon Sep 17 00:00:00 2001
+From: Simon Xue <xxm@rock-chips.com>
+Date: Thu, 10 Jan 2019 10:36:00 +0800
+Subject: [PATCH] PCI: rockchip: add PCIe uDMA transfer debug node
+
+cat /sys/kernel/debug/pcie/pcie_trx
+
+Change-Id: Idfdd9176ad55af4c7c0029bf1581f036d798bebc
+Signed-off-by: Simon Xue <xxm@rock-chips.com>
+---
+ drivers/pci/host/pcie-dw-rockchip.c  |  1 +
+ drivers/pci/host/pcie-rockchip.c     |  6 +++-
+ drivers/pci/host/rockchip-pcie-dma.c | 47 ++++++++++++++++++++++++++++
+ drivers/pci/host/rockchip-pcie-dma.h |  4 +++
+ 4 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/host/pcie-dw-rockchip.c b/drivers/pci/host/pcie-dw-rockchip.c
+index faf3fecb3304..a4f7aeafbb9b 100644
+--- a/drivers/pci/host/pcie-dw-rockchip.c
++++ b/drivers/pci/host/pcie-dw-rockchip.c
+@@ -992,6 +992,7 @@ rk_pcie_handle_dma_interrupt(struct rk_pcie *rk_pcie)
+ 		return;
+ 
+ 	obj->dma_free = true;
++	obj->irq_num++;
+ 
+ 	if (list_empty(&obj->tbl_list)) {
+ 		if (obj->dma_free &&
+diff --git a/drivers/pci/host/pcie-rockchip.c b/drivers/pci/host/pcie-rockchip.c
+index 74f861b10893..894fe99d7edf 100644
+--- a/drivers/pci/host/pcie-rockchip.c
++++ b/drivers/pci/host/pcie-rockchip.c
+@@ -724,8 +724,10 @@ rk_pcie_handle_dma_interrupt(struct rockchip_pcie *rockchip)
+ 
+ 	WARN_ONCE(!(dma_status & 0x3), "dma_status 0x%x\n", dma_status);
+ 
+-	if (dma_status & (1 << 0))
++	if (dma_status & (1 << 0)) {
++		obj->irq_num++;
+ 		obj->dma_free = true;
++	}
+ 
+ 	if (list_empty(&obj->tbl_list)) {
+ 		if (obj->dma_free &&
+@@ -1446,6 +1448,8 @@ static ssize_t pcie_reset_ep_store(struct device *dev,
+ 	struct rockchip_pcie *rockchip = dev_get_drvdata(dev);
+ 	struct dma_trx_obj *obj = rockchip->dma_obj;
+ 
++	dev_info(dev, "loop_cout = %d\n", obj->loop_count);
++
+ 	err = kstrtou32(buf, 10, &val);
+ 	if (err)
+ 		return err;
+diff --git a/drivers/pci/host/rockchip-pcie-dma.c b/drivers/pci/host/rockchip-pcie-dma.c
+index b56f628cd500..9f7fe96d2a01 100644
+--- a/drivers/pci/host/rockchip-pcie-dma.c
++++ b/drivers/pci/host/rockchip-pcie-dma.c
+@@ -606,6 +606,41 @@ static int rk_pcie_dma_table_alloc(struct dma_trx_obj *obj)
+ 	return -ENOMEM;
+ }
+ 
++#ifdef CONFIG_DEBUG_FS
++static int rk_pcie_debugfs_trx_show(struct seq_file *s, void *v)
++{
++	struct dma_trx_obj *dma_obj = s->private;
++	bool list = list_empty(&dma_obj->tbl_list);
++
++	seq_printf(s, "irq_num = %ld, loop_count = %d,",
++			dma_obj->irq_num, dma_obj->loop_count);
++	seq_printf(s, "loop_threshold = %d,",
++			dma_obj->loop_count_threshold);
++	seq_printf(s, "lwa = %lx, rwa = %lx, lra = %lx,",
++			dma_obj->local_write_available,
++			dma_obj->remote_write_available,
++			dma_obj->local_read_available);
++	seq_printf(s, "list : (%s), dma chn : (%s)\n",
++			list ? "empty" : "not empty",
++			dma_obj->dma_free ? "free" : "busy");
++
++	return 0;
++}
++
++static int rk_pcie_debugfs_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rk_pcie_debugfs_trx_show, inode->i_private);
++}
++
++static const struct file_operations rk_pcie_debugfs_fops = {
++	.owner = THIS_MODULE,
++	.open = rk_pcie_debugfs_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++#endif
++
+ struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev)
+ {
+ 	int ret;
+@@ -676,12 +711,24 @@ struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev)
+ 	}
+ 
+ 	obj->dma_free = true;
++	obj->irq_num = 0;
+ 	obj->loop_count = 0;
+ 	obj->loop_count_threshold = 0;
+ 	init_completion(&obj->done);
+ 
+ 	rk_pcie_add_misc(obj);
+ 
++#ifdef CONFIG_DEBUG_FS
++	obj->pcie_root = debugfs_create_dir("pcie", NULL);
++	if (!obj->pcie_root) {
++		obj = ERR_PTR(-EINVAL);
++		goto free_dma_table;
++	}
++
++	debugfs_create_file("pcie_trx", 0644, obj->pcie_root, obj,
++			&rk_pcie_debugfs_fops);
++#endif
++
+ 	return obj;
+ free_dma_table:
+ 	rk_pcie_dma_table_free(obj, PCIE_DMA_TABLE_NUM);
+diff --git a/drivers/pci/host/rockchip-pcie-dma.h b/drivers/pci/host/rockchip-pcie-dma.h
+index c90ec9943733..57b884f0b7ee 100644
+--- a/drivers/pci/host/rockchip-pcie-dma.h
++++ b/drivers/pci/host/rockchip-pcie-dma.h
+@@ -3,6 +3,8 @@
+  * Copyright (C) 2018 Rockchip Electronics Co., Ltd.
+  */
+ 
++#include <linux/debugfs.h>
++
+ #define PCIE_DMA_TABLE_NUM		24
+ 
+ #define PCIE_DMA_TRX_TYPE_NUM		3
+@@ -168,6 +170,8 @@ struct dma_trx_obj {
+ 	int				busno;
+ 	void				*priv;
+ 	struct completion		done;
++	unsigned long			irq_num;
++	struct dentry			*pcie_root;
+ };
+ 
+ #ifdef CONFIG_PCIE_DW_ROCKCHIP
+-- 
+2.35.3
+

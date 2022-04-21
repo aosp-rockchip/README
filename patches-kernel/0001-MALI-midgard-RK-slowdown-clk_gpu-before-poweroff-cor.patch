@@ -1,0 +1,155 @@
+From 89501d8dd3c214e4a162e94804f0d56c61c23237 Mon Sep 17 00:00:00 2001
+From: chenzhen <chenzhen@rock-chips.com>
+Date: Sat, 24 Sep 2016 16:31:08 +0800
+Subject: [PATCH] MALI: midgard: RK: slowdown clk_gpu before poweroff cores
+
+This is a workaround for the issue that
+"400M, 500M and 600M of clk_gpu needs high vdd_gpu",
+according to "6.2" of Mali Application Note
+"Potential glitches on Power Domain interfaces".
+
+Change-Id: I8b8eccd2079e21ac5e1db7b4552c8f998f676a9f
+Signed-off-by: chenzhen <chenzhen@rock-chips.com>
+---
+ .../midgard/backend/gpu/mali_kbase_devfreq.c  |  8 +++-
+ .../backend/gpu/mali_kbase_pm_backend.c       | 39 +++++++++++++++++++
+ .../gpu/arm/midgard/mali_kbase_core_linux.c   |  3 ++
+ drivers/gpu/arm/midgard/mali_kbase_defs.h     | 11 ++++++
+ 4 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
+index ad05fe5bea8d..8f9a67e57cea 100644
+--- a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
++++ b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_devfreq.c
+@@ -54,7 +54,7 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
+ 	struct dev_pm_opp *opp;
+ 	unsigned long freq = 0;
+ 	unsigned long voltage;
+-	int err;
++	int err = 0;
+ 
+ 	freq = *target_freq;
+ 
+@@ -86,7 +86,11 @@ kbase_devfreq_target(struct device *dev, unsigned long *target_freq, u32 flags)
+ 	}
+ #endif
+ 
+-	err = clk_set_rate(kbdev->clock, freq);
++	mutex_lock(&kbdev->mutex_for_clk);
++	if (!kbdev->is_power_off)
++		err = clk_set_rate(kbdev->clock, freq);
++	kbdev->freq = freq;
++	mutex_unlock(&kbdev->mutex_for_clk);
+ 	if (err) {
+ 		dev_err(dev, "Failed to set clock %lu (target %lu)\n",
+ 				freq, *target_freq);
+diff --git a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_pm_backend.c b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_pm_backend.c
+index 711e44c7f80a..0919969da523 100644
+--- a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_pm_backend.c
++++ b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_pm_backend.c
+@@ -20,6 +20,9 @@
+  * GPU backend implementation of base kernel power management APIs
+  */
+ 
++/* #define ENABLE_DEBUG_LOG */
++#include "../../platform/rk/custom_log.h"
++
+ #include <mali_kbase.h>
+ #include <mali_midg_regmap.h>
+ #include <mali_kbase_config_defaults.h>
+@@ -32,6 +35,36 @@
+ #include <backend/gpu/mali_kbase_js_internal.h>
+ #include <backend/gpu/mali_kbase_pm_internal.h>
+ 
++static int rk_slowdown_clk_gpu_before_poweroff_cores(struct kbase_device *kbdev)
++{
++	int ret = 0;
++	const unsigned long freq = 200 * 1000 * 1000;
++
++	mutex_lock(&kbdev->mutex_for_clk);
++	ret = clk_set_rate(kbdev->clock, freq);
++	if (ret)
++		E("Failed to set clock to %lu.", freq);
++	kbdev->is_power_off = true;
++	mutex_unlock(&kbdev->mutex_for_clk);
++
++	return ret;
++}
++
++static int rk_restore_clk_gpu(struct kbase_device *kbdev)
++{
++	int ret = 0;
++
++	mutex_lock(&kbdev->mutex_for_clk);
++	if (kbdev->freq != 0)
++		ret = clk_set_rate(kbdev->clock, kbdev->freq);
++	if (ret)
++		E("Failed to set clock to %lu.", kbdev->freq);
++	kbdev->is_power_off = false;
++	mutex_unlock(&kbdev->mutex_for_clk);
++
++	return ret;
++}
++
+ void kbase_pm_register_access_enable(struct kbase_device *kbdev)
+ {
+ 	struct kbase_pm_callback_conf *callbacks;
+@@ -155,6 +188,9 @@ void kbase_pm_do_poweron(struct kbase_device *kbdev, bool is_resume)
+ 
+ 	/* NOTE: We don't wait to reach the desired state, since running atoms
+ 	 * will wait for that state to be reached anyway */
++
++	D("to restore clk_gpu.");
++	rk_restore_clk_gpu(kbdev);
+ }
+ 
+ bool kbase_pm_do_poweroff(struct kbase_device *kbdev, bool is_suspend)
+@@ -164,6 +200,9 @@ bool kbase_pm_do_poweroff(struct kbase_device *kbdev, bool is_suspend)
+ 
+ 	lockdep_assert_held(&kbdev->pm.lock);
+ 
++	D("to slowdown clk_gpu before poweroff pm_cores.");
++	rk_slowdown_clk_gpu_before_poweroff_cores(kbdev);
++
+ 	spin_lock_irqsave(&kbdev->pm.power_change_lock, flags);
+ 
+ 	/* Force all cores off */
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_core_linux.c b/drivers/gpu/arm/midgard/mali_kbase_core_linux.c
+index ee59504cd4e8..499ef46a0fe2 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_core_linux.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_core_linux.c
+@@ -3026,6 +3026,9 @@ static int power_control_init(struct platform_device *pdev)
+ 			goto fail;
+ 		}
+ 	}
++	kbdev->freq = 0;
++	mutex_init(&kbdev->mutex_for_clk);
++	kbdev->is_power_off = false;
+ 
+ #if defined(CONFIG_OF) && defined(CONFIG_PM_OPP)
+ 	/* Register the OPPs if they are available in device tree */
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_defs.h b/drivers/gpu/arm/midgard/mali_kbase_defs.h
+index 4bb8c2c7aec2..f5775bcbb248 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_defs.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_defs.h
+@@ -912,6 +912,17 @@ struct kbase_device {
+ 	} irqs[3];
+ 
+ 	struct clk *clock;
++
++	/*
++	 * current freq of clk_gpu, in Hz.
++	 */
++	unsigned long freq;
++	/*
++	 * mutex for setting freq of clk_gpu.
++	 */
++	struct mutex mutex_for_clk;
++	bool is_power_off;
++
+ #ifdef CONFIG_REGULATOR
+ 	struct regulator *regulator;
+ #endif
+-- 
+2.35.3
+

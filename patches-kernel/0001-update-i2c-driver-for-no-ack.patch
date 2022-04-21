@@ -1,0 +1,193 @@
+From e96ed2d0c8dc89a3ac684a89a902242edb0e0975 Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Thu, 16 Feb 2012 12:49:04 +0800
+Subject: [PATCH] update i2c driver for 'no ack'
+
+---
+ drivers/i2c/busses/i2c-rk30-adapter.c | 16 ++++----
+ drivers/i2c/busses/i2c-rk30-test.c    | 56 ++++++++++++++++-----------
+ 2 files changed, 41 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-rk30-adapter.c b/drivers/i2c/busses/i2c-rk30-adapter.c
+index d7459c31333d..ce3d821f939d 100755
+--- a/drivers/i2c/busses/i2c-rk30-adapter.c
++++ b/drivers/i2c/busses/i2c-rk30-adapter.c
+@@ -145,8 +145,8 @@ static inline void rk30_i2c_send_stop(struct rk30_i2c *i2c)
+     writel(p, i2c->regs + I2C_CON);
+ 
+ }
+-/* SCL Divisor = CLKDIVL + CLKDIVH
+- * SCL = i2c_rate/ 8*SCLK Divisor
++/* SCL Divisor = 8 * (CLKDIVL + CLKDIVH)
++ * SCL = i2c_rate/ SCLK Divisor
+ */
+ static void  rk30_i2c_set_clk(struct rk30_i2c *i2c, unsigned long scl_rate)
+ {
+@@ -160,6 +160,7 @@ static void  rk30_i2c_set_clk(struct rk30_i2c *i2c, unsigned long scl_rate)
+     i2c->scl_rate = scl_rate;
+     div = rk30_ceil(i2c_rate, scl_rate * 8);
+     divh = divl = rk30_ceil(div, 2);
++    i2c_dbg(i2c->dev, "div divh divl: %d %d %d\n", div, divh, divl);
+     writel(I2C_CLKDIV_VAL(divl, divh), i2c->regs + I2C_CLKDIV);
+     return;
+ }
+@@ -260,7 +261,6 @@ static void rk30_i2c_irq_nextblock(struct rk30_i2c *i2c, unsigned int ipd)
+         if(!(ipd & I2C_STARTIPD)){
+             if(ipd & I2C_STOPIPD){
+                 writel(I2C_STOPIPD, i2c->regs + I2C_IPD);
+-                rk30_i2c_send_start(i2c);
+             }
+             else {
+                 rk30_i2c_stop(i2c, -ENXIO);
+@@ -296,8 +296,9 @@ static void rk30_i2c_irq_nextblock(struct rk30_i2c *i2c, unsigned int ipd)
+         rk30_irq_read_prepare(i2c);
+         break;
+     case STATE_STOP:
+-        if(ipd & I2C_STOPIPD || i2c->msg_idx  < 0){
++        if(ipd & I2C_STOPIPD){
+             writel(0xff, i2c->regs + I2C_IPD);
++            i2c->state = STATE_IDLE;
+ 	        rk30_i2c_disable_irq(i2c);
+ 	        wake_up(&i2c->wait);
+         }
+@@ -432,16 +433,15 @@ static int rk30_i2c_doxfer(struct rk30_i2c *i2c,
+ 	if (timeout == 0){
+         dev_err(i2c->dev, "addr[0x%02x] wait event timeout, state = %d\n", msgs[0].addr, i2c->state);  
+         rk30_show_regs(i2c);
++        writel(0xff, i2c->regs + I2C_IPD);
++	    rk30_i2c_disable_irq(i2c);
+         rk30_i2c_send_stop(i2c);
+         if(ret >= 0)
+             ret = -ETIMEDOUT;
+-        goto out;
++        return ret;
+     }
+     if(ret > 0)
+         ret = num;
+- out:
+-    writel(0xff, i2c->regs + I2C_IPD);
+-	rk30_i2c_disable_irq(i2c);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/i2c/busses/i2c-rk30-test.c b/drivers/i2c/busses/i2c-rk30-test.c
+index d86b3e94e874..d76f8a9c156a 100644
+--- a/drivers/i2c/busses/i2c-rk30-test.c
++++ b/drivers/i2c/busses/i2c-rk30-test.c
+@@ -11,8 +11,10 @@ struct rw_info {
+     unsigned short addr;
+     unsigned int reg;
+     unsigned int reg_bytes;
+-    unsigned char buf[100];
+-    unsigned int len;
++    unsigned char tx_buf[100];
++    unsigned char rx_buf[100];
++    unsigned int rx_len;
++    unsigned int tx_len;
+ };
+ 
+ static int test_write(struct i2c_client *client, struct rw_info *info)
+@@ -20,16 +22,16 @@ static int test_write(struct i2c_client *client, struct rw_info *info)
+     int i, ret = 0;
+     struct i2c_msg msg;
+     
+-    char *buf = kzalloc(info->reg_bytes + info->len, GFP_KERNEL);
++    char *buf = kzalloc(info->reg_bytes + info->tx_len, GFP_KERNEL);
+     for(i = 0; i < info->reg_bytes; i++)
+         buf[i] = (info->reg >> i)& 0xff;
+-    for(i = info->reg_bytes; i < info->len; i++)
+-        buf[i] = info->buf[i - info->reg_bytes];
++    for(i = info->reg_bytes; i < info->tx_len; i++)
++        buf[i] = info->tx_buf[i - info->reg_bytes];
+ 
+     msg.addr = client->addr;
+     msg.flags = client->flags;
+     msg.buf = buf;
+-    msg.len = info->reg_bytes + info->len;
++    msg.len = info->reg_bytes + info->tx_len;
+     msg.scl_rate = TEST_SCL_RATE;
+     ret = i2c_transfer(client->adapter, &msg, 1);
+     kfree(buf);
+@@ -46,8 +48,8 @@ static int test_read(struct i2c_client *client, struct rw_info *info)
+     if(info->reg_bytes == 0){
+         msgs[0].addr = client->addr;
+         msgs[0].flags = client->flags|I2C_M_RD;
+-        msgs[0].buf = info->buf;
+-        msgs[0].len = info->len;
++        msgs[0].buf = info->rx_buf;
++        msgs[0].len = info->rx_len;
+         msgs[0].scl_rate = TEST_SCL_RATE;  
+         msg_num = 1;
+     }else {
+@@ -62,8 +64,8 @@ static int test_read(struct i2c_client *client, struct rw_info *info)
+ 
+         msgs[1].addr = client->addr;
+         msgs[1].flags = client->flags|I2C_M_RD;
+-        msgs[1].buf = info->buf;
+-        msgs[1].len = info->len;
++        msgs[1].buf = info->rx_buf;
++        msgs[1].len = info->rx_len;
+         msgs[1].scl_rate = TEST_SCL_RATE;
+         msg_num = 2;
+     }
+@@ -82,16 +84,18 @@ static void test_set_client(struct i2c_client *client, __u16 addr, int nr)
+ static int __init test_init(void)
+ {
+     int nr = 0, ret = 0;
++    unsigned long i = 0;
+     struct i2c_client *client = NULL;
+     struct rw_info info = {
+         .addr = 0x51,
+         .reg = 0x01,
+         .reg_bytes = 1,
+-        .len = 8,
+-        .buf = 
++        .tx_len = 8,
++        .tx_buf = 
+         {
+             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+         },
++        .rx_len = 8,
+     };
+         
+     client = kzalloc(sizeof(struct i2c_client) * I2C_NUM, GFP_KERNEL);
+@@ -99,19 +103,25 @@ static int __init test_init(void)
+     printk("%s: start\n", __func__);
+     while(1) {
+         for(nr = 0; nr < I2C_NUM; nr++){
+-            test_set_client(&client[nr], info.addr, nr);
+-            ret = test_write(&client[nr], &info);
+-            printk("i2c-%d: write val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
+-                    nr, info.buf[0], info.buf[1], info.buf[2], info.buf[3], info.buf[4], info.buf[5], info.buf[6], info.buf[7], ret);
+-            if(ret < 0)
+-                break;
+-            ret = test_read(&client[nr], &info);
+-            printk("i2c-%d: read val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
+-                    nr, info.buf[0], info.buf[1], info.buf[2], info.buf[3], info.buf[4], info.buf[5], info.buf[6], info.buf[7], ret);
+-            if(ret < 0)
+-                break;
++            for(i = 0x51; i < 0x52; i++){
++                info.addr = i;
++                test_set_client(&client[nr], info.addr, nr);
++                ret = test_write(&client[nr], &info);
++                printk("i2c-%d: addr[0x%02x] write val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
++                        nr, info.addr, info.tx_buf[0], info.tx_buf[1], info.tx_buf[2], info.tx_buf[3], 
++                        info.tx_buf[4], info.tx_buf[5], info.tx_buf[6], info.tx_buf[7], ret);
++                if(info.addr == 0x51 && ret < 0)
++                    goto out;
++                ret = test_read(&client[nr], &info);
++                printk("i2c-%d: addr[0x%02x] read val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
++                        nr, info.addr, info.rx_buf[0], info.rx_buf[1], info.rx_buf[2], info.rx_buf[3], 
++                        info.rx_buf[4], info.rx_buf[5], info.rx_buf[6], info.rx_buf[7], ret);
++                if(info.addr == 0x51 && ret < 0)
++                    goto out;
++            }
+         }
+     }
++out:
+     kfree(client);
+     return 0;
+ }
+-- 
+2.35.3
+

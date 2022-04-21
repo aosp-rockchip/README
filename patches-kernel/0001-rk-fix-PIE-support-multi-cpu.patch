@@ -1,0 +1,237 @@
+From 0d3914fff0a7878a341088fc019ffc6538167b15 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Mon, 13 Jan 2014 10:43:41 +0800
+Subject: [PATCH] rk: fix PIE support multi cpu
+
+---
+ arch/arm/kernel/pie.c         | 28 ++++++++++++++++++++--------
+ arch/arm/kernel/pie.lds.S     | 14 +++++++-------
+ include/asm-generic/pie.lds.h |  8 ++++++++
+ include/linux/pie.h           | 15 ++++++++++-----
+ lib/pie.c                     | 16 ++++++++++------
+ pie/Makefile                  |  2 +-
+ 6 files changed, 56 insertions(+), 27 deletions(-)
+
+diff --git a/arch/arm/kernel/pie.c b/arch/arm/kernel/pie.c
+index 598562fd12ea..a4b41e9441f7 100644
+--- a/arch/arm/kernel/pie.c
++++ b/arch/arm/kernel/pie.c
+@@ -25,23 +25,23 @@ struct arm_pie_tail {
+ };
+ 
+ int pie_arch_fill_tail(void *tail, void *common_start, void *common_end,
+-			void *overlay_start, void *code_start, void *code_end)
++			void *overlay_start, void *code_start, void *code_end,
++			void *rel_start, void *rel_end)
+ {
+ 	Elf32_Rel *rel;
+ 	int records;
+ 	int i;
+ 	struct arm_pie_tail *pie_tail = tail;
+ 	int count;
++	void *kern_off;
+ 
+ 	rel = (Elf32_Rel *) __pie_rel_dyn_start;
+-	records = (__pie_rel_dyn_end - __pie_rel_dyn_start) /
+-						sizeof(*rel);
++	records = (__pie_rel_dyn_end - __pie_rel_dyn_start) / sizeof(*rel);
+ 
+ 	count = 0;
+ 	for (i = 0; i < records; i++, rel++) {
+-		void *kern_off;
+ 		if (ELF32_R_TYPE(rel->r_info) != R_ARM_RELATIVE)
+-			return -ENOEXEC;
++			break;
+ 
+ 		/* Adjust offset to match area in kernel */
+ 		kern_off = common_start + rel->r_offset;
+@@ -50,10 +50,22 @@ int pie_arch_fill_tail(void *tail, void *common_start, void *common_end,
+ 			if (tail)
+ 				pie_tail->offset[count] = rel->r_offset;
+ 			count++;
+-		} else if (kern_off >= code_start && kern_off < code_end) {
++		}
++	}
++
++	rel = (Elf32_Rel *) rel_start;
++	records = (rel_end - rel_start) / sizeof(*rel);
++
++	for (i = 0; i < records; i++, rel++) {
++		if (ELF32_R_TYPE(rel->r_info) != R_ARM_RELATIVE)
++			break;
++
++		/* Adjust offset to match area in kernel */
++		kern_off = common_start + rel->r_offset;
++
++		if (kern_off >= common_start && kern_off < code_end) {
+ 			if (tail)
+-				pie_tail->offset[count] = rel->r_offset -
+-						(code_start - overlay_start);
++				pie_tail->offset[count] = rel->r_offset;
+ 			count++;
+ 		}
+ 	}
+diff --git a/arch/arm/kernel/pie.lds.S b/arch/arm/kernel/pie.lds.S
+index 25f2e9ee4c3f..e843d323da91 100644
+--- a/arch/arm/kernel/pie.lds.S
++++ b/arch/arm/kernel/pie.lds.S
+@@ -21,21 +21,21 @@ SECTIONS
+ 	}
+ 	PIE_COMMON_END
+ 
+-	PIE_OVERLAY_START
+-	OVERLAY : NOCROSSREFS {
+-		PIE_OVERLAY_SECTION(rockchip)
+-	}
+-	PIE_OVERLAY_END
+-
+ 	__pie_rel_dyn_start : {
+ 		VMLINUX_SYMBOL(__pie_rel_dyn_start) = .;
+ 	}
+ 	.rel.dyn : {
+-		KEEP(*(.rel*))
++		KEEP(*(.rel.pie.text))
+ 	}
+ 	__pie_rel_dyn_end : {
+ 		VMLINUX_SYMBOL(__pie_rel_dyn_end) = .;
+ 	}
+ 
++	PIE_OVERLAY_START
++	OVERLAY : NOCROSSREFS {
++		PIE_OVERLAY_SECTION(rk3188)
++	}
++	PIE_OVERLAY_END
++
+ 	PIE_DISCARDS
+ }
+diff --git a/include/asm-generic/pie.lds.h b/include/asm-generic/pie.lds.h
+index 2f8d20e8e03c..d3c61e496495 100644
+--- a/include/asm-generic/pie.lds.h
++++ b/include/asm-generic/pie.lds.h
+@@ -62,6 +62,14 @@
+ 		VMLINUX_SYMBOL(__pie_##name##_end) =			\
+ 				LOADADDR(.pie.##name##) +		\
+ 				SIZEOF(.pie.##name##);			\
++	}								\
++	.rel.##name {							\
++		KEEP(*(.rel.pie.##name##.*))				\
++		VMLINUX_SYMBOL(__pie_rel_##name##_start) =		\
++				LOADADDR(.rel.##name##);		\
++		VMLINUX_SYMBOL(__pie_rel_##name##_end) =		\
++				LOADADDR(.rel.##name##) +		\
++				SIZEOF(.rel.##name##);			\
+ 	}
+ 
+ #define PIE_DISCARDS							\
+diff --git a/include/linux/pie.h b/include/linux/pie.h
+index 66450c1f5d5c..b1e546864379 100644
+--- a/include/linux/pie.h
++++ b/include/linux/pie.h
+@@ -48,7 +48,8 @@ extern int pie_arch_fixup(struct pie_chunk *chunk, void *base, void *tail,
+  * Returns number of bytes required/used for tail on success, -EERROR otherwise.
+  */
+ extern int pie_arch_fill_tail(void *tail, void *common_start, void *common_end,
+-			void *overlay_start, void *code_start, void *code_end);
++			void *overlay_start, void *code_start, void *code_end,
++			void *rel_start, void *rel_end);
+ 
+ #ifdef CONFIG_PIE
+ 
+@@ -62,8 +63,9 @@ extern int pie_arch_fill_tail(void *tail, void *common_start, void *common_end,
+  *
+  * Returns 0 on success, -EERROR otherwise
+  */
+-extern struct pie_chunk *__pie_load_data(struct gen_pool *pool,
+-				void *start, void *end, bool phys);
++extern struct pie_chunk *__pie_load_data(struct gen_pool *pool, bool phys,
++				void *start, void *end,
++				void *rel_start, void *rel_end);
+ 
+ /**
+  * pie_to_phys - translate a virtual PIE address into a physical one
+@@ -85,9 +87,12 @@ extern void pie_free(struct pie_chunk *chunk);
+ #define __pie_load_sections(pool, name, phys) ({			\
+ 	extern char __pie_##name##_start[];				\
+ 	extern char __pie_##name##_end[];				\
++	extern char __pie_rel_##name##_start[];				\
++	extern char __pie_rel_##name##_end[];				\
+ 									\
+-	__pie_load_data(pool, __pie_##name##_start,			\
+-					__pie_##name##_end, phys);	\
++	__pie_load_data(pool, phys,					\
++		__pie_##name##_start, __pie_##name##_end,		\
++		__pie_rel_##name##_start, __pie_rel_##name##_end);	\
+ })
+ 
+ /*
+diff --git a/lib/pie.c b/lib/pie.c
+index c0190dd1b554..2aa0fc996985 100644
+--- a/lib/pie.c
++++ b/lib/pie.c
+@@ -26,7 +26,8 @@ extern char __pie_common_end[];
+ extern char __pie_overlay_start[];
+ 
+ int __weak pie_arch_fill_tail(void *tail, void *common_start, void *common_end,
+-			void *overlay_start, void *code_start, void *code_end)
++			void *overlay_start, void *code_start, void *code_end,
++			void *rel_start, void *rel_end)
+ {
+ 	return 0;
+ }
+@@ -37,8 +38,9 @@ int __weak pie_arch_fixup(struct pie_chunk *chunk, void *base, void *tail,
+ 	return 0;
+ }
+ 
+-struct pie_chunk *__pie_load_data(struct gen_pool *pool, void *code_start,
+-					void *code_end, bool phys)
++struct pie_chunk *__pie_load_data(struct gen_pool *pool, bool phys,
++		void *code_start, void *code_end,
++		void *rel_start, void *rel_end)
+ {
+ 	struct pie_chunk *chunk;
+ 	unsigned long offset;
+@@ -50,7 +52,8 @@ struct pie_chunk *__pie_load_data(struct gen_pool *pool, void *code_start,
+ 
+ 	/* Calculate the tail size */
+ 	ret = pie_arch_fill_tail(NULL, __pie_common_start, __pie_common_end,
+-				__pie_overlay_start, code_start, code_end);
++				__pie_overlay_start, code_start, code_end,
++				rel_start, rel_end);
+ 	if (ret < 0)
+ 		goto err;
+ 	tail_sz = ret;
+@@ -61,7 +64,7 @@ struct pie_chunk *__pie_load_data(struct gen_pool *pool, void *code_start,
+ 		goto err;
+ 	}
+ 
+-	common_sz = __pie_overlay_start - __pie_common_start;
++	common_sz = code_start - (void *)__pie_common_start;
+ 	code_sz = code_end - code_start;
+ 
+ 	chunk->pool = pool;
+@@ -84,7 +87,8 @@ struct pie_chunk *__pie_load_data(struct gen_pool *pool, void *code_start,
+ 
+ 	/* Fill in tail data */
+ 	ret = pie_arch_fill_tail(tail, __pie_common_start, __pie_common_end,
+-				__pie_overlay_start, code_start, code_end);
++				__pie_overlay_start, code_start, code_end,
++				rel_start, rel_end);
+ 	if (ret < 0)
+ 		goto err_alloc;
+ 
+diff --git a/pie/Makefile b/pie/Makefile
+index bd90261704ce..2d0541899c41 100644
+--- a/pie/Makefile
++++ b/pie/Makefile
+@@ -63,7 +63,7 @@ $(obj)/pie_stage2.o: $(obj)/pie_stage1.o $(obj)/libpie_stage2.o
+ # Drop everything but the pie sections
+ OBJCOPYFLAGS_pie_stage3.o += -j ".pie.*"
+ OBJCOPYFLAGS_pie_stage3.o += -j ".pie.text"
+-OBJCOPYFLAGS_pie_stage3.o += -j ".pie.rockchip.text" -j ".pie.rockchip.data"
++OBJCOPYFLAGS_pie_stage3.o += -j ".pie.rk3188.text" -j ".pie.rk3188.data"
+ 
+ $(obj)/pie_stage3.o: $(obj)/pie_stage2.o
+ 	$(call if_changed,objcopy)
+-- 
+2.35.3
+

@@ -1,0 +1,211 @@
+From df8183eff9cd9e1d8752e7e46fe98aa859093c17 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Wed, 31 Oct 2018 14:15:24 +0800
+Subject: [PATCH] media: rockchip: isp1: add vs irq handle
+
+Change-Id: I94e4a22316c3e5a6feea42d4698ceadc21aa82b4
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp1/dev.c    | 62 ++++++++++++++++++-
+ drivers/media/platform/rockchip/isp1/dev.h    |  2 +
+ drivers/media/platform/rockchip/isp1/rkisp1.c | 16 ++++-
+ drivers/media/platform/rockchip/isp1/rkisp1.h |  3 +
+ 4 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 79d8a5b1ca2d..b901364c9a53 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -37,6 +37,7 @@
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_gpio.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_platform.h>
+ #include <linux/pm_runtime.h>
+@@ -49,7 +50,6 @@
+ #include "regs.h"
+ #include "rkisp1.h"
+ #include "common.h"
+-#include "regs.h"
+ 
+ struct isp_match_data {
+ 	const char * const *clks;
+@@ -246,6 +246,8 @@ static int rkisp1_pipeline_set_stream(struct rkisp1_pipeline *p, bool on)
+ 		return 0;
+ 
+ 	if (on) {
++		if (dev->vs_irq >= 0)
++			enable_irq(dev->vs_irq);
+ 		rockchip_set_system_status(SYS_STATUS_ISP);
+ 		v4l2_subdev_call(&dev->isp_sdev.sd, video, s_stream, true);
+ 	}
+@@ -258,6 +260,8 @@ static int rkisp1_pipeline_set_stream(struct rkisp1_pipeline *p, bool on)
+ 	}
+ 
+ 	if (!on) {
++		if (dev->vs_irq >= 0)
++			disable_irq(dev->vs_irq);
+ 		v4l2_subdev_call(&dev->isp_sdev.sd, video, s_stream, false);
+ 		rockchip_clear_system_status(SYS_STATUS_ISP);
+ 	}
+@@ -750,6 +754,49 @@ static void rkisp1_iommu_cleanup(struct rkisp1_device *rkisp1_dev)
+ 	iommu_domain_free(rkisp1_dev->domain);
+ }
+ 
++static int rkisp1_vs_irq_parse(struct platform_device *pdev)
++{
++	int ret;
++	int vs_irq;
++	unsigned long vs_irq_flags;
++	struct gpio_desc *vs_irq_gpio;
++	struct device *dev = &pdev->dev;
++	struct rkisp1_device *isp_dev = dev_get_drvdata(dev);
++
++	/* this irq recevice the message of sensor vs from preisp */
++	isp_dev->vs_irq = -1;
++	vs_irq_gpio = devm_gpiod_get(dev, "vsirq", GPIOD_IN);
++	if (!IS_ERR(vs_irq_gpio)) {
++		vs_irq_flags = IRQF_TRIGGER_RISING |
++			       IRQF_ONESHOT | IRQF_SHARED;
++
++		vs_irq = gpiod_to_irq(vs_irq_gpio);
++		if (vs_irq < 0) {
++			dev_err(dev, "GPIO to interrupt failed\n");
++			return vs_irq;
++		}
++
++		dev_info(dev, "register_irq: %d\n", vs_irq);
++		ret = devm_request_irq(dev,
++				       vs_irq,
++				       rkisp1_vs_isr_handler,
++				       vs_irq_flags,
++				       "vs_irq_gpio_int",
++				       dev);
++		if (ret) {
++			dev_err(dev, "devm_request_irq failed: %d\n", ret);
++			return ret;
++		} else {
++			disable_irq(vs_irq);
++			isp_dev->vs_irq = vs_irq;
++			isp_dev->vs_irq_gpio = vs_irq_gpio;
++			dev_info(dev, "vs_gpio_int interrupt is hooked\n");
++		}
++	}
++
++	return 0;
++}
++
+ static int rkisp1_plat_probe(struct platform_device *pdev)
+ {
+ 	const struct of_device_id *match;
+@@ -825,8 +872,11 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 	v4l2_dev->ctrl_handler = &isp_dev->ctrl_handler;
+ 
+ 	ret = v4l2_device_register(isp_dev->dev, &isp_dev->v4l2_dev);
+-	if (ret < 0)
++	if (ret < 0) {
++		v4l2_err(v4l2_dev, "Failed to register v4l2 device: %d\n",
++			 ret);
+ 		return ret;
++	}
+ 
+ 	ret = media_device_register(&isp_dev->media_dev);
+ 	if (ret < 0) {
+@@ -843,12 +893,20 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 	rkisp1_iommu_init(isp_dev);
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	ret = rkisp1_vs_irq_parse(pdev);
++	if (ret)
++		goto err_runtime_disable;
++
+ 	return 0;
+ 
++err_runtime_disable:
++	pm_runtime_disable(&pdev->dev);
++	rkisp1_iommu_cleanup(isp_dev);
+ err_unreg_media_dev:
+ 	media_device_unregister(&isp_dev->media_dev);
+ err_unreg_v4l2_dev:
+ 	v4l2_device_unregister(&isp_dev->v4l2_dev);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index c3043ea5ff1e..be092acd70d2 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -135,6 +135,8 @@ struct rkisp1_device {
+ 	unsigned int emd_data_idx;
+ 	unsigned int emd_vc;
+ 	unsigned int emd_dt;
++	int vs_irq;
++	struct gpio_desc *vs_irq_gpio;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index 2d8a8533bb8d..c6e7bef81276 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -38,6 +38,7 @@
+ #include <linux/videodev2.h>
+ #include <linux/vmalloc.h>
+ #include <linux/kfifo.h>
++#include <linux/interrupt.h>
+ #include <media/v4l2-event.h>
+ #include <media/media-entity.h>
+ 
+@@ -1413,7 +1414,8 @@ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev)
+ 
+ 	/* start edge of v_sync */
+ 	if (isp_mis & CIF_ISP_V_START) {
+-		riksp1_isp_queue_event_sof(&dev->isp_sdev);
++		if (dev->vs_irq < 0)
++			riksp1_isp_queue_event_sof(&dev->isp_sdev);
+ 
+ 		writel(CIF_ISP_V_START, base + CIF_ISP_ICR);
+ 		isp_mis_tmp = readl(base + CIF_ISP_MIS);
+@@ -1470,3 +1472,15 @@ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev)
+ 	 */
+ 	rkisp1_params_isr(&dev->params_vdev, isp_mis);
+ }
++
++irqreturn_t rkisp1_vs_isr_handler(int irq, void *ctx)
++{
++	struct device *dev = ctx;
++	struct rkisp1_device *rkisp1_dev = dev_get_drvdata(dev);
++
++	if (rkisp1_dev->vs_irq >= 0)
++		riksp1_isp_queue_event_sof(&rkisp1_dev->isp_sdev);
++
++	return IRQ_HANDLED;
++}
++
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.h b/drivers/media/platform/rockchip/isp1/rkisp1.h
+index d96f314ba205..f3bdc47ce741 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.h
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.h
+@@ -37,6 +37,7 @@
+ 
+ #include <linux/kfifo.h>
+ #include <linux/platform_device.h>
++#include <linux/interrupt.h>
+ #include <media/v4l2-fwnode.h>
+ #include "common.h"
+ 
+@@ -121,6 +122,8 @@ void rkisp1_mipi_v13_isr(unsigned int err1, unsigned int err2,
+ 
+ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev);
+ 
++irqreturn_t rkisp1_vs_isr_handler(int irq, void *ctx);
++
+ static inline
+ struct ispsd_out_fmt *rkisp1_get_ispsd_out_fmt(struct rkisp1_isp_subdev *isp_sdev)
+ {
+-- 
+2.35.3
+

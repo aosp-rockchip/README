@@ -1,0 +1,686 @@
+From 3207637c8df2eaa11b427ee4b9a83bc2f27e5798 Mon Sep 17 00:00:00 2001
+From: dkl <dkl@rock-chips.com>
+Date: Fri, 27 Jun 2014 21:37:45 +0800
+Subject: [PATCH] rockchip: add reset-rockchip driver to support Generic Reset
+ Controller framework
+
+---
+ arch/arm/boot/dts/rk3288.dtsi               |   7 +
+ arch/arm/configs/rockchip_defconfig         |   1 +
+ drivers/reset/Makefile                      |   2 +
+ drivers/reset/reset-rockchip.c              | 168 ++++++++++++++++
+ include/dt-bindings/clock/rockchip,rk3288.h | 206 +++++++++++++++++++
+ include/dt-bindings/clock/rockchip.h        |   2 +
+ include/linux/rockchip/cru.h                | 209 +-------------------
+ 7 files changed, 388 insertions(+), 207 deletions(-)
+ create mode 100644 drivers/reset/reset-rockchip.c
+
+diff --git a/arch/arm/boot/dts/rk3288.dtsi b/arch/arm/boot/dts/rk3288.dtsi
+index ff5a291e3264..6e718d2a3163 100755
+--- a/arch/arm/boot/dts/rk3288.dtsi
++++ b/arch/arm/boot/dts/rk3288.dtsi
+@@ -239,6 +239,13 @@
+ 		};
+ 	};
+ 
++	reset: reset@ff7601b8{
++		compatible = "rockchip,reset";
++		reg = <0xff7601b8 0x30>;
++		rockchip,reset-flag = <ROCKCHIP_RESET_HIWORD_MASK>;
++		#reset-cells = <1>;
++	};
++
+ 	nandc0: nandc@0xff400000 {
+ 		compatible = "rockchip,rk-nandc";
+ 		reg = <0xff400000 0x4000>;
+diff --git a/arch/arm/configs/rockchip_defconfig b/arch/arm/configs/rockchip_defconfig
+index fb17e24d0083..7297cc94c9ca 100644
+--- a/arch/arm/configs/rockchip_defconfig
++++ b/arch/arm/configs/rockchip_defconfig
+@@ -514,6 +514,7 @@ CONFIG_IIO=y
+ CONFIG_ROCKCHIP_ADC=y
+ CONFIG_PWM=y
+ CONFIG_PWM_ROCKCHIP=y
++CONFIG_RESET_CONTROLLER=y
+ CONFIG_RK_HEADSET=y
+ CONFIG_EXT2_FS=y
+ CONFIG_EXT2_FS_XATTR=y
+diff --git a/drivers/reset/Makefile b/drivers/reset/Makefile
+index 1e2d83f2b995..64a4ee3c08a2 100644
+--- a/drivers/reset/Makefile
++++ b/drivers/reset/Makefile
+@@ -1 +1,3 @@
+ obj-$(CONFIG_RESET_CONTROLLER) += core.o
++
++obj-$(CONFIG_ARCH_ROCKCHIP)    += reset-rockchip.o
+diff --git a/drivers/reset/reset-rockchip.c b/drivers/reset/reset-rockchip.c
+new file mode 100644
+index 000000000000..8f8ce66968fb
+--- /dev/null
++++ b/drivers/reset/reset-rockchip.c
+@@ -0,0 +1,168 @@
++/*
++ * Copyright (c) 2014 ROCKCHIP, Inc.
++ * Author: Dai Kelin <dkl@rock-chips.com>
++ * Based on codes from Heiko Stuebner <heiko@sntech.de>.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/slab.h>
++#include <linux/io.h>
++#include <linux/reset-controller.h>
++#include <linux/spinlock.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++
++#include <dt-bindings/clock/rockchip.h>
++
++
++struct rockchip_reset {
++	struct reset_controller_dev	rcdev;
++	void __iomem			*reg_base;
++	int				num_regs;
++	int				num_per_reg;
++	u8				flags;
++	spinlock_t			lock;
++};
++
++static int rockchip_reset_assert(struct reset_controller_dev *rcdev,
++			      unsigned long id)
++{
++	struct rockchip_reset *reset = container_of(rcdev,
++						     struct rockchip_reset,
++						     rcdev);
++	int bank = id / reset->num_per_reg;
++	int offset = id % reset->num_per_reg;
++
++	if (reset->flags & ROCKCHIP_RESET_HIWORD_MASK) {
++		writel(BIT(offset) | (BIT(offset) << 16),
++		       reset->reg_base + (bank * 4));
++	} else {
++		unsigned long flags;
++		u32 reg;
++
++		spin_lock_irqsave(&reset->lock, flags);
++
++		reg = readl(reset->reg_base + (bank * 4));
++		writel(reg | BIT(offset), reset->reg_base + (bank * 4));
++
++		spin_unlock_irqrestore(&reset->lock, flags);
++	}
++
++	return 0;
++}
++
++static int rockchip_reset_deassert(struct reset_controller_dev *rcdev,
++				unsigned long id)
++{
++	struct rockchip_reset *reset = container_of(rcdev,
++						     struct rockchip_reset,
++						     rcdev);
++	int bank = id / reset->num_per_reg;
++	int offset = id % reset->num_per_reg;
++
++	if (reset->flags & ROCKCHIP_RESET_HIWORD_MASK) {
++		writel((BIT(offset) << 16), reset->reg_base + (bank * 4));
++	} else {
++		unsigned long flags;
++		u32 reg;
++
++		spin_lock_irqsave(&reset->lock, flags);
++
++		reg = readl(reset->reg_base + (bank * 4));
++		writel(reg & ~BIT(offset), reset->reg_base + (bank * 4));
++
++		spin_unlock_irqrestore(&reset->lock, flags);
++	}
++
++	return 0;
++}
++
++static struct reset_control_ops rockchip_reset_ops = {
++	.assert		= rockchip_reset_assert,
++	.deassert	= rockchip_reset_deassert,
++};
++
++static int rockchip_register_reset(struct device_node *np,
++				      unsigned int num_regs,
++				      void __iomem *base, u8 flags)
++{
++	struct rockchip_reset *reset;
++	int ret;
++
++	reset = kzalloc(sizeof(*reset), GFP_KERNEL);
++	if (!reset)
++		return -ENOMEM;
++
++	reset->flags = flags;
++	reset->reg_base = base;
++	reset->num_regs = num_regs;
++	reset->num_per_reg = (flags & ROCKCHIP_RESET_HIWORD_MASK) ? 16 : 32;
++	spin_lock_init(&reset->lock);
++
++	reset->rcdev.owner = THIS_MODULE;
++	reset->rcdev.nr_resets =  num_regs * reset->num_per_reg;
++	reset->rcdev.ops = &rockchip_reset_ops;
++	reset->rcdev.of_node = np;
++	ret = reset_controller_register(&reset->rcdev);
++	if (ret) {
++		pr_err("%s: could not register reset controller, %d\n",
++		       __func__, ret);
++		kfree(reset);
++		return ret;
++	}
++
++	return 0;
++};
++
++static int rockchip_reset_probe(struct platform_device *pdev)
++{
++	struct resource *res;
++	void __iomem *base;
++	resource_size_t size;
++	u32 flag = 0;
++
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(base)) {
++		pr_err("%s: ioremap err\n", __func__);
++		return PTR_ERR(base);
++	}
++
++	size = resource_size(res);
++	if (size%4) {
++		pr_err("%s: wrong size value\n", __func__);
++		return -EINVAL;
++	}
++
++	of_property_read_u32(pdev->dev.of_node, "rockchip,reset-flag", &flag);
++
++	return rockchip_register_reset(pdev->dev.of_node, size/4, base, flag);
++}
++
++static const struct of_device_id rockchip_reset_dt_ids[]  = {
++	{ .compatible = "rockchip,reset", },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, rockchip_reset_dt_ids);
++
++static struct platform_driver rockchip_reset_driver = {
++	.probe  = rockchip_reset_probe,
++	.driver = {
++		.name           = "rockchip-reset",
++		.owner          = THIS_MODULE,
++		.of_match_table = rockchip_reset_dt_ids,
++	},
++};
++module_platform_driver(rockchip_reset_driver);
++
+diff --git a/include/dt-bindings/clock/rockchip,rk3288.h b/include/dt-bindings/clock/rockchip,rk3288.h
+index b6df7eac90ff..8b45948c45fb 100644
+--- a/include/dt-bindings/clock/rockchip,rk3288.h
++++ b/include/dt-bindings/clock/rockchip,rk3288.h
+@@ -11,4 +11,210 @@
+ #define RK3288_NPLL_ID 		4
+ #define RK3288_END_PLL_ID	5
+ 
++/* reset id */
++#define RK3288_SOFT_RST_CORE0			0
++#define RK3288_SOFT_RST_CORE1			1
++#define RK3288_SOFT_RST_CORE2			2
++#define RK3288_SOFT_RST_CORE3			3
++#define RK3288_SOFT_RST_CORE0_PO		4
++#define RK3288_SOFT_RST_CORE1_PO		5
++#define RK3288_SOFT_RST_CORE2_PO		6
++#define RK3288_SOFT_RST_CORE3_PO		7
++#define RK3288_SOFT_RST_PD_CORE_STR_SYS_A	8
++#define RK3288_SOFT_RST_PD_BUS_STR_SYS_A	9
++#define RK3288_SOFT_RST_L2C			10
++#define RK3288_SOFT_RST_TOPDBG			11
++#define RK3288_SOFT_RST_CORE0_DBG		12
++#define RK3288_SOFT_RST_CORE1_DBG		13
++#define RK3288_SOFT_RST_CORE2_DBG		14
++#define RK3288_SOFT_RST_CORE3_DBG		15
++
++#define RK3288_SOFT_RST_PD_BUS_AHB_ARBITOR	16
++#define RK3288_SOFT_RST_EFUSE_256BIT_P		17
++#define RK3288_SOFT_RST_DMA1			18
++#define RK3288_SOFT_RST_INTMEM			19
++#define RK3288_SOFT_RST_ROM			20
++#define RK3288_SOFT_RST_SPDIF_8CH		21
++#define RK3288_SOFT_RST_TIMER_P			22
++#define RK3288_SOFT_RST_I2S			23
++#define RK3288_SOFT_RST_SPDIF			24
++#define RK3288_SOFT_RST_TIMER0			25
++#define RK3288_SOFT_RST_TIMER1			26
++#define RK3288_SOFT_RST_TIMER2			27
++#define RK3288_SOFT_RST_TIMER3			28
++#define RK3288_SOFT_RST_TIMER4			29
++#define RK3288_SOFT_RST_TIMER5			30
++#define RK3288_SOFT_RST_EFUSE_P			31
++
++#define RK3288_SOFT_RST_GPIO0			32
++#define RK3288_SOFT_RST_GPIO1			33
++#define RK3288_SOFT_RST_GPIO2			34
++#define RK3288_SOFT_RST_GPIO3			35
++#define RK3288_SOFT_RST_GPIO4			36
++#define RK3288_SOFT_RST_GPIO5			37
++#define RK3288_SOFT_RST_GPIO6			38
++#define RK3288_SOFT_RST_GPIO7			39
++#define RK3288_SOFT_RST_GPIO8			40
++#define RK3288_SOFT_RST_2RES9			41
++#define RK3288_SOFT_RST_I2C0			42
++#define RK3288_SOFT_RST_I2C1			43
++#define RK3288_SOFT_RST_I2C2			44
++#define RK3288_SOFT_RST_I2C3			45
++#define RK3288_SOFT_RST_I2C4			46
++#define RK3288_SOFT_RST_I2C5			47
++
++#define RK3288_SOFT_RST_DW_PWM			48
++#define RK3288_SOFT_RST_MMC_PERI		49
++#define RK3288_SOFT_RST_PERIPH_MMU		50
++#define RK3288_SOFT_RST_DAP			51
++#define RK3288_SOFT_RST_DAP_SYS			52
++#define RK3288_SOFT_RST_TPIU_AT			53
++#define RK3288_SOFT_RST_PMU_P			54
++#define RK3288_SOFT_RST_GRF			55
++#define RK3288_SOFT_RST_PMU			56
++#define RK3288_SOFT_RST_PERIPHSYS_A		57
++#define RK3288_SOFT_RST_PERIPHSYS_H		58
++#define RK3288_SOFT_RST_PERIPHSYS_P		59
++#define RK3288_SOFT_RST_PERIPH_NIU		60
++#define RK3288_SOFT_RST_PD_PERI_AHB_ARBITOR	61
++#define RK3288_SOFT_RST_EMEM_PERI		62
++#define RK3288_SOFT_RST_USB_PERI		63
++
++#define RK3288_SOFT_RST_DMA2			64
++#define RK3288_SOFT_RST_4RES1			65
++#define RK3288_SOFT_RST_MAC			66
++#define RK3288_SOFT_RST_GPS			67
++#define RK3288_SOFT_RST_4RES4			68
++#define RK3288_SOFT_RST_RK_PWM			69
++#define RK3288_SOFT_RST_4RES6			70
++#define RK3288_SOFT_RST_CCP			71
++#define RK3288_SOFT_RST_USB_HOST0		72
++#define RK3288_SOFT_RST_HSIC			73
++#define RK3288_SOFT_RST_HSIC_AUX		74
++#define RK3288_SOFT_RST_HSICPHY			75
++#define RK3288_SOFT_RST_HSADC			76
++#define RK3288_SOFT_RST_NANDC0			77
++#define RK3288_SOFT_RST_NANDC1			78
++#define RK3288_SOFT_RST_4RES15			79
++
++#define RK3288_SOFT_RST_TZPC			80
++#define RK3288_SOFT_RST_5RES1			81
++#define RK3288_SOFT_RST_5RES2			82
++#define RK3288_SOFT_RST_SPI0			83
++#define RK3288_SOFT_RST_SPI1			84
++#define RK3288_SOFT_RST_SPI2			85
++#define RK3288_SOFT_RST_5RES6			86
++#define RK3288_SOFT_RST_SARADC			87
++#define RK3288_SOFT_RST_PD_ALIVE_NIU_P		88
++#define RK3288_SOFT_RST_PD_PMU_INTMEM_P		89
++#define RK3288_SOFT_RST_PD_PMU_NIU_P		90
++#define RK3288_SOFT_RST_SECURITY_GRF_P		91
++#define RK3288_SOFT_RST_5RES12			92
++#define RK3288_SOFT_RST_5RES13			93
++#define RK3288_SOFT_RST_5RES14			94
++#define RK3288_SOFT_RST_5RES15			95
++
++#define RK3288_SOFT_RST_VIO_ARBI_H		96
++#define RK3288_SOFT_RST_RGA_NIU_A		97
++#define RK3288_SOFT_RST_VIO0_NIU_A		98
++#define RK3288_SOFT_RST_VIO_NIU_H		99
++#define RK3288_SOFT_RST_LCDC0_A			100
++#define RK3288_SOFT_RST_LCDC0_H			101
++#define RK3288_SOFT_RST_LCDC0_D			102
++#define RK3288_SOFT_RST_VIO1_NIU_A		103
++#define RK3288_SOFT_RST_VIP			104
++#define RK3288_SOFT_RST_RGA_CORE		105
++#define RK3288_SOFT_RST_IEP_A			106
++#define RK3288_SOFT_RST_IEP_H			107
++#define RK3288_SOFT_RST_RGA_A			108
++#define RK3288_SOFT_RST_RGA_H			109
++#define RK3288_SOFT_RST_ISP			110
++#define RK3288_SOFT_RST_EDP			111
++
++#define RK3288_SOFT_RST_VCODEC_A		112
++#define RK3288_SOFT_RST_VCODEC_H		113
++#define RK3288_SOFT_RST_VIO_H2P_H		114
++#define RK3288_SOFT_RST_MIPIDSI0_P		115
++#define RK3288_SOFT_RST_MIPIDSI1_P		116
++#define RK3288_SOFT_RST_MIPICSI_P		117
++#define RK3288_SOFT_RST_LVDS_PHY_P		118
++#define RK3288_SOFT_RST_LVDS_CON		119
++#define RK3288_SOFT_RST_GPU			120
++#define RK3288_SOFT_RST_HDMI			121
++#define RK3288_SOFT_RST_7RES10			122
++#define RK3288_SOFT_RST_7RES11			123
++#define RK3288_SOFT_RST_CORE_PVTM		124
++#define RK3288_SOFT_RST_GPU_PVTM		125
++#define RK3288_SOFT_RST_7RES14			126
++#define RK3288_SOFT_RST_7RES15			127
++
++#define RK3288_SOFT_RST_MMC0			128
++#define RK3288_SOFT_RST_SDIO0			129
++#define RK3288_SOFT_RST_SDIO1			130
++#define RK3288_SOFT_RST_EMMC			131
++#define RK3288_SOFT_RST_USBOTG_H		132
++#define RK3288_SOFT_RST_USBOTGPHY		133
++#define RK3288_SOFT_RST_USBOTGC			134
++#define RK3288_SOFT_RST_USBHOST0_H		135
++#define RK3288_SOFT_RST_USBHOST0PHY		136
++#define RK3288_SOFT_RST_USBHOST0C		137
++#define RK3288_SOFT_RST_USBHOST1_H		138
++#define RK3288_SOFT_RST_USBHOST1PHY		139
++#define RK3288_SOFT_RST_USBHOST1C		140
++#define RK3288_SOFT_RST_USB_ADP			141
++#define RK3288_SOFT_RST_ACC_EFUSE		142
++#define RK3288_SOFT_RST_8RES15			143
++
++#define RK3288_SOFT_RST_CORESIGHT		144
++#define RK3288_SOFT_RST_PD_CORE_AHB_NOC		145
++#define RK3288_SOFT_RST_PD_CORE_APB_NOC		146
++#define RK3288_SOFT_RST_PD_CORE_MP_AXI		147
++#define RK3288_SOFT_RST_GIC			148
++#define RK3288_SOFT_RST_LCDCPWM0		149
++#define RK3288_SOFT_RST_LCDCPWM1		150
++#define RK3288_SOFT_RST_VIO0_H2P_BRG		151
++#define RK3288_SOFT_RST_VIO1_H2P_BRG		152
++#define RK3288_SOFT_RST_RGA_H2P_BRG		153
++#define RK3288_SOFT_RST_HEVC			154
++#define RK3288_SOFT_RST_9RES11			155
++#define RK3288_SOFT_RST_9RES12			156
++#define RK3288_SOFT_RST_9RES13			157
++#define RK3288_SOFT_RST_9RES14			158
++#define RK3288_SOFT_RST_TSADC_P			159
++
++#define RK3288_SOFT_RST_DDRPHY0			160
++#define RK3288_SOFT_RST_DDRPHY0_P		161
++#define RK3288_SOFT_RST_DDRCTRL0		162
++#define RK3288_SOFT_RST_DDRCTRL0_P		163
++#define RK3288_SOFT_RST_DDRPHY0_CTL		164
++#define RK3288_SOFT_RST_DDRPHY1			165
++#define RK3288_SOFT_RST_DDRPHY1_P		166
++#define RK3288_SOFT_RST_DDRCTRL1		167
++#define RK3288_SOFT_RST_DDRCTRL1_P		168
++#define RK3288_SOFT_RST_DDRPHY1_CTL		169
++#define RK3288_SOFT_RST_DDRMSCH0		170
++#define RK3288_SOFT_RST_DDRMSCH1		171
++#define RK3288_SOFT_RST_10RES12			172
++#define RK3288_SOFT_RST_10RES13			173
++#define RK3288_SOFT_RST_CRYPTO			174
++#define RK3288_SOFT_RST_C2C_HOST		175
++
++#define RK3288_SOFT_RST_LCDC1_A			176
++#define RK3288_SOFT_RST_LCDC1_H			177
++#define RK3288_SOFT_RST_LCDC1_D			178
++#define RK3288_SOFT_RST_UART0			179
++#define RK3288_SOFT_RST_UART1			180
++#define RK3288_SOFT_RST_UART2			181
++#define RK3288_SOFT_RST_UART3			182
++#define RK3288_SOFT_RST_UART4			183
++#define RK3288_SOFT_RST_11RES8			184
++#define RK3288_SOFT_RST_11RES9			185
++#define RK3288_SOFT_RST_SIMC			186
++#define RK3288_SOFT_RST_PS2C			187
++#define RK3288_SOFT_RST_TSP			188
++#define RK3288_SOFT_RST_TSP_CLKIN0		189
++#define RK3288_SOFT_RST_TSP_CLKIN1		190
++#define RK3288_SOFT_RST_TSP_27M			191
++
++
+ #endif /* _DT_BINDINGS_CLOCK_ROCKCHIP_RK3288_H */
+diff --git a/include/dt-bindings/clock/rockchip.h b/include/dt-bindings/clock/rockchip.h
+index ffd38921c4b0..b00ccd571df7 100644
+--- a/include/dt-bindings/clock/rockchip.h
++++ b/include/dt-bindings/clock/rockchip.h
+@@ -79,5 +79,7 @@
+ #define CLK_PD_VIO		13
+ #define CLK_PD_VIRT		255
+ 
++/* reset flag */
++#define ROCKCHIP_RESET_HIWORD_MASK	BIT(0)
+ 
+ #endif /* _DT_BINDINGS_CLOCK_ROCKCHIP_H */
+diff --git a/include/linux/rockchip/cru.h b/include/linux/rockchip/cru.h
+index e5d355b7e06c..0e1df2b347fc 100755
+--- a/include/linux/rockchip/cru.h
++++ b/include/linux/rockchip/cru.h
+@@ -2,6 +2,7 @@
+ #define __MACH_ROCKCHIP_CRU_H
+ 
+ #include <dt-bindings/clock/rockchip,rk3188.h>
++#include <dt-bindings/clock/rockchip,rk3288.h>
+ #include <linux/rockchip/iomap.h>
+ 
+ 
+@@ -116,213 +117,7 @@ enum rk3288_cru_clk_gate {
+ #define RK3288_CRU_SOFTRSTS_CON_CNT	(12)
+ #define RK3288_CRU_SOFTRSTS_CON(i)	(RK3288_CRU_SOFTRST_CON + ((i) * 4))
+ 
+-enum rk3288_cru_soft_reset {
+-	RK3288_SOFT_RST_CORE0,
+-	RK3288_SOFT_RST_CORE1,
+-	RK3288_SOFT_RST_CORE2,
+-	RK3288_SOFT_RST_CORE3,
+-	RK3288_SOFT_RST_CORE0_PO,
+-	RK3288_SOFT_RST_CORE1_PO,
+-	RK3288_SOFT_RST_CORE2_PO,
+-	RK3288_SOFT_RST_CORE3_PO,
+-	RK3288_SOFT_RST_PD_CORE_STR_SYS_A,
+-	RK3288_SOFT_RST_PD_BUS_STR_SYS_A,
+-	RK3288_SOFT_RST_L2C,
+-	RK3288_SOFT_RST_TOPDBG,
+-	RK3288_SOFT_RST_CORE0_DBG,
+-	RK3288_SOFT_RST_CORE1_DBG,
+-	RK3288_SOFT_RST_CORE2_DBG,
+-	RK3288_SOFT_RST_CORE3_DBG,
+-
+-	RK3288_SOFT_RST_PD_BUS_AHB_ARBITOR,
+-	RK3288_SOFT_RST_EFUSE_256BIT_P,
+-	RK3288_SOFT_RST_DMA1,
+-	RK3288_SOFT_RST_INTMEM,
+-	RK3288_SOFT_RST_ROM,
+-	RK3288_SOFT_RST_SPDIF_8CH,
+-	RK3288_SOFT_RST_TIMER_P,
+-	RK3288_SOFT_RST_I2S,
+-	RK3288_SOFT_RST_SPDIF,
+-	RK3288_SOFT_RST_TIMER0,
+-	RK3288_SOFT_RST_TIMER1,
+-	RK3288_SOFT_RST_TIMER2,
+-	RK3288_SOFT_RST_TIMER3,
+-	RK3288_SOFT_RST_TIMER4,
+-	RK3288_SOFT_RST_TIMER5,
+-	RK3288_SOFT_RST_EFUSE_P,
+-
+-	RK3288_SOFT_RST_GPIO0,
+-	RK3288_SOFT_RST_GPIO1,
+-	RK3288_SOFT_RST_GPIO2,
+-	RK3288_SOFT_RST_GPIO3,
+-	RK3288_SOFT_RST_GPIO4,
+-	RK3288_SOFT_RST_GPIO5,
+-	RK3288_SOFT_RST_GPIO6,
+-	RK3288_SOFT_RST_GPIO7,
+-	RK3288_SOFT_RST_GPIO8,
+-	RK3288_SOFT_RST_2RES9,
+-	RK3288_SOFT_RST_I2C0,
+-	RK3288_SOFT_RST_I2C1,
+-	RK3288_SOFT_RST_I2C2,
+-	RK3288_SOFT_RST_I2C3,
+-	RK3288_SOFT_RST_I2C4,
+-	RK3288_SOFT_RST_I2C5,
+-
+-	RK3288_SOFT_RST_DW_PWM,
+-	RK3288_SOFT_RST_MMC_PERI,
+-	RK3288_SOFT_RST_PERIPH_MMU,
+-	RK3288_SOFT_RST_DAP,
+-	RK3288_SOFT_RST_DAP_SYS,
+-	RK3288_SOFT_RST_TPIU_AT,
+-	RK3288_SOFT_RST_PMU_P,
+-	RK3288_SOFT_RST_GRF,
+-	RK3288_SOFT_RST_PMU,
+-	RK3288_SOFT_RST_PERIPHSYS_A,
+-	RK3288_SOFT_RST_PERIPHSYS_H,
+-	RK3288_SOFT_RST_PERIPHSYS_P,
+-	RK3288_SOFT_RST_PERIPH_NIU,
+-	RK3288_SOFT_RST_PD_PERI_AHB_ARBITOR,
+-	RK3288_SOFT_RST_EMEM_PERI,
+-	RK3288_SOFT_RST_USB_PERI,
+-
+-	RK3288_SOFT_RST_DMA2,
+-	RK3288_SOFT_RST_4RES1,
+-	RK3288_SOFT_RST_MAC,
+-	RK3288_SOFT_RST_GPS,
+-	RK3288_SOFT_RST_4RES4,
+-	RK3288_SOFT_RST_RK_PWM,
+-	RK3288_SOFT_RST_4RES6,
+-	RK3288_SOFT_RST_CCP,
+-	RK3288_SOFT_RST_USB_HOST0,
+-	RK3288_SOFT_RST_HSIC,
+-	RK3288_SOFT_RST_HSIC_AUX,
+-	RK3288_SOFT_RST_HSICPHY,
+-	RK3288_SOFT_RST_HSADC,
+-	RK3288_SOFT_RST_NANDC0,
+-	RK3288_SOFT_RST_NANDC1,
+-	RK3288_SOFT_RST_4RES15,
+-
+-	RK3288_SOFT_RST_TZPC,
+-	RK3288_SOFT_RST_5RES1,
+-	RK3288_SOFT_RST_5RES2,
+-	RK3288_SOFT_RST_SPI0,
+-	RK3288_SOFT_RST_SPI1,
+-	RK3288_SOFT_RST_SPI2,
+-	RK3288_SOFT_RST_5RES6,
+-	RK3288_SOFT_RST_SARADC,
+-	RK3288_SOFT_RST_PD_ALIVE_NIU_P,
+-	RK3288_SOFT_RST_PD_PMU_INTMEM_P,
+-	RK3288_SOFT_RST_PD_PMU_NIU_P,
+-	RK3288_SOFT_RST_SECURITY_GRF_P,
+-	RK3288_SOFT_RST_5RES12,
+-	RK3288_SOFT_RST_5RES13,
+-	RK3288_SOFT_RST_5RES14,
+-	RK3288_SOFT_RST_5RES15,
+-
+-	RK3288_SOFT_RST_VIO_ARBI_H,
+-	RK3288_SOFT_RST_RGA_NIU_A,
+-	RK3288_SOFT_RST_VIO0_NIU_A,
+-	RK3288_SOFT_RST_VIO_NIU_H,
+-	RK3288_SOFT_RST_LCDC0_A,
+-	RK3288_SOFT_RST_LCDC0_H,
+-	RK3288_SOFT_RST_LCDC0_D,
+-	RK3288_SOFT_RST_VIO1_NIU_A,
+-	RK3288_SOFT_RST_VIP,
+-	RK3288_SOFT_RST_RGA_CORE,
+-	RK3288_SOFT_RST_IEP_A,
+-	RK3288_SOFT_RST_IEP_H,
+-	RK3288_SOFT_RST_RGA_A,
+-	RK3288_SOFT_RST_RGA_H,
+-	RK3288_SOFT_RST_ISP,
+-	RK3288_SOFT_RST_EDP,
+-
+-	RK3288_SOFT_RST_VCODEC_A,
+-	RK3288_SOFT_RST_VCODEC_H,
+-	RK3288_SOFT_RST_VIO_H2P_H,
+-	RK3288_SOFT_RST_MIPIDSI0_P,
+-	RK3288_SOFT_RST_MIPIDSI1_P,
+-	RK3288_SOFT_RST_MIPICSI_P,
+-	RK3288_SOFT_RST_LVDS_PHY_P,
+-	RK3288_SOFT_RST_LVDS_CON,
+-	RK3288_SOFT_RST_GPU,
+-	RK3288_SOFT_RST_HDMI,
+-	RK3288_SOFT_RST_7RES10,
+-	RK3288_SOFT_RST_7RES11,
+-	RK3288_SOFT_RST_CORE_PVTM,
+-	RK3288_SOFT_RST_GPU_PVTM,
+-	RK3288_SOFT_RST_7RES14,
+-	RK3288_SOFT_RST_7RES15,
+-
+-	RK3288_SOFT_RST_MMC0,
+-	RK3288_SOFT_RST_SDIO0,
+-	RK3288_SOFT_RST_SDIO1,
+-	RK3288_SOFT_RST_EMMC,
+-	RK3288_SOFT_RST_USBOTG_H,
+-	RK3288_SOFT_RST_USBOTGPHY,
+-	RK3288_SOFT_RST_USBOTGC,
+-	RK3288_SOFT_RST_USBHOST0_H,
+-	RK3288_SOFT_RST_USBHOST0PHY,
+-	RK3288_SOFT_RST_USBHOST0C,
+-	RK3288_SOFT_RST_USBHOST1_H,
+-	RK3288_SOFT_RST_USBHOST1PHY,
+-	RK3288_SOFT_RST_USBHOST1C,
+-	RK3288_SOFT_RST_USB_ADP,
+-	RK3288_SOFT_RST_ACC_EFUSE,
+-	RK3288_SOFT_RST_8RES15,
+-
+-	RK3288_SOFT_RST_CORESIGHT,
+-	RK3288_SOFT_RST_PD_CORE_AHB_NOC,
+-	RK3288_SOFT_RST_PD_CORE_APB_NOC,
+-	RK3288_SOFT_RST_PD_CORE_MP_AXI,
+-	RK3288_SOFT_RST_GIC,
+-	RK3288_SOFT_RST_LCDCPWM0,
+-	RK3288_SOFT_RST_LCDCPWM1,
+-	RK3288_SOFT_RST_VIO0_H2P_BRG,
+-	RK3288_SOFT_RST_VIO1_H2P_BRG,
+-	RK3288_SOFT_RST_RGA_H2P_BRG,
+-	RK3288_SOFT_RST_HEVC,
+-	RK3288_SOFT_RST_9RES11,
+-	RK3288_SOFT_RST_9RES12,
+-	RK3288_SOFT_RST_9RES13,
+-	RK3288_SOFT_RST_9RES14,
+-	RK3288_SOFT_RST_TSADC_P,
+-
+-	RK3288_SOFT_RST_DDRPHY0,
+-	RK3288_SOFT_RST_DDRPHY0_P,
+-	RK3288_SOFT_RST_DDRCTRL0,
+-	RK3288_SOFT_RST_DDRCTRL0_P,
+-	RK3288_SOFT_RST_DDRPHY0_CTL,
+-	RK3288_SOFT_RST_DDRPHY1,
+-	RK3288_SOFT_RST_DDRPHY1_P,
+-	RK3288_SOFT_RST_DDRCTRL1,
+-	RK3288_SOFT_RST_DDRCTRL1_P,
+-	RK3288_SOFT_RST_DDRPHY1_CTL,
+-	RK3288_SOFT_RST_DDRMSCH0,
+-	RK3288_SOFT_RST_DDRMSCH1,
+-	RK3288_SOFT_RST_10RES12,
+-	RK3288_SOFT_RST_10RES13,
+-	RK3288_SOFT_RST_CRYPTO,
+-	RK3288_SOFT_RST_C2C_HOST,
+-
+-	RK3288_SOFT_RST_LCDC1_A,
+-	RK3288_SOFT_RST_LCDC1_H,
+-	RK3288_SOFT_RST_LCDC1_D,
+-	RK3288_SOFT_RST_UART0,
+-	RK3288_SOFT_RST_UART1,
+-	RK3288_SOFT_RST_UART2,
+-	RK3288_SOFT_RST_UART3,
+-	RK3288_SOFT_RST_UART4,
+-	RK3288_SOFT_RST_11RES8,
+-	RK3288_SOFT_RST_11RES9,
+-	RK3288_SOFT_RST_SIMC,
+-	RK3288_SOFT_RST_PS2C,
+-	RK3288_SOFT_RST_TSP,
+-	RK3288_SOFT_RST_TSP_CLKIN0,
+-	RK3288_SOFT_RST_TSP_CLKIN1,
+-	RK3288_SOFT_RST_TSP_27M,
+-};
+-
+-static inline void rk3288_cru_set_soft_reset(enum rk3288_cru_soft_reset idx, bool on)
++static inline void rk3288_cru_set_soft_reset(u32 idx, bool on)
+ {
+ 	void __iomem *reg = RK_CRU_VIRT + RK3288_CRU_SOFTRSTS_CON(idx >> 4);
+ 	u32 val = on ? 0x10001U << (idx & 0xf) : 0x10000U << (idx & 0xf);
+-- 
+2.35.3
+

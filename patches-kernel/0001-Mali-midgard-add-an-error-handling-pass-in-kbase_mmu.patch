@@ -1,0 +1,128 @@
+From 94f98e877ce40db83ee49789b81b463b6202b6fd Mon Sep 17 00:00:00 2001
+From: Zhen Chen <chenzhen@rock-chips.com>
+Date: Sun, 8 Jul 2018 15:25:35 +0800
+Subject: [PATCH] Mali: midgard: add an error handling pass in
+ kbase_mmu_interrupt()
+
+For RK redmine Defect #168230.
+
+Change-Id: I3cd6544dd23b833138e4cc700a8f2cdd627ff592
+Signed-off-by: Zhen Chen <chenzhen@rock-chips.com>
+---
+ .../backend/gpu/mali_kbase_mmu_hw_direct.c        |  6 ++++++
+ drivers/gpu/arm/midgard/mali_kbase_ctx_sched.c    |  7 ++++++-
+ drivers/gpu/arm/midgard/mali_kbase_ctx_sched.h    |  5 ++++-
+ drivers/gpu/arm/midgard/mali_kbase_js.c           | 15 ++++++++++-----
+ 4 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_mmu_hw_direct.c b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_mmu_hw_direct.c
+index aa1817c8bca9..ba826184dd3f 100644
+--- a/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_mmu_hw_direct.c
++++ b/drivers/gpu/arm/midgard/backend/gpu/mali_kbase_mmu_hw_direct.c
+@@ -14,6 +14,8 @@
+  */
+ 
+ 
++/* #define ENABLE_DEBUG_LOG */
++#include "../../platform/rk/custom_log.h"
+ 
+ #include <linux/bitops.h>
+ 
+@@ -164,6 +166,10 @@ void kbase_mmu_interrupt(struct kbase_device *kbdev, u32 irq_stat)
+ 		 * the MMU is updated
+ 		 */
+ 		kctx = kbasep_js_runpool_lookup_ctx(kbdev, as_no);
++		if (!kctx) {
++			E("fail to lookup ctx, to break out.");
++			break;
++		}
+ 
+ 
+ 		/* find faulting address */
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.c b/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.c
+index e2f7baabad43..ce004841403f 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.c
+@@ -131,16 +131,21 @@ int kbase_ctx_sched_retain_ctx(struct kbase_context *kctx)
+ 	return kctx->as_nr;
+ }
+ 
+-void kbase_ctx_sched_retain_ctx_refcount(struct kbase_context *kctx)
++int kbase_ctx_sched_retain_ctx_refcount(struct kbase_context *kctx)
+ {
+ 	struct kbase_device *const kbdev = kctx->kbdev;
+ 
+ 	lockdep_assert_held(&kbdev->hwaccess_lock);
+ 	WARN_ON(atomic_read(&kctx->refcount) == 0);
++	if (atomic_read(&kctx->refcount) == 0)
++		return -1;
++
+ 	WARN_ON(kctx->as_nr == KBASEP_AS_NR_INVALID);
+ 	WARN_ON(kbdev->as_to_kctx[kctx->as_nr] != kctx);
+ 
+ 	atomic_inc(&kctx->refcount);
++
++	return 0;
+ }
+ 
+ void kbase_ctx_sched_release_ctx(struct kbase_context *kctx)
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.h b/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.h
+index e55152547c31..47474fecc2a9 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_ctx_sched.h
+@@ -87,8 +87,11 @@ int kbase_ctx_sched_retain_ctx(struct kbase_context *kctx);
+  * it doesn't get descheduled.
+  *
+  * The kbase_device::hwaccess_lock must be held whilst calling this function
++ * @return
++ *	若成功, 返回 0;
++ *	若 *kctx 状态异常, 返回 -1.
+  */
+-void kbase_ctx_sched_retain_ctx_refcount(struct kbase_context *kctx);
++int kbase_ctx_sched_retain_ctx_refcount(struct kbase_context *kctx);
+ 
+ /* kbase_ctx_sched_release_ctx - Release a reference to the @ref kbase_context
+  *
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_js.c b/drivers/gpu/arm/midgard/mali_kbase_js.c
+index b053ce1f22a1..10a1d5909bbe 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_js.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_js.c
+@@ -13,9 +13,8 @@
+  *
+  */
+ 
+-
+-
+-
++/* #define ENABLE_DEBUG_LOG */
++#include "./platform/rk/custom_log.h"
+ 
+ /*
+  * Job Scheduler Implementation
+@@ -1245,6 +1244,7 @@ bool kbasep_js_runpool_retain_ctx(struct kbase_device *kbdev,
+ struct kbase_context *kbasep_js_runpool_lookup_ctx(struct kbase_device *kbdev,
+ 		int as_nr)
+ {
++	int ret = 0;
+ 	unsigned long flags;
+ 	struct kbasep_js_device_data *js_devdata;
+ 	struct kbase_context *found_kctx = NULL;
+@@ -1257,8 +1257,13 @@ struct kbase_context *kbasep_js_runpool_lookup_ctx(struct kbase_device *kbdev,
+ 
+ 	found_kctx = kbdev->as_to_kctx[as_nr];
+ 
+-	if (found_kctx != NULL)
+-		kbase_ctx_sched_retain_ctx_refcount(found_kctx);
++	if (found_kctx != NULL) {
++		ret = kbase_ctx_sched_retain_ctx_refcount(found_kctx);
++		if (ret != 0) {
++			E("fail to retain ctx_refcount, ret : %d.", ret);
++			found_kctx = NULL;
++		}
++	}
+ 
+ 	spin_unlock_irqrestore(&kbdev->hwaccess_lock, flags);
+ 
+-- 
+2.35.3
+

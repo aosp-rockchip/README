@@ -1,0 +1,271 @@
+From a8eb21def54e07d601635b658f11d8e74eb3e355 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Tue, 9 Jul 2019 20:09:33 +0800
+Subject: [PATCH] media: rockchip: isp1: add start/stop event for params video
+
+This patch adds two v4l2 events, start/stop streaming, for
+userspace to subscribe. With these events, userspace could
+init/de-init 3A tuning in proper time.
+
+Only if isp sub-device input format is Raw Bayer and output
+format is YUV, the 3A tuning is required.
+
+Change-Id: I027d603fcf6d6901ebcd3762d0889ef8f7603601
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Signed-off-by: Shunqian Zheng <zhengsq@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp1/dev.c    |  2 +
+ drivers/media/platform/rockchip/isp1/dev.h    |  4 +-
+ .../media/platform/rockchip/isp1/isp_params.c | 27 +++++++-
+ .../media/platform/rockchip/isp1/isp_stats.c  |  4 +-
+ drivers/media/platform/rockchip/isp1/rkisp1.c | 65 ++++++++++++++++++-
+ include/uapi/linux/rkisp1-config.h            |  7 ++
+ 6 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 9da0efe176c8..71b1947cab8b 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -1062,9 +1062,11 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 	isp_dev->num_clk_rate_tbl = match_data->num_clk_rate_tbl;
+ 
+ 	mutex_init(&isp_dev->apilock);
++	mutex_init(&isp_dev->iqlock);
+ 	atomic_set(&isp_dev->pipe.power_cnt, 0);
+ 	atomic_set(&isp_dev->pipe.stream_cnt, 0);
+ 	atomic_set(&isp_dev->open_cnt, 0);
++	init_waitqueue_head(&isp_dev->sync_onoff);
+ 	isp_dev->pipe.open = rkisp1_pipeline_open;
+ 	isp_dev->pipe.close = rkisp1_pipeline_close;
+ 	isp_dev->pipe.set_stream = rkisp1_pipeline_set_stream;
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index e83e5803e225..980f7711302d 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -165,7 +165,9 @@ struct rkisp1_device {
+ 	enum rkisp1_isp_state isp_state;
+ 	unsigned int isp_err_cnt;
+ 	enum rkisp1_isp_inp isp_inp;
+-	struct mutex apilock; /* mutex to serialize the calls from user */
++	struct mutex apilock; /* mutex to serialize the calls of stream */
++	struct mutex iqlock; /* mutex to serialize the calls of iq */
++	wait_queue_head_t sync_onoff;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/isp_params.c b/drivers/media/platform/rockchip/isp1/isp_params.c
+index 3052302741d4..fa1aacce7190 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_params.c
++++ b/drivers/media/platform/rockchip/isp1/isp_params.c
+@@ -36,6 +36,7 @@
+ #include <media/v4l2-ioctl.h>
+ #include <media/videobuf2-core.h>
+ #include <media/videobuf2-vmalloc.h>	/* for ISP params */
++#include <media/v4l2-event.h>
+ #include <linux/rk-preisp.h>
+ #include "dev.h"
+ #include "regs.h"
+@@ -2406,6 +2407,21 @@ static int rkisp1_params_querycap(struct file *file,
+ 	return 0;
+ }
+ 
++static int rkisp1_params_subs_evt(struct v4l2_fh *fh,
++				  const struct v4l2_event_subscription *sub)
++{
++	if (sub->id != 0)
++		return -EINVAL;
++
++	switch (sub->type) {
++	case CIFISP_V4L2_EVENT_STREAM_START:
++	case CIFISP_V4L2_EVENT_STREAM_STOP:
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	default:
++		return -EINVAL;
++	}
++}
++
+ /* ISP params video device IOCTLs */
+ static const struct v4l2_ioctl_ops rkisp1_params_ioctl = {
+ 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+@@ -2421,7 +2437,9 @@ static const struct v4l2_ioctl_ops rkisp1_params_ioctl = {
+ 	.vidioc_g_fmt_meta_out = rkisp1_params_g_fmt_meta_out,
+ 	.vidioc_s_fmt_meta_out = rkisp1_params_g_fmt_meta_out,
+ 	.vidioc_try_fmt_meta_out = rkisp1_params_g_fmt_meta_out,
+-	.vidioc_querycap = rkisp1_params_querycap
++	.vidioc_querycap = rkisp1_params_querycap,
++	.vidioc_subscribe_event = rkisp1_params_subs_evt,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe
+ };
+ 
+ static int rkisp1_params_vb2_queue_setup(struct vb2_queue *vq,
+@@ -2465,6 +2483,7 @@ static void rkisp1_params_vb2_buf_queue(struct vb2_buffer *vb)
+ 		vb2_buffer_done(&params_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+ 		params_vdev->first_params = false;
+ 		params_vdev->cur_params = *new_params;
++		wake_up(&params_vdev->dev->sync_onoff);
+ 		return;
+ 	}
+ 
+@@ -2477,6 +2496,7 @@ static void rkisp1_params_vb2_buf_queue(struct vb2_buffer *vb)
+ static void rkisp1_params_vb2_stop_streaming(struct vb2_queue *vq)
+ {
+ 	struct rkisp1_isp_params_vdev *params_vdev = vq->drv_priv;
++	struct rkisp1_device *dev = params_vdev->dev;
+ 	struct rkisp1_buffer *buf;
+ 	unsigned long flags;
+ 	int i;
+@@ -2484,6 +2504,7 @@ static void rkisp1_params_vb2_stop_streaming(struct vb2_queue *vq)
+ 	/* stop params input firstly */
+ 	spin_lock_irqsave(&params_vdev->config_lock, flags);
+ 	params_vdev->streamon = false;
++	wake_up(&dev->sync_onoff);
+ 	spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+ 
+ 	for (i = 0; i < RKISP1_ISP_PARAMS_REQ_BUFS_MAX; i++) {
+@@ -2556,7 +2577,7 @@ rkisp1_params_init_vb2_queue(struct vb2_queue *q,
+ 	q->mem_ops = &vb2_vmalloc_memops;
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &params_vdev->dev->apilock;
++	q->lock = &params_vdev->dev->iqlock;
+ 	q->dev = params_vdev->dev->dev;
+ 
+ 	return vb2_queue_init(q);
+@@ -2600,7 +2621,7 @@ int rkisp1_register_params_vdev(struct rkisp1_isp_params_vdev *params_vdev,
+ 	 * Provide a mutex to v4l2 core. It will be used
+ 	 * to protect all fops and v4l2 ioctls.
+ 	 */
+-	vdev->lock = &dev->apilock;
++	vdev->lock = &dev->iqlock;
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	vdev->queue = &node->buf_queue;
+ 	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_META_OUTPUT;
+diff --git a/drivers/media/platform/rockchip/isp1/isp_stats.c b/drivers/media/platform/rockchip/isp1/isp_stats.c
+index bbc4d99a400c..c061441875d9 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_stats.c
++++ b/drivers/media/platform/rockchip/isp1/isp_stats.c
+@@ -211,7 +211,7 @@ static int rkisp1_stats_init_vb2_queue(struct vb2_queue *q,
+ 	q->mem_ops = &vb2_vmalloc_memops;
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &stats_vdev->dev->apilock;
++	q->lock = &stats_vdev->dev->iqlock;
+ 	q->dev = stats_vdev->dev->dev;
+ 
+ 	return vb2_queue_init(q);
+@@ -630,7 +630,7 @@ int rkisp1_register_stats_vdev(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	vdev->ioctl_ops = &rkisp1_stats_ioctl;
+ 	vdev->fops = &rkisp1_stats_fops;
+ 	vdev->release = video_device_release_empty;
+-	vdev->lock = &dev->apilock;
++	vdev->lock = &dev->iqlock;
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	vdev->queue = &node->buf_queue;
+ 	vdev->device_caps = V4L2_CAP_META_CAPTURE | V4L2_CAP_STREAMING;
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index ac638016afe9..3fe1b17effb1 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -610,6 +610,64 @@ static int rkisp1_config_cif(struct rkisp1_device *dev)
+ 	return 0;
+ }
+ 
++static bool rkisp1_is_need_3a(struct rkisp1_device *dev)
++{
++	struct rkisp1_isp_subdev *isp_sdev = &dev->isp_sdev;
++
++	return isp_sdev->in_fmt.fmt_type == FMT_BAYER &&
++	       isp_sdev->out_fmt.fmt_type == FMT_YUV;
++}
++
++static void rkisp1_start_3a_run(struct rkisp1_device *dev)
++{
++	struct rkisp1_isp_params_vdev *params_vdev = &dev->params_vdev;
++	struct video_device *vdev = &params_vdev->vnode.vdev;
++	struct v4l2_event ev = {
++		.type = CIFISP_V4L2_EVENT_STREAM_START,
++	};
++	int ret;
++
++	if (!rkisp1_is_need_3a(dev))
++		return;
++
++	v4l2_event_queue(vdev, &ev);
++	/* rk3326/px30 require first params queued before
++	 * rkisp1_params_configure_isp() called
++	 */
++	ret = wait_event_timeout(dev->sync_onoff,
++			params_vdev->streamon && !params_vdev->first_params,
++			msecs_to_jiffies(1000));
++	if (!ret)
++		v4l2_warn(&dev->v4l2_dev,
++			  "waiting on params stream on event timeout\n");
++	else
++		v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
++			 "Waiting for 3A on use %d ms\n", 1000 - ret);
++}
++
++static void rkisp1_stop_3a_run(struct rkisp1_device *dev)
++{
++	struct rkisp1_isp_params_vdev *params_vdev = &dev->params_vdev;
++	struct video_device *vdev = &params_vdev->vnode.vdev;
++	struct v4l2_event ev = {
++		.type = CIFISP_V4L2_EVENT_STREAM_STOP,
++	};
++	int ret;
++
++	if (!rkisp1_is_need_3a(dev))
++		return;
++
++	v4l2_event_queue(vdev, &ev);
++	ret = wait_event_timeout(dev->sync_onoff, !params_vdev->streamon,
++				 msecs_to_jiffies(1000));
++	if (!ret)
++		v4l2_warn(&dev->v4l2_dev,
++			  "waiting on params stream off event timeout\n");
++	else
++		v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
++			 "Waiting for 3A off use %d ms\n", 1000 - ret);
++}
++
+ /* Mess register operations to stop isp */
+ static int rkisp1_isp_stop(struct rkisp1_device *dev)
+ {
+@@ -1347,8 +1405,13 @@ static int rkisp1_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 	struct rkisp1_device *isp_dev = sd_to_isp_dev(sd);
+ 	int ret = 0;
+ 
+-	if (!on)
++	if (!on) {
++		rkisp1_stop_3a_run(isp_dev);
++
+ 		return rkisp1_isp_stop(isp_dev);
++	}
++
++	rkisp1_start_3a_run(isp_dev);
+ 
+ 	atomic_set(&isp_dev->isp_sdev.frm_sync_seq, 0);
+ 	ret = rkisp1_config_cif(isp_dev);
+diff --git a/include/uapi/linux/rkisp1-config.h b/include/uapi/linux/rkisp1-config.h
+index ff977e9687ec..c7742f59d135 100644
+--- a/include/uapi/linux/rkisp1-config.h
++++ b/include/uapi/linux/rkisp1-config.h
+@@ -114,8 +114,15 @@
+ #define CIFISP_STAT_HIST			(1 << 3)
+ #define CIFISP_STAT_EMB_DATA			(1 << 4)
+ 
++/* ADD DATA */
+ #define CIFISP_ADD_DATA_FIFO_SIZE		(2048 * 4)
+ 
++/* Private v4l2 event */
++#define CIFISP_V4L2_EVENT_STREAM_START	\
++				(V4L2_EVENT_PRIVATE_START + 1)
++#define CIFISP_V4L2_EVENT_STREAM_STOP	\
++				(V4L2_EVENT_PRIVATE_START + 2)
++
+ /*
+  * private control id
+  */
+-- 
+2.35.3
+

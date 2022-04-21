@@ -1,0 +1,122 @@
+From 57ea50d72cb21f85b7f85c0f3654101ddeb5a593 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Wed, 30 Jan 2013 20:31:44 +0800
+Subject: [PATCH] rk fb: report vysnc in rk_fb
+
+---
+ drivers/video/rockchip/rk_fb.c | 61 +++++++++++++++++++++++++++++++++-
+ include/linux/rk_fb.h          |  3 +-
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 35abf4153238..9ff5f6f13f48 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -22,6 +22,7 @@
+ #include <linux/slab.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/kthread.h>
+ #include <linux/fb.h>
+ #include <linux/init.h>
+ #include <linux/platform_device.h>
+@@ -320,9 +321,14 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ 			dev_drv->num_buf = num_buf;
+ 			printk("rk fb use %d buffers\n",num_buf);
+ 			break;
++		case RK_FBIOSET_VSYNC_ENABLE:
++			if (copy_from_user(&enable, argp, sizeof(enable)))
++				return -EFAULT;
++			dev_drv->vsync_info.active = enable;
++			break;
+         	default:
+ 			dev_drv->ioctl(dev_drv,cmd,arg,layer_id);
+-            break;
++            		break;
+     }
+     return 0;
+ }
+@@ -636,6 +642,39 @@ static struct fb_fix_screeninfo def_fix = {
+ };
+ 
+ 
++static int rk_fb_wait_for_vsync_thread(void *data)
++{
++	struct rk_lcdc_device_driver  *dev_drv = data;
++	struct rk_fb_inf *inf =  platform_get_drvdata(g_fb_pdev);
++	struct fb_info *fbi = inf->fb[0];
++
++	while (!kthread_should_stop()) {
++		ktime_t timestamp = dev_drv->vsync_info.timestamp;
++		int ret = wait_event_interruptible(dev_drv->vsync_info.wait,
++			!ktime_equal(timestamp, dev_drv->vsync_info.timestamp) &&
++			dev_drv->vsync_info.active);
++
++		if (!ret) {
++			sysfs_notify(&fbi->dev->kobj, NULL, "vsync");
++		}
++	}
++
++	return 0;
++}
++
++static ssize_t rk_fb_vsync_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_lcdc_device_driver * dev_drv = 
++		(struct rk_lcdc_device_driver * )fbi->par;
++	return scnprintf(buf, PAGE_SIZE, "%llu\n",
++			ktime_to_ns(dev_drv->vsync_info.timestamp));
++}
++
++static DEVICE_ATTR(vsync, S_IRUGO, rk_fb_vsync_show, NULL);
++
++
+ /*****************************************************************
+ this two function is for other module that in the kernel which
+ need show image directly through fb
+@@ -1150,6 +1189,26 @@ int rk_fb_register(struct rk_lcdc_device_driver *dev_drv,
+ 		    ret = -EINVAL;
+ 		}
+ 		rkfb_create_sysfs(fbi);
++
++		if(i == 0)
++		{
++			init_waitqueue_head(&dev_drv->vsync_info.wait);
++			ret = device_create_file(fbi->dev,&dev_attr_vsync);
++			if (ret) 
++			{
++				dev_err(fbi->dev, "failed to create vsync file\n");
++			}
++			dev_drv->vsync_info.thread = kthread_run(rk_fb_wait_for_vsync_thread,
++				dev_drv, "fb-vsync");
++
++			
++			if (dev_drv->vsync_info.thread == ERR_PTR(-ENOMEM)) 
++			{
++				dev_err(fbi->dev, "failed to run vsync thread\n");
++				dev_drv->vsync_info.thread = NULL;
++			}
++			dev_drv->vsync_info.active = 1;
++		}
+ 		fb_inf->fb[fb_inf->num_fb] = fbi;
+ 	        printk("%s>>>>>%s\n",__func__,fb_inf->fb[fb_inf->num_fb]->fix.id);
+ 	        fb_inf->num_fb++;	
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 1a7e1fc9c123..8c7982e73dca 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -238,7 +238,8 @@ struct rk_lcdc_device_driver{
+ 	struct completion  frame_done;		  //sync for pan_display,whe we set a new frame address to lcdc register,we must make sure the frame begain to display
+ 	spinlock_t  cpl_lock; 			 //lock for completion  frame done
+ 	int first_frame ;
+-
++	struct rk_fb_vsync	 vsync_info;
++	
+ 	struct rk29fb_info *screen_ctr_info;
+ 	int (*open)(struct rk_lcdc_device_driver *dev_drv,int layer_id,bool open);
+ 	int (*init_lcdc)(struct rk_lcdc_device_driver *dev_drv);
+-- 
+2.35.3
+

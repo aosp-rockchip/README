@@ -1,0 +1,1576 @@
+From 8fda2f1ee493d1523d5368eb88d463a38293b3a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Tue, 15 Nov 2011 21:23:21 +0800
+Subject: [PATCH] sound: rk29: fix for kernel 3.0
+
+---
+ arch/arm/mach-rk29/devices.c |   7 +
+ sound/soc/codecs/wm8900.c    | 406 +++++++++++++++++++++--------------
+ sound/soc/rk29/rk29_i2s.c    |  83 ++++---
+ sound/soc/rk29/rk29_i2s.h    |   4 +
+ sound/soc/rk29/rk29_pcm.c    | 251 ++++++----------------
+ sound/soc/rk29/rk29_pcm.h    |   7 +-
+ sound/soc/rk29/rk29_wm8900.c |  68 +++++-
+ 7 files changed, 438 insertions(+), 388 deletions(-)
+
+diff --git a/arch/arm/mach-rk29/devices.c b/arch/arm/mach-rk29/devices.c
+index 6e20d9290ab3..0f49e6c8cb38 100644
+--- a/arch/arm/mach-rk29/devices.c
++++ b/arch/arm/mach-rk29/devices.c
+@@ -582,6 +582,12 @@ struct platform_device rk29_device_iis_8ch = {
+         .resource       = rk29_iis_8ch_resource,
+ };
+ #endif
++
++static struct platform_device rk29_device_pcm = {
++	.name = "rockchip-audio",
++	.id = -1,
++};
++
+ #ifdef CONFIG_RK29_IPP
+ /* rk29 ipp resource */
+ static struct resource rk29_ipp_resource[] = {
+@@ -864,6 +870,7 @@ EXPORT_SYMBOL(board_boot_mode);
+ static int __init rk29_init_devices(void)
+ {
+ 	platform_device_register(&rk29_device_pmu);
++	platform_device_register(&rk29_device_pcm);
+         return 0;
+ }
+ arch_initcall(rk29_init_devices);
+diff --git a/sound/soc/codecs/wm8900.c b/sound/soc/codecs/wm8900.c
+index 979e57fdcee5..4d6c4621e7fb 100755
+--- a/sound/soc/codecs/wm8900.c
++++ b/sound/soc/codecs/wm8900.c
+@@ -23,13 +23,13 @@
+ #include <linux/delay.h>
+ #include <linux/pm.h>
+ #include <linux/i2c.h>
+-#include <linux/spi/spi.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <sound/core.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
++#include <sound/soc-dapm.h>
+ #include <sound/initval.h>
+ #include <sound/tlv.h>
+ #include <mach/gpio.h>
+@@ -165,11 +165,19 @@ static struct workqueue_struct *wm8900_workq;
+ static DECLARE_DELAYED_WORK(delayed_work, wm8900_work);
+ static int wm8900_current_status = WM8900_IS_SHUTDOWN, wm8900_work_type = WM8900_WORK_NULL;
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static struct snd_soc_codec_driver soc_codec_dev_wm8900;
++#endif
+ static struct snd_soc_codec *wm8900_codec;
+ static bool isSPKon = true;
+ 
+ struct wm8900_priv {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ 	enum snd_soc_control_type control_type;
++#endif
++	struct snd_soc_codec codec;
++
++	u16 reg_cache[WM8900_MAXREG];
+ 
+ 	u32 fll_in; /* FLL input frequency */
+ 	u32 fll_out; /* FLL output frequency */
+@@ -211,7 +219,11 @@ static const u16 wm8900_reg_defaults[WM8900_MAXREG] = {
+ 	/* Remaining registers all zero */
+ };
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ static int wm8900_volatile_register(struct snd_soc_codec *codec, unsigned int reg)
++#else
++static int wm8900_volatile_register(unsigned int reg)
++#endif
+ {
+ 	switch (reg) {
+ 	case WM8900_REG_ID:
+@@ -223,7 +235,7 @@ static int wm8900_volatile_register(struct snd_soc_codec *codec, unsigned int re
+ 
+ static void wm8900_reset(struct snd_soc_codec *codec)
+ {
+-	WM8900_DBG("Enter:%s, %d, codec=0x%8X \n", __FUNCTION__, __LINE__,codec);
++	WM8900_DBG("Enter:%s, %d, codec=%p\n", __FUNCTION__, __LINE__,codec);
+ 
+ 	snd_soc_write(codec, WM8900_REG_RESET, 0);
+ 
+@@ -342,15 +354,6 @@ static void wm8900_set_hw(struct snd_soc_codec *codec)
+ 
+ static void wm8900_work(struct work_struct *work)
+ {
+-<<<<<<< HEAD
+-	struct snd_soc_dapm_context *dapm = &codec->dapm;
+-
+-	snd_soc_dapm_new_controls(dapm, wm8900_dapm_widgets,
+-				  ARRAY_SIZE(wm8900_dapm_widgets));
+-	snd_soc_dapm_add_routes(dapm, audio_map, ARRAY_SIZE(audio_map));
+-
+-	return 0;
+-=======
+         WM8900_DBG("Enter::wm8900_work : wm8900_work_type = %d\n", wm8900_work_type);
+ 
+         switch (wm8900_work_type) {
+@@ -370,7 +373,6 @@ static void wm8900_work(struct work_struct *work)
+         }
+ 
+         wm8900_work_type = WM8900_WORK_NULL;
+->>>>>>> parent of 15f7fab... temp revert rk change
+ }
+ 
+ static int wm8900_hw_params(struct snd_pcm_substream *substream,
+@@ -378,7 +380,12 @@ static int wm8900_hw_params(struct snd_pcm_substream *substream,
+ 	struct snd_soc_dai *dai)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ 	struct snd_soc_codec *codec = rtd->codec;
++#else
++	struct snd_soc_device *socdev = rtd->socdev;
++	struct snd_soc_codec *codec = socdev->card->codec;
++#endif
+ 	u16 reg;
+ 
+ 	WM8900_DBG("Enter:%s, %d \n", __FUNCTION__, __LINE__);
+@@ -745,10 +752,15 @@ static int wm8900_startup(struct snd_pcm_substream *substream,
+ 			  struct snd_soc_dai *dai)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_codec *codec = rtd->codec;
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++#else
+ 	struct snd_soc_device *socdev = rtd->socdev;
+ 	struct snd_soc_codec *codec = socdev->card->codec;
+ 	struct snd_soc_dai_link *machine = rtd->dai;
+ 	struct snd_soc_dai *codec_dai = machine->codec_dai;
++#endif
+ 
+ 	WM8900_DBG("Enter::%s----%d substream->stream:%s \n",__FUNCTION__,__LINE__,
+ 		   substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "PLAYBACK":"CAPTURE");
+@@ -759,9 +771,17 @@ static int wm8900_startup(struct snd_pcm_substream *substream,
+ 	wm8900_set_hw(codec);
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE ||
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	     codec_dai->capture_active) {
++#else
+ 	     codec_dai->capture.active) {
++#endif
+ 		snd_soc_write(codec, WM8900_REG_POWER1, 0x211D);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	} else if (!codec_dai->capture_active) {
++#else
+ 	} else if (!codec_dai->capture.active) {
++#endif
+ 		snd_soc_write(codec, WM8900_REG_POWER1, 0x210D);
+ 	}
+ 
+@@ -772,8 +792,12 @@ static void wm8900_shutdown(struct snd_pcm_substream *substream,
+ 			    struct snd_soc_dai *dai)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++#else
+ 	struct snd_soc_dai_link *machine = rtd->dai;
+ 	struct snd_soc_dai *codec_dai = machine->codec_dai;
++#endif
+ 
+ 	WM8900_DBG("Enter::%s----%d substream->stream:%s \n",__FUNCTION__,__LINE__,
+ 		   substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "PLAYBACK":"CAPTURE");
+@@ -789,7 +813,11 @@ static void wm8900_shutdown(struct snd_pcm_substream *substream,
+ 	return; /* Let codec not going to power off for pop noise */
+ #endif
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	if (!codec_dai->capture_active && !codec_dai->playback_active) {
++#else
+ 	if (!codec_dai->capture.active && !codec_dai->playback.active) {
++#endif
+ 
+ 		cancel_delayed_work_sync(&delayed_work);
+ 		wm8900_work_type = WM8900_WORK_NULL;
+@@ -818,17 +846,29 @@ static int wm8900_trigger(struct snd_pcm_substream *substream,
+ 			  struct snd_soc_dai *dai)
+ {	
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++#else
+ 	struct snd_soc_dai_link *machine = rtd->dai;
+ 	struct snd_soc_dai *codec_dai = machine->codec_dai;
++#endif
+ 
+ 	WM8900_DBG("Enter::%s----%d status = %d substream->stream:%s \n",__FUNCTION__, __LINE__, status,
+ 		   substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "PLAYBACK":"CAPTURE");	
+ 
+ 	if(status == 1 || status == 0){
+ 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK){
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++			codec_dai->playback_active = status;
++#else
+ 			codec_dai->playback.active = status;
++#endif
+ 		}else{
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++			codec_dai->capture_active = status;
++#else
+ 			codec_dai->capture.active = status;
++#endif
+ 		}
+ 	}
+ 
+@@ -852,8 +892,12 @@ static struct snd_soc_dai_ops wm8900_dai_ops = {
+ 	.trigger	= wm8900_trigger,
+ };
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ static struct snd_soc_dai_driver wm8900_dai = {
+-	.name = "wm8900-hifi",
++#else
++struct snd_soc_dai wm8900_dai = {
++#endif
++	.name = "WM8900 HiFi",
+ 	.playback = {
+ 		.stream_name = "HiFi Playback",
+ 		.channels_min = 1,
+@@ -870,6 +914,7 @@ static struct snd_soc_dai_driver wm8900_dai = {
+ 	 },
+ 	.ops = &wm8900_dai_ops,
+ };
++EXPORT_SYMBOL_GPL(wm8900_dai);
+ 
+ static int wm8900_set_bias_level(struct snd_soc_codec *codec,
+ 				 enum snd_soc_bias_level level)
+@@ -878,8 +923,13 @@ static int wm8900_set_bias_level(struct snd_soc_codec *codec,
+ 
+ 	WM8900_DBG("Enter:%s, %d, level=0x%08X \n", __FUNCTION__, __LINE__, level);
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	codec->dapm.bias_level = level;
++#else
+ 	codec->bias_level = level;
++#endif
+ 	return 0;
++#if 0
+ 
+ 	switch (level) {
+ 	case SND_SOC_BIAS_ON:
+@@ -897,7 +947,7 @@ static int wm8900_set_bias_level(struct snd_soc_codec *codec,
+ 
+ 	case SND_SOC_BIAS_STANDBY:
+ 		/* Charge capacitors if initial power up */
+-		if (codec->dapm.bias_level == SND_SOC_BIAS_OFF) {
++		if (codec->bias_level == SND_SOC_BIAS_OFF) {
+ 			/* STARTUP_BIAS_ENA on */
+ 			snd_soc_write(codec, WM8900_REG_POWER1,
+ 				     WM8900_REG_POWER1_STARTUP_BIAS_ENA);
+@@ -965,17 +1015,22 @@ static int wm8900_set_bias_level(struct snd_soc_codec *codec,
+ 			     WM8900_REG_POWER2_SYSCLK_ENA);
+ 		break;
+ 	}
+-<<<<<<< HEAD
+-	codec->dapm.bias_level = level;
+-=======
+ 
+ 	codec->bias_level = level;
+->>>>>>> parent of 15f7fab... temp revert rk change
+ 	return 0;
++#endif
+ }
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ static int wm8900_suspend(struct snd_soc_codec *codec, pm_message_t state)
++#else
++static int wm8900_suspend(struct platform_device *pdev, pm_message_t state)
++#endif
+ {
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_device *socdev = platform_get_drvdata(pdev);
++	struct snd_soc_codec *codec = socdev->card->codec;
++#endif
+ 	struct wm8900_priv *wm8900 = snd_soc_codec_get_drvdata(codec);
+ 	int fll_out = wm8900->fll_out;
+ 	int fll_in  = wm8900->fll_in;
+@@ -993,7 +1048,11 @@ static int wm8900_suspend(struct snd_soc_codec *codec, pm_message_t state)
+ 	/* Stop the FLL in an orderly fashion */
+ 	ret = wm8900_set_fll(codec, 0, 0, 0);
+ 	if (ret != 0) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ 		dev_err(codec->dev, "Failed to stop FLL\n");
++#else
++		dev_err(&pdev->dev, "Failed to stop FLL\n");
++#endif
+ 		return ret;
+ 	}
+ 
+@@ -1005,8 +1064,16 @@ static int wm8900_suspend(struct snd_soc_codec *codec, pm_message_t state)
+ 	return 0;
+ }
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ static int wm8900_resume(struct snd_soc_codec *codec)
++#else
++static int wm8900_resume(struct platform_device *pdev)
++#endif
+ {
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_device *socdev = platform_get_drvdata(pdev);
++	struct snd_soc_codec *codec = socdev->card->codec;
++#endif
+ 	struct wm8900_priv *wm8900 = snd_soc_codec_get_drvdata(codec);
+ 
+ 	wm8900_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+@@ -1022,19 +1089,15 @@ static int wm8900_resume(struct snd_soc_codec *codec)
+ 
+ 		ret = wm8900_set_fll(codec, 0, fll_in, fll_out);
+ 		if (ret != 0) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ 			dev_err(codec->dev, "Failed to restart FLL\n");
++#else
++			dev_err(&pdev->dev, "Failed to restart FLL\n");
++#endif
+ 			return ret;
+ 		}
+ 	}
+ 
+-<<<<<<< HEAD
+-	if (cache) {
+-		for (i = 0; i < WM8900_MAXREG; i++)
+-			snd_soc_write(codec, i, cache[i]);
+-		kfree(cache);
+-	} else
+-		dev_err(codec->dev, "Unable to allocate register cache\n");
+-=======
+ #ifdef WM8900_NO_POWEROFF
+ 	if (wm8900_current_status == WM8900_IS_SHUTDOWN) {
+ 
+@@ -1044,17 +1107,11 @@ static int wm8900_resume(struct snd_soc_codec *codec)
+ 		                   msecs_to_jiffies(1000));
+ 	}
+ #endif
+->>>>>>> parent of 15f7fab... temp revert rk change
+ 
+ 	return 0;
+ }
+ 
+-<<<<<<< HEAD
+-static int wm8900_probe(struct snd_soc_codec *codec)
+-{
+-	struct wm8900_priv *wm8900 = snd_soc_codec_get_drvdata(codec);
+-	int ret = 0, reg;
+-=======
++#if 0
+ static __devinit int wm8900_i2c_probe(struct i2c_client *i2c,
+ 				      const struct i2c_device_id *id)
+ {
+@@ -1068,18 +1125,44 @@ static __devinit int wm8900_i2c_probe(struct i2c_client *i2c,
+ 	wm8900 = kzalloc(sizeof(struct wm8900_priv), GFP_KERNEL);
+ 	if (wm8900 == NULL)
+ 		return -ENOMEM;
+->>>>>>> parent of 15f7fab... temp revert rk change
+ 
+-	ret = snd_soc_codec_set_cache_io(codec, 8, 16, wm8900->control_type);
++	codec = &wm8900->codec;
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	snd_soc_codec_set_drvdata(codec, wm8900);
++	codec->reg_cache = &wm8900->reg_cache[0];
++	codec->reg_cache_size = WM8900_MAXREG;
++#endif
++
++	mutex_init(&codec->mutex);
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	INIT_LIST_HEAD(&codec->dapm_widgets);
++	INIT_LIST_HEAD(&codec->dapm_paths);
++#endif
++
++	codec->name = "WM8900";
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	codec->owner = THIS_MODULE;
++	codec->dai = &wm8900_dai;
++#endif
++	codec->num_dai = 1;
++	codec->control_data = i2c;
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	codec->set_bias_level = wm8900_set_bias_level;
++	codec->volatile_register = wm8900_volatile_register;
++#endif
++	codec->dev = &i2c->dev;
++
++	ret = snd_soc_codec_set_cache_io(codec, 8, 16, SND_SOC_I2C);
+ 	if (ret != 0) {
+-		dev_err(codec->dev, "Failed to set cache I/O: %d\n", ret);
+-		return ret;
++		dev_err(&i2c->dev, "Failed to set cache I/O: %d\n", ret);
++		goto err;
+ 	}
+ 
+ 	reg = snd_soc_read(codec, WM8900_REG_ID);
+ 	if (reg != 0x8900) {
+-		dev_err(codec->dev, "Device is not a WM8900 - ID %x\n", reg);
+-		return -ENODEV;
++		dev_err(&i2c->dev, "Device is not a WM8900 - ID %x\n", reg);
++		ret = -ENODEV;
++		goto err;
+ 	}
+ 
+ 	wm8900_reset(codec);
+@@ -1087,112 +1170,51 @@ static __devinit int wm8900_i2c_probe(struct i2c_client *i2c,
+ 	/* Turn the chip on */
+ 	wm8900_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+ 
+-<<<<<<< HEAD
+-	/* Latch the volume update bits */
+-	snd_soc_write(codec, WM8900_REG_LINVOL,
+-		      snd_soc_read(codec, WM8900_REG_LINVOL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_RINVOL,
+-		      snd_soc_read(codec, WM8900_REG_RINVOL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_LOUT1CTL,
+-		      snd_soc_read(codec, WM8900_REG_LOUT1CTL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_ROUT1CTL,
+-		      snd_soc_read(codec, WM8900_REG_ROUT1CTL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_LOUT2CTL,
+-		      snd_soc_read(codec, WM8900_REG_LOUT2CTL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_ROUT2CTL,
+-		      snd_soc_read(codec, WM8900_REG_ROUT2CTL) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_LDAC_DV,
+-		      snd_soc_read(codec, WM8900_REG_LDAC_DV) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_RDAC_DV,
+-		      snd_soc_read(codec, WM8900_REG_RDAC_DV) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_LADC_DV,
+-		      snd_soc_read(codec, WM8900_REG_LADC_DV) | 0x100);
+-	snd_soc_write(codec, WM8900_REG_RADC_DV,
+-		      snd_soc_read(codec, WM8900_REG_RADC_DV) | 0x100);
+-
+-	/* Set the DAC and mixer output bias */
+-	snd_soc_write(codec, WM8900_REG_OUTBIASCTL, 0x81);
+-
+-	snd_soc_add_controls(codec, wm8900_snd_controls,
+-				ARRAY_SIZE(wm8900_snd_controls));
+-	wm8900_add_widgets(codec);
+-=======
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
+ 	wm8900_dai.dev = &i2c->dev;
+->>>>>>> parent of 15f7fab... temp revert rk change
+-
+-	return 0;
+-}
+-
+-/* power down chip */
+-static int wm8900_remove(struct snd_soc_codec *codec)
+-{
+-	wm8900_set_bias_level(codec, SND_SOC_BIAS_OFF);
+-	return 0;
+-}
+-
+-static struct snd_soc_codec_driver soc_codec_dev_wm8900 = {
+-	.probe =	wm8900_probe,
+-	.remove =	wm8900_remove,
+-	.suspend =	wm8900_suspend,
+-	.resume =	wm8900_resume,
+-	.set_bias_level = wm8900_set_bias_level,
+-	.volatile_register = wm8900_volatile_register,
+-	.reg_cache_size = ARRAY_SIZE(wm8900_reg_defaults),
+-	.reg_word_size = sizeof(u16),
+-	.reg_cache_default = wm8900_reg_defaults,
+-};
++#endif
+ 
+-#if defined(CONFIG_SPI_MASTER)
+-static int __devinit wm8900_spi_probe(struct spi_device *spi)
+-{
+-	struct wm8900_priv *wm8900;
+-	int ret;
++	wm8900_codec = codec;
+ 
+-	wm8900 = kzalloc(sizeof(struct wm8900_priv), GFP_KERNEL);
+-	if (wm8900 == NULL)
+-		return -ENOMEM;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	ret = snd_soc_register_codec(&i2c->dev,
++			&soc_codec_dev_wm8900, &wm8900_dai, 1);
++#else
++	ret = snd_soc_register_codec(codec);
++#endif
++	if (ret != 0) {
++		dev_err(&i2c->dev, "Failed to register codec: %d\n", ret);
++		goto err;
++	}
+ 
+-	wm8900->control_type = SND_SOC_SPI;
+-	spi_set_drvdata(spi, wm8900);
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++	ret = snd_soc_register_dai(&wm8900_dai);
++	if (ret != 0) {
++		dev_err(&i2c->dev, "Failed to register DAI: %d\n", ret);
++		goto err_codec;
++	}
++#endif
+ 
+-	ret = snd_soc_register_codec(&spi->dev,
+-			&soc_codec_dev_wm8900, &wm8900_dai, 1);
+-	if (ret < 0)
+-		kfree(wm8900);
+ 	return ret;
+-}
+ 
+-static int __devexit wm8900_spi_remove(struct spi_device *spi)
+-{
+-<<<<<<< HEAD
+-	snd_soc_unregister_codec(&spi->dev);
+-	kfree(spi_get_drvdata(spi));
+-	return 0;
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
++err_codec:
++	snd_soc_unregister_codec(codec);
++#endif
++err:
++	kfree(wm8900);
++	wm8900_codec = NULL;
++	return ret;
+ }
+-=======
+-	WM8900_DBG("Enter:%s, %d \n", __FUNCTION__, __LINE__);
+-        
+-	snd_soc_unregister_dai(&wm8900_dai);
+-	snd_soc_unregister_codec(wm8900_codec);
+->>>>>>> parent of 15f7fab... temp revert rk change
+-
+-static struct spi_driver wm8900_spi_driver = {
+-	.driver = {
+-		.name	= "wm8900-codec",
+-		.owner	= THIS_MODULE,
+-	},
+-	.probe		= wm8900_spi_probe,
+-	.remove		= __devexit_p(wm8900_spi_remove),
+-};
+-#endif /* CONFIG_SPI_MASTER */
+-
+-#if defined(CONFIG_I2C) || defined(CONFIG_I2C_MODULE)
++#else
+ static __devinit int wm8900_i2c_probe(struct i2c_client *i2c,
+ 				      const struct i2c_device_id *id)
+ {
+ 	struct wm8900_priv *wm8900;
+ 	int ret;
+ 
++	WM8900_DBG("Enter:%s, %d \n", __FUNCTION__, __LINE__);
++
+ 	wm8900 = kzalloc(sizeof(struct wm8900_priv), GFP_KERNEL);
+ 	if (wm8900 == NULL)
+ 		return -ENOMEM;
+@@ -1202,15 +1224,32 @@ static __devinit int wm8900_i2c_probe(struct i2c_client *i2c,
+ 
+ 	ret =  snd_soc_register_codec(&i2c->dev,
+ 			&soc_codec_dev_wm8900, &wm8900_dai, 1);
+-	if (ret < 0)
++	if (ret < 0) {
++		dev_err(&i2c->dev, "Failed to register codec: %d\n", ret);
+ 		kfree(wm8900);
++	}
+ 	return ret;
+ }
++#endif
+ 
+ static __devexit int wm8900_i2c_remove(struct i2c_client *client)
+ {
++	WM8900_DBG("Enter:%s, %d \n", __FUNCTION__, __LINE__);
++
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
+ 	snd_soc_unregister_codec(&client->dev);
+ 	kfree(i2c_get_clientdata(client));
++#else
++	snd_soc_unregister_dai(&wm8900_dai);
++	snd_soc_unregister_codec(wm8900_codec);
++
++	wm8900_set_bias_level(wm8900_codec, SND_SOC_BIAS_OFF);
++
++	wm8900_dai.dev = NULL;
++	kfree(snd_soc_codec_get_drvdata(wm8900_codec));
++	wm8900_codec = NULL;
++#endif
++
+ 	return 0;
+ }
+ 
+@@ -1228,40 +1267,34 @@ MODULE_DEVICE_TABLE(i2c, wm8900_i2c_id);
+ 
+ static struct i2c_driver wm8900_i2c_driver = {
+ 	.driver = {
+-		.name = "wm8900-codec",
++		.name = "WM8900",
+ 		.owner = THIS_MODULE,
+ 	},
+-<<<<<<< HEAD
+-	.probe =    wm8900_i2c_probe,
+-	.remove =   __devexit_p(wm8900_i2c_remove),
+-=======
+ 	.probe = wm8900_i2c_probe,
+ 	.remove = __devexit_p(wm8900_i2c_remove),
+ 	.shutdown = wm8900_i2c_shutdown,
+->>>>>>> parent of 15f7fab... temp revert rk change
+ 	.id_table = wm8900_i2c_id,
+ };
+-#endif
+ 
+-static int __init wm8900_modinit(void)
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static int wm8900_probe(struct snd_soc_codec *codec)
+ {
+-	int ret = 0;
+-<<<<<<< HEAD
+-#if defined(CONFIG_I2C) || defined(CONFIG_I2C_MODULE)
+-	ret = i2c_add_driver(&wm8900_i2c_driver);
+-	if (ret != 0) {
+-		printk(KERN_ERR "Failed to register wm8900 I2C driver: %d\n",
+-		       ret);
+-	}
+-#endif
+-#if defined(CONFIG_SPI_MASTER)
+-	ret = spi_register_driver(&wm8900_spi_driver);
++	struct wm8900_priv *wm8900 = snd_soc_codec_get_drvdata(codec);
++	int ret;
++	wm8900_codec = codec;
++
++	ret = snd_soc_codec_set_cache_io(codec, 8, 16, wm8900->control_type);
+ 	if (ret != 0) {
+-		printk(KERN_ERR "Failed to register wm8900 SPI driver: %d\n",
+-		       ret);
++		dev_err(codec->dev, "Failed to set cache I/O: %d\n", ret);
++		return ret;
+ 	}
++#else
++static int wm8900_probe(struct platform_device *pdev)
++{
++	struct snd_soc_device *socdev = platform_get_drvdata(pdev);
++	struct snd_soc_codec *codec;
++	int ret = 0;
+ #endif
+-=======
+ 
+ #ifndef WM8900_NO_POWEROFF
+ 	gpio_set_value(RK29_PIN1_PD6, GPIO_LOW);
+@@ -1270,7 +1303,11 @@ static int __init wm8900_modinit(void)
+ 	WM8900_DBG("Enter:%s, %d \n", __FUNCTION__, __LINE__);
+         
+ 	if (!wm8900_codec) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++		dev_err(codec->dev, "I2C client not yet instantiated\n");
++#else
+ 		dev_err(&pdev->dev, "I2C client not yet instantiated\n");
++#endif
+ 		return -ENODEV;
+ 	}
+ 
+@@ -1280,16 +1317,23 @@ static int __init wm8900_modinit(void)
+ #endif
+ 
+ 	codec = wm8900_codec;
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
+ 	socdev->card->codec = codec;
+ 
+ 	/* Register pcms */
+ 	ret = snd_soc_new_pcms(socdev, SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1);
+ 	if (ret < 0) {
++		dev_err(codec->dev, "Failed to register new PCMs\n");
+ 		dev_err(&pdev->dev, "Failed to register new PCMs\n");
+ 		goto pcm_err;
+ 	}
++#endif
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38))
++	wm8900_workq = create_freezable_workqueue("wm8900");
++#else
+ 	wm8900_workq = create_freezeable_workqueue("wm8900");
++#endif
+ 	if (wm8900_workq == NULL) {
+ 		kfree(codec);
+ 		return -ENOMEM;
+@@ -1301,20 +1345,62 @@ static int __init wm8900_modinit(void)
+ 
+ 	return ret;
+ 
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
+ pcm_err:
+->>>>>>> parent of 15f7fab... temp revert rk change
+ 	return ret;
++#endif
++}
++
++/* power down chip */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static int wm8900_remove(struct snd_soc_codec *codec)
++{
++	wm8900_set_bias_level(codec, SND_SOC_BIAS_OFF);
++	return 0;
++}
++#else
++static int wm8900_remove(struct platform_device *pdev)
++{
++	struct snd_soc_device *socdev = platform_get_drvdata(pdev);
++
++	snd_soc_free_pcms(socdev);
++	snd_soc_dapm_free(socdev);
++
++	return 0;
++}
++#endif
++
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static struct snd_soc_codec_driver soc_codec_dev_wm8900 = {
++	.probe =	wm8900_probe,
++	.remove =	wm8900_remove,
++	.suspend =	wm8900_suspend,
++	.resume =	wm8900_resume,
++	.set_bias_level = wm8900_set_bias_level,
++	.volatile_register = wm8900_volatile_register,
++	.reg_cache_size = ARRAY_SIZE(wm8900_reg_defaults),
++	.reg_word_size = sizeof(u16),
++	.reg_cache_default = wm8900_reg_defaults,
++};
++#else
++struct snd_soc_codec_device soc_codec_dev_wm8900 = {
++	.probe = 	wm8900_probe,
++	.remove = 	wm8900_remove,
++	.suspend = 	wm8900_suspend,
++	.resume =	wm8900_resume,
++};
++EXPORT_SYMBOL_GPL(soc_codec_dev_wm8900);
++#endif
++
++static int __init wm8900_modinit(void)
++{
++	return i2c_add_driver(&wm8900_i2c_driver);
+ }
+ module_init(wm8900_modinit);
+ 
+ static void __exit wm8900_exit(void)
+ {
+-#if defined(CONFIG_I2C) || defined(CONFIG_I2C_MODULE)
+ 	i2c_del_driver(&wm8900_i2c_driver);
+-#endif
+-#if defined(CONFIG_SPI_MASTER)
+-	spi_unregister_driver(&wm8900_spi_driver);
+-#endif
+ }
+ module_exit(wm8900_exit);
+ 
+diff --git a/sound/soc/rk29/rk29_i2s.c b/sound/soc/rk29/rk29_i2s.c
+index cb8a3cbadd5e..3c129885ba73 100755
+--- a/sound/soc/rk29/rk29_i2s.c
++++ b/sound/soc/rk29/rk29_i2s.c
+@@ -77,14 +77,22 @@ static struct rk29_dma_client rk29_dma_client_in = {
+ 
+ static inline struct rk29_i2s_info *to_info(struct snd_soc_dai *cpu_dai)
+ {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	return snd_soc_dai_get_drvdata(cpu_dai);
++#else
+ 	return cpu_dai->private_data;
++#endif
+ }
+ 
+ static struct rockchip_pcm_dma_params rk29_i2s_pcm_stereo_out[MAX_I2S];
+ static struct rockchip_pcm_dma_params rk29_i2s_pcm_stereo_in[MAX_I2S];
+ static struct rk29_i2s_info rk29_i2s[MAX_I2S];
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++struct snd_soc_dai_driver rk29_i2s_dai[MAX_I2S];
++#else
+ struct snd_soc_dai rk29_i2s_dai[MAX_I2S];
++#endif
+ EXPORT_SYMBOL_GPL(rk29_i2s_dai);
+ 
+ /*
+@@ -120,7 +128,7 @@ static struct rockchip_pcm_dma_params rockchip_i2s_pcm_stereo_in[MAX_I2S] = {
+ */
+ 
+ #if 1
+-static u32 i2s0_clk_enter()
++static u32 i2s0_clk_enter(void)
+ {
+   u32 clk = cru_readl(CRU_CLKSEL3_CON);
+   cru_writel(0x1ffff, CRU_CLKSEL3_CON);
+@@ -337,9 +345,13 @@ static int rockchip_i2s_set_fmt(struct snd_soc_dai *cpu_dai,
+ static int rockchip_i2s_hw_params(struct snd_pcm_substream *substream,
+ 				struct snd_pcm_hw_params *params, struct snd_soc_dai *socdai)
+ {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct rk29_i2s_info *i2s = to_info(socdai);
++#else
+         struct snd_soc_pcm_runtime *rtd = substream->private_data;
+         struct snd_soc_dai_link *dai = rtd->dai;
+         struct rk29_i2s_info *i2s = to_info(dai->cpu_dai);
++#endif
+ 	u32 iismod;
+ 	u32 dmarc;
+ 	  
+@@ -352,7 +364,12 @@ static int rockchip_i2s_hw_params(struct snd_pcm_substream *substream,
+     		return 0;
+     	}
+ 
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		snd_soc_dai_set_dma_data(socdai, substream, i2s->dma_playback);
++	else
++		snd_soc_dai_set_dma_data(socdai, substream, i2s->dma_capture);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+                 dai->cpu_dai->playback.dma_data = i2s->dma_playback;
+ 	else
+@@ -420,7 +437,11 @@ static int rockchip_i2s_trigger(struct snd_pcm_substream *substream, int cmd, st
+ {    
+         int ret = 0;
+         struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct rk29_i2s_info *i2s = to_info(rtd->cpu_dai);
++#else
+         struct rk29_i2s_info *i2s = to_info(rtd->dai->cpu_dai);
++#endif
+         bool stopI2S = false;
+ 
+         I2S_DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+@@ -504,13 +525,6 @@ static int rockchip_i2s_set_clkdiv(struct snd_soc_dai *cpu_dai,
+         return 0;
+ }
+ 
+-static int rockchip_set_sysclk(struct snd_soc_dai *cpu_dai,
+-                                int clk_id, unsigned int freq, int dir)
+-{
+-        return 0;
+-}
+-
+-
+ /*
+  * To avoid duplicating clock code, allow machine driver to
+  * get the clockrate from here.
+@@ -557,7 +571,11 @@ static struct snd_soc_dai_ops rockchip_i2s_dai_ops = {
+ 	.set_sysclk = rockchip_i2s_set_sysclk,
+ };
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static int rockchip_i2s_dai_probe(struct snd_soc_dai *dai)
++#else
+ static int rockchip_i2s_dai_probe(struct platform_device *pdev, struct snd_soc_dai *dai)
++#endif
+ {	
+ 	I2S_DBG("Enter %s, %d >>>>>>>>>>>\n", __func__, __LINE__);
+ 
+@@ -591,7 +609,11 @@ static int rockchip_i2s_dai_probe(struct platform_device *pdev, struct snd_soc_d
+ }
+ 
+ static int rk29_i2s_probe(struct platform_device *pdev,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++		    struct snd_soc_dai_driver *dai,
++#else
+ 		    struct snd_soc_dai *dai,
++#endif
+ 		    struct rk29_i2s_info *i2s,
+ 		    unsigned long base)
+ {
+@@ -603,7 +625,11 @@ static int rk29_i2s_probe(struct platform_device *pdev,
+ 	i2s->dev = dev;
+ 
+ 	/* record our i2s structure for later use in the callbacks */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	dev_set_drvdata(&pdev->dev, i2s);
++#else
+ 	dai->private_data = i2s;
++#endif
+ 
+ 	if (!base) {
+ 		res = platform_get_resource(pdev,
+@@ -646,27 +672,14 @@ static int rk29_i2s_probe(struct platform_device *pdev,
+ 	return 0;
+ }
+ 
+-static int rk29_i2s_register_dai(struct snd_soc_dai *dai)
+-{
+-	struct snd_soc_dai_ops *ops = dai->ops;
+-
+-	ops->trigger = rockchip_i2s_trigger;
+-	if (!ops->hw_params)
+-		ops->hw_params = rockchip_i2s_hw_params;
+-	ops->set_fmt = rockchip_i2s_set_fmt;
+-	ops->set_clkdiv = rockchip_i2s_set_clkdiv;
+-	ops->set_sysclk = rockchip_i2s_set_sysclk;
+-
+-	dai->suspend = rockchip_i2s_suspend;
+-	dai->resume = rockchip_i2s_resume;
+-
+-	return snd_soc_register_dai(dai);
+-}
+-
+ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ {
+         struct rk29_i2s_info *i2s;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_dai_driver *dai;
++#else
+         struct snd_soc_dai *dai;
++#endif
+         int    ret;
+ 
+         I2S_DBG("Enter %s, %d pdev->id = %d >>>>>>>>>>>\n", __func__, __LINE__, pdev->id);
+@@ -678,14 +691,17 @@ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ 
+         i2s = &rk29_i2s[pdev->id];
+         dai = &rk29_i2s_dai[pdev->id];
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
+ 	dai->dev = &pdev->dev;
+-	dai->name = "rk29_i2s";
++#endif
+ 	dai->id = pdev->id;
+ 	dai->symmetric_rates = 1;
+ 	if(pdev->id == 0) {
++		dai->name = "rk29_i2s.0";
+         	dai->playback.channels_min = 2;
+         	dai->playback.channels_max = 8;
+ 	}else{
++		dai->name = "rk29_i2s.1";
+                 dai->playback.channels_min = 2;
+         	dai->playback.channels_max = 2;
+ 	}
+@@ -697,6 +713,8 @@ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ 	dai->capture.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | SNDRV_PCM_FMTBIT_S24_LE;
+ 	dai->probe = rockchip_i2s_dai_probe; 
+ 	dai->ops = &rockchip_i2s_dai_ops;
++	dai->suspend = rockchip_i2s_suspend;
++	dai->resume = rockchip_i2s_resume;
+ 
+ 	//i2s->feature |= S3C_FEATURE_CDCLKCON;
+ 
+@@ -726,7 +744,7 @@ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ 	 WARN_ON(rk29_dma_request(i2s->dma_capture->channel, i2s->dma_capture->client, NULL));
+ #endif
+ 	i2s->iis_clk = clk_get(&pdev->dev, "i2s");
+-	I2S_DBG("Enter:%s, %d, iis_clk=%d\n", __FUNCTION__, __LINE__, i2s->iis_clk);
++	I2S_DBG("Enter:%s, %d, iis_clk=%p\n", __FUNCTION__, __LINE__, i2s->iis_clk);
+ 	if (IS_ERR(i2s->iis_clk)) {
+ 		dev_err(&pdev->dev, "failed to get i2s clk\n");
+ 		ret = PTR_ERR(i2s->iis_clk);
+@@ -739,7 +757,7 @@ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_clk;
+ 
+-	ret = rk29_i2s_register_dai(dai);
++	ret = snd_soc_register_dai(&pdev->dev, dai);
+ 	if (ret != 0)
+ 		goto err_i2sv2;
+ 
+@@ -756,7 +774,11 @@ static int __devinit rockchip_i2s_probe(struct platform_device *pdev)
+ 
+ static int __devexit rockchip_i2s_remove(struct platform_device *pdev)
+ {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	snd_soc_unregister_dai(&pdev->dev);
++#else
+ 	snd_soc_unregister_dai(&rk29_i2s_dai);
++#endif
+ 
+ 	return 0;
+ }
+@@ -795,9 +817,6 @@ MODULE_LICENSE("GPL");
+ #include <linux/seq_file.h>
+ static int proc_i2s_show(struct seq_file *s, void *v)
+ {
+-        unsigned int i;
+-        unsigned int reg;
+-
+         struct rk29_i2s_info *i2s=&rk29_i2s[0];
+         
+         printk("========Show I2S reg========\n");
+diff --git a/sound/soc/rk29/rk29_i2s.h b/sound/soc/rk29/rk29_i2s.h
+index 8e08d7b20650..ae9eb51ee886 100755
+--- a/sound/soc/rk29/rk29_i2s.h
++++ b/sound/soc/rk29/rk29_i2s.h
+@@ -197,7 +197,11 @@ typedef volatile struct tagIIS_STRUCT
+     unsigned int I2S_RXRST;
+ }I2S_REG,*pI2S_REG;
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++extern struct snd_soc_dai_driver rk29_i2s_dai[];
++#else
+ extern struct snd_soc_dai rk29_i2s_dai[];
++#endif
+ //extern void rockchip_add_device_i2s(void);
+ #endif /* _ROCKCHIP_IIS_H */
+ 
+diff --git a/sound/soc/rk29/rk29_pcm.c b/sound/soc/rk29/rk29_pcm.c
+index 4958779a993f..689a9910f71e 100755
+--- a/sound/soc/rk29/rk29_pcm.c
++++ b/sound/soc/rk29/rk29_pcm.c
+@@ -28,11 +28,6 @@
+ 
+ #include "rk29_pcm.h"
+ 
+-#ifdef CONFIG_ANDROID_POWER
+-#include <linux/android_power.h>
+-static android_suspend_lock_t audio_lock;
+-#endif
+-
+ #if 0
+ #define DBG(x...) printk(KERN_INFO x)
+ #else
+@@ -83,119 +78,6 @@ struct rockchip_runtime_data {
+ };
+ 
+ 
+-/* rockchip__dma_buf_enqueue
+- *
+- *queue an given buffer for dma transfer set.
+- *data       the physical address of the buffer data
+- *size       the size of the buffer in bytes
+-*/
+-static int rockchip_dma_buffer_set_enqueue(struct rockchip_runtime_data *prtd, dma_addr_t data, int size)
+-{   
+-	struct rockchip_dma_buf_set *sg_buf;
+-	
+-        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+-	sg_buf = kzalloc(sizeof(struct rockchip_dma_buf_set), GFP_ATOMIC);/* ddl@rock-chips.com:GFP_KERNEL->GFP_ATOMIC */
+-	
+-	if (sg_buf == NULL) {
+-		DBG("scatter sg buffer allocate failed,no memory!\n");
+-		return -ENOMEM;
+-	}
+-	sg_buf->next = NULL;
+-	sg_buf->sg.dma_address = data;
+-	sg_buf->sg.length = size/4;  ////4;
+-	if( prtd->curr == NULL) {
+-		prtd->curr = sg_buf;
+-		prtd->end  = sg_buf;
+-		prtd->next = NULL;
+-	} else {
+-		if (prtd->end == NULL)
+-			DBG("prtd->end is NULL\n");
+-			prtd->end->next = sg_buf;
+-			prtd->end = sg_buf;
+-	}
+-	/* if necessary, update the next buffer field */
+-	if (prtd->next == NULL)
+-		prtd->next = sg_buf;
+-	return 0;
+-}
+-
+-void rockchip_pcm_dma_irq(s32 ch, void *data);
+-
+-void audio_start_dma(struct snd_pcm_substream *substream, int mode)
+-{
+-	struct rockchip_runtime_data *prtd;
+-	unsigned long flags;
+-	struct rockchip_dma_buf_set *sg_buf;
+-    
+-        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+-
+-	prtd = substream->runtime->private_data;
+-
+-	switch (mode) {
+-	case DMA_MODE_WRITE:
+-		if (prtd->transfer_first == 1) {
+-			prtd->transfer_first = 0;
+-		} else {
+-			sg_buf = prtd->curr;
+-			if (sg_buf != NULL) {
+-				prtd->curr = sg_buf->next;
+-				prtd->next = sg_buf->next;
+-				sg_buf->next  = NULL;
+-				kfree(sg_buf);
+-				sg_buf = NULL;
+-			}
+-		}
+-
+-		sg_buf = prtd->next;
+-		DBG("Enter::%s----%d---length=%x---dma_address=%x\n",__FUNCTION__,__LINE__,sg_buf->sg.length,sg_buf->sg.dma_address);		
+-		if (sg_buf) {			
+-			spin_lock_irqsave(&prtd->lock, flags);
+-			disable_dma(prtd->params->channel);
+-			//set_dma_sg(prtd->params->channel, &(sg_buf->sg), 1);
+-			set_dma_mode(prtd->params->channel, DMA_MODE_WRITE);
+-			set_dma_handler(prtd->params->channel, rockchip_pcm_dma_irq, substream, DMA_IRQ_RIGHTNOW_MODE);
+-			__set_dma_addr(prtd->params->channel, (void *)(sg_buf->sg.dma_address));
+-			set_dma_count(prtd->params->channel, sg_buf->sg.length);
+-			enable_dma(prtd->params->channel);
+-			spin_unlock_irqrestore(&prtd->lock, flags);
+-		} else {
+-			DBG("next buffer is NULL for playback\n");
+-			return;
+-		}
+-		break;
+-	case DMA_MODE_READ:
+-		if (prtd->transfer_first == 1) {
+-			prtd->transfer_first = 0;
+-		} else {
+-			sg_buf = prtd->curr;
+-			if (sg_buf != NULL) {
+-				prtd->curr = sg_buf->next;
+-				prtd->next = sg_buf->next;
+-				sg_buf->next  = NULL;
+-				kfree(sg_buf);
+-				sg_buf = NULL;
+-			}
+-		}
+-
+-		sg_buf = prtd->next;
+-		if (sg_buf) {			
+-			spin_lock_irqsave(&prtd->lock, flags);
+-			disable_dma(prtd->params->channel);
+-			//set_dma_sg(prtd->params->channel, &(sg_buf->sg), 1);
+-			set_dma_mode(prtd->params->channel, DMA_MODE_READ);
+-			set_dma_handler(prtd->params->channel, rockchip_pcm_dma_irq, substream, DMA_IRQ_RIGHTNOW_MODE);			
+-			__set_dma_addr(prtd->params->channel, (void *)(sg_buf->sg.dma_address));
+-			set_dma_count(prtd->params->channel, sg_buf->sg.length);
+-			enable_dma(prtd->params->channel);
+-			spin_unlock_irqrestore(&prtd->lock, flags);
+-		} else {
+-			DBG("next buffer is NULL for capture\n");
+-			return;
+-		}
+-		break;
+-	}
+-}
+-
+ /* rockchip_pcm_enqueue
+  *
+  * place a dma buffer onto the queue for the dma system
+@@ -206,10 +88,7 @@ static void rockchip_pcm_enqueue(struct snd_pcm_substream *substream)
+ 	struct rockchip_runtime_data *prtd = substream->runtime->private_data;	
+ 	dma_addr_t pos = prtd->dma_pos;
+ 	int ret;
+-	char* vpos;
+-	int i;
+-        
+-	
++
+         DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+         
+         while (prtd->dma_loaded < prtd->dma_limit) {
+@@ -236,11 +115,10 @@ static void rockchip_pcm_enqueue(struct snd_pcm_substream *substream)
+ 		}
+ 
+ 
+-		//ret = rockchip_dma_buffer_set_enqueue(prtd, pos, len);		
+ 		ret = rk29_dma_enqueue(prtd->params->channel, 
+ 		        substream, pos, len);
+                 
+-                DBG("Enter::%s, %d, ret=%d, Channel=%d, Addr=0x%X, Len=%d\n",
++                DBG("Enter::%s, %d, ret=%d, Channel=%d, Addr=0x%X, Len=%lu\n",
+                         __FUNCTION__,__LINE__, ret, prtd->params->channel, pos, len);		        
+ 		if (ret == 0) {
+ 			prtd->dma_loaded++;
+@@ -254,43 +132,12 @@ static void rockchip_pcm_enqueue(struct snd_pcm_substream *substream)
+ 	prtd->dma_pos = pos;
+ }
+ 
+-void rockchip_pcm_dma_irq(s32 ch, void *data)
+-{    
+-        struct snd_pcm_substream *substream = data;
+-	struct rockchip_runtime_data *prtd;
+-	unsigned long flags;
+-	
+-	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+-
+-	prtd = substream->runtime->private_data;
+-	if (substream)
+-		snd_pcm_period_elapsed(substream);
+-	spin_lock(&prtd->lock);
+-	prtd->dma_loaded--;
+-	if (prtd->state & ST_RUNNING) {
+-		rockchip_pcm_enqueue(substream);
+-	}
+-        spin_unlock(&prtd->lock);
+-        local_irq_save(flags);
+-	if (prtd->state & ST_RUNNING) {
+-		if (prtd->dma_loaded) {
+-			if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+-				audio_start_dma(substream, DMA_MODE_WRITE);
+-			else
+-				audio_start_dma(substream, DMA_MODE_READ);
+-		}
+-	}
+-	local_irq_restore(flags);   
+-}
+-
+-
+ void rk29_audio_buffdone(void *dev_id, int size,
+ 				   enum rk29_dma_buffresult result)
+ {
+         struct snd_pcm_substream *substream = dev_id;
+ 	struct rockchip_runtime_data *prtd;
+-	unsigned long flags;
+-	
++
+ 	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+ 	
+ 	if (!substream)
+@@ -299,7 +146,7 @@ void rk29_audio_buffdone(void *dev_id, int size,
+ 		return;
+ 
+ 	prtd = substream->runtime->private_data;
+-	DBG("Enter::%s----%d, substream=0x%08X, prtd=0x%08X\n",__FUNCTION__,__LINE__, substream, prtd);
++	DBG("Enter::%s----%d, substream=%p, prtd=%p\n",__FUNCTION__,__LINE__, substream, prtd);
+ 	if (substream){
+ 		snd_pcm_period_elapsed(substream);
+ 	}
+@@ -318,7 +165,9 @@ static int rockchip_pcm_hw_params(struct snd_pcm_substream *substream,
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct rockchip_runtime_data *prtd = runtime->private_data;
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct rockchip_pcm_dma_params *dma = snd_soc_dai_get_dma_data(rtd->cpu_dai, substream);
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
+ 	struct rockchip_pcm_dma_params *dma = snd_soc_dai_get_dma_data(rtd->dai->cpu_dai, substream);
+ #else
+ 	struct rockchip_pcm_dma_params *dma = rtd->dai->cpu_dai->dma_data;
+@@ -350,7 +199,6 @@ static int rockchip_pcm_hw_params(struct snd_pcm_substream *substream,
+ 		DBG("params %p, client %p, channel %d\n", prtd->params,
+ 			prtd->params->client, prtd->params->channel);
+ 
+-		//ret = request_dma(prtd->params->channel, "i2s");  ///prtd->params->client->name);
+                 ret = rk29_dma_request(prtd->params->channel, prtd->params->client, NULL);
+                 DBG("Enter::%s, %d, ret=%d, Channel=%d\n", __FUNCTION__, __LINE__, ret, prtd->params->channel);
+ /*
+@@ -399,7 +247,6 @@ static int rockchip_pcm_hw_free(struct snd_pcm_substream *substream)
+ 
+ 	if (prtd->params) {
+ #ifdef CONFIG_SND_I2S_DMA_EVENT_DYNAMIC		
+-		//free_dma(prtd->params->channel);
+ 		rk29_dma_free(prtd->params->channel, prtd->params->client);
+ 		prtd->params = NULL;
+ #endif		
+@@ -455,7 +302,11 @@ static int rockchip_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	int ret = 0;
+ 	/**************add by qiuen for volume*****/
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_dai *pCodec_dai = rtd->codec_dai;
++#else
+ 	struct snd_soc_dai *pCodec_dai = rtd->dai->codec_dai;
++#endif
+ 	int vol = 0;
+ 	int streamType = 0;
+ 	
+@@ -465,8 +316,13 @@ static int rockchip_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 		vol = substream->number % 100;
+ 		streamType = (substream->number / 100) % 100;
+ 		DBG("enter:vol=%d,streamType=%d\n",vol,streamType);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++		if(pCodec_dai->driver->ops->set_volume)
++			pCodec_dai->driver->ops->set_volume(streamType, vol);
++#else
+ 		if(pCodec_dai->ops->set_volume)
+ 			pCodec_dai->ops->set_volume(streamType, vol);
++#endif
+ 	}
+ 	/****************************************************/
+ 	spin_lock(&prtd->lock);
+@@ -476,17 +332,6 @@ static int rockchip_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	        DBG(" START \n");
+ 	    prtd->state |= ST_RUNNING;
+ 	    rk29_dma_ctrl(prtd->params->channel, RK29_DMAOP_START);
+-	    /*
+-	    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+-		    audio_start_dma(substream, DMA_MODE_WRITE);
+-		} else {
+-		    audio_start_dma(substream, DMA_MODE_READ);
+-		}
+-		*/
+-#ifdef CONFIG_ANDROID_POWER        
+-        android_lock_suspend(&audio_lock);
+-        DBG("%s::start audio , lock system suspend\n" , __func__ );
+-#endif		
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	    DBG(" RESUME \n");
+@@ -501,12 +346,6 @@ static int rockchip_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	    DBG(" STOPS \n");
+ 		prtd->state &= ~ST_RUNNING;
+ 		rk29_dma_ctrl(prtd->params->channel, RK29_DMAOP_STOP);
+-		//disable_dma(prtd->params->channel);
+-#ifdef CONFIG_ANDROID_POWER        
+-        android_unlock_suspend(&audio_lock );
+-        DBG("%s::stop audio , unlock system suspend\n" , __func__ );
+-#endif
+-		
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -530,9 +369,7 @@ rockchip_pcm_pointer(struct snd_pcm_substream *substream)
+ 	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+ 	spin_lock(&prtd->lock);
+ 
+-        //get_dma_position(prtd->params->channel, &src, &dst);
+         rk29_dma_getposition(prtd->params->channel, &src, &dst);
+-	//dma_getposition(prtd->params->channel, &src, &dst);
+ 	
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+ 		res = dst - prtd->dma_start;
+@@ -635,6 +472,7 @@ static int rockchip_pcm_preallocate_dma_buffer(struct snd_pcm *pcm, int stream)
+ 	if (!buf->area)
+ 		return -ENOMEM;
+ 	buf->bytes = size;
++	DBG("%s: size %d\n",__FUNCTION__, size);
+ 	return 0;
+ }
+ 
+@@ -670,24 +508,27 @@ static int rockchip_pcm_new(struct snd_card *card,
+ 
+ 	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+ 
+-#ifdef CONFIG_ANDROID_POWER
+-	audio_lock.name = "rk-audio";
+-	android_init_suspend_lock(&audio_lock);
+-#endif
+-
+ 	if (!card->dev->dma_mask)
+ 		card->dev->dma_mask = &rockchip_pcm_dmamask;
+ 	if (!card->dev->coherent_dma_mask)
+ 		card->dev->coherent_dma_mask = 0xffffffff;
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	if (dai->driver->playback.channels_min) {
++#else
+ 	if (dai->playback.channels_min) {
++#endif
+ 		ret = rockchip_pcm_preallocate_dma_buffer(pcm,
+ 			SNDRV_PCM_STREAM_PLAYBACK);
+ 		if (ret)
+ 			goto out;
+ 	}
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	if (dai->driver->capture.channels_min) {
++#else
+ 	if (dai->capture.channels_min) {
++#endif
+ 		ret = rockchip_pcm_preallocate_dma_buffer(pcm,
+ 			SNDRV_PCM_STREAM_CAPTURE);
+ 		if (ret)
+@@ -697,6 +538,47 @@ static int rockchip_pcm_new(struct snd_card *card,
+ 	return ret;
+ }
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static struct snd_soc_platform_driver rockchip_pcm_platform = {
++	.ops		= &rockchip_pcm_ops,
++	.pcm_new	= rockchip_pcm_new,
++	.pcm_free	= rockchip_pcm_free_dma_buffers,
++};
++
++static int __devinit rockchip_pcm_platform_probe(struct platform_device *pdev)
++{
++        DBG("Enter::%s, %d\n", __FUNCTION__, __LINE__);
++	return snd_soc_register_platform(&pdev->dev, &rockchip_pcm_platform);
++}
++
++static int __devexit rockchip_pcm_platform_remove(struct platform_device *pdev)
++{
++	snd_soc_unregister_platform(&pdev->dev);
++	return 0;
++}
++
++static struct platform_driver rockchip_pcm_driver = {
++	.driver = {
++		.name = "rockchip-audio",
++		.owner = THIS_MODULE,
++	},
++	.probe = rockchip_pcm_platform_probe,
++	.remove = __devexit_p(rockchip_pcm_platform_remove),
++};
++
++static int __init snd_rockchip_pcm_init(void)
++{
++        DBG("Enter::%s, %d\n", __FUNCTION__, __LINE__);
++	return platform_driver_register(&rockchip_pcm_driver);
++}
++module_init(snd_rockchip_pcm_init);
++
++static void __exit snd_rockchip_pcm_exit(void)
++{
++	platform_driver_unregister(&rockchip_pcm_driver);
++}
++module_exit(snd_rockchip_pcm_exit);
++#else
+ struct snd_soc_platform rk29_soc_platform = {
+ 	.name		= "rockchip-audio",
+ 	.pcm_ops 	= &rockchip_pcm_ops,
+@@ -717,6 +599,7 @@ static void __exit rockchip_soc_platform_exit(void)
+ 	snd_soc_unregister_platform(&rk29_soc_platform);
+ }
+ module_exit(rockchip_soc_platform_exit);
++#endif
+ 
+ /* Module information */
+ MODULE_AUTHOR("rockchip");
+diff --git a/sound/soc/rk29/rk29_pcm.h b/sound/soc/rk29/rk29_pcm.h
+index 96d774c5a626..62c92e2acba1 100755
+--- a/sound/soc/rk29/rk29_pcm.h
++++ b/sound/soc/rk29/rk29_pcm.h
+@@ -17,13 +17,8 @@
+ #define ST_RUNNING		(1<<0)
+ #define ST_OPENED		(1<<1)
+ 
+-/* dma buffer */
+-struct rockchip_dma_client {
+-	char                *name;
+-};
+-
+ struct rockchip_pcm_dma_params {
+-	struct rockchip_dma_client *client;	/* stream identifier */
++	struct rk29_dma_client *client;	/* stream identifier */
+ 	int channel;				/* Channel ID */
+ 	dma_addr_t dma_addr;
+ 	int dma_size;				/* Size of the DMA transfer */
+diff --git a/sound/soc/rk29/rk29_wm8900.c b/sound/soc/rk29/rk29_wm8900.c
+index e7430080ee91..aca84583eac8 100755
+--- a/sound/soc/rk29/rk29_wm8900.c
++++ b/sound/soc/rk29/rk29_wm8900.c
+@@ -35,10 +35,14 @@ static int rk29_hw_params(struct snd_pcm_substream *substream,
+ 	struct snd_pcm_hw_params *params)
+ {
+         struct snd_soc_pcm_runtime *rtd = substream->private_data;
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	struct snd_soc_dai *codec_dai = rtd->codec_dai;
++	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
++#else
+         struct snd_soc_dai *codec_dai = rtd->dai->codec_dai;
+         struct snd_soc_dai *cpu_dai = rtd->dai->cpu_dai;
++#endif
+         unsigned int pll_out = 0; 
+-        unsigned int lrclk = 0;
+ 		int div_bclk,div_mclk;
+         int ret;
+ 		struct clk	*general_pll;
+@@ -49,7 +53,11 @@ static int rk29_hw_params(struct snd_pcm_substream *substream,
+         #define HW_PARAMS_FLAG_EQVOL_OFF 0x22
+         if ((params->flags == HW_PARAMS_FLAG_EQVOL_ON)||(params->flags == HW_PARAMS_FLAG_EQVOL_OFF))
+         {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++		ret = codec_dai->driver->ops->hw_params(substream, params, codec_dai); //by Vincent
++#else
+         	ret = codec_dai->ops->hw_params(substream, params, codec_dai); //by Vincent
++#endif
+         	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+         }
+         else
+@@ -130,7 +138,7 @@ static int rk29_hw_params(struct snd_pcm_substream *substream,
+ 			div_bclk=(pll_out)/params_rate(params)-1;
+ 			div_mclk=0;
+ 		}
+-		DBG("func is%s,gpll=%ld,pll_out=%ld,div_mclk=%ld\n",
++		DBG("func is%s,gpll=%ld,pll_out=%u,div_mclk=%d\n",
+ 			__FUNCTION__,clk_get_rate(general_pll),pll_out,div_mclk);
+ 		snd_soc_dai_set_sysclk(cpu_dai, 0, pll_out, 0);
+         snd_soc_dai_set_clkdiv(cpu_dai, ROCKCHIP_DIV_BCLK,div_bclk);
+@@ -161,11 +169,33 @@ static const struct snd_soc_dapm_route audio_map[]= {
+ /*
+  * Logic for a wm8900 as connected on a rockchip board.
+  */
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static int rk29_wm8900_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_codec *codec = rtd->codec;
++	struct snd_soc_dapm_context *dapm = &codec->dapm;
++
++        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++
++        /* Add specific widgets */
++	snd_soc_dapm_new_controls(dapm, wm8900_dapm_widgets,
++				  ARRAY_SIZE(wm8900_dapm_widgets));
++	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++        /* Set up specific audio path audio_mapnects */
++        snd_soc_dapm_add_routes(dapm, audio_map, ARRAY_SIZE(audio_map));
++        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++        snd_soc_dapm_nc_pin(dapm, "HP_L");
++        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++	snd_soc_dapm_nc_pin(dapm, "HP_R");
++	DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++        snd_soc_dapm_sync(dapm);
++        DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
++
++	return 0;
++}
++#else
+ static int rk29_wm8900_init(struct snd_soc_codec *codec)
+ {
+-	struct snd_soc_dai *codec_dai = &codec->dai[0];
+-	int ret;
+-	  
+         DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+ 
+         /* Add specific widgets */
+@@ -183,11 +213,24 @@ static int rk29_wm8900_init(struct snd_soc_codec *codec)
+         DBG("Enter::%s----%d\n",__FUNCTION__,__LINE__);
+         return 0;
+ }
++#endif
+ 
+ static struct snd_soc_ops rk29_ops = {
+ 	  .hw_params = rk29_hw_params,
+ };
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static struct snd_soc_dai_link rk29_dai = {
++	.name = "WM8900",
++	.stream_name = "WM8900 PCM",
++	.codec_name = "WM8900.0-001a",
++	.platform_name = "rockchip-audio",
++	.cpu_dai_name = "rk29_i2s.0",
++	.codec_dai_name = "WM8900 HiFi",
++	.init = rk29_wm8900_init,
++	.ops = &rk29_ops,
++};
++#else
+ static struct snd_soc_dai_link rk29_dai = {
+ 	  .name = "WM8900",
+ 	  .stream_name = "WM8900 PCM",
+@@ -196,7 +239,15 @@ static struct snd_soc_dai_link rk29_dai = {
+ 	  .init = rk29_wm8900_init,
+ 	  .ops = &rk29_ops,
+ };
++#endif
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static struct snd_soc_card snd_soc_card_rk29 = {
++	.name = "RK29_WM8900",
++	.dai_link = &rk29_dai,
++	.num_links = 1,
++};
++#else
+ static struct snd_soc_card snd_soc_card_rk29 = {
+ 	  .name = "RK29_WM8900",
+ 	  .platform = &rk29_soc_platform,
+@@ -205,10 +256,11 @@ static struct snd_soc_card snd_soc_card_rk29 = {
+ };
+ 
+ 
+-static struct snd_soc_device rk29_snd_devdata = {
++static struct snd_soc_card rk29_snd_devdata = {
+ 	  .card = &snd_soc_card_rk29,
+ 	  .codec_dev = &soc_codec_dev_wm8900,
+ };
++#endif
+ 
+ static struct platform_device *rk29_snd_device;
+ 
+@@ -222,8 +274,12 @@ static int __init audio_card_init(void)
+ 		  ret = -ENOMEM;
+ 		  return ret;
+ 	}
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++	platform_set_drvdata(rk29_snd_device, &snd_soc_card_rk29);
++#else
+ 	platform_set_drvdata(rk29_snd_device, &rk29_snd_devdata);
+ 	rk29_snd_devdata.dev = &rk29_snd_device->dev;
++#endif
+ 	ret = platform_device_add(rk29_snd_device);
+ 	if (ret) {
+ 	        DBG("platform device add failed\n");
+-- 
+2.35.3
+

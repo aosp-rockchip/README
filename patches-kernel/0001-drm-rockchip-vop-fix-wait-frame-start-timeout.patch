@@ -1,0 +1,124 @@
+From ac4076851c5c59d23415338ba958085724fbbfc8 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Tue, 30 Jan 2018 16:50:17 +0800
+Subject: [PATCH] drm/rockchip: vop: fix wait frame start timeout
+
+In the following case will lead to wait frame start timeout:
+
+uboot(HDMI output 4K(DCLK: 594HZ))
+    -> kernel start(unplug HDMI)
+        ->drm driver probe(plug HDMI)enable crtc(set dclk to 27Mhz)
+            ->VOP timing register is frame effect
+                ->VOP working at 4k output but dclk is 27M
+                    -> VOP frame time 16.6ms * 574 / 27 = 354ms
+
+Change-Id: Ic98af0029a15fbeef78e4f3abe4e739e760ab471
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 45 +++++++++++++--------
+ 1 file changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 2426c0f7d6ac..6290aec7f100 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -201,6 +201,7 @@ struct vop {
+ 	bool is_iommu_enabled;
+ 	bool is_iommu_needed;
+ 	bool is_enabled;
++	bool mode_update;
+ 
+ 	u32 version;
+ 
+@@ -860,6 +861,20 @@ static int to_vop_csc_mode(int csc_mode)
+ 	}
+ }
+ 
++static void vop_disable_all_planes(struct vop *vop)
++{
++	bool active;
++	int ret;
++
++	vop_disable_allwin(vop);
++	vop_cfg_done(vop);
++	ret = readx_poll_timeout_atomic(vop_is_allwin_disabled,
++					vop, active, active,
++					0, 500 * 1000);
++	if (ret)
++		dev_err(vop->dev, "wait win close timeout\n");
++}
++
+ /*
+  * rk3399 colorspace path:
+  *      Input        Win csc                     Output
+@@ -2401,8 +2416,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 	int sys_status = drm_crtc_index(crtc) ?
+ 				SYS_STATUS_LCDC1 : SYS_STATUS_LCDC0;
+ 	uint32_t val;
+-	bool active;
+-	int ret, act_end;
++	int act_end;
+ 
+ 	rockchip_set_system_status(sys_status);
+ 	mutex_lock(&vop->vop_lock);
+@@ -2523,7 +2537,8 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 	VOP_CTRL_SET(vop, win_csc_mode_sel, 1);
+ 
+ 	if (vop_crtc_mode_update(crtc)) {
+-		vop_disable_allwin(vop);
++		vop_disable_all_planes(vop);
++		vop->mode_update = true;
+ 		DRM_DEV_INFO(vop->dev, "Update mode to %d*%d, close all win\n",
+ 			      hdisplay, vdisplay);
+ 	}
+@@ -2538,20 +2553,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	enable_irq(vop->irq);
+ 	drm_crtc_vblank_on(crtc);
+-	drm_crtc_vblank_get(crtc);
+ 	mutex_unlock(&vop->vop_lock);
+-	/* make sure timing config take effect */
+-	ret = readx_poll_timeout_atomic(vop_fs_irq_is_active,
+-					vop, active, !active,
+-					0, 100 * 1000);
+-	if (ret)
+-		dev_err(vop->dev, "wait exit fs irq timeout\n");
+-	ret = readx_poll_timeout_atomic(vop_fs_irq_is_active,
+-					vop, active, active,
+-					0, 100 * 1000);
+-	if (ret)
+-		dev_err(vop->dev, "wait get fs irq timeout\n");
+-	drm_crtc_vblank_put(crtc);
+ }
+ 
+ static int vop_zpos_cmp(const void *a, const void *b)
+@@ -3142,9 +3144,17 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	vop_cfg_update(crtc, old_crtc_state);
+ 
+ 	if (!vop->is_iommu_enabled && vop->is_iommu_needed) {
+-		bool need_wait_vblank = !vop_is_allwin_disabled(vop);
++		bool need_wait_vblank;
+ 		int ret;
+ 
++		if (vop->mode_update)
++			vop_disable_all_planes(vop);
++
++		need_wait_vblank = !vop_is_allwin_disabled(vop);
++		if (vop->mode_update && need_wait_vblank)
++			dev_warn(vop->dev, "mode_update:%d, need wait blk:%d\n",
++				 vop->mode_update, need_wait_vblank);
++
+ 		if (need_wait_vblank) {
+ 			bool active;
+ 
+@@ -3188,6 +3198,7 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	spin_lock_irqsave(&vop->irq_lock, flags);
+ 	vop->pre_overlay = s->hdr.pre_overlay;
+ 	vop_cfg_done(vop);
++	vop->mode_update = false;
+ 	spin_unlock_irqrestore(&vop->irq_lock, flags);
+ 
+ 	/*
+-- 
+2.35.3
+

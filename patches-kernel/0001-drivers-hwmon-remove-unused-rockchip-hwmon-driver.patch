@@ -1,0 +1,1087 @@
+From a2d35be1e0e5db6f938877b4b7921f512f30dd27 Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Mon, 5 Nov 2018 09:35:10 +0800
+Subject: [PATCH] drivers/hwmon: remove unused rockchip-hwmon driver
+
+Change-Id: I0dd911d10309f7760aa3846afa0e414ee6494e81
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ drivers/hwmon/hwmon-rockchip.h |  77 -----
+ drivers/hwmon/rockchip-hwmon.c | 453 ----------------------------
+ drivers/hwmon/rockchip_tsadc.c | 520 ---------------------------------
+ 3 files changed, 1050 deletions(-)
+ delete mode 100755 drivers/hwmon/hwmon-rockchip.h
+ delete mode 100755 drivers/hwmon/rockchip-hwmon.c
+ delete mode 100755 drivers/hwmon/rockchip_tsadc.c
+
+diff --git a/drivers/hwmon/hwmon-rockchip.h b/drivers/hwmon/hwmon-rockchip.h
+deleted file mode 100755
+index df2c91ed8d25..000000000000
+--- a/drivers/hwmon/hwmon-rockchip.h
++++ /dev/null
+@@ -1,77 +0,0 @@
+-/*
+- * Copyright (C) ST-Ericsson 2010 - 2013
+- * License terms: GNU General Public License v2
+- * Author: Martin Persson <martin.persson@stericsson.com>
+- *         Hongbo Zhang <hongbo.zhang@linaro.com>
+- */
+-
+-#ifndef _ROCKCHIP_H
+-#define _ROCKCHIP_H
+-
+-#define NUM_SENSORS 5
+-
+-struct rockchip_temp;
+-
+-/*
+- * struct rockchip_temp_ops - rockchip chip specific ops
+- * @read_sensor: reads gpadc output
+- * @irq_handler: irq handler
+- * @show_name: hwmon device name
+- * @show_label: hwmon attribute label
+- * @is_visible: is attribute visible
+- */
+-struct rockchip_temp_ops {
+-	int (*read_sensor)(int);
+-	int (*irq_handler)(int, struct rockchip_temp *);
+-	ssize_t (*show_name)(struct device *,
+-			struct device_attribute *, char *);
+-	ssize_t (*show_label) (struct device *,
+-			struct device_attribute *, char *);
+-	int (*is_visible)(struct attribute *, int);
+-};
+-
+-/*
+- * struct rockchip_temp - representation of temp mon device
+- * @pdev: platform device
+- * @hwmon_dev: hwmon device
+- * @ops: rockchip chip specific ops
+- * @gpadc_addr: gpadc channel address
+- * @min: sensor temperature min value
+- * @max: sensor temperature max value
+- * @max_hyst: sensor temperature hysteresis value for max limit
+- * @min_alarm: sensor temperature min alarm
+- * @max_alarm: sensor temperature max alarm
+- * @work: delayed work scheduled to monitor temperature periodically
+- * @work_active: True if work is active
+- * @lock: mutex
+- * @monitored_sensors: number of monitored sensors
+- * @plat_data: private usage, usually points to platform specific data
+- */
+-struct rockchip_temp {
+-	struct platform_device *pdev;
+-	struct device *hwmon_dev;
+-	struct rockchip_temp_ops ops;
+-	u8 tsadc_addr[NUM_SENSORS];
+-	unsigned long min[NUM_SENSORS];
+-	unsigned long max[NUM_SENSORS];
+-	unsigned long max_hyst[NUM_SENSORS];
+-	bool min_alarm[NUM_SENSORS];
+-	bool max_alarm[NUM_SENSORS];
+-	struct delayed_work work;
+-	bool work_active;
+-	struct mutex lock;
+-	int monitored_sensors;
+-	void *plat_data;
+-	void __iomem		*regs;
+-	struct clk		*clk;
+-	struct clk		*pclk;
+-	struct resource		*ioarea;
+-	struct tsadc_host		*tsadc;
+-	struct work_struct 	auto_ht_irq_work;
+-	struct workqueue_struct  *workqueue;
+-	struct workqueue_struct  *tsadc_workqueue;
+-};
+-
+-int rockchip_hwmon_init(struct rockchip_temp *data);
+-
+-#endif /* _ROCKCHIP_H */
+diff --git a/drivers/hwmon/rockchip-hwmon.c b/drivers/hwmon/rockchip-hwmon.c
+deleted file mode 100755
+index bed728ed4e49..000000000000
+--- a/drivers/hwmon/rockchip-hwmon.c
++++ /dev/null
+@@ -1,453 +0,0 @@
+-/*
+- * Copyright (C) rockchip 2014
+- * Author:zhangqing <zhangqing@rock-chips.com>
+- *        
+- * License Terms: GNU General Public License v2
+- *
+- * rockchip tsadc does not provide auto tsADC, so to monitor the required temperatures,
+- * a periodic work is used. It is more important to not wake up the CPU than
+- * to perform this job, hence the use of a deferred delay.
+- *
+- */
+-
+-#include <linux/err.h>
+-#include <linux/hwmon.h>
+-#include <linux/hwmon-sysfs.h>
+-#include <linux/interrupt.h>
+-#include <linux/jiffies.h>
+-#include <linux/module.h>
+-#include <linux/mutex.h>
+-#include <linux/of.h>
+-#include <linux/platform_device.h>
+-#include <linux/pm.h>
+-#include <linux/slab.h>
+-#include <linux/sysfs.h>
+-#include <linux/workqueue.h>
+-#include <linux/rockchip/common.h>
+-#include "hwmon-rockchip.h"
+-
+-
+-#define DEFAULT_MONITOR_DELAY	HZ
+-#define DEFAULT_MAX_TEMP	130
+-
+-static inline void schedule_monitor(struct rockchip_temp *data)
+-{
+-	data->work_active = true;
+-	schedule_delayed_work(&data->work, DEFAULT_MONITOR_DELAY);
+-}
+-
+-static void threshold_updated(struct rockchip_temp *data)
+-{
+-	int i;
+-	for (i = 0; i < data->monitored_sensors; i++)
+-		if (data->max[i] != 0 || data->min[i] != 0) {
+-			schedule_monitor(data);
+-			return;
+-		}
+-
+-	dev_dbg(&data->pdev->dev, "No active thresholds.\n");
+-	cancel_delayed_work_sync(&data->work);
+-	data->work_active = false;
+-}
+-
+-static void tsadc_monitor(struct work_struct *work)
+-{
+-	int temp,i, ret;
+-	char alarm_node[30];
+-	bool updated_min_alarm, updated_max_alarm;
+-	struct rockchip_temp *data;
+-
+-	data = container_of(work, struct rockchip_temp, work.work);
+-	mutex_lock(&data->lock);
+-
+-	for (i = 0; i < data->monitored_sensors; i++) {
+-		/* Thresholds are considered inactive if set to 0 */
+-		if (data->max[i] == 0 && data->min[i] == 0)
+-			continue;
+-
+-		if (data->max[i] < data->min[i])
+-			continue;
+-
+-		temp = data->ops.read_sensor(i);
+-		if (temp == INVALID_TEMP) {
+-			dev_err(&data->pdev->dev, "TSADC read failed\n");
+-			continue;
+-		}
+-
+-		updated_min_alarm = false;
+-		updated_max_alarm = false;
+-
+-		if (data->min[i] != 0) {
+-			if (temp < data->min[i]) {
+-				if (data->min_alarm[i] == false) {
+-					data->min_alarm[i] = true;
+-					updated_min_alarm = true;
+-				}
+-			} else {
+-				if (data->min_alarm[i] == true) {
+-					data->min_alarm[i] = false;
+-					updated_min_alarm = true;
+-				}
+-			}
+-		}
+-		if (data->max[i] != 0) {
+-			if (temp > data->max[i]) {
+-				if (data->max_alarm[i] == false) {
+-					data->max_alarm[i] = true;
+-					updated_max_alarm = true;
+-				}
+-			} else if (temp < data->max[i] - data->max_hyst[i]) {
+-				if (data->max_alarm[i] == true) {
+-					data->max_alarm[i] = false;
+-					updated_max_alarm = true;
+-				}
+-			}
+-		}
+-
+-		if (updated_min_alarm) {
+-			ret = sprintf(alarm_node, "temp%d_min_alarm", i + 1);
+-			sysfs_notify(&data->pdev->dev.kobj, NULL, alarm_node);
+-		}
+-		if (updated_max_alarm) {
+-			ret = sprintf(alarm_node, "temp%d_max_alarm", i + 1);
+-			sysfs_notify(&data->pdev->dev.kobj, NULL, alarm_node);
+-		}
+-	}
+-
+-	schedule_monitor(data);
+-	mutex_unlock(&data->lock);
+-}
+-
+-/* HWMON sysfs interfaces */
+-static ssize_t show_name(struct device *dev, struct device_attribute *devattr,
+-			 char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	/* Show chip name */
+-	return data->ops.show_name(dev, devattr, buf);
+-}
+-
+-static ssize_t show_label(struct device *dev,
+-			  struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	/* Show each sensor label */
+-	return data->ops.show_label(dev, devattr, buf);
+-}
+-
+-static ssize_t show_input(struct device *dev,
+-			  struct device_attribute *devattr, char *buf)
+-{
+-	int  temp;
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	temp = data->ops.read_sensor(attr->index);
+-
+-	return sprintf(buf, "%d\n", temp);
+-}
+-
+-/* Set functions (RW nodes) */
+-static ssize_t set_min(struct device *dev, struct device_attribute *devattr,
+-		       const char *buf, size_t count)
+-{
+-	unsigned long val;
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-	int res = kstrtol(buf, 10, &val);
+-	if (res < 0)
+-		return res;
+-
+-	val = clamp_val(val, 0, DEFAULT_MAX_TEMP);
+-
+-	mutex_lock(&data->lock);
+-	data->min[attr->index] = val;
+-	threshold_updated(data);
+-	mutex_unlock(&data->lock);
+-
+-	return count;
+-}
+-
+-static ssize_t set_max(struct device *dev, struct device_attribute *devattr,
+-		       const char *buf, size_t count)
+-{
+-	unsigned long val;
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-	int res = kstrtol(buf, 10, &val);
+-	if (res < 0)
+-		return res;
+-
+-	val = clamp_val(val, 0, DEFAULT_MAX_TEMP);
+-
+-	mutex_lock(&data->lock);
+-	data->max[attr->index] = val;
+-	threshold_updated(data);
+-	mutex_unlock(&data->lock);
+-
+-	return count;
+-}
+-
+-static ssize_t set_max_hyst(struct device *dev,
+-			    struct device_attribute *devattr,
+-			    const char *buf, size_t count)
+-{
+-	unsigned long val;
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-	int res = kstrtoul(buf, 10, &val);
+-	if (res < 0)
+-		return res;
+-
+-	val = clamp_val(val, 0, DEFAULT_MAX_TEMP);
+-
+-	mutex_lock(&data->lock);
+-	data->max_hyst[attr->index] = val;
+-	threshold_updated(data);
+-	mutex_unlock(&data->lock);
+-
+-	return count;
+-}
+-
+-/* Show functions (RO nodes) */
+-static ssize_t show_min(struct device *dev,
+-			struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%ld\n", data->min[attr->index]);
+-}
+-
+-static ssize_t show_max(struct device *dev,
+-			struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%ld\n", data->max[attr->index]);
+-}
+-
+-static ssize_t show_max_hyst(struct device *dev,
+-			     struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%ld\n", data->max_hyst[attr->index]);
+-}
+-
+-static ssize_t show_min_alarm(struct device *dev,
+-			      struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%d\n", data->min_alarm[attr->index]);
+-}
+-
+-static ssize_t show_max_alarm(struct device *dev,
+-			      struct device_attribute *devattr, char *buf)
+-{
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-
+-	return sprintf(buf, "%d\n", data->max_alarm[attr->index]);
+-}
+-
+-static umode_t rockchip_attrs_visible(struct kobject *kobj,
+-				   struct attribute *attr, int n)
+-{
+-	struct device *dev = container_of(kobj, struct device, kobj);
+-	struct rockchip_temp *data = dev_get_drvdata(dev);
+-
+-	if (data->ops.is_visible)
+-		return data->ops.is_visible(attr, n);
+-
+-	return attr->mode;
+-}
+-
+-/* Chip name, required by hwmon */
+-static SENSOR_DEVICE_ATTR(name, S_IRUGO, show_name, NULL, 0);
+-
+-/* GPADC - SENSOR0 */
+-static SENSOR_DEVICE_ATTR(temp0_label, S_IRUGO, show_label, NULL, 0);
+-static SENSOR_DEVICE_ATTR(temp0_input, S_IRUGO, show_input, NULL, 0);
+-static SENSOR_DEVICE_ATTR(temp0_min, S_IWUSR | S_IRUGO, show_min, set_min, 0);
+-static SENSOR_DEVICE_ATTR(temp0_max, S_IWUSR | S_IRUGO, show_max, set_max, 0);
+-static SENSOR_DEVICE_ATTR(temp0_max_hyst, S_IWUSR | S_IRUGO,
+-			  show_max_hyst, set_max_hyst, 0);
+-static SENSOR_DEVICE_ATTR(temp0_min_alarm, S_IRUGO, show_min_alarm, NULL, 0);
+-static SENSOR_DEVICE_ATTR(temp0_max_alarm, S_IRUGO, show_max_alarm, NULL, 0);
+-
+-/* GPADC - SENSOR1 */
+-static SENSOR_DEVICE_ATTR(temp1_label, S_IRUGO, show_label, NULL, 1);
+-static SENSOR_DEVICE_ATTR(temp1_input, S_IRUGO, show_input, NULL, 1);
+-static SENSOR_DEVICE_ATTR(temp1_min, S_IWUSR | S_IRUGO, show_min, set_min, 1);
+-static SENSOR_DEVICE_ATTR(temp1_max, S_IWUSR | S_IRUGO, show_max, set_max, 1);
+-static SENSOR_DEVICE_ATTR(temp1_max_hyst, S_IWUSR | S_IRUGO,
+-			  show_max_hyst, set_max_hyst, 1);
+-static SENSOR_DEVICE_ATTR(temp1_min_alarm, S_IRUGO, show_min_alarm, NULL, 1);
+-static SENSOR_DEVICE_ATTR(temp1_max_alarm, S_IRUGO, show_max_alarm, NULL, 1);
+-
+-/* GPADC - SENSOR2 */
+-static SENSOR_DEVICE_ATTR(temp2_label, S_IRUGO, show_label, NULL, 2);
+-static SENSOR_DEVICE_ATTR(temp2_input, S_IRUGO, show_input, NULL, 2);
+-static SENSOR_DEVICE_ATTR(temp2_min, S_IWUSR | S_IRUGO, show_min, set_min, 2);
+-static SENSOR_DEVICE_ATTR(temp2_max, S_IWUSR | S_IRUGO, show_max, set_max, 2);
+-static SENSOR_DEVICE_ATTR(temp2_max_hyst, S_IWUSR | S_IRUGO,
+-			  show_max_hyst, set_max_hyst, 2);
+-static SENSOR_DEVICE_ATTR(temp2_min_alarm, S_IRUGO, show_min_alarm, NULL, 2);
+-static SENSOR_DEVICE_ATTR(temp2_max_alarm, S_IRUGO, show_max_alarm, NULL, 2);
+-
+-/* GPADC - SENSOR3 */
+-static SENSOR_DEVICE_ATTR(temp3_label, S_IRUGO, show_label, NULL, 3);
+-static SENSOR_DEVICE_ATTR(temp3_input, S_IRUGO, show_input, NULL, 3);
+-static SENSOR_DEVICE_ATTR(temp3_min, S_IWUSR | S_IRUGO, show_min, set_min, 3);
+-static SENSOR_DEVICE_ATTR(temp3_max, S_IWUSR | S_IRUGO, show_max, set_max, 3);
+-static SENSOR_DEVICE_ATTR(temp3_max_hyst, S_IWUSR | S_IRUGO,
+-			  show_max_hyst, set_max_hyst, 3);
+-static SENSOR_DEVICE_ATTR(temp3_min_alarm, S_IRUGO, show_min_alarm, NULL, 3);
+-static SENSOR_DEVICE_ATTR(temp3_max_alarm, S_IRUGO, show_max_alarm, NULL, 3);
+-
+-
+-struct attribute *rockchip_temp_attributes[] = {
+-	&sensor_dev_attr_name.dev_attr.attr,
+-
+-	&sensor_dev_attr_temp0_label.dev_attr.attr,
+-	&sensor_dev_attr_temp0_input.dev_attr.attr,
+-	&sensor_dev_attr_temp0_min.dev_attr.attr,
+-	&sensor_dev_attr_temp0_max.dev_attr.attr,
+-	&sensor_dev_attr_temp0_max_hyst.dev_attr.attr,
+-	&sensor_dev_attr_temp0_min_alarm.dev_attr.attr,
+-	&sensor_dev_attr_temp0_max_alarm.dev_attr.attr,
+-
+-	&sensor_dev_attr_temp1_label.dev_attr.attr,
+-	&sensor_dev_attr_temp1_input.dev_attr.attr,
+-	&sensor_dev_attr_temp1_min.dev_attr.attr,
+-	&sensor_dev_attr_temp1_max.dev_attr.attr,
+-	&sensor_dev_attr_temp1_max_hyst.dev_attr.attr,
+-	&sensor_dev_attr_temp1_min_alarm.dev_attr.attr,
+-	&sensor_dev_attr_temp1_max_alarm.dev_attr.attr,
+-
+-	&sensor_dev_attr_temp2_label.dev_attr.attr,
+-	&sensor_dev_attr_temp2_input.dev_attr.attr,
+-	&sensor_dev_attr_temp2_min.dev_attr.attr,
+-	&sensor_dev_attr_temp2_max.dev_attr.attr,
+-	&sensor_dev_attr_temp2_max_hyst.dev_attr.attr,
+-	&sensor_dev_attr_temp2_min_alarm.dev_attr.attr,
+-	&sensor_dev_attr_temp2_max_alarm.dev_attr.attr,
+-
+-	&sensor_dev_attr_temp3_label.dev_attr.attr,
+-	&sensor_dev_attr_temp3_input.dev_attr.attr,
+-	&sensor_dev_attr_temp3_min.dev_attr.attr,
+-	&sensor_dev_attr_temp3_max.dev_attr.attr,
+-	&sensor_dev_attr_temp3_max_hyst.dev_attr.attr,
+-	&sensor_dev_attr_temp3_min_alarm.dev_attr.attr,
+-	&sensor_dev_attr_temp3_max_alarm.dev_attr.attr,
+-
+-	
+-	NULL
+-};
+-
+-static const struct attribute_group rockchip_temp_group = {
+-	.attrs = rockchip_temp_attributes,
+-	.is_visible = rockchip_attrs_visible,
+-};
+-
+-static int rockchip_temp_probe(struct platform_device *pdev)
+-{
+-	struct rockchip_temp *data;
+-	int err;
+-	printk("%s,line=%d\n", __func__,__LINE__);
+-
+-	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+-	if (!data)
+-		return -ENOMEM;
+-	data->pdev = pdev;
+-	mutex_init(&data->lock);
+-
+-	/* Chip specific initialization */
+-	err = rockchip_hwmon_init(data);
+-	if (err	< 0 || !data->ops.read_sensor || !data->ops.show_name ||
+-			!data->ops.show_label)
+-		return err;
+-
+-	INIT_DEFERRABLE_WORK(&data->work, tsadc_monitor);
+-	platform_set_drvdata(pdev, data);
+-
+-	err = sysfs_create_group(&pdev->dev.kobj, &rockchip_temp_group);
+-	if (err < 0) {
+-		dev_err(&pdev->dev, "Create sysfs group failed (%d)\n", err);
+-		return err;
+-	}
+-	data->hwmon_dev = hwmon_device_register(&pdev->dev);
+-	if (IS_ERR(data->hwmon_dev)) {
+-		err = PTR_ERR(data->hwmon_dev);
+-		dev_err(&pdev->dev, "Class registration failed (%d)\n", err);
+-		goto exit_sysfs_group;
+-	}
+-	return 0;
+-
+-exit_sysfs_group:
+-	sysfs_remove_group(&pdev->dev.kobj, &rockchip_temp_group);
+-	return err;
+-}
+-
+-static int rockchip_temp_remove(struct platform_device *pdev)
+-{
+-	struct rockchip_temp *data = platform_get_drvdata(pdev);
+-
+-	cancel_delayed_work_sync(&data->work);
+-	hwmon_device_unregister(data->hwmon_dev);
+-	sysfs_remove_group(&pdev->dev.kobj, &rockchip_temp_group);
+-
+-	return 0;
+-}
+-
+-static int rockchip_temp_suspend(struct platform_device *pdev,
+-			       pm_message_t state)
+-{
+-	struct rockchip_temp *data = platform_get_drvdata(pdev);
+-
+-	if (data->work_active)
+-		cancel_delayed_work_sync(&data->work);
+-
+-	return 0;
+-}
+-
+-static int rockchip_temp_resume(struct platform_device *pdev)
+-{
+-	struct rockchip_temp *data = platform_get_drvdata(pdev);
+-
+-	if (data->work_active)
+-		schedule_monitor(data);
+-
+-	return 0;
+-}
+-
+-#ifdef CONFIG_OF
+-static const struct of_device_id rockchip_temp_match[] = {
+-	{ .compatible = "rockchip,tsadc" },
+-	{},
+-};
+-#endif
+-
+-static struct platform_driver rockchip_temp_driver = {
+-	.driver = {
+-		.owner = THIS_MODULE,
+-		.name = "tsadc",
+-		.of_match_table = of_match_ptr(rockchip_temp_match),
+-	},
+-	.suspend = rockchip_temp_suspend,
+-	.resume = rockchip_temp_resume,
+-	.probe = rockchip_temp_probe,
+-	.remove = rockchip_temp_remove,
+-};
+-
+-module_platform_driver(rockchip_temp_driver);
+-
+-MODULE_AUTHOR("<rockchip>");
+-MODULE_DESCRIPTION("rockchip temperature driver");
+-MODULE_LICENSE("GPL");
+-
+diff --git a/drivers/hwmon/rockchip_tsadc.c b/drivers/hwmon/rockchip_tsadc.c
+deleted file mode 100755
+index 22691294087c..000000000000
+--- a/drivers/hwmon/rockchip_tsadc.c
++++ /dev/null
+@@ -1,520 +0,0 @@
+-/*
+- * Copyright (C) ST-Ericsson 2010 - 2013
+- * Author: Martin Persson <martin.persson@stericsson.com>
+- *         Hongbo Zhang <hongbo.zhang@linaro.org>
+- * License Terms: GNU General Public License v2
+- *
+- * When the AB8500 thermal warning temperature is reached (threshold cannot
+- * be changed by SW), an interrupt is set, and if no further action is taken
+- * within a certain time frame, pm_power off will be called.
+- *
+- * When AB8500 thermal shutdown temperature is reached a hardware shutdown of
+- * the AB8500 will occur.
+- */
+-
+- #include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/device.h>
+-#include <linux/platform_device.h>
+-#include <linux/err.h>
+-#include <linux/clk.h>
+-#include <linux/interrupt.h>
+-#include <linux/irq.h>
+-#include <linux/io.h>
+-#include <linux/delay.h>
+-#include <linux/slab.h>
+-#include <linux/workqueue.h>
+-#include <linux/ioport.h>
+-
+-#include <linux/err.h>
+-#include <linux/hwmon.h>
+-#include <linux/hwmon-sysfs.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/sysfs.h>
+-
+-#include <linux/timer.h>
+-#include <linux/completion.h>
+-#include <linux/of_irq.h>
+-#include <linux/regulator/consumer.h>
+-#include <linux/of_platform.h>
+-#include <linux/of.h>
+-#include <linux/of_device.h>
+-#include <linux/rockchip/common.h>
+-#include "hwmon-rockchip.h"
+-
+-
+-#define DEFAULT_POWER_OFF_DELAY	(HZ * 10)
+-/* Number of monitored sensors should not greater than NUM_SENSORS */
+-#define NUM_MONITORED_SENSORS	4
+-
+-#define TSADC_USER_CON  0x00
+-#define TSADC_AUTO_CON  0x04
+-
+-#define TSADC_CTRL_CH(ch)	((ch) << 0)
+-#define TSADC_CTRL_POWER_UP	(1 << 3)
+-#define TSADC_CTRL_START	(1 << 4)
+-
+-#define TSADC_STAS_BUSY		(1 << 12)
+-#define TSADC_STAS_BUSY_MASK	(1 << 12)
+-#define TSADC_AUTO_STAS_BUSY		(1 << 16)
+-#define TSADC_AUTO_STAS_BUSY_MASK	(1 << 16)
+-#define TSADC_SAMPLE_DLY_SEL  (1 << 17)
+-#define TSADC_SAMPLE_DLY_SEL_MASK  (1 << 17)
+-
+-#define TSADC_INT_EN  0x08
+-#define TSADC_INT_PD  0x0c
+-
+-#define TSADC_DATA0  0x20
+-#define TSADC_DATA1  0x24
+-#define TSADC_DATA2  0x28
+-#define TSADC_DATA3  0x2c
+-#define TSADC_DATA_MASK		0xfff
+-
+-#define TSADC_COMP0_INT  0x30
+-#define TSADC_COMP1_INT  0x34
+-#define TSADC_COMP2_INT  0x38
+-#define TSADC_COMP3_INT  0x3c
+-
+-#define TSADC_COMP0_SHUT  0x40
+-#define TSADC_COMP1_SHUT  0x44
+-#define TSADC_COMP2_SHUT  0x48
+-#define TSADC_COMP3_SHUT  0x4c
+-
+-#define TSADC_HIGHT_INT_DEBOUNCE  0x60
+-#define TSADC_HIGHT_TSHUT_DEBOUNCE  0x64
+-#define TSADC_HIGHT_INT_DEBOUNCE_TIME 0x0a
+-#define TSADC_HIGHT_TSHUT_DEBOUNCE_TIME 0x0a
+-
+-#define TSADC_AUTO_PERIOD  0x68
+-#define TSADC_AUTO_PERIOD_HT  0x6c
+-#define TSADC_AUTO_PERIOD_TIME	0x03e8
+-#define TSADC_AUTO_PERIOD_HT_TIME  0x64
+-
+-#define TSADC_AUTO_EVENT_NAME		"tsadc"
+-
+-#define TSADC_COMP_INT_DATA		80
+-#define TSADC_COMP_INT_DATA_MASK		0xfff
+-#define TSADC_COMP_SHUT_DATA_MASK		0xfff
+-#define TSADC_TEMP_INT_EN 0
+-#define TSADC_TEMP_SHUT_EN 1
+-static int tsadc_ht_temp;
+-static int tsadc_ht_reset_cru;
+-static int tsadc_ht_pull_gpio;
+-
+-struct tsadc_port {
+-	struct pinctrl		*pctl;
+-	struct pinctrl_state	*pins_default;
+-	struct pinctrl_state	*pins_tsadc_int;
+-};
+-
+-struct rockchip_tsadc_temp {
+-	struct delayed_work power_off_work;
+-	struct rockchip_temp *rockchip_data;
+-	void __iomem		*regs;
+-	struct clk		*clk;
+-	struct clk		*pclk;
+-	int irq;
+-	struct resource		*ioarea;
+-	struct tsadc_host		*tsadc;
+-	struct work_struct 	auto_ht_irq_work;
+-	struct workqueue_struct  *workqueue;
+-	struct workqueue_struct  *tsadc_workqueue;
+-};
+-struct tsadc_table
+-{
+-	int code;
+-	int temp;
+-};
+-
+-static const struct tsadc_table table[] =
+-{
+-	{TSADC_DATA_MASK, -40},
+-
+-	{3800, -40},
+-	{3792, -35},
+-	{3783, -30},
+-	{3774, -25},
+-	{3765, -20},
+-	{3756, -15},
+-	{3747, -10},
+-	{3737, -5},
+-	{3728, 0},
+-	{3718, 5},
+-
+-	{3708, 10},
+-	{3698, 15},
+-	{3688, 20},
+-	{3678, 25},
+-	{3667, 30},
+-	{3656, 35},
+-	{3645, 40},
+-	{3634, 45},
+-	{3623, 50},
+-	{3611, 55},
+-
+-	{3600, 60},
+-	{3588, 65},
+-	{3575, 70},
+-	{3563, 75},
+-	{3550, 80},
+-	{3537, 85},
+-	{3524, 90},
+-	{3510, 95},
+-	{3496, 100},
+-	{3482, 105},
+-
+-	{3467, 110},
+-	{3452, 115},
+-	{3437, 120},
+-	{3421, 125},
+-
+-	{0, 125},
+-};
+-
+-static struct rockchip_tsadc_temp *g_dev;
+-
+-static DEFINE_MUTEX(tsadc_mutex);
+-
+-static u32 tsadc_readl(u32 offset)
+-{
+-	return readl_relaxed(g_dev->regs + offset);
+-}
+-
+-static void tsadc_writel(u32 val, u32 offset)
+-{
+-	writel_relaxed(val, g_dev->regs + offset);
+-}
+-
+-void rockchip_tsadc_auto_ht_work(struct work_struct *work)
+-{
+-        int ret,val;
+-
+-//	printk("%s,line=%d\n", __func__,__LINE__);
+-
+-	mutex_lock(&tsadc_mutex);
+-
+-	val = tsadc_readl(TSADC_INT_PD);
+-	tsadc_writel(val &(~ (1 <<8) ), TSADC_INT_PD);
+-	ret = tsadc_readl(TSADC_INT_PD);
+-	tsadc_writel(ret | 0xff, TSADC_INT_PD);       //clr irq status
+-	if ((val & 0x0f) != 0){
+-		printk("rockchip tsadc is over temp . %s,line=%d\n", __func__,__LINE__);
+-		pm_power_off();					//power_off
+-	}
+-	mutex_unlock(&tsadc_mutex);
+-}
+-
+-static irqreturn_t rockchip_tsadc_auto_ht_interrupt(int irq, void *data)
+-{
+-	struct rockchip_tsadc_temp *dev = data;
+-
+-	printk("%s,line=%d\n", __func__,__LINE__);
+-	
+-	queue_work(dev->workqueue, &dev->auto_ht_irq_work);
+-	
+-	return IRQ_HANDLED;
+-}
+-
+-static void rockchip_tsadc_set_cmpn_int_vale( int chn, int temp)
+-{
+-	u32 code = 0;
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(table) - 1; i++) {
+-		if (temp <= table[i].temp && temp > table[i -1].temp) {
+-			code = table[i].code;
+-		}
+-	}
+-	tsadc_writel((code & TSADC_COMP_INT_DATA_MASK), (TSADC_COMP0_INT + chn*4));
+-
+-}
+-
+-static void rockchip_tsadc_set_cmpn_shut_vale( int chn, int temp)
+-{
+-	u32 code=0;
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(table) - 1; i++) {
+-		if (temp <= table[i].temp && temp > table[i -1].temp) {
+-			code = table[i].code;
+-		}
+-	}
+-
+-	tsadc_writel((code & TSADC_COMP_SHUT_DATA_MASK), (TSADC_COMP0_SHUT + chn*4));
+-}
+-
+-static void rockchip_tsadc_set_auto_int_en( int chn, int ht_int_en,int tshut_en)
+-{
+-	u32 ret;
+-	tsadc_writel(0, TSADC_INT_EN);
+-	if (ht_int_en){
+-		ret = tsadc_readl(TSADC_INT_EN);
+-		tsadc_writel( ret | (1 << chn), TSADC_INT_EN);
+-	}
+-	if (tshut_en){
+-		ret = tsadc_readl(TSADC_INT_EN);
+-		if (tsadc_ht_pull_gpio)
+-			tsadc_writel(ret | (0xf << (chn + 4)), TSADC_INT_EN);
+-		else if (tsadc_ht_reset_cru)
+-			tsadc_writel(ret | (0xf << (chn + 8)), TSADC_INT_EN);
+-	}	
+-
+-}
+-static void rockchip_tsadc_auto_mode_set(int chn, int int_temp,
+-	int shut_temp, int int_en, int shut_en)
+-{
+-	u32 ret;
+-	
+-	if (!g_dev || chn > 4)
+-		return;
+-	
+-	mutex_lock(&tsadc_mutex);
+-	
+-	clk_enable(g_dev->pclk);
+-	clk_enable(g_dev->clk);
+-	
+-	msleep(10);
+-	tsadc_writel(0, TSADC_AUTO_CON);
+-	tsadc_writel(3 << (4+chn), TSADC_AUTO_CON);
+-	msleep(10);
+-	if ((tsadc_readl(TSADC_AUTO_CON) & TSADC_AUTO_STAS_BUSY_MASK) != TSADC_AUTO_STAS_BUSY) {
+-		rockchip_tsadc_set_cmpn_int_vale(chn,int_temp);
+-		rockchip_tsadc_set_cmpn_shut_vale(chn,shut_temp),
+-
+-		tsadc_writel(TSADC_AUTO_PERIOD_TIME, TSADC_AUTO_PERIOD);
+-		tsadc_writel(TSADC_AUTO_PERIOD_HT_TIME, TSADC_AUTO_PERIOD_HT);
+-
+-		tsadc_writel(TSADC_HIGHT_INT_DEBOUNCE_TIME,
+-			TSADC_HIGHT_INT_DEBOUNCE);
+-		tsadc_writel(TSADC_HIGHT_TSHUT_DEBOUNCE_TIME,
+-			TSADC_HIGHT_TSHUT_DEBOUNCE);
+-		
+-		rockchip_tsadc_set_auto_int_en(chn,int_en,shut_en);	
+-	}
+-
+-	msleep(10);
+-
+-	ret = tsadc_readl(TSADC_AUTO_CON);
+-	tsadc_writel(ret | (1 <<0) , TSADC_AUTO_CON);
+-	
+-	mutex_unlock(&tsadc_mutex);
+-		
+-}
+-
+-int rockchip_tsadc_set_auto_temp(int chn)
+-{
+-	rockchip_tsadc_auto_mode_set(chn, TSADC_COMP_INT_DATA,
+-		tsadc_ht_temp, TSADC_TEMP_INT_EN, TSADC_TEMP_SHUT_EN);
+-	return 0;
+-}
+-EXPORT_SYMBOL(rockchip_tsadc_set_auto_temp);
+-
+-static void rockchip_tsadc_get(int chn, int *temp, int *code)
+-{
+-	int i;
+-	*temp = 0;
+-	*code = 0;
+-
+-	if (!g_dev || chn > 4){
+-		*temp = INVALID_TEMP;
+-		return ;
+-	}
+-#if 0
+-	mutex_lock(&tsadc_mutex);
+-
+-	clk_enable(g_dev->pclk);
+-	clk_enable(g_dev->clk);
+-
+-	msleep(10);
+-	tsadc_writel(0, TSADC_USER_CON);
+-	tsadc_writel(TSADC_CTRL_POWER_UP | TSADC_CTRL_CH(chn), TSADC_USER_CON);
+-	msleep(20);
+-	if ((tsadc_readl(TSADC_USER_CON) & TSADC_STAS_BUSY_MASK) != TSADC_STAS_BUSY) {
+-		*code = tsadc_readl((TSADC_DATA0 + chn*4)) & TSADC_DATA_MASK;
+-		for (i = 0; i < ARRAY_SIZE(table) - 1; i++) {
+-			if ((*code) <= table[i].code && (*code) > table[i + 1].code) {
+-				*temp = table[i].temp + (table[i + 1].temp - table[i].temp) * (table[i].code - (*code)) / (table[i].code - table[i + 1].code);
+-			}
+-		}
+-	}
+-	
+-	tsadc_writel(0, TSADC_USER_CON);
+-
+-	clk_disable(g_dev->clk);
+-	clk_disable(g_dev->pclk);
+-
+-	mutex_unlock(&tsadc_mutex);
+-#else
+-	*code = tsadc_readl((TSADC_DATA0 + chn*4)) & TSADC_DATA_MASK;
+-	for (i = 0; i < ARRAY_SIZE(table) - 1; i++) {
+-		if ((*code) <= table[i].code && (*code) > table[i + 1].code)
+-			*temp = table[i].temp + (table[i + 1].temp
+-			- table[i].temp) * (table[i].code - (*code))
+-			/ (table[i].code - table[i + 1].code);
+-	}
+-#endif
+-}
+-
+- int rockchip_tsadc_get_temp(int chn)
+-{
+-	int temp, code;
+-	
+-	rockchip_tsadc_get(chn, &temp, &code);
+-
+-	return temp;
+-}
+-EXPORT_SYMBOL(rockchip_tsadc_get_temp);
+-
+-static ssize_t rockchip_show_name(struct device *dev,
+-		struct device_attribute *devattr, char *buf)
+-{
+-	return sprintf(buf, "rockchip-tsadc\n");
+-}
+-
+-static ssize_t rockchip_show_label(struct device *dev,
+-		struct device_attribute *devattr, char *buf)
+-{
+-	char *label;
+-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
+-	int index = attr->index;
+-
+-	switch (index) {
+-	case 0:
+-		label = "tsadc0";
+-		break;
+-	case 1:
+-		label = "tsadc1";
+-		break;
+-	case 2:
+-		label = "tsadc2";
+-		break;
+-	case 3:
+-		label = "tsadc3";
+-		break;
+-	default:
+-		return -EINVAL;
+-	}
+-
+-	return sprintf(buf, "%s\n", label);
+-}
+-
+-int rockchip_hwmon_init(struct rockchip_temp *data)
+-{
+-	struct rockchip_tsadc_temp *rockchip_tsadc_data;
+-	struct resource *res;
+-	struct device_node *np = data->pdev->dev.of_node;
+-	int ret,irq;
+-	u32 rate;
+-	struct tsadc_port *uap;
+-	
+-	rockchip_tsadc_data = devm_kzalloc(&data->pdev->dev, sizeof(*rockchip_tsadc_data),
+-		GFP_KERNEL);
+-	if (!rockchip_tsadc_data)
+-		return -ENOMEM;
+-
+-	res = platform_get_resource(data->pdev, IORESOURCE_MEM, 0);
+-	rockchip_tsadc_data->regs = devm_request_and_ioremap(&data->pdev->dev, res);
+-	if (!rockchip_tsadc_data->regs) {
+-		dev_err(&data->pdev->dev, "cannot map IO\n");
+-		return -ENXIO;
+-	} 
+-
+-	//irq request	
+-	irq = platform_get_irq(data->pdev, 0);
+-	if (irq < 0) {
+-		dev_err(&data->pdev->dev, "no irq resource?\n");
+-		return -EPERM;
+-	}
+-	rockchip_tsadc_data->irq = irq;
+-	ret = request_threaded_irq(rockchip_tsadc_data->irq, NULL, rockchip_tsadc_auto_ht_interrupt, IRQF_ONESHOT, TSADC_AUTO_EVENT_NAME, rockchip_tsadc_data);
+-	if (ret < 0) {
+-		dev_err(&data->pdev->dev, "failed to attach tsadc irq\n");
+-		return -EPERM;
+-	}	
+-
+-	rockchip_tsadc_data->workqueue = create_singlethread_workqueue("rockchip_tsadc");
+-	INIT_WORK(&rockchip_tsadc_data->auto_ht_irq_work, rockchip_tsadc_auto_ht_work);
+-	
+-	//clk enable
+-	rockchip_tsadc_data->clk = devm_clk_get(&data->pdev->dev, "tsadc");
+-	if (IS_ERR(rockchip_tsadc_data->clk)) {
+-	    dev_err(&data->pdev->dev, "failed to get tsadc clock\n");
+-	    ret = PTR_ERR(rockchip_tsadc_data->clk);
+-	    return -EPERM;
+-	}
+-
+-	if(of_property_read_u32(np, "clock-frequency", &rate)) {
+-          dev_err(&data->pdev->dev, "Missing clock-frequency property in the DT.\n");
+-	  return -EPERM;
+-	}
+-
+-	ret = clk_set_rate(rockchip_tsadc_data->clk, rate);
+-	    if(ret < 0) {
+-	    dev_err(&data->pdev->dev, "failed to set adc clk\n");
+-	    return -EPERM;
+-	}
+-	clk_prepare_enable(rockchip_tsadc_data->clk);
+-
+-	rockchip_tsadc_data->pclk = devm_clk_get(&data->pdev->dev, "pclk_tsadc");
+-	if (IS_ERR(rockchip_tsadc_data->pclk)) {
+-	    dev_err(&data->pdev->dev, "failed to get tsadc pclk\n");
+-	    ret = PTR_ERR(rockchip_tsadc_data->pclk);
+-	    return -EPERM;
+-	}
+-	clk_prepare_enable(rockchip_tsadc_data->pclk);
+-
+-	platform_set_drvdata(data->pdev, rockchip_tsadc_data);
+-	g_dev = rockchip_tsadc_data;
+-	data->plat_data = rockchip_tsadc_data;
+-
+-	if (of_property_read_u32(np, "tsadc-ht-temp",
+-		&tsadc_ht_temp)) {
+-		dev_err(&data->pdev->dev, "Missing  tsadc_ht_temp in the DT.\n");
+-		return -EPERM;
+-	}
+-	if (of_property_read_u32(np, "tsadc-ht-reset-cru",
+-		&tsadc_ht_reset_cru)) {
+-		dev_err(&data->pdev->dev, "Missing tsadc_ht_reset_cru in the DT.\n");
+-		return -EPERM;
+-	}
+-	if (of_property_read_u32(np, "tsadc-ht-pull-gpio",
+-		&tsadc_ht_pull_gpio)) {
+-		dev_err(&data->pdev->dev, "Missing tsadc_ht_pull_gpio in the DT.\n");
+-		return -EPERM;
+-	}
+-
+-	if (tsadc_ht_pull_gpio){
+-		/*bit8=1 gpio0_b2 = 1 shutdown else gpio0_b2 =1 shutdown*/
+-		/*
+-		ret = tsadc_readl(TSADC_AUTO_CON);
+-		tsadc_writel(ret | (1 << 8) , TSADC_AUTO_CON);
+-		*/
+-		uap = devm_kzalloc(&data->pdev->dev, sizeof(struct tsadc_port),
+-		GFP_KERNEL);
+-		if (uap == NULL)
+-			dev_err(&data->pdev->dev,
+-			"uap is not set %s,line=%d\n", __func__, __LINE__);
+-		uap->pctl = devm_pinctrl_get(&data->pdev->dev);
+-		uap->pins_default = pinctrl_lookup_state(uap->pctl, "default");
+-		uap->pins_tsadc_int = pinctrl_lookup_state(uap->pctl, "tsadc_int");
+-		pinctrl_select_state(uap->pctl, uap->pins_tsadc_int);
+-	}
+-
+-	rockchip_tsadc_set_auto_temp(1);
+-
+-	data->monitored_sensors = NUM_MONITORED_SENSORS;
+-	data->ops.read_sensor = rockchip_tsadc_get_temp;
+-	data->ops.show_name = rockchip_show_name;
+-	data->ops.show_label = rockchip_show_label;
+-	data->ops.is_visible = NULL;
+-
+-	dev_info(&data->pdev->dev, "initialized\n");
+-	return 0;
+-}
+-EXPORT_SYMBOL(rockchip_hwmon_init);
+-
+-MODULE_LICENSE("GPL");
+-MODULE_AUTHOR("zhangqing <zhangqing@rock-chips.com>");
+-MODULE_DESCRIPTION("Driver for TSADC");
+-- 
+2.35.3
+

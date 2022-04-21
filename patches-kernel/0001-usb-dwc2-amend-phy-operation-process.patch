@@ -1,0 +1,257 @@
+From eef525a1f027659c7d1d194ed93fe57a390acc21 Mon Sep 17 00:00:00 2001
+From: Frank Wang <frank.wang@rock-chips.com>
+Date: Thu, 5 Mar 2020 17:30:40 +0800
+Subject: [PATCH] usb: dwc2: amend phy operation process
+
+Refer to lowlevel mechanism of dwc2, amend the PHY operation
+process in case of unbalance for power on and off as well.
+
+This patch fix unbalanced phy power management if otg cable
+plug in between the completion of dwc2 probe and udc_start.
+
+Signed-off-by: Frank Wang <frank.wang@rock-chips.com>
+Change-Id: Ic0c2811ed84f8f46e99e03eff44c9d20a791e05f
+---
+ drivers/usb/dwc2/core.h     |   5 ++
+ drivers/usb/dwc2/gadget.c   |  30 +++--------
+ drivers/usb/dwc2/hcd.c      |   3 ++
+ drivers/usb/dwc2/platform.c | 105 +++++++++++++++++++++++++-----------
+ 4 files changed, 89 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index 86020473b1be..6d7f9ce79150 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -834,6 +834,7 @@ struct dwc2_hregs_backup {
+  * @hcd_enabled:	Host mode sub-driver initialization indicator.
+  * @gadget_enabled:	Peripheral mode sub-driver initialization indicator.
+  * @ll_hw_enabled:	Status of low-level hardware resources.
++ * @ll_phy_enabled	Status of low-level PHY resources.
+  * @hibernated:		True if core is hibernated
+  * @frame_number:       Frame number read from the core. For both device
+  *			and host modes. The value ranges are from 0
+@@ -1020,6 +1021,7 @@ struct dwc2_hsotg {
+ 	unsigned int hcd_enabled:1;
+ 	unsigned int gadget_enabled:1;
+ 	unsigned int ll_hw_enabled:1;
++	unsigned int ll_phy_enabled:1;
+ 	unsigned int hibernated:1;
+ 	u16 frame_number;
+ 
+@@ -1294,6 +1296,9 @@ extern const struct of_device_id dwc2_of_match_table[];
+ int dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg);
+ int dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg);
+ 
++int dwc2_lowlevel_phy_enable(struct dwc2_hsotg *hsotg);
++int dwc2_lowlevel_phy_disable(struct dwc2_hsotg *hsotg);
++
+ /* Common polling functions */
+ int dwc2_hsotg_wait_bit_set(struct dwc2_hsotg *hs_otg, u32 reg, u32 bit,
+ 			    u32 timeout);
+diff --git a/drivers/usb/dwc2/gadget.c b/drivers/usb/dwc2/gadget.c
+index 23bbf5952593..2150f65a0df3 100644
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -4314,21 +4314,11 @@ static int dwc2_hsotg_udc_start(struct usb_gadget *gadget,
+ 	}
+ 
+ 	if (hsotg->dr_mode == USB_DR_MODE_OTG && dwc2_is_device_mode(hsotg)) {
+-		struct platform_device *pdev = to_platform_device(hsotg->dev);
+-
+-		if (hsotg->uphy) {
+-			ret = usb_phy_init(hsotg->uphy);
+-		} else if (hsotg->plat && hsotg->plat->phy_init) {
+-			ret = hsotg->plat->phy_init(pdev,
+-						    hsotg->plat->phy_type);
+-		} else {
+-			ret = phy_power_on(hsotg->phy);
+-			if (ret == 0)
+-				ret = phy_init(hsotg->phy);
++		if (!hsotg->ll_phy_enabled) {
++			ret = dwc2_lowlevel_phy_enable(hsotg);
++			if (ret)
++				goto err;
+ 		}
+-
+-		if (ret)
+-			goto err;
+ 	}
+ 
+ 	if (!IS_ERR_OR_NULL(hsotg->uphy))
+@@ -4390,16 +4380,8 @@ static int dwc2_hsotg_udc_stop(struct usb_gadget *gadget)
+ 		dwc2_lowlevel_hw_disable(hsotg);
+ 
+ 	if (hsotg->dr_mode == USB_DR_MODE_OTG && dwc2_is_device_mode(hsotg)) {
+-		struct platform_device *pdev = to_platform_device(hsotg->dev);
+-
+-		if (hsotg->uphy) {
+-			usb_phy_shutdown(hsotg->uphy);
+-		} else if (hsotg->plat && hsotg->plat->phy_exit) {
+-			hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
+-		} else {
+-			phy_exit(hsotg->phy);
+-			phy_power_off(hsotg->phy);
+-		}
++		if (hsotg->ll_phy_enabled)
++			dwc2_lowlevel_phy_disable(hsotg);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 6a75926ae75d..2b543c8a76ef 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -3380,6 +3380,9 @@ static void dwc2_conn_id_status_change(struct work_struct *work)
+ 
+ 	dev_dbg(hsotg->dev, "%s()\n", __func__);
+ 
++	if (!hsotg->ll_phy_enabled && dwc2_is_host_mode(hsotg))
++		dwc2_lowlevel_phy_enable(hsotg);
++
+ 	gotgctl = dwc2_readl(hsotg, GOTGCTL);
+ 	dev_dbg(hsotg->dev, "gotgctl=%0x\n", gotgctl);
+ 	dev_dbg(hsotg->dev, "gotgctl.b.conidsts=%d\n",
+diff --git a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+index 11a34f17e04b..dfbb6459a407 100644
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -121,9 +121,76 @@ static int dwc2_get_dr_mode(struct dwc2_hsotg *hsotg)
+ 	return 0;
+ }
+ 
+-static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
++static int __dwc2_lowlevel_phy_enable(struct dwc2_hsotg *hsotg)
+ {
+ 	struct platform_device *pdev = to_platform_device(hsotg->dev);
++	int ret;
++
++	if (hsotg->uphy) {
++		ret = usb_phy_init(hsotg->uphy);
++	} else if (hsotg->plat && hsotg->plat->phy_init) {
++		ret = hsotg->plat->phy_init(pdev, hsotg->plat->phy_type);
++	} else {
++		ret = phy_power_on(hsotg->phy);
++		if (ret == 0)
++			ret = phy_init(hsotg->phy);
++	}
++
++	return ret;
++}
++
++/**
++ * dwc2_lowlevel_phy_enable - enable lowlevel PHY resources
++ * @hsotg: The driver state
++ *
++ * A wrapper for platform code responsible for controlling
++ * low-level PHY resources.
++ */
++int dwc2_lowlevel_phy_enable(struct dwc2_hsotg *hsotg)
++{
++	int ret = __dwc2_lowlevel_phy_enable(hsotg);
++
++	if (ret == 0)
++		hsotg->ll_phy_enabled = true;
++	return ret;
++}
++
++static int __dwc2_lowlevel_phy_disable(struct dwc2_hsotg *hsotg)
++{
++	struct platform_device *pdev = to_platform_device(hsotg->dev);
++	int ret = 0;
++
++	if (hsotg->uphy) {
++		usb_phy_shutdown(hsotg->uphy);
++	} else if (hsotg->plat && hsotg->plat->phy_exit) {
++		ret = hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
++	} else {
++		ret = phy_exit(hsotg->phy);
++		if (ret == 0)
++			ret = phy_power_off(hsotg->phy);
++	}
++
++	return ret;
++}
++
++/**
++ * dwc2_lowlevel_phy_disable - disable lowlevel PHY resources
++ * @hsotg: The driver state
++ *
++ * A wrapper for platform code responsible for controlling
++ * low-level PHY platform resources.
++ */
++int dwc2_lowlevel_phy_disable(struct dwc2_hsotg *hsotg)
++{
++	int ret = __dwc2_lowlevel_phy_disable(hsotg);
++
++	if (ret == 0)
++		hsotg->ll_phy_enabled = false;
++	return ret;
++}
++
++static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
++{
+ 	int clk, ret;
+ 
+ 	ret = regulator_bulk_enable(ARRAY_SIZE(hsotg->supplies),
+@@ -140,15 +207,8 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
+ 		}
+ 	}
+ 
+-	if (hsotg->uphy) {
+-		ret = usb_phy_init(hsotg->uphy);
+-	} else if (hsotg->plat && hsotg->plat->phy_init) {
+-		ret = hsotg->plat->phy_init(pdev, hsotg->plat->phy_type);
+-	} else {
+-		ret = phy_power_on(hsotg->phy);
+-		if (ret == 0)
+-			ret = phy_init(hsotg->phy);
+-	}
++	if (!hsotg->ll_phy_enabled)
++		ret = dwc2_lowlevel_phy_enable(hsotg);
+ 
+ 	return ret;
+ }
+@@ -171,18 +231,11 @@ int dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
+ 
+ static int __dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
+ {
+-	struct platform_device *pdev = to_platform_device(hsotg->dev);
+ 	int clk, ret = 0;
+ 
+-	if (hsotg->uphy) {
+-		usb_phy_shutdown(hsotg->uphy);
+-	} else if (hsotg->plat && hsotg->plat->phy_exit) {
+-		ret = hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
+-	} else {
+-		ret = phy_exit(hsotg->phy);
+-		if (ret == 0)
+-			ret = phy_power_off(hsotg->phy);
+-	}
++	if (hsotg->ll_phy_enabled)
++		ret = dwc2_lowlevel_phy_disable(hsotg);
++
+ 	if (ret)
+ 		return ret;
+ 
+@@ -522,16 +575,8 @@ static int dwc2_driver_probe(struct platform_device *dev)
+ 		dwc2_lowlevel_hw_disable(hsotg);
+ 
+ 	if (hsotg->dr_mode == USB_DR_MODE_OTG && dwc2_is_device_mode(hsotg)) {
+-		struct platform_device *pdev = to_platform_device(hsotg->dev);
+-
+-		if (hsotg->uphy) {
+-			usb_phy_shutdown(hsotg->uphy);
+-		} else if (hsotg->plat && hsotg->plat->phy_exit) {
+-			hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
+-		} else {
+-			phy_exit(hsotg->phy);
+-			phy_power_off(hsotg->phy);
+-		}
++		if (hsotg->ll_phy_enabled)
++			dwc2_lowlevel_phy_disable(hsotg);
+ 	}
+ 
+ 	return 0;
+-- 
+2.35.3
+

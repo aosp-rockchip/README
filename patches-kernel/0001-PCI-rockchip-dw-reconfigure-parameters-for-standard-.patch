@@ -1,0 +1,104 @@
+From 460e7bc63dc66e5e97b360735c67b25275da2006 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Mon, 11 Jan 2021 09:26:47 +0800
+Subject: [PATCH] PCI: rockchip: dw: reconfigure parameters for standard RC
+
+Some parameters would bs lost during gating vdd_logic power
+supply and lead to unstable link training sequence observed
+from the debug process. Especially we need to separate rc's
+resuming process from that of endpoint by a flag.
+
+Change-Id: I221762866c4b9f07c207dfa0a6ef9ac65b2ab6da
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/pci/controller/dwc/pcie-dw-rockchip.c | 32 ++++++++++++++++---
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-dw-rockchip.c b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+index 3cdaa55ebc37..24169e1ce16e 100644
+--- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c
++++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+@@ -1279,6 +1279,7 @@ static int rk_pcie_probe(struct platform_device *pdev)
+ static int __maybe_unused rockchip_dw_pcie_suspend(struct device *dev)
+ {
+ 	struct rk_pcie *rk_pcie = dev_get_drvdata(dev);
++	int ret;
+ 
+ 	rk_pcie_link_status_clear(rk_pcie);
+ 	rk_pcie_disable_ltssm(rk_pcie);
+@@ -1293,14 +1294,31 @@ static int __maybe_unused rockchip_dw_pcie_suspend(struct device *dev)
+ 
+ 	rk_pcie->in_suspend = true;
+ 
++	if (!IS_ERR(rk_pcie->vpcie3v3)) {
++		ret = regulator_disable(rk_pcie->vpcie3v3);
++		if (ret) {
++			dev_err(dev, "fail to disable vpcie3v3 regulator\n");
++			return ret;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+ static int __maybe_unused rockchip_dw_pcie_resume(struct device *dev)
+ {
+ 	struct rk_pcie *rk_pcie = dev_get_drvdata(dev);
++	bool std_rc = rk_pcie->mode == RK_PCIE_RC_TYPE && !rk_pcie->dma_obj;
+ 	int ret;
+ 
++	if (!IS_ERR(rk_pcie->vpcie3v3)) {
++		ret = regulator_enable(rk_pcie->vpcie3v3);
++		if (ret) {
++			dev_err(dev, "fail to enable vpcie3v3 regulator\n");
++			return ret;
++		}
++	}
++
+ 	ret = clk_bulk_enable(rk_pcie->clk_cnt, rk_pcie->clks);
+ 	if (ret) {
+ 		clk_bulk_unprepare(rk_pcie->clk_cnt, rk_pcie->clks);
+@@ -1337,12 +1355,18 @@ static int __maybe_unused rockchip_dw_pcie_resume(struct device *dev)
+ 	/* Set PCIe mode */
+ 	rk_pcie_set_mode(rk_pcie);
+ 
++	if (std_rc)
++		dw_pcie_setup_rc(&rk_pcie->pci->pp);
++
+ 	ret = rk_pcie_establish_link(rk_pcie->pci);
+ 	if (ret) {
+ 		dev_err(dev, "failed to establish pcie link\n");
+ 		goto err;
+ 	}
+ 
++	if (std_rc)
++		goto std_rc_done;
++
+ 	ret = rk_pcie_ep_atu_init(rk_pcie);
+ 	if (ret) {
+ 		dev_err(dev, "failed to init ep device\n");
+@@ -1351,6 +1375,10 @@ static int __maybe_unused rockchip_dw_pcie_resume(struct device *dev)
+ 
+ 	rk_pcie_ep_setup(rk_pcie);
+ 
++	rk_pcie->in_suspend = false;
++
++std_rc_done:
++	dw_pcie_dbi_ro_wr_dis(rk_pcie->pci);
+ 	/* hold link reset grant after link-up */
+ 	if (rk_pcie->is_rk1808) {
+ 		ret = rk_pcie_reset_grant_ctrl(rk_pcie, false);
+@@ -1358,10 +1386,6 @@ static int __maybe_unused rockchip_dw_pcie_resume(struct device *dev)
+ 			goto err;
+ 	}
+ 
+-	dw_pcie_dbi_ro_wr_dis(rk_pcie->pci);
+-
+-	rk_pcie->in_suspend = false;
+-
+ 	return 0;
+ err:
+ 	if (!IS_ERR(rk_pcie->vpcie3v3))
+-- 
+2.35.3
+

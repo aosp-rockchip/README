@@ -1,0 +1,244 @@
+From 0f3aeb151fdddfe95e5ea97c342838352c9361ff Mon Sep 17 00:00:00 2001
+From: zwl <zwl@rock-chips.com>
+Date: Mon, 17 Mar 2014 21:17:00 +0800
+Subject: [PATCH] HDMI: modify rk3288 hdmi phy config and add 4kx2k timing
+
+---
+ .../rockchip/hdmi/chips/rk3288/rk3288_hdmi.c  |   7 +-
+ .../hdmi/chips/rk3288/rk3288_hdmi_hw.c        | 110 +++++++++++++++---
+ .../hdmi/chips/rk3288/rk3288_hdmi_hw.h        |   3 +-
+ drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c    |   5 +-
+ 4 files changed, 102 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
+index 9c1e64a9f25b..fef837d6546b 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
+@@ -144,8 +144,11 @@ struct hdmi* rk3288_hdmi_register_hdcp_callbacks(
+ static int rk3288_hdmi_drv_init(struct hdmi *hdmi_drv)
+ {
+ 	int ret = 0;
++	struct rk_screen screen;
+ 	//struct rk_hdmi_device *hdmi_dev = container_of(hdmi_drv, struct rk_hdmi_device, driver);
+ 
++	rk_fb_get_prmry_screen(&screen);
++	hdmi_dev->lcdc_id = (screen.lcdc_id == 1) ? 0 : 1;	//hdmi is extend as default,TODO modify if hdmi is primary
+         grf_writel(HDMI_SEL_LCDC(hdmi_dev->lcdc_id), RK3288_GRF_SOC_CON6);	//lcdc source select
+ 	if(hdmi_dev->lcdc_id == 0)
+ 		hdmi_drv->lcdc = rk_get_lcdc_drv("lcdc0");
+@@ -177,8 +180,8 @@ static int rk3288_hdmi_parse_dt(struct rk3288_hdmi_device *hdmi_dev)
+ 	int val = 0;
+ 	struct device_node *np = hdmi_dev->dev->of_node;
+ 
+-	if(!of_property_read_u32(np, "rockchips,hdmi_lcdc_source", &val))
+-		hdmi_dev->lcdc_id = val;
++	//if(!of_property_read_u32(np, "rockchips,hdmi_lcdc_source", &val))
++	//	hdmi_dev->lcdc_id = val;
+ 
+ 	if(!of_property_read_u32(np, "rockchips,hdmi_audio_source", &val))
+ 		hdmi_dev->driver.audio.type = val;
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
+index 4850df939c00..e6bcb01e4e6f 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
+@@ -360,6 +360,44 @@ int rk3288_hdmi_video_sampler(struct hdmi *hdmi_drv, struct hdmi_video_para *vpa
+ 	return 0;
+ }
+ 
++static int rk3288_hdmi_read_phy(struct rk3288_hdmi_device *hdmi_dev, int reg_addr, int *val)
++{
++	int trytime = 2, i = 0, op_status = 0;
++
++	mutex_lock(&hdmi_dev->int_mutex);
++	hdmi_dev->phy_i2cm_int = 0;
++	mutex_unlock(&hdmi_dev->int_mutex);
++
++	while(trytime--) {
++		hdmi_writel(hdmi_dev, PHY_I2CM_ADDRESS, reg_addr);
++		hdmi_writel(hdmi_dev, PHY_I2CM_OPERATION, m_PHY_I2CM_READ);
++
++		i = 100;
++		while(i--) {
++			mutex_lock(&hdmi_dev->int_mutex);
++			//op_status = hdmi_readl(hdmi_dev, PHY_I2CM_INT);
++			op_status = hdmi_dev->phy_i2cm_int;
++			hdmi_dev->phy_i2cm_int = 0;
++			mutex_unlock(&hdmi_dev->int_mutex);
++			if(op_status & (m_I2CMPHY_DONE | m_I2CMPHY_ERR)) {
++				break;
++			}
++			msleep(10);
++		}
++
++		if(op_status & m_I2CMPHY_DONE) {
++			*val = (hdmi_readl(hdmi_dev, PHY_I2CM_DATAI_1) >> 8) & 0xff;
++			*val += (hdmi_readl(hdmi_dev, PHY_I2CM_DATAI_0) & 0xff);
++			return 0;
++		}
++		else {
++			hdmi_err(hdmi_dev->dev, "[%s] operation error,trytime=%d\n", __FUNCTION__,trytime);
++		}
++		msleep(100);
++	}
++
++	return -1;
++}
+ 
+ static int rk3288_hdmi_write_phy(struct rk3288_hdmi_device *hdmi_dev, int reg_addr, int val)
+ {
+@@ -400,38 +438,70 @@ static int rk3288_hdmi_write_phy(struct rk3288_hdmi_device *hdmi_dev, int reg_ad
+ 	return -1;
+ }
+ 
+-static void rk3288_hdmi_config_phy(struct hdmi *hdmi_drv)
++static int rk3288_hdmi_config_phy(struct hdmi *hdmi_drv)
+ {
+-	int stat = 0;
+-	char color_depth = COLOR_DEPTH_24BIT_DEFAULT;
++	int stat = 0, i = 0;
++	//char color_depth = COLOR_DEPTH_24BIT;//COLOR_DEPTH_24BIT_DEFAULT;
+ 	char pix_repet = NO_PIXEL_REPET;
+ 	const struct phy_mpll_config_tab *phy_mpll = NULL;
+ 	struct rk3288_hdmi_device *hdmi_dev = container_of(hdmi_drv, struct rk3288_hdmi_device, driver);
+ 
+-	hdmi_writel(hdmi_dev, PHY_CONF0, 0x32);
++	//get phy_type,if PHY_GEN2==1 config phy register
++	//phy_type = hdmi_readl(hdmi_dev, CONFIG2_ID);
++	//if(phy_type != HDMI_3D_TX_WITH_HEAC_PHY && phy_type != HDMI_3D_TX_PHY) {
++	//	printk("%s: PHY_GEN2 = 0,No need to config phy", __FUNCTION__);
++	//	return;
++	//}
++
++	//hdmi_writel(hdmi_dev, PHY_CONF0, 0x32);
++	hdmi_msk_reg(hdmi_dev, PHY_CONF0, m_PDDQ_SIG | m_TXPWRON_SIG, v_PDDQ_SIG(1) | v_TXPWRON_SIG(0));
+ 	hdmi_writel(hdmi_dev, MC_PHYRSTZ, v_PHY_RSTZ(1));
+ 	//the resolution that we used is no pixel repet,refer to the CEA-861 specification.
+-	hdmi_writel(hdmi_dev, VP_PR_CD, v_COLOR_DEPTH(color_depth) | v_DESIRED_PR_FACTOR(pix_repet));
+-	msleep(5);
++	//hdmi_writel(hdmi_dev, VP_PR_CD, v_COLOR_DEPTH(color_depth) | v_DESIRED_PR_FACTOR(pix_repet));
++	//msleep(5);
+ 	hdmi_writel(hdmi_dev, MC_PHYRSTZ, v_PHY_RSTZ(0));
+ 
+ 	//Set slave address as PHY GEN2 address
+-	hdmi_writel(hdmi_dev, PHY_I2CM_SLAVE, PHY_GEN2_ADDR);
++	hdmi_writel(hdmi_dev, PHY_I2CM_SLAVE, PHY_I2C_SLAVE_ADDR);
++
++	rk3288_hdmi_write_phy(hdmi_dev, 0x13, 0x0000); /* PLLPHBYCTRL */
++	rk3288_hdmi_write_phy(hdmi_dev, 0x17, 0x0006);
++	/* RESISTANCE TERM 133Ohm Cfg  */
++	rk3288_hdmi_write_phy(hdmi_dev, 0x19, 0x0005); /* TXTERM */	//TODO Daisen wait to modify
++	/* REMOVE CLK TERM */
++	rk3288_hdmi_write_phy(hdmi_dev, 0x05, 0x8000); /* CKCALCTRL */
+ 
+ 	//config the required PHY I2C register
+-	phy_mpll = get_phy_mpll_tab(hdmi_drv->tmdsclk, pix_repet, color_depth);
+-	rk3288_hdmi_write_phy(hdmi_dev, PHYTX_OPMODE_PLLCFG, v_PREP_DIV(phy_mpll->prep_div) | v_TMDS_CNTRL(phy_mpll->tmdsmhl_cntrl) | v_OPMODE(phy_mpll->opmode) |
+-		v_FBDIV2_CNTRL(phy_mpll->fbdiv2_cntrl) | v_FBDIV1_CNTRL(phy_mpll->fbdiv1_cntrl) | v_REF_CNTRL(phy_mpll->ref_cntrl) | v_MPLL_N_CNTRL(phy_mpll->n_cntrl));
+-	rk3288_hdmi_write_phy(hdmi_dev, PHYTX_PLLCURRCTRL, v_MPLL_PROP_CNTRL(phy_mpll->prop_cntrl) | v_MPLL_INT_CNTRL(phy_mpll->int_cntrl));
+-	rk3288_hdmi_write_phy(hdmi_dev, PHYTX_PLLGMPCTRL, v_MPLL_GMP_CNTRL(phy_mpll->gmp_cntrl));
++	phy_mpll = get_phy_mpll_tab(hdmi_drv->tmdsclk, pix_repet, 8);
++	if(phy_mpll) {
++		rk3288_hdmi_write_phy(hdmi_dev, PHYTX_OPMODE_PLLCFG, v_PREP_DIV(phy_mpll->prep_div) | v_TMDS_CNTRL(phy_mpll->tmdsmhl_cntrl) | v_OPMODE(phy_mpll->opmode) |
++			v_FBDIV2_CNTRL(phy_mpll->fbdiv2_cntrl) | v_FBDIV1_CNTRL(phy_mpll->fbdiv1_cntrl) | v_REF_CNTRL(phy_mpll->ref_cntrl) | v_MPLL_N_CNTRL(phy_mpll->n_cntrl));
++		rk3288_hdmi_write_phy(hdmi_dev, PHYTX_PLLCURRCTRL, v_MPLL_PROP_CNTRL(phy_mpll->prop_cntrl) | v_MPLL_INT_CNTRL(phy_mpll->int_cntrl));
++		rk3288_hdmi_write_phy(hdmi_dev, PHYTX_PLLGMPCTRL, v_MPLL_GMP_CNTRL(phy_mpll->gmp_cntrl));
++	}
+ 
+ 	//power on PHY
+-	hdmi_writel(hdmi_dev, PHY_CONF0, 0x2a);
++	//hdmi_writel(hdmi_dev, PHY_CONF0, 0x2a);
++	hdmi_msk_reg(hdmi_dev, PHY_CONF0, m_PDDQ_SIG | m_TXPWRON_SIG | m_ENHPD_RXSENSE_SIG,
++		v_PDDQ_SIG(0) | v_TXPWRON_SIG(1) | v_ENHPD_RXSENSE_SIG(1));
+ 
+ 	//check if the PHY PLL is locked
+-	stat = hdmi_readl(hdmi_dev, PHY_STAT0);
+-	if(stat & m_PHY_LOCK)
+-		hdmi_writel(hdmi_dev, PHY_STAT0, v_PHY_LOCK(1));
++	#define PHY_TIMEOUT	10000
++	while(i++ < PHY_TIMEOUT) {
++		if ((i % 100) == 0) {
++			stat = hdmi_readl(hdmi_dev, PHY_STAT0);
++			if(stat & m_PHY_LOCK) {
++				//hdmi_writel(hdmi_dev, PHY_STAT0, v_PHY_LOCK(1));
++				break;
++			}
++		}
++	}
++	if((stat & m_PHY_LOCK) == 0) {
++		hdmi_err(hdmi_dev->dev, "PHY PLL not locked\n");
++		return -1;
++	}
++
++	return 0;
+ }
+ 
+ static void rk3288_hdmi_config_avi(struct hdmi *hdmi_drv, unsigned char vic, unsigned char output_color)
+@@ -638,7 +708,7 @@ static void rk3288_hdmi_config_aai(struct hdmi *hdmi_drv, struct hdmi_audio *aud
+ 
+ int rk3288_hdmi_config_audio(struct hdmi *hdmi_drv, struct hdmi_audio *audio)
+ {
+-	int word_length = 0, channel = 0, N = 0, mclk_fs, value;
++	int word_length = 0, channel = 0, N = 0, mclk_fs;
+ 	struct rk3288_hdmi_device *hdmi_dev = container_of(hdmi_drv, struct rk3288_hdmi_device, driver);
+ 
+ 	if(audio->channel < 3)
+@@ -736,8 +806,8 @@ int rk3288_hdmi_config_audio(struct hdmi *hdmi_drv, struct hdmi_audio *audio)
+ 	}
+ 
+ 	/* more than 2 channels => layout 1 else layout 0 */
+-	value = (audio->channel > 2) ? 1 : 0;	//TODO Daisen wait to modify
+-	hdmi_msk_reg(hdmi_dev, FC_AUDSCONF, m_AUD_PACK_LAYOUT, v_AUD_PACK_LAYOUT(1));
++	//value = (audio->channel > 2) ? 1 : 0;	//TODO Daisen wait to modify
++	//hdmi_msk_reg(hdmi_dev, FC_AUDSCONF, m_AUD_PACK_LAYOUT, v_AUD_PACK_LAYOUT(value));
+ 
+ 	if(hdmi_drv->audio.type == INPUT_SPDIF) {
+ 		hdmi_msk_reg(hdmi_dev, AUD_CONF0, m_I2S_SEL, v_I2S_SEL(AUDIO_SPDIF_GPA));
+@@ -778,6 +848,8 @@ void rk3288_hdmi_control_output(struct hdmi *hdmi_drv, int enable)
+ 	else {
+ 		if(hdmi_drv->pwr_mode == LOWER_PWR)
+ 			rk3288_hdmi_set_pwr_mode(hdmi_drv, NORMAL);
++		/* disable blue screen transmission after turning on all necessary blocks*/
++		rk3288_hdmi_video_forceOutput(hdmi_drv, 0);
+ 		rk3288_hdmi_av_mute(hdmi_drv, 0);
+ 	}
+ }
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
+index 70c0a584a753..b727f54712af 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
+@@ -635,7 +635,7 @@ enum {
+ #define m_TXPWRON_SIG		(1 << 3)		//depend on PHY_GEN2=1 or PHY_EXTERNAL=1
+ #define v_TXPWRON_SIG(n)	(((n)&0x01) << 3)
+ #define m_ENHPD_RXSENSE_SIG	(1 << 2)		//depend on PHY_GEN2=1 or PHY_EXTERNAL=1
+-#define v_ENHPD_RXSENSE_SIG	(((n)&0x01) << 2)
++#define v_ENHPD_RXSENSE_SIG(n)	(((n)&0x01) << 2)
+ #define m_SEL_DATAEN_POL	(1 << 1)
+ #define v_SEL_DATAEN_POL(n)	(((n)&0x01) << 1)
+ #define m_SEL_INTERFACE		(1 << 0)
+@@ -678,6 +678,7 @@ enum {
+ #define	PHY_I2CM_SLAVE			0x3020
+ #define PHY_GEN2_ADDR		0x69
+ #define PHY_HEAC_ADDR		0x49
++#define PHY_I2C_SLAVE_ADDR	0x54
+ 
+ #define	PHY_I2CM_ADDRESS		0x3021
+ #define	PHY_I2CM_DATAO_1		0x3022
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+index c453ab644dd3..7a1a97d65ec7 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+@@ -60,7 +60,10 @@ static const struct fb_videomode hdmi_mode [] = {
+ {	"720x480p@240Hz",	240,		720,	480,	108000000,	60,	16,	30,	9,	62,	6,		0,			0,		56	},
+ {	"1440x480i@240Hz",	240,		1440,	480,	108000000,	114,	38,	15,	4,	12,	3,		0,			1,		58	},
+ */
+-{	"3840x2160p@30Hz",	30,		3840,	2160,	297000000,	296,	1276,	72,	8,	88,	10,	FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,			0,		93	},					
++{	"3840x2160p@24Hz",	24,		3840,	2160,	297000000,	296,	1276,	72,	8,	88,	10,	FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,			0,		93	},
++{	"3840x2160p@25Hz",	25,		3840,	2160,	297000000,	296,	1056,	72,	8,	88,	10,	FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,			0,		94	},
++{	"3840x2160p@30Hz", 	30,		3840,	2160,	297000000,	296,	176,	72,	8,	88,	10,	FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,			0,		95	},
++{	"4096x2160p@24Hz",	24,		4096,	2160,	297000000,	296,	1020,	72,	8,	88,	10,	FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,			0,		98	},
+ 
+ };
+ 
+-- 
+2.35.3
+

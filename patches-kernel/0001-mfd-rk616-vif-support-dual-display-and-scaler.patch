@@ -1,0 +1,924 @@
+From 5db2043d478088b798b2b25c327a004d33a067da Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Sun, 28 Apr 2013 11:26:11 +0800
+Subject: [PATCH] mfd:rk616:vif:support dual display and scaler
+
+---
+ drivers/mfd/rk616-core.c                      |  54 +--
+ drivers/video/display/transmitter/Kconfig     |   4 +-
+ drivers/video/display/transmitter/Makefile    |   2 +-
+ .../transmitter/{rk616_lvds.c => rk616_vif.c} | 440 ++++++++++++------
+ include/linux/mfd/rk616.h                     |  72 ++-
+ 5 files changed, 374 insertions(+), 198 deletions(-)
+ rename drivers/video/display/transmitter/{rk616_lvds.c => rk616_vif.c} (57%)
+
+diff --git a/drivers/mfd/rk616-core.c b/drivers/mfd/rk616-core.c
+index 864dc23511a1..e88f13793667 100644
+--- a/drivers/mfd/rk616-core.c
++++ b/drivers/mfd/rk616-core.c
+@@ -21,7 +21,7 @@
+ 
+ static struct mfd_cell rk616_devs[] = {
+ 	{
+-		.name = "rk616-lvds",
++		.name = "rk616-vif",
+ 		.id = 0,
+ 	},
+ 	{
+@@ -113,7 +113,7 @@ static int rk616_reg_show(struct seq_file *s, void *v)
+ 	{
+ 		rk616->read_dev(rk616,i,&val);
+ 		if(i%16==0)
+-			seq_printf(s,"\n%04x:",i);
++			seq_printf(s,"\n0x%04x:",i);
+ 		seq_printf(s," %08x",val);
+ 	}
+ 	seq_printf(s,"\n");
+@@ -246,7 +246,7 @@ static  int  rk616_pll_wait_lock(struct mfd_rk616 *rk616,int id)
+ 		ret = rk616->read_dev(rk616,CRU_PLL0_CON1 + offset,&val);
+ 		if (val&PLL0_LOCK)
+ 		{
+-			dev_info(rk616->dev,"pll locked\n");
++			dev_info(rk616->dev,"PLL%d locked\n",id);
+ 			break;
+ 		}
+ 		msleep(1);
+@@ -261,28 +261,19 @@ static  int  rk616_pll_wait_lock(struct mfd_rk616 *rk616,int id)
+ }
+ 
+ 
+-int rk616_pll_set_rate(struct mfd_rk616 *rk616,int id,u32 fin,u32 fout)
++int rk616_pll_set_rate(struct mfd_rk616 *rk616,int id,u32 cfg_val,u32 frac)
+ {
+ 	u32 val = 0;
+ 	int ret;
+ 	int offset;
+-	u32 refdiv,fbdiv,postdiv1,postdiv2,frac;
+-	int mode; //pll div mode,integer or frac
+-
+-
+-	ret = rk616_pll_par_calc(fin,fout,&refdiv,&fbdiv,
+-					&postdiv1,&postdiv2,&frac);
+-	refdiv = 4;
+-	fbdiv = 32;
+-	postdiv1 = 2;
+-	postdiv2 = 4;
+-	frac = 0;
+-	if(ret < 0)
+-	{
+-		return -EINVAL;
+-	}
+-
+-	mode = !frac;
++	u16 con0 = cfg_val & 0xffff;
++	u16 con1 = (cfg_val >> 16)&0xffff;
++	u32 fbdiv = con0 & 0xfff;
++	u32 postdiv1 = (con0 >> 12)&0x7;
++	u32 refdiv = con1 & 0x3f;
++	u32 postdiv2 = (con1 >> 6) & 0x7;
++	u8 mode = !frac;
++	
+ 	
+ 	if(id == 0)  //PLL0
+ 	{
+@@ -294,8 +285,6 @@ int rk616_pll_set_rate(struct mfd_rk616 *rk616,int id,u32 fin,u32 fout)
+ 	}
+ 
+ 
+-	
+-	
+ 	val = PLL0_PWR_DN | (PLL0_PWR_DN << 16);
+ 	ret = rk616->write_dev(rk616,CRU_PLL0_CON1 + offset,&val);
+ 
+@@ -306,6 +295,9 @@ int rk616_pll_set_rate(struct mfd_rk616 *rk616,int id,u32 fin,u32 fout)
+ 	val = PLL0_DIV_MODE(mode) | PLL0_POSTDIV2(postdiv2) | PLL0_REFDIV(refdiv) |
+ 		(PLL0_DIV_MODE_MASK) | PLL0_POSTDIV2_MASK | PLL0_REFDIV_MASK;
+ 	ret = rk616->write_dev(rk616,CRU_PLL0_CON1 + offset,&val);
++
++	val = PLL0_FRAC(frac);
++	ret = rk616->write_dev(rk616,CRU_PLL0_CON2 + offset,&val);
+ 	
+ 	val = (PLL0_PWR_DN << 16);
+ 	ret = rk616->write_dev(rk616,CRU_PLL0_CON1 + offset,&val);
+@@ -326,23 +318,20 @@ static int rk616_clk_common_init(struct mfd_rk616 *rk616)
+ 	u32 val = 0;
+ 	int ret;
+ 
+-	val = PLL1_CLK_SEL(1) | PLL0_CLK_SEL(0) | LCD1_CLK_DIV(0) | LCD0_CLK_DIV(0) |
+-		PLL1_CLK_SEL_MASK | PLL0_CLK_SEL_MASK | LCD1_CLK_DIV_MASK | 
+-		LCD0_CLK_DIV_MASK; //pll1 clk from lcdc1_dclk,pll0 clk from lcdc0_dclk,mux_lcdx = lcdx_clk
++	val = PLL1_CLK_SEL(LCD1_DCLK) | PLL0_CLK_SEL(LCD0_DCLK) | LCD1_CLK_DIV(0) | 
++		LCD0_CLK_DIV(0) | PLL1_CLK_SEL_MASK | PLL0_CLK_SEL_MASK | 
++		LCD1_CLK_DIV_MASK | LCD0_CLK_DIV_MASK; //pll1 clk from lcdc1_dclk,pll0 clk from lcdc0_dclk,mux_lcdx = lcdx_clk
+ 	ret = rk616->write_dev(rk616,CRU_CLKSEL0_CON,&val);
+ 
+-	val = CODEC_MCLK_SEL(2) | CODEC_MCLK_SEL_MASK; //codec mclk from clkin
++	val = SCLK_SEL(SCLK_SEL_PLL1) | CODEC_MCLK_SEL(CODEC_MCLK_SEL_12M) |
++		CODEC_MCLK_SEL_MASK | SCLK_SEL_MASK; //codec mclk from clkin
+ 	ret = rk616->write_dev(rk616,CRU_CLKSEL1_CON,&val);
+ 	
+ 	val = 0; //codec mck = clkin
+ 	ret = rk616->write_dev(rk616,CRU_CODEC_DIV,&val);
+ 
+-#if 1
+ 	val = (PLL0_BYPASS) | (PLL0_BYPASS << 16);  //bypass pll0 
+ 	ret = rk616->write_dev(rk616,CRU_PLL0_CON0,&val);
+-#else
+-	rk616_pll_set_rate(rk616,0,66500000,66500000);
+-#endif
+ 
+ 	val = (PLL1_BYPASS) | (PLL1_BYPASS << 16);
+ 	ret = rk616->write_dev(rk616,CRU_PLL1_CON0,&val);
+@@ -403,6 +392,7 @@ static int rk616_i2c_probe(struct i2c_client *client,const struct i2c_device_id
+ 	}
+ 	rk616->read_dev = rk616_i2c_read_reg;
+ 	rk616->write_dev = rk616_i2c_write_reg;
++	
+ #if defined(CONFIG_DEBUG_FS)
+ 	rk616->debugfs_dir = debugfs_create_dir("rk616", NULL);
+ 	if (IS_ERR(rk616->debugfs_dir))
+@@ -410,7 +400,7 @@ static int rk616_i2c_probe(struct i2c_client *client,const struct i2c_device_id
+ 		dev_err(rk616->dev,"failed to create debugfs dir for rk616!\n");
+ 	}
+ 	else
+-		debugfs_create_file("rk616-core", S_IRUSR,rk616->debugfs_dir,rk616,&rk616_reg_fops);
++		debugfs_create_file("core", S_IRUSR,rk616->debugfs_dir,rk616,&rk616_reg_fops);
+ #endif
+ 	rk616_clk_common_init(rk616);
+ 	ret = mfd_add_devices(rk616->dev, -1,
+diff --git a/drivers/video/display/transmitter/Kconfig b/drivers/video/display/transmitter/Kconfig
+index 0d16b082b927..a5d6248c1ebe 100644
+--- a/drivers/video/display/transmitter/Kconfig
++++ b/drivers/video/display/transmitter/Kconfig
+@@ -11,8 +11,8 @@ config RK610_LVDS
+ 	help
+ 		Support Jetta(RK610) to output LCD1 and LVDS.
+ 
+-config RK616_LVDS
+-        bool "RK616(Jetta B) lvds,lcd,scaler transmitter support"
++config RK616_VIF
++        bool "RK616(JettaB) lvds,lcd,scaler vido interface support"
+         depends on MFD_RK616
+         help
+            RK616(Jetta B) LVDS,LCD,scaler transmitter support.
+diff --git a/drivers/video/display/transmitter/Makefile b/drivers/video/display/transmitter/Makefile
+index 7c9ccf2a360c..b74e537c44ff 100644
+--- a/drivers/video/display/transmitter/Makefile
++++ b/drivers/video/display/transmitter/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for display transmitter like lvds edp mipi
+ #
+ obj-$(CONFIG_RK610_LVDS)	  += rk610_lcd.o
+-obj-$(CONFIG_RK616_LVDS)          += rk616_lvds.o
++obj-$(CONFIG_RK616_VIF)          += rk616_vif.o
+ obj-$(CONFIG_TC358768_RGB2MIPI)   += mipi_dsi.o tc358768.o
+ obj-$(CONFIG_SSD2828_RGB2MIPI)   += mipi_dsi.o ssd2828.o
+ obj-$(CONFIG_DP_ANX6345)          += dp_anx6345.o
+diff --git a/drivers/video/display/transmitter/rk616_lvds.c b/drivers/video/display/transmitter/rk616_vif.c
+similarity index 57%
+rename from drivers/video/display/transmitter/rk616_lvds.c
+rename to drivers/video/display/transmitter/rk616_vif.c
+index 6debbce843b8..b2ed195156fc 100644
+--- a/drivers/video/display/transmitter/rk616_lvds.c
++++ b/drivers/video/display/transmitter/rk616_vif.c
+@@ -6,13 +6,17 @@
+ #include <linux/rk_fb.h>
+ 
+ struct mfd_rk616 *g_rk616;
++extern int rk616_pll_set_rate(struct mfd_rk616 *rk616,int id,u32 cfg_val,u32 frac);
+ 
+ /*rk616 video interface config*/
+-static int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *screen,int id)
++static int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *fscreen,int id)
+ {
+ 	int ret = 0;
+ 	u32 val = 0;
+ 	int offset = 0;
++	int pll_id;
++	rk_screen *screen  = NULL;
++	
+ 	if(id == 0) //video interface 0
+ 	{
+ 		if(!rk616->route.vif0_en)
+@@ -22,6 +26,7 @@ static int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *screen,int id)
+ 			return 0;
+ 		}
+ 		offset = 0;
++		pll_id = rk616->route.vif0_clk_sel; 
+ 	}
+ 	else       //vide0 interface 1
+ 	{
+@@ -32,14 +37,37 @@ static int rk616_vif_cfg(struct mfd_rk616 *rk616,rk_screen *screen,int id)
+ 			return 0;
+ 		}
+ 		offset = 0x18;
++		pll_id = (rk616->route.vif1_clk_sel >> 6);
++	}
++
++	screen = fscreen->ext_screen;
++	if(!screen)
++	{
++		dev_err(rk616->dev,"%s:screen is null.........\n",__func__);
++		return -EINVAL;
+ 	}
++
++	
+ 	
+ 	val |= (VIF0_DDR_CLK_EN <<16) | (VIF0_DDR_PHASEN_EN << 16) | (VIF0_DDR_MODE_EN << 16)|
+ 		(VIF0_EN <<16) | VIF0_EN; //disable ddr mode,enable VIF
+ 	
+ 	ret = rk616->write_dev(rk616,VIF0_REG0 + offset,&val);	
+ 
+-	val = (1) | (1<<16);
++	if( (screen->x_res == 1920) && (screen->y_res == 1080))
++	{
++		rk616_pll_set_rate(rk616,pll_id,0x02bf5276,0);
++	}
++	else if((screen->x_res == 1280) && (screen->y_res == 720))
++	{
++		rk616_pll_set_rate(rk616,pll_id,0x1422014,0);
++	}
++	else if((screen->x_res == 720))
++	{
++		rk616_pll_set_rate(rk616,pll_id,0x1c13015,0);
++	}
++
++	val = fscreen->vif_hst | (fscreen->vif_vst<<16);
+ 	ret = rk616->write_dev(rk616,VIF0_REG1 + offset,&val);
+ 
+ 	val = (screen->hsync_len << 16) | (screen->hsync_len + screen->left_margin + 
+@@ -83,19 +111,17 @@ static int rk616_scaler_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 	u32 dsp_vtotal,dsp_vs_end,dsp_vact_st,dsp_vact_end; 
+ 	u32 dsp_hbor_end,dsp_hbor_st,dsp_vbor_end,dsp_vbor_st;
+ 	u32 src_w,src_h,src_htotal,src_vtotal,dst_w,dst_h,src_hact_st,src_vact_st;
+-	u32 pll_value,T_frm_st;
+ 	u16 bor_right = 0;
+ 	u16 bor_left = 0;
+ 	u16 bor_up = 0;
+ 	u16 bor_down = 0;
+-	u8 hor_down_mode = 1;  //default use Proprietary averaging filter
+-	u8 ver_down_mode = 1;
++	u8 hor_down_mode = 0;  //1:average,0:bilinear
++	u8 ver_down_mode = 0;
+ 	u8 bic_coe_sel = 2;
+ 	rk_screen *src;
+ 	rk_screen *dst;
+-	u32 DCLK_IN;
++	int pll_id;
+ 
+-	double fk = 1.0;
+ 	struct rk616_route *route = &rk616->route;
+ 
+ 
+@@ -107,10 +133,26 @@ static int rk616_scaler_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 		return 0;
+ 	}
+ 	
+-
+-	src = screen;
++	
+ 	dst = screen;
+-	DCLK_IN = src->pixclock;
++	if(!dst)
++	{
++		dev_err(rk616->dev,"%s:screen is null!\n",__func__);
++		return -EINVAL;
++	}
++
++	if(route->scl_bypass)
++		src = dst;
++	else
++		src = screen->ext_screen;
++	
++	if(route->sclk_sel == SCLK_SEL(SCLK_SEL_PLL0))
++		pll_id = 0;
++	else
++		pll_id = 1;
++	rk616_pll_set_rate(rk616,pll_id,dst->pll_cfg_val,dst->frac);
++	dst_frame_vst = dst->scl_vst;
++	dst_frame_hst = dst->scl_hst;
+ 
+ 
+ #if 1
+@@ -140,24 +182,6 @@ static int rk616_scaler_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 	dst_w = dsp_hact_end - dsp_hact_st ;
+ 	dst_h = dsp_vact_end - dsp_vact_st ;
+ 
+-
+-	pll_value = (DCLK_IN*dsp_htotal*(dsp_vact_end-dsp_vact_st))/(src_htotal*src_h);
+-	dev_info(rk616->dev,"SCALER CLK Frq  =%u\n",pll_value);
+-
+-	T_frm_st = ((src_vact_st + 7)*src_htotal/DCLK_IN) -(dst_vact_st*dst_htotal)/pll_value;
+-	if(T_frm_st <0)
+-	{
+-		T_frm_st = (src_htotal * src_vtotal)/DCLK_IN + T_frm_st;
+-	}
+-	 
+-	dst_frame_vst = (T_frm_st * DCLK_IN) / src_htotal ;
+-	dst_frame_hst = (u32)(T_frm_st * DCLK_IN) % src_htotal ;    //dst
+-
+-	dev_info(rk616->dev,"scaler:dst_frame_h_st =%d\n"
+-		"dst_frame_v_st =%d\n",
+-		dst_frame_hst,dst_frame_vst);
+-
+-
+ 	if(src_w > dst_w)         //判断hor的缩放模式 0：no_scl 1：scl_up 2：scl_down
+ 	{
+ 		scl_hor_mode = 0x2;   //scl_down
+@@ -249,146 +273,239 @@ static int rk616_scaler_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 	return 0;
+ 	
+ }
+-static int  rk616_set_router(struct mfd_rk616 *rk616,rk_screen *screen)
++
++
++static int rk616_dual_input_cfg(struct mfd_rk616 *rk616,rk_screen *screen,
++					bool enable)
+ {
+ 	struct rk616_platform_data *pdata = rk616->pdata;
+ 	struct rk616_route *route = &rk616->route;
+-	if((pdata->lcd0_func == INPUT) && (pdata->lcd1_func == INPUT))
++	
++	route->vif0_bypass = VIF0_CLK_BYPASS;
++	route->vif0_en     = 0;
++ 	route->vif0_clk_sel = VIF0_CLKIN_SEL(VIF_CLKIN_SEL_PLL0);
++	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
++	route->pll1_clk_sel = PLL1_CLK_SEL(LCD1_DCLK);
++	route->vif1_clk_sel = VIF1_CLKIN_SEL(VIF_CLKIN_SEL_PLL1);
++	route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF1);
++	if(enable)  //hdmi plug in
+ 	{
+-		route->vif0_bypass = 1;
+-		route->vif0_en     = 0;
+-		route->vif1_bypass = 1;
++		route->vif1_bypass  = 0;
++		route->vif1_en      = 1;
++		
++	}
++	else  //hdmi plug out
++	{
++		route->vif1_bypass = VIF1_CLK_BYPASS;
+ 		route->vif1_en     = 0;
+-		route->sclin_sel   = 0; //0:vif0 1:vif1
++	}
++
++	route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
++	route->scl_en      = 0;            //dual lcdc, scaler not needed
++	route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_VIF0); //dither from vif0
++	route->lcd1_input  = 1; 
++	route->lvds_en	   = 1;
++
++	if(screen->type == SCREEN_RGB)
++	{
++		route->lvds_mode   = RGB; //rgb output 
++	}
++	else if(screen->type == SCREEN_LVDS)
++	{
++		route->lvds_mode = LVDS;
++		route->lvds_ch_nr = pdata->lvds_ch_nr;
++	}
++	else
++	{
++		dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
++		return -EINVAL;
++	}
++
++	return 0;
++	
++}
++
++static int rk616_lcd0_input_lcd1_unused_cfg(struct mfd_rk616 *rk616,rk_screen *screen,
++							bool enable)
++{
++	struct rk616_platform_data *pdata = rk616->pdata;
++	struct rk616_route *route = &rk616->route;
++	
++	if(enable)  //hdmi plug in
++	{
++		route->vif0_bypass  = 0;
++		route->vif0_en      = 1;
++		route->vif0_clk_sel = VIF0_CLKIN_SEL(VIF_CLKIN_SEL_PLL0);
++		route->sclin_sel    = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
++		route->scl_en       = 1;
++		route->sclk_sel     = SCLK_SEL(SCLK_SEL_PLL1);
++		route->dither_sel   = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
++		route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
++		
++	}
++	else
++	{
++		route->vif0_bypass = VIF0_CLK_BYPASS;
++		route->vif0_en     = 0;
++		route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
+ 		route->scl_en      = 0;
+-		route->dither_sel  = 0; //dither from vif0
+-		route->hdmi_sel    = 0;
+-		route->lcd1_input  = 1; 
+-		route->lvds_en	   = 1;
+-		if(screen->type == SCREEN_RGB)
+-		{
+-			route->lvds_mode   = 0; //rgb output 
+-		}
+-		else if(screen->type == SCREEN_LVDS)
+-		{
+-			route->lvds_mode = 1;
+-			route->lvds_ch_nr = pdata->lvds_ch_nr;
+-		}
+-		#if 0
+-		else
+-		{
+-			dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
+-			return -EINVAL;
+-		}
+-		#endif
+-			
++		route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_VIF0); //dither from sclaer
++		route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
++	}
++	route->pll1_clk_sel = PLL1_CLK_SEL(LCD0_DCLK);
++	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
++	route->vif1_bypass = VIF1_CLK_BYPASS;
++	route->vif1_en     = 0;
++	route->lcd1_input  = 0;  
++	route->lvds_en	   = 1;
++	if(screen->type == SCREEN_RGB)
++	{
++		route->lvds_mode   = RGB; //rgb output 
++	}
++	else if(screen->type == SCREEN_LVDS)
++	{
++		route->lvds_mode = LVDS;
++		route->lvds_ch_nr = pdata->lvds_ch_nr;
++	}
++	else
++	{
++		dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++
++static int rk616_lcd0_input_lcd1_output_cfg(struct mfd_rk616 *rk616,rk_screen *screen,
++							bool enable)
++{
++	struct rk616_route *route = &rk616->route;
++
++	if(enable)
++	{
++		route->vif0_bypass  = 0;
++		route->vif0_en      = 1;
++		route->vif0_clk_sel = VIF0_CLKIN_SEL(VIF_CLKIN_SEL_PLL0);
++		route->sclin_sel    = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
++		route->scl_en       = 1;
++		route->sclk_sel     = SCLK_SEL(SCLK_SEL_PLL1);
++		route->dither_sel   = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
++		route->hdmi_sel     = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0
++	}
++	else
++	{
++		route->vif0_bypass = VIF0_CLK_BYPASS;
++		route->vif0_en     = 0;
++		route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF0); //from vif0
++		route->scl_en      = 0;
++		route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_VIF0); //dither from sclaer
++		route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF0);//from vif0	
++	}
++	route->pll0_clk_sel = PLL0_CLK_SEL(LCD0_DCLK);
++	route->pll1_clk_sel = PLL1_CLK_SEL(LCD0_DCLK);
++	route->vif1_bypass = VIF1_CLK_BYPASS;
++	route->vif1_en = 0;
++	route->lcd1_input = 0; //lcd1 as out put
++	route->lvds_en	= 0;
++
++	return 0;
++	
++}
++
++
++static int rk616_lcd0_unused_lcd1_input_cfg(struct mfd_rk616 *rk616,rk_screen *screen,
++							bool enable)
++{
++	struct rk616_platform_data *pdata = rk616->pdata;
++	struct rk616_route *route = &rk616->route;
++
++	route->pll0_clk_sel = PLL0_CLK_SEL(LCD1_DCLK);
++	route->pll1_clk_sel = PLL1_CLK_SEL(LCD1_DCLK);
++	route->vif0_bypass = VIF0_CLK_BYPASS;
++	route->vif0_en     = 0;
++	route->vif1_bypass = 0;
++	route->vif1_en     = 1;
++	route->vif1_clk_sel = VIF1_CLKIN_SEL(VIF_CLKIN_SEL_PLL1);
++	route->sclin_sel   = SCL_IN_SEL(SCL_SEL_VIF1); //from vif1
++	route->scl_en      = 1;
++	route->sclk_sel    = SCLK_SEL(SCLK_SEL_PLL0);
++	route->scl_bypass  = 1; //1:1 scaler
++	route->dither_sel  = DITHER_IN_SEL(DITHER_SEL_SCL); //dither from sclaer
++	route->hdmi_sel    = HDMI_IN_SEL(HDMI_CLK_SEL_VIF1); //from vif1
++	route->lcd1_input  = 1;  
++	route->lvds_en	   = 1;
++	if(screen->type == SCREEN_RGB)
++	{
++		route->lvds_mode   = RGB; //rgb output 
++	}
++	else if(screen->type == SCREEN_LVDS)
++	{
++		route->lvds_mode = LVDS;
++		route->lvds_ch_nr = pdata->lvds_ch_nr;
++	}
++	else
++	{
++		dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int  rk616_set_router(struct mfd_rk616 *rk616,rk_screen *screen,bool enable)
++{
++	struct rk616_platform_data *pdata = rk616->pdata;
++	int ret;
++
++	if((pdata->lcd0_func == INPUT) && (pdata->lcd1_func == INPUT))
++	{
++		
++		ret = rk616_dual_input_cfg(rk616,screen,enable);
+ 		dev_info(rk616->dev,"rk616 use dual input for dual display!\n");
+ 	}
+ 	else if((pdata->lcd0_func == INPUT) && (pdata->lcd1_func == UNUSED))
+ 	{
+-		route->vif0_bypass = 1;
+-		route->vif0_en     = 0;
+-		route->vif1_bypass = 1;
+-		route->vif1_en     = 0;
+-		route->sclin_sel   = 0; //from vif0
+-		route->scl_en      = 1;
+-		route->dither_sel  = 1; //dither from sclaer
+-		route->hdmi_sel    = 2;//from vif0
+-		route->lcd1_input  = 0;  
+-		route->lvds_en	   = 1;
+-		if(screen->type == SCREEN_RGB)
+-		{
+-			route->lvds_mode   = 0; //rgb output 
+-		}
+-		else if(screen->type == SCREEN_LVDS)
+-		{
+-			route->lvds_mode = 1;
+-			route->lvds_ch_nr = pdata->lvds_ch_nr;
+-		}
+-		else
+-		{
+-			dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
+-			return -EINVAL;
+-		}
+-			
++		ret = rk616_lcd0_input_lcd1_unused_cfg(rk616,screen,enable);
++
+ 		dev_info(rk616->dev,
+ 			"rk616 use lcd0 as input and lvds/rgb "
+ 			"port as output for dual display\n");
+ 	}
+ 	else if((pdata->lcd0_func == INPUT) && (pdata->lcd1_func == OUTPUT))
+ 	{
+-		route->vif0_bypass = 1;
+-		route->vif0_en = 0;
+-		route->vif1_bypass = 1;
+-		route->vif1_en = 0;
+-		route->sclin_sel = 0;  // scl from vif0
+-		route->scl_en	= 1;
+-		route->dither_sel = 0;
+-		route->hdmi_sel = 2;  //hdmi from lcd0
+-		route->lcd1_input = 0; //lcd1 as out put
+-		route->lvds_en	= 0;
++		ret = rk616_lcd0_input_lcd1_output_cfg(rk616,screen,enable);
++		
+ 		dev_info(rk616->dev,
+ 			"rk616 use lcd0 as input and lcd1 as"
+ 			"output for dual display\n");
+-
+ 	}
+ 	else if((pdata->lcd0_func == UNUSED) && (pdata->lcd1_func == INPUT))
+ 	{
+-		route->vif0_bypass = 1;
+-		route->vif0_en     = 0;
+-		route->vif1_bypass = 1;
+-		route->vif1_en     = 0;
+-		route->sclin_sel   = 1; //from vif1
+-		route->scl_en      = 1;
+-		route->dither_sel  = 1; //dither from sclaer
+-		route->hdmi_sel    = 0; //from vif1
+-		route->lcd1_input  = 1;  
+-		route->lvds_en	   = 1;
+-		if(screen->type == SCREEN_RGB)
+-		{
+-			route->lvds_mode   = 0; //rgb output 
+-		}
+-		else if(screen->type == SCREEN_LVDS)
+-		{
+-			route->lvds_mode = 1;
+-			route->lvds_ch_nr = pdata->lvds_ch_nr;
+-		}
+-		else
+-		{
+-			dev_err(rk616->dev,"un supported interface:%d\n",screen->type);
+-			return -EINVAL;
+-		}
+-			
+-		
++		ret = rk616_lcd0_unused_lcd1_input_cfg(rk616,screen,enable);
++		dev_info(rk616->dev,
++			"rk616 use lcd1 as input and lvds/rgb as"
++			"output for dual display\n");
+ 	}
+ 	else
+ 	{
+ 		dev_err(rk616->dev,
+ 			"invalid configration,please check your"
+-			"rk616_platform_data setting in your board file!\n");	
++			"rk616_platform_data setting in your board file!\n");
++		return -EINVAL;
+ 	}
+ 
+-	return 0;
++	return ret ;
+ 	
+ }
+-static int rk616_display_router_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
++
++
++static int rk616_lvds_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ {
++	struct rk616_route *route = &rk616->route;
+ 	u32 val = 0;
+ 	int ret;
+-	struct rk616_route *route = &rk616->route;
+-
+ 	
+-
+-	ret = rk616_set_router(rk616,screen);
+-	if(ret < 0)
+-		return ret;
+-	
+-	val = (SCLIN_CLK_SEL << 16) | (DITHER_CLK_SEL << 16) | (HDMI_CLK_SEL_MASK) | 
+-		(VIF1_CLK_BYPASS << 16) | (VIF0_CLK_BYPASS << 16) |(route->sclin_sel<<15) | 
+-		(route->dither_sel<<14) | (route->hdmi_sel<<12) | (route->vif1_bypass<<7) | 
+-		(route->vif0_bypass<<1); 
+-	ret = rk616->write_dev(rk616,CRU_CLKSE2_CON,&val);
+-
+ 	if(!route->lvds_en)  //lvds port is not used ,power down lvds
+ 	{
+ 		val &= ~(LVDS_CH1TTL_EN | LVDS_CH0TTL_EN | LVDS_CH1_PWR_EN |
+@@ -452,9 +569,47 @@ static int rk616_display_router_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 			
+ 		}
+ 	}
++
++	return 0;
++	
++}
++static int rk616_display_router_cfg(struct mfd_rk616 *rk616,rk_screen *screen,bool enable)
++{
++	u32 val = 0;
++	int ret;
++	struct rk616_route *route = &rk616->route;
++
++	
++	ret = rk616_set_router(rk616,screen,enable);
++	if(ret < 0)
++		return ret;
++
++	
++	val = (route->pll0_clk_sel) | (route->pll1_clk_sel) |
++		PLL1_CLK_SEL_MASK | PLL0_CLK_SEL_MASK; //pll1 clk from lcdc1_dclk,pll0 clk from lcdc0_dclk,mux_lcdx = lcdx_clk
++	ret = rk616->write_dev(rk616,CRU_CLKSEL0_CON,&val);
++	
++	val = (route->sclk_sel) | SCLK_SEL_MASK;
++	ret = rk616->write_dev(rk616,CRU_CLKSEL1_CON,&val);
++	
++	val = (SCL_IN_SEL_MASK) | (DITHER_IN_SEL_MASK) | (HDMI_IN_SEL_MASK) | 
++		(VIF1_CLKIN_SEL_MASK) | (VIF0_CLKIN_SEL_MASK) | (VIF1_CLK_BYPASS << 16) | 
++		(VIF0_CLK_BYPASS << 16) |(route->sclin_sel) | (route->dither_sel) | 
++		(route->hdmi_sel) | (route->vif1_bypass) | (route->vif0_bypass) |
++		(route->vif1_clk_sel)| (route->vif0_clk_sel); 
++	ret = rk616->write_dev(rk616,CRU_CLKSE2_CON,&val);
++	
++	if((screen->type == SCREEN_RGB) || (screen->type == SCREEN_LVDS))
++	{
++		rk616_lvds_cfg(rk616,screen);
++	}	
+ 	
+ 	
+ 	val = FRC_DCLK_INV | (FRC_DCLK_INV << 16);
++	if((screen->face != OUT_P888) && enable)  //enable frc dither if the screen is not 24bit
++		val |= FRC_DITHER_EN | (FRC_DITHER_EN << 16);
++	else
++		val |= (FRC_DITHER_EN << 16);
+ 	ret = rk616->write_dev(rk616,FRC_REG,&val);
+ 	
+ 	ret = rk616_vif_cfg(rk616,screen,0);
+@@ -464,6 +619,7 @@ static int rk616_display_router_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 	return 0;
+ 	
+ }
++
+ int rk610_lcd_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass 1: scale
+ {
+ 	int ret;
+@@ -473,11 +629,11 @@ int rk610_lcd_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass
+ 		printk(KERN_ERR "%s:mfd rk616 is null!\n",__func__);
+ 		return -1;
+ 	}
+-	rk616_display_router_cfg(rk616,screen);
++	ret = rk616_display_router_cfg(rk616,screen,enable);
+ 	return ret;
+ }
+ 
+-static int rk616_lvds_probe(struct platform_device *pdev)
++static int rk616_vif_probe(struct platform_device *pdev)
+ {
+ 
+ 	struct mfd_rk616 *rk616 = dev_get_drvdata(pdev->dev.parent);
+@@ -490,19 +646,19 @@ static int rk616_lvds_probe(struct platform_device *pdev)
+ 		g_rk616 = rk616;
+ 	
+ 
+-	dev_info(&pdev->dev,"rk616 lvds probe success!\n");
++	dev_info(&pdev->dev,"rk616 vif probe success!\n");
+ 
+ 	return 0;
+ 	
+ }
+ 
+-static int rk616_lvds_remove(struct platform_device *pdev)
++static int rk616_vif_remove(struct platform_device *pdev)
+ {
+ 	
+ 	return 0;
+ }
+ 
+-static void rk616_lvds_shutdown(struct platform_device *pdev)
++static void rk616_vif_shutdown(struct platform_device *pdev)
+ {
+ 	
+ 	return;
+@@ -510,12 +666,12 @@ static void rk616_lvds_shutdown(struct platform_device *pdev)
+ 
+ static struct platform_driver rk616_lvds_driver = {
+ 	.driver		= {
+-		.name	= "rk616-lvds",
++		.name	= "rk616-vif",
+ 		.owner	= THIS_MODULE,
+ 	},
+-	.probe		= rk616_lvds_probe,
+-	.remove		= rk616_lvds_remove,
+-	.shutdown	= rk616_lvds_shutdown,
++	.probe		= rk616_vif_probe,
++	.remove		= rk616_vif_remove,
++	.shutdown	= rk616_vif_shutdown,
+ };
+ 
+ static int __init rk616_lvds_init(void)
+diff --git a/include/linux/mfd/rk616.h b/include/linux/mfd/rk616.h
+index 6832956f9b04..ff72bf2df62b 100644
+--- a/include/linux/mfd/rk616.h
++++ b/include/linux/mfd/rk616.h
+@@ -41,6 +41,7 @@
+ #define FRC_RGB18_MODE		(1<<2)
+ #define FRC_HIFRC_MODE		(1<<1)
+ #define FRC_DITHER_EN		(1<<0)
++
+ #define CRU_CLKSEL0_CON 	0x0058
+ #define PLL1_CLK_SEL_MASK	(0x3<<24)
+ #define PLL0_CLK_SEL_MASK	(0x3<<22)
+@@ -48,10 +49,14 @@
+ #define LCD0_CLK_DIV_MASK	(0x7<<16)
+ #define PLL1_CLK_SEL(x)  	(((x)&3)<<8)
+ #define PLL0_CLK_SEL(x)  	(((x)&3)<<6)
++#define LCD0_DCLK		0
++#define LCD1_DCLK		1
++#define MCLK_12M		2
+ #define LCD1_CLK_DIV(x) 	(((x)&7)<<3)
+ #define LCD0_CLK_DIV(x) 	(((x)&7)<<0)
+ 
+ #define CRU_CLKSEL1_CON 	0x005C
++#define SCLK_SEL_MASK		(1<<19)
+ #define CODEC_MCLK_SEL_MASK	(3<<16)
+ #define LCDC_CLK_GATE		(1<<12)
+ #define LCDC1_CLK_GATE		(1<<11)
+@@ -60,32 +65,47 @@
+ #define HDMI_CLK_GATE		(1<<8)
+ #define SCL_CLK_DIV(x)		(((x)&7)<<5)
+ #define SCL_CLK_GATE		(1<<4)
+-#define SCL_CLK_IN_SEL		(1<<3)
++#define SCLK_SEL(x)		(((x)&1)<<3)
++#define SCLK_SEL_PLL0		0
++#define SCLK_SEL_PLL1		1
+ #define CODEC_CLK_GATE		(1<<2)
+ #define CODEC_MCLK_SEL(x)	(((x)&3)<<0)
++#define CODEC_MCLK_SEL_PLL0	0
++#define CODEC_MCLK_SEL_PLL1	1
++#define CODEC_MCLK_SEL_12M	2
+ 
+ #define CRU_CODEC_DIV		0x0060
+ 
+ #define CRU_CLKSE2_CON  	0x0064
+-#define HDMI_CLK_SEL_MASK	(3<<28)
++#define SCL_IN_SEL_MASK		(1<<31)
++#define DITHER_IN_SEL_MASK	(1<<30)
++#define HDMI_IN_SEL_MASK	(3<<28)
+ #define VIF1_CLK_DIV_MASK	(7<<25)
+ #define VIF0_CLK_DIV_MASK	(7<<19)
+-#define SCLIN_CLK_SEL		(1<<15)
+-#define SCL_SEL_VIF0           0
+-#define SCL_SEL_VIF1           1
+-#define DITHER_CLK_SEL		(1<<14)
++#define VIF1_CLKIN_SEL_MASK	(1<<22)
++#define VIF0_CLKIN_SEL_MASK	(1<<16)
++#define SCL_IN_SEL(x)		(((x)&1)<<15)
++#define SCL_SEL_VIF0           	0
++#define SCL_SEL_VIF1           	1
++#define DITHER_IN_SEL(x)	(((x)&1)<<14)
+ #define DITHER_SEL_VIF0		0
+ #define DITHER_SEL_SCL		1
+ 
+-#define HDMI_CLK_SEL(x)		(((x)&3)<<12)
++#define HDMI_IN_SEL(x)		(((x)&3)<<12)
++#define HDMI_CLK_SEL_VIF1	0
++#define HDMI_CLK_SEL_SCL	1
++#define HDMI_CLK_SEL_VIF0	2
+ #define VIF1_CLK_DIV(x) 	(((x)&7)<<9)
+ #define VIF1_CLK_GATE		(1<<8)
+ #define VIF1_CLK_BYPASS		(1<<7)
+-#define VIF1_CLK_SEL		(1<<6)
++#define VIF1_CLKIN_SEL(x)	(((x)&1)<<6)
++#define VIF_CLKIN_SEL_PLL0	0
++#define VIF_CLKIN_SEL_PLL1	1
+ #define VIF0_CLK_DIV(x)		(((x)&7)<<3)
+ #define VIF0_CLK_GATE		(1<<2)
+ #define VIF0_CLK_BYPASS		(1<<1)
+-#define VIF0_CLK_SEL		(1<<0)
++#define VIF0_CLKIN_SEL(x)	(((x)&1)<<0)
++
+ 
+ #define CRU_PLL0_CON0   	0x0068
+ #define PLL0_POSTDIV1_MASK	(7<<28)
+@@ -109,7 +129,7 @@
+ #define PLL0_FOUTVCO_PWR_DN	(1<<26)
+ #define PLL0_POSTDIV_PWR_DN	(1<<25)
+ #define PLL0_DAC_PWR_DN		(1<<24)
+-#define PLL0_FRAC(x)		(((x)&0xffffff)<0)
++#define PLL0_FRAC(x)		(((x)&0xffffff)<<0)
+ 
+ #define CRU_PLL1_CON0   	0x0074
+ #define PLL1_POSTDIV1_MASK	(7<<28)
+@@ -194,6 +214,10 @@ enum lcd_port_func{       // the function of lcd ports(lcd0,lcd1),the lcd0 only
+ 	OUTPUT,
+ };
+ 
++enum lvds_mode {
++	RGB,
++	LVDS,
++};
+ struct rk616_platform_data {
+ 	int (*power_init)(void);
+ 	int scl_rate;
+@@ -205,17 +229,23 @@ struct rk616_platform_data {
+ };
+ 
+ struct rk616_route {
+-	u8 vif0_bypass;
+-	u8 vif0_en;
+-	u8 vif1_bypass;
+-	u8 vif1_en;
+-	u8 sclin_sel;
+-	u8 scl_en;
+-	u8 dither_sel;
+-	u8 hdmi_sel;
+-	u8 lcd1_input;
+-	u8 lvds_en;
+-	u8 lvds_mode;                //RGB or LVDS
++	u16 vif0_bypass;
++	u8  vif0_en;
++	u16 vif0_clk_sel;
++	u16 vif1_bypass;
++	u8  vif1_en;
++	u16 vif1_clk_sel;
++	u16 sclin_sel;
++	u8  scl_en;
++	u8  scl_bypass;
++	u16 dither_sel;
++	u16 hdmi_sel;
++	u16 pll0_clk_sel;
++	u16 pll1_clk_sel;
++	u16 sclk_sel;
++	u8  lcd1_input;
++	u8  lvds_en;
++	enum lvds_mode lvds_mode;                //RGB or LVDS
+ 	int lvds_ch_nr;		//the number of used  lvds channel 
+ };
+ 
+-- 
+2.35.3
+

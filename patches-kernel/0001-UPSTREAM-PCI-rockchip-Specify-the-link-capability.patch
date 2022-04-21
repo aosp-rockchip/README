@@ -1,0 +1,132 @@
+From 9d5d5ab0dc51bbc4dce45aca04e59a6cfeb41975 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Tue, 18 Oct 2016 09:45:10 +0800
+Subject: [PATCH] UPSTREAM: PCI: rockchip: Specify the link capability
+
+rk3399 supports PCIe 2.x link speeds marginally at best, and on some
+boards, the link won't train at 5 GT/s at all. Rather than sacrifice
+500ms waiting for training that will never happen, let's use the helper
+function, of_pci_get_max_link_speed, to get the max link speed from DT
+and specify link capability.
+
+Change-Id: I899df707f0555eea8ae4a370b171a4786162bb90
+Signed-off-by: Brian Norris <briannorris@chromium.org>
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+(am from git.kernel.org/cgit/linux/kernel/git/next/linux-next.git
+commit 9d4052126b0deeb67552580ffe7f6383e0123c62)
+---
+ drivers/pci/host/pcie-rockchip.c | 60 ++++++++++++++++++++------------
+ 1 file changed, 37 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/pci/host/pcie-rockchip.c b/drivers/pci/host/pcie-rockchip.c
+index fd8620f92cae..f567518cb35c 100644
+--- a/drivers/pci/host/pcie-rockchip.c
++++ b/drivers/pci/host/pcie-rockchip.c
+@@ -53,6 +53,7 @@
+ #define   PCIE_CLIENT_ARI_ENABLE	  HIWORD_UPDATE_BIT(0x0008)
+ #define   PCIE_CLIENT_CONF_LANE_NUM(x)	  HIWORD_UPDATE(0x0030, ENCODE_LANES(x))
+ #define   PCIE_CLIENT_MODE_RC		  HIWORD_UPDATE_BIT(0x0040)
++#define   PCIE_CLIENT_GEN_SEL_1		  HIWORD_UPDATE(0x0080, 0)
+ #define   PCIE_CLIENT_GEN_SEL_2		  HIWORD_UPDATE_BIT(0x0080)
+ #define PCIE_CLIENT_BASIC_STATUS1	(PCIE_CLIENT_BASE + 0x48)
+ #define   PCIE_CLIENT_LINK_STATUS_UP		0x00300000
+@@ -205,6 +206,7 @@ struct rockchip_pcie {
+ 	struct	gpio_desc *ep_gpio;
+ 	u32	lanes;
+ 	u8	root_bus_nr;
++	int	link_gen;
+ 	struct	device *dev;
+ 	struct	irq_domain *irq_domain;
+ };
+@@ -477,14 +479,20 @@ static int rockchip_pcie_init_port(struct rockchip_pcie *rockchip)
+ 		return err;
+ 	}
+ 
++	if (rockchip->link_gen == 2)
++		rockchip_pcie_write(rockchip, PCIE_CLIENT_GEN_SEL_2,
++				    PCIE_CLIENT_CONFIG);
++	else
++		rockchip_pcie_write(rockchip, PCIE_CLIENT_GEN_SEL_1,
++				    PCIE_CLIENT_CONFIG);
++
+ 	rockchip_pcie_write(rockchip,
+ 			    PCIE_CLIENT_CONF_ENABLE |
+ 			    PCIE_CLIENT_LINK_TRAIN_ENABLE |
+ 			    PCIE_CLIENT_ARI_ENABLE |
+ 			    PCIE_CLIENT_CONF_LANE_NUM(rockchip->lanes) |
+-			    PCIE_CLIENT_MODE_RC |
+-			    PCIE_CLIENT_GEN_SEL_2,
+-				PCIE_CLIENT_CONFIG);
++			    PCIE_CLIENT_MODE_RC,
++			    PCIE_CLIENT_CONFIG);
+ 
+ 	err = phy_power_on(rockchip->phy);
+ 	if (err) {
+@@ -568,29 +576,31 @@ static int rockchip_pcie_init_port(struct rockchip_pcie *rockchip)
+ 		msleep(20);
+ 	}
+ 
+-	/*
+-	 * Enable retrain for gen2. This should be configured only after
+-	 * gen1 finished.
+-	 */
+-	status = rockchip_pcie_read(rockchip, PCIE_RC_CONFIG_LCS);
+-	status |= PCIE_RC_CONFIG_LCS_RETRAIN_LINK;
+-	rockchip_pcie_write(rockchip, status, PCIE_RC_CONFIG_LCS);
++	if (rockchip->link_gen == 2) {
++		/*
++		 * Enable retrain for gen2. This should be configured only after
++		 * gen1 finished.
++		 */
++		status = rockchip_pcie_read(rockchip, PCIE_RC_CONFIG_LCS);
++		status |= PCIE_RC_CONFIG_LCS_RETRAIN_LINK;
++		rockchip_pcie_write(rockchip, status, PCIE_RC_CONFIG_LCS);
++
++		timeout = jiffies + msecs_to_jiffies(500);
++		for (;;) {
++			status = rockchip_pcie_read(rockchip, PCIE_CORE_CTRL);
++			if ((status & PCIE_CORE_PL_CONF_SPEED_MASK) ==
++			    PCIE_CORE_PL_CONF_SPEED_5G) {
++				dev_dbg(dev, "PCIe link training gen2 pass!\n");
++				break;
++			}
+ 
+-	timeout = jiffies + msecs_to_jiffies(500);
+-	for (;;) {
+-		status = rockchip_pcie_read(rockchip, PCIE_CORE_CTRL);
+-		if ((status & PCIE_CORE_PL_CONF_SPEED_MASK) ==
+-		    PCIE_CORE_PL_CONF_SPEED_5G) {
+-			dev_dbg(dev, "PCIe link training gen2 pass!\n");
+-			break;
+-		}
++			if (time_after(jiffies, timeout)) {
++				dev_dbg(dev, "PCIe link training gen2 timeout, fall back to gen1!\n");
++				break;
++			}
+ 
+-		if (time_after(jiffies, timeout)) {
+-			dev_dbg(dev, "PCIe link training gen2 timeout, fall back to gen1!\n");
+-			break;
++			msleep(20);
+ 		}
+-
+-		msleep(20);
+ 	}
+ 
+ 	/* Check the final link width from negotiated lane counter from MGMT */
+@@ -799,6 +809,10 @@ static int rockchip_pcie_parse_dt(struct rockchip_pcie *rockchip)
+ 		rockchip->lanes = 1;
+ 	}
+ 
++	rockchip->link_gen = of_pci_get_max_link_speed(node);
++	if (rockchip->link_gen < 0 || rockchip->link_gen > 2)
++		rockchip->link_gen = 2;
++
+ 	rockchip->core_rst = devm_reset_control_get(dev, "core");
+ 	if (IS_ERR(rockchip->core_rst)) {
+ 		if (PTR_ERR(rockchip->core_rst) != -EPROBE_DEFER)
+-- 
+2.35.3
+

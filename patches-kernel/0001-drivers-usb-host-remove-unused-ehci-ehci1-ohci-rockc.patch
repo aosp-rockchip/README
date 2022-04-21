@@ -1,0 +1,1158 @@
+From 2d5222e4ae62e03a853645fd0efd4f2e49cead3e Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Mon, 5 Nov 2018 15:29:51 +0800
+Subject: [PATCH] drivers/usb/host: remove unused ehci/ehci1/ohci-rockchip
+ drivers
+
+Change-Id: If3eab374ea98ffba3db60d1039f9ee12e01c6874
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ drivers/usb/host/ehci-rockchip.c  | 500 ------------------------------
+ drivers/usb/host/ehci1-rockchip.c | 376 ----------------------
+ drivers/usb/host/ohci-rockchip.c  | 244 ---------------
+ 3 files changed, 1120 deletions(-)
+ delete mode 100755 drivers/usb/host/ehci-rockchip.c
+ delete mode 100755 drivers/usb/host/ehci1-rockchip.c
+ delete mode 100755 drivers/usb/host/ohci-rockchip.c
+
+diff --git a/drivers/usb/host/ehci-rockchip.c b/drivers/usb/host/ehci-rockchip.c
+deleted file mode 100755
+index 425a7626ed83..000000000000
+--- a/drivers/usb/host/ehci-rockchip.c
++++ /dev/null
+@@ -1,500 +0,0 @@
+-/*
+- * EHCI-compliant USB host controller driver for Rockchip SoCs
+- *
+- * Copyright (C) 2010 Google, Inc.
+- * Copyright (C) 2009 - 2013 NVIDIA Corporation
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License as published by the
+- * Free Software Foundation; either version 2 of the License, or (at your
+- * option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+- * more details.
+- *
+- */
+-# include <linux/platform_device.h>
+-# include <linux/clk.h>
+-# include <linux/err.h>
+-# include <linux/device.h>
+-# include <linux/of.h>
+-# include <linux/of_platform.h>
+-# include <linux/usb.h>
+-# include <linux/usb/hcd.h>
+-# include <linux/usb/otg.h>
+-
+-# include "../dwc_otg_310/usbdev_rk.h"
+-# include "ehci.h"
+-
+-static int rkehci_status = 1;
+-static struct hc_driver rk_ehci_hc_driver;
+-
+-struct rk_ehci_hcd {
+-	struct ehci_hcd *ehci;
+-	uint8_t host_enabled;
+-	uint8_t host_setenable;
+-	struct rkehci_platform_data *pldata;
+-	struct timer_list connect_detect_timer;
+-	struct delayed_work host_enable_work;
+-};
+-#define EHCI_PRINT(x...)   printk(KERN_INFO "EHCI: " x)
+-
+-static void rk_ehci_hcd_enable(struct work_struct *work)
+-{
+-	struct rk_ehci_hcd *rk_ehci;
+-	struct usb_hcd *hcd;
+-	struct rkehci_platform_data *pldata;
+-	struct ehci_hcd *ehci;
+-
+-	rk_ehci = container_of(work, struct rk_ehci_hcd, host_enable_work.work);
+-	pldata = rk_ehci->pldata;
+-	ehci = rk_ehci->ehci;
+-	hcd = ehci_to_hcd(ehci);
+-
+-	if (rk_ehci->host_enabled == rk_ehci->host_setenable) {
+-		EHCI_PRINT("%s, enable flag %d\n", __func__,
+-		       rk_ehci->host_setenable);
+-		goto out;
+-	}
+-
+-	if (rk_ehci->host_setenable == 2) {
+-		/* enable -> disable */
+-		if (pldata->get_status(USB_STATUS_DPDM)) {
+-			/* usb device connected */
+-			rk_ehci->host_setenable = 1;
+-			goto out;
+-		}
+-
+-		EHCI_PRINT("%s, disable host controller\n", __func__);
+-
+-		if (pldata->phy_suspend)
+-			pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+-		/* do not disable EHCI clk, otherwise RK3288
+-		 * host1(DWC_OTG) can't work normally.
+-		 */
+-		/* pldata->clock_enable(pldata, 0); */
+-	} else if (rk_ehci->host_setenable == 1) {
+-		/* pldata->clock_enable(pldata, 1); */
+-		if (pldata->phy_suspend)
+-			pldata->phy_suspend(pldata, USB_PHY_ENABLED);
+-		mdelay(5);
+-		EHCI_PRINT("%s, enable host controller\n", __func__);
+-	}
+-	rk_ehci->host_enabled = rk_ehci->host_setenable;
+-
+-out:
+-	return;
+-}
+-
+-static void rk_ehci_hcd_connect_detect(unsigned long pdata)
+-{
+-	struct rk_ehci_hcd *rk_ehci = (struct rk_ehci_hcd *)pdata;
+-	struct ehci_hcd *ehci = rk_ehci->ehci;
+-	struct rkehci_platform_data *pldata;
+-	uint32_t status;
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-
+-	pldata = rk_ehci->pldata;
+-
+-	if (pldata->get_status(USB_STATUS_DPDM)) {
+-		/* usb device connected */
+-		rk_ehci->host_setenable = 1;
+-	} else {
+-		/* no device, suspend host */
+-		status = readl(&ehci->regs->port_status[0]);
+-		if (!(status & PORT_CONNECT)) {
+-			rk_ehci->host_setenable = 2;
+-		}
+-	}
+-
+-	if ((rk_ehci->host_enabled)
+-	    && (rk_ehci->host_setenable != rk_ehci->host_enabled)) {
+-		schedule_delayed_work(&rk_ehci->host_enable_work, 1);
+-	}
+-
+-	mod_timer(&rk_ehci->connect_detect_timer, jiffies + (HZ << 1));
+-
+-	local_irq_restore(flags);
+-	return;
+-}
+-
+-static ssize_t ehci_power_show(struct device *_dev,
+-			       struct device_attribute *attr, char *buf)
+-{
+-	return sprintf(buf, "%d\n", rkehci_status);
+-}
+-
+-static ssize_t ehci_power_store(struct device *_dev,
+-				struct device_attribute *attr,
+-				const char *buf, size_t count)
+-{
+-	uint32_t val = simple_strtoul(buf, NULL, 16);
+-	struct usb_hcd *hcd = dev_get_drvdata(_dev);
+-	struct rkehci_platform_data *pldata = _dev->platform_data;
+-	struct rk_ehci_hcd *rk_ehci = (struct rk_ehci_hcd *)hcd_to_ehci(hcd)->priv;
+-
+-	EHCI_PRINT("%s: %d setting to: %d\n", __func__, rkehci_status, val);
+-	if (val == rkehci_status)
+-		goto out;
+-
+-	rkehci_status = val;
+-	switch (val) {
+-	case 0:	/* power down */
+-		rk_ehci->host_enabled = 0;
+-		msleep(5);
+-		usb_remove_hcd(hcd);
+-		break;
+-	case 1:	/*  power on */
+-		pldata->soft_reset(pldata, RST_POR);
+-		usb_add_hcd(hcd, hcd->irq, IRQF_DISABLED | IRQF_SHARED);
+-		rk_ehci->host_enabled = 2;
+-		break;
+-	default:
+-		break;
+-	}
+-out:
+-	return count;
+-}
+-
+-static DEVICE_ATTR(ehci_power, S_IRUGO | S_IWUSR, ehci_power_show,
+-		   ehci_power_store);
+-static ssize_t debug_show(struct device *dev, struct device_attribute *attr,
+-			  char *buf)
+-{
+-	struct ehci_hcd *ehci = hcd_to_ehci(dev_get_drvdata(dev));
+-	volatile uint32_t *addr;
+-
+-	EHCI_PRINT("******** EHCI Capability Registers **********\n");
+-	addr = &ehci->caps->hc_capbase;
+-	EHCI_PRINT("HCIVERSION / CAPLENGTH  @0z%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->caps->hcs_params;
+-	EHCI_PRINT("HCSPARAMS               @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->caps->hcc_params;
+-	EHCI_PRINT("HCCPARAMS               @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	EHCI_PRINT("********* EHCI Operational Registers *********\n");
+-	addr = &ehci->regs->command;
+-	EHCI_PRINT("USBCMD                  @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->status;
+-	EHCI_PRINT("USBSTS                  @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->intr_enable;
+-	EHCI_PRINT("USBINTR                 @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->frame_index;
+-	EHCI_PRINT("FRINDEX                 @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->segment;
+-	EHCI_PRINT("CTRLDSSEGMENT           @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->frame_list;
+-	EHCI_PRINT("PERIODICLISTBASE        @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->async_next;
+-	EHCI_PRINT("ASYNCLISTADDR           @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->configured_flag;
+-	EHCI_PRINT("CONFIGFLAG              @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	addr = &ehci->regs->port_status[0];
+-	EHCI_PRINT("PORTSC                  @0x%p:  0x%08x\n",
+-		   addr, readl_relaxed(addr));
+-	return sprintf(buf, "EHCI Registers Dump\n");
+-}
+-
+-static DEVICE_ATTR(debug_ehci, S_IRUGO, debug_show, NULL);
+-
+-static int test_sq(struct ehci_hcd *ehci)
+-{
+-	u32 portc = readl(&ehci->regs->port_status);
+-	struct rk_ehci_hcd *rk_ehci = (struct rk_ehci_hcd *)ehci->priv;
+-
+-	if ((portc & PORT_PE) && !(portc & PORT_SUSPEND)) {
+-		/* At first del usb connect detect timer */
+-		del_timer_sync(&rk_ehci->connect_detect_timer);
+-		writel(PORT_TEST_PKT, &ehci->regs->port_status);
+-		EHCI_PRINT("Start packet test\n");
+-		return 0;
+-
+-	} else
+-		EHCI_PRINT("Invalid connect status PORTC = 0x%08x\n", portc);
+-
+-	return -1;
+-}
+-
+-static ssize_t test_sq_store(struct device *dev,
+-				 struct device_attribute *attr,
+-				 const char *buf, size_t count)
+-
+-{
+-	struct rkehci_platform_data *pldata = dev->platform_data;
+-	struct ehci_hcd *ehci = hcd_to_ehci(dev_get_drvdata(dev));
+-
+-	if (pldata->phy_status == USB_PHY_SUSPEND) {
+-		EHCI_PRINT("Invalid status : SUSPEND\n");
+-		return -EBUSY;
+-	}
+-
+-	return (test_sq(ehci)) ? -EBUSY : count;
+-}
+-
+-static DEVICE_ATTR(test_sq, S_IWUSR, NULL, test_sq_store);
+-
+-static struct of_device_id rk_ehci_of_match[] = {
+-#ifdef CONFIG_ARM
+-	{
+-	 .compatible = "rockchip,rk3288_rk_ehci_host",
+-	 .data = &rkehci_pdata_rk3288,
+-	 },
+-	{
+-	 .compatible = "rockchip,rk3126_ehci",
+-	 .data = &usb20ehci_pdata_rk3126,
+-	 },
+-#endif
+-#ifdef CONFIG_ARM64
+-	{
+-	 .compatible = "rockchip,rk3368_ehci",
+-	 .data = &usb20ehci_pdata_rk3368,
+-	 },
+-#endif
+-	{},
+-};
+-
+-MODULE_DEVICE_TABLE(of, rk_ehci_of_match);
+-
+-static int ehci_rk_probe(struct platform_device *pdev)
+-{
+-	struct usb_hcd *hcd;
+-	struct ehci_hcd *ehci;
+-	struct resource *res;
+-	struct device *dev = &pdev->dev;
+-	struct rkehci_platform_data *pldata;
+-	int ret;
+-	struct device_node *node = pdev->dev.of_node;
+-	struct rk_ehci_hcd *rk_ehci;
+-	const struct of_device_id *match =
+-	    of_match_device(of_match_ptr(rk_ehci_of_match), &pdev->dev);
+-
+-	dev_dbg(&pdev->dev, "ehci_rk probe!\n");
+-
+-	if (match && match->data) {
+-		dev->platform_data = (void *)match->data;
+-	} else {
+-		dev_err(dev, "ehci_rk match failed\n");
+-		return -EINVAL;
+-	}
+-
+-	pldata = dev->platform_data;
+-	pldata->dev = dev;
+-
+-	if (!node) {
+-		dev_err(dev, "device node not found\n");
+-		return -EINVAL;
+-	}
+-
+-	if (!pdev->dev.dma_mask)
+-		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+-	if (!pdev->dev.coherent_dma_mask)
+-		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
+-
+-	device_create_file(dev, &dev_attr_ehci_power);
+-	device_create_file(dev, &dev_attr_debug_ehci);
+-	device_create_file(dev, &dev_attr_test_sq);
+-
+-	hcd =
+-	    usb_create_hcd(&rk_ehci_hc_driver, &pdev->dev,
+-			   dev_name(&pdev->dev));
+-	if (!hcd) {
+-		dev_err(&pdev->dev, "Unable to create HCD\n");
+-		return -ENOMEM;
+-	}
+-
+-	if (pldata->hw_init)
+-		pldata->hw_init();
+-
+-	if (pldata->clock_init) {
+-		pldata->clock_init(pldata);
+-		pldata->clock_enable(pldata, 1);
+-	}
+-
+-	if (pldata->phy_suspend)
+-		pldata->phy_suspend(pldata, USB_PHY_ENABLED);
+-
+-	if (pldata->soft_reset)
+-		pldata->soft_reset(pldata, RST_POR);;
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(&pdev->dev, "Unable to get memory resource\n");
+-		ret = -ENODEV;
+-		goto put_hcd;
+-	}
+-
+-	hcd->rsrc_start = res->start;
+-	hcd->rsrc_len = resource_size(res);
+-	hcd->regs = devm_ioremap_resource(dev, res);
+-	if (!hcd->regs) {
+-		dev_err(&pdev->dev, "ioremap failed\n");
+-		ret = -ENOMEM;
+-		goto put_hcd;
+-	}
+-
+-	hcd->irq = platform_get_irq(pdev, 0);
+-	if (hcd->irq < 0) {
+-		dev_err(&pdev->dev, "Unable to get IRQ resource\n");
+-		ret = hcd->irq;
+-		goto put_hcd;
+-	}
+-
+-	ehci = hcd_to_ehci(hcd);
+-	ehci->caps = hcd->regs;
+-	ehci->regs = hcd->regs + 0x10;
+-	EHCI_PRINT("%s %p %p\n", __func__, ehci->caps, ehci->regs);
+-
+-	ehci->hcs_params = readl(&ehci->caps->hcs_params);
+-
+-	ret = usb_add_hcd(hcd, hcd->irq, IRQF_DISABLED | IRQF_SHARED);
+-	if (ret) {
+-		dev_err(&pdev->dev, "Failed to add USB HCD\n");
+-		goto put_hcd;
+-	}
+-
+-	rk_ehci = (struct rk_ehci_hcd *)hcd_to_ehci(hcd)->priv;
+-
+-	if (!rk_ehci) {
+-		ret = -ENOMEM;
+-		goto put_hcd;
+-	}
+-
+-	rk_ehci->ehci = ehci;
+-	rk_ehci->pldata = pldata;
+-	rk_ehci->host_enabled = -1;
+-	rk_ehci->host_setenable = -1;
+-	rk_ehci->connect_detect_timer.function = rk_ehci_hcd_connect_detect;
+-	rk_ehci->connect_detect_timer.data = (unsigned long)(rk_ehci);
+-	init_timer(&rk_ehci->connect_detect_timer);
+-	mod_timer(&rk_ehci->connect_detect_timer, jiffies + (HZ << 1));
+-	INIT_DELAYED_WORK(&rk_ehci->host_enable_work, rk_ehci_hcd_enable);
+-
+-	EHCI_PRINT("%s ok\n", __func__);
+-
+-	return 0;
+-
+-put_hcd:
+-	if (pldata->clock_enable)
+-		pldata->clock_enable(pldata, 0);
+-	usb_put_hcd(hcd);
+-
+-	return ret;
+-}
+-
+-static int ehci_rk_remove(struct platform_device *pdev)
+-{
+-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
+-	struct device *dev = &pdev->dev;
+-
+-	device_remove_file(dev, &dev_attr_ehci_power);
+-	device_remove_file(dev, &dev_attr_debug_ehci);
+-	device_remove_file(dev, &dev_attr_test_sq);
+-
+-	usb_put_hcd(hcd);
+-
+-	return 0;
+-}
+-
+-#ifdef CONFIG_PM
+-static int ehci_rk_pm_suspend(struct device *dev)
+-{
+-	struct usb_hcd *hcd = dev_get_drvdata(dev);
+-	bool do_wakeup = device_may_wakeup(dev);
+-	int ret;
+-
+-	dev_dbg(dev, "ehci-rockchip PM suspend\n");
+-
+-	ret = ehci_suspend(hcd, do_wakeup);
+-
+-	return ret;
+-}
+-
+-static int ehci_rk_pm_resume(struct device *dev)
+-{
+-	struct usb_hcd *hcd = dev_get_drvdata(dev);
+-
+-	dev_dbg(dev, "ehci-rockchip PM resume\n");
+-	ehci_resume(hcd, false);
+-
+-	return 0;
+-}
+-#else
+-#define ehci_rk_pm_suspend	NULL
+-#define ehci_rk_pm_resume	NULL
+-#endif
+-
+-static const struct dev_pm_ops ehci_rk_dev_pm_ops = {
+-	.suspend = ehci_rk_pm_suspend,
+-	.resume = ehci_rk_pm_resume,
+-};
+-
+-static struct platform_driver rk_ehci_driver = {
+-	.probe = ehci_rk_probe,
+-	.remove = ehci_rk_remove,
+-	.driver = {
+-		   .name = "rockchip_ehci_host",
+-		   .of_match_table = of_match_ptr(rk_ehci_of_match),
+-#ifdef CONFIG_PM
+-		   .pm = &ehci_rk_dev_pm_ops,
+-#endif
+-		   },
+-};
+-
+-static const struct ehci_driver_overrides rk_overrides __initdata = {
+-	.extra_priv_size = sizeof(struct rk_ehci_hcd),
+-};
+-
+-static void rk32_ehci_relinquish_port(struct usb_hcd *hcd, int portnum)
+-{
+-	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
+-	u32	*status_reg = &ehci->regs->port_status[--portnum];
+-	u32	portsc;
+-
+-	portsc = ehci_readl(ehci, status_reg);
+-	portsc &= ~(PORT_OWNER | PORT_RWC_BITS);
+-
+-	ehci_writel(ehci, portsc, status_reg);
+-}
+-
+-static int __init ehci_rk_init(void)
+-{
+-	if (usb_disabled())
+-		return -ENODEV;
+-
+-	ehci_init_driver(&rk_ehci_hc_driver, &rk_overrides);
+-
+-	/*
+-	 * Walk around: RK3288 do not support OHCI controller, so our
+-	 * vendor-spec ehci driver has to prevent handing off this port to
+-	 * OHCI by standard ehci-hub driver, put PORT_OWNER back to 0 manually.
+-	 */
+-	if (cpu_is_rk3288())
+-		rk_ehci_hc_driver.relinquish_port = rk32_ehci_relinquish_port;
+-
+-	return platform_driver_register(&rk_ehci_driver);
+-}
+-
+-module_init(ehci_rk_init);
+-
+-static void __exit ehci_rk_cleanup(void)
+-{
+-	platform_driver_unregister(&rk_ehci_driver);
+-}
+-module_exit(ehci_rk_cleanup);
+-MODULE_AUTHOR("Rockchip");
+-MODULE_LICENSE("GPL v2");
+-
+diff --git a/drivers/usb/host/ehci1-rockchip.c b/drivers/usb/host/ehci1-rockchip.c
+deleted file mode 100755
+index b973947d7665..000000000000
+--- a/drivers/usb/host/ehci1-rockchip.c
++++ /dev/null
+@@ -1,376 +0,0 @@
+-/* ehci-msm.c - HSUSB Host Controller Driver Implementation
+- *
+- * Copyright (c) 2008-2011, Code Aurora Forum. All rights reserved.
+- *
+- * Partly derived from ehci-fsl.c and ehci-hcd.c
+- * Copyright (c) 2000-2004 by David Brownell
+- * Copyright (c) 2005 MontaVista Software
+- *
+- * All source code in this file is licensed under the following license except
+- * where indicated.
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 as published
+- * by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+- *
+- * See the GNU General Public License for more details.
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, you can find it at http://www.fsf.org
+- */
+-
+-# include <linux/platform_device.h>
+-# include <linux/clk.h>
+-# include <linux/err.h>
+-# include <linux/device.h>
+-# include <linux/of.h>
+-# include <linux/of_platform.h>
+-# include "ehci.h"
+-# include "../dwc_otg_310/usbdev_rk.h"
+-
+-static int rkehci1_status = 1;
+-static struct ehci_hcd *g_ehci;
+-#define EHCI1_PRINT(x...)	printk(KERN_INFO "EHCI1: " x)
+-
+-static void ehci1_rk_port_power(struct ehci_hcd *ehci, int is_on)
+-{
+-	unsigned port;
+-
+-	if (!HCS_PPC(ehci->hcs_params))
+-		return;
+-
+-	ehci_dbg(ehci, "...power%s ports...\n", is_on ? "up" : "down");
+-	for (port = HCS_N_PORTS(ehci->hcs_params); port > 0;)
+-		(void)ehci_hub_control(ehci_to_hcd(ehci),
+-				       is_on ? SetPortFeature :
+-				       ClearPortFeature, USB_PORT_FEAT_POWER,
+-				       port--, NULL, 0);
+-	/* Flush those writes */
+-	ehci_readl(ehci, &ehci->regs->command);
+-	msleep(20);
+-}
+-
+-static struct hc_driver rk_ehci1_driver = {
+-	.description = hcd_name,
+-	.product_desc = "Rockchip On-Chip EHCI1 Host Controller",
+-	.hcd_priv_size = sizeof(struct ehci_hcd),
+-
+-	/*
+-	 * generic hardware linkage
+-	 */
+-	.irq = ehci_irq,
+-	.flags = HCD_USB2 | HCD_MEMORY,
+-
+-	.reset = ehci_init,
+-	.start = ehci_run,
+-
+-	.stop = ehci_stop,
+-	.shutdown = ehci_shutdown,
+-
+-	/*
+-	 * managing i/o requests and associated device resources
+-	 */
+-	.urb_enqueue = ehci_urb_enqueue,
+-	.urb_dequeue = ehci_urb_dequeue,
+-	.endpoint_disable = ehci_endpoint_disable,
+-	.endpoint_reset = ehci_endpoint_reset,
+-	.clear_tt_buffer_complete = ehci_clear_tt_buffer_complete,
+-
+-	/*
+-	 * scheduling support
+-	 */
+-	.get_frame_number = ehci_get_frame,
+-
+-	/*
+-	 * root hub support
+-	 */
+-	.hub_status_data = ehci_hub_status_data,
+-	.hub_control = ehci_hub_control,
+-	.relinquish_port = ehci_relinquish_port,
+-	.port_handed_over = ehci_port_handed_over,
+-
+-	/*
+-	 * PM support
+-	 */
+-#ifdef CONFIG_PM
+-	.bus_suspend = ehci_bus_suspend,
+-	.bus_resume = ehci_bus_resume,
+-#endif
+-};
+-
+-static ssize_t ehci1_rk_power_show(struct device *_dev,
+-				      struct device_attribute *attr, char *buf)
+-{
+-	return sprintf(buf, "%d\n", rkehci1_status);
+-}
+-
+-static ssize_t ehci1_rk_power_store(struct device *_dev,
+-				       struct device_attribute *attr,
+-				       const char *buf, size_t count)
+-{
+-	uint32_t val = simple_strtoul(buf, NULL, 16);
+-	struct usb_hcd *hcd = dev_get_drvdata(_dev);
+-	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
+-	struct rkehci_platform_data *pldata = _dev->platform_data;
+-
+-	printk("%s: %d setting to: %d\n", __func__, rkehci1_status, val);
+-	if (val == rkehci1_status)
+-		goto out;
+-
+-	rkehci1_status = val;
+-	switch (val) {
+-	case 0:	/* power down */
+-		ehci1_rk_port_power(ehci, 0);
+-		writel_relaxed(0, hcd->regs + 0xb0);
+-		dsb();
+-		msleep(5);
+-		usb_remove_hcd(hcd);
+-		break;
+-	case 1:	/* power on */
+-		pldata->soft_reset(pldata, RST_POR);
+-		usb_add_hcd(hcd, hcd->irq, IRQF_DISABLED | IRQF_SHARED);
+-
+-		ehci1_rk_port_power(ehci, 1);
+-		writel_relaxed(1, hcd->regs + 0xb0);
+-		writel_relaxed(0x1d4d, hcd->regs + 0x90);
+-		writel_relaxed(0x4, hcd->regs + 0xa0);
+-		dsb();
+-		break;
+-	default:
+-		break;
+-	}
+-out:
+-	return count;
+-}
+-
+-static DEVICE_ATTR(ehci1_rk_power, S_IRUGO | S_IWUSR, ehci1_rk_power_show,
+-		   ehci1_rk_power_store);
+-
+-static ssize_t ehci1_debug_show(struct device *_dev,
+-			       struct device_attribute *attr, char *buf)
+-{
+-	volatile uint32_t *addr;
+-
+-	EHCI1_PRINT("******** EHCI Capability Registers **********\n");
+-	addr = &g_ehci->caps->hc_capbase;
+-	EHCI1_PRINT("HCIVERSION / CAPLENGTH  @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->caps->hcs_params;
+-	EHCI1_PRINT("HCSPARAMS               @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->caps->hcc_params;
+-	EHCI1_PRINT("HCCPARAMS               @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	EHCI1_PRINT("********* EHCI Operational Registers *********\n");
+-	addr = &g_ehci->regs->command;
+-	EHCI1_PRINT("USBCMD                  @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->status;
+-	EHCI1_PRINT("USBSTS                  @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->intr_enable;
+-	EHCI1_PRINT("USBINTR                 @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->frame_index;
+-	EHCI1_PRINT("FRINDEX                 @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->segment;
+-	EHCI1_PRINT("CTRLDSSEGMENT           @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->frame_list;
+-	EHCI1_PRINT("PERIODICLISTBASE        @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->async_next;
+-	EHCI1_PRINT("ASYNCLISTADDR           @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = &g_ehci->regs->configured_flag;
+-	EHCI1_PRINT("CONFIGFLAG              @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	addr = g_ehci->regs->port_status;
+-	EHCI1_PRINT("PORTSC                  @0x%08x:  0x%08x\n",
+-			(uint32_t) addr, readl_relaxed(addr));
+-	return sprintf(buf, "EHCI1 Registers Dump\n");
+-}
+-
+-static DEVICE_ATTR(debug_ehci1, S_IRUGO, ehci1_debug_show, NULL);
+-
+-static struct of_device_id rk_ehci1_of_match[] = {
+-	{
+-	 .compatible = "rockchip,rk3188_rk_ehci_host",
+-	 .data = &rkehci_pdata_rk3188,
+-	 },
+-	{
+-	 .compatible = "rockchip,rk3288_rk_ehci1_host",
+-	 .data = &rkehci1_pdata_rk3288,
+-	 },
+-	{},
+-};
+-
+-MODULE_DEVICE_TABLE(of, rk_ehci1_of_match);
+-
+-static int ehci1_rk_probe(struct platform_device *pdev)
+-{
+-	struct usb_hcd *hcd;
+-	struct ehci_hcd *ehci;
+-	struct resource *res;
+-	struct device *dev = &pdev->dev;
+-	struct rkehci_platform_data *pldata;
+-	int ret;
+-	int retval = 0;
+-	static u64 usb_dmamask = 0xffffffffUL;
+-	struct device_node *node = pdev->dev.of_node;
+-	const struct of_device_id *match =
+-	    of_match_device(of_match_ptr(rk_ehci1_of_match), &pdev->dev);
+-
+-	dev_dbg(&pdev->dev, "ehci1_rk proble\n");
+-
+-	if (match && match->data) {
+-		dev->platform_data  = (void *)match->data;
+-	} else {
+-		dev_err(dev, "ehci1_rk match failed\n");
+-		return -EINVAL;
+-	}
+-
+-	pldata = dev->platform_data;
+-	pldata->dev = dev;
+-
+-	if (!node) {
+-		dev_err(dev, "device node not found\n");
+-		return -EINVAL;
+-	}
+-
+-	dev->dma_mask = &usb_dmamask;
+-
+-	retval = device_create_file(dev, &dev_attr_ehci1_rk_power);
+-	retval = device_create_file(dev, &dev_attr_debug_ehci1);
+-	hcd = usb_create_hcd(&rk_ehci1_driver, &pdev->dev, dev_name(&pdev->dev));
+-	if (!hcd) {
+-		dev_err(&pdev->dev, "Unable to create HCD\n");
+-		return -ENOMEM;
+-	}
+-
+-	if (pldata->hw_init)
+-		pldata->hw_init();
+-
+-	if (pldata->clock_init) {
+-		pldata->clock_init(pldata);
+-		pldata->clock_enable(pldata, 1);
+-	}
+-
+-	if (pldata->soft_reset)
+-		pldata->soft_reset(pldata, RST_POR);;
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(&pdev->dev, "Unable to get memory resource\n");
+-		ret = -ENODEV;
+-		goto put_hcd;
+-	}
+-
+-	hcd->rsrc_start = res->start;
+-	hcd->rsrc_len = resource_size(res);
+-	hcd->regs = devm_ioremap_resource(dev, res);
+-
+-	if (!hcd->regs) {
+-		dev_err(&pdev->dev, "ioremap failed\n");
+-		ret = -ENOMEM;
+-		goto put_hcd;
+-	}
+-
+-	hcd->irq = platform_get_irq(pdev, 0);
+-	if (hcd->irq < 0) {
+-		dev_err(&pdev->dev, "Unable to get IRQ resource\n");
+-		ret = hcd->irq;
+-		goto put_hcd;
+-	}
+-
+-	ehci = hcd_to_ehci(hcd);
+-	ehci->caps = hcd->regs;
+-	ehci->regs = hcd->regs + 0x10;
+-	printk("%s %p %p\n", __func__, ehci->caps, ehci->regs);
+-
+-	dbg_hcs_params(ehci, "reset");
+-	dbg_hcc_params(ehci, "reset");
+-
+-	ehci->hcs_params = readl(&ehci->caps->hcs_params);
+-
+-	ret = usb_add_hcd(hcd, hcd->irq, IRQF_DISABLED | IRQF_SHARED);
+-	if (ret) {
+-		dev_err(&pdev->dev, "Failed to add USB HCD\n");
+-		goto put_hcd;
+-	}
+-
+-	g_ehci = ehci;
+-	ehci1_rk_port_power(ehci, 1);
+-	writel_relaxed(1, hcd->regs + 0xb0);
+-	writel_relaxed(0x1d4d, hcd->regs + 0x90);
+-	writel_relaxed(0x4, hcd->regs + 0xa0);
+-	dsb();
+-
+-	printk("%s ok\n", __func__);
+-
+-	return 0;
+-
+-put_hcd:
+-	if (pldata->clock_enable)
+-		pldata->clock_enable(pldata, 0);
+-	usb_put_hcd(hcd);
+-
+-	return ret;
+-}
+-
+-static int ehci1_rk_remove(struct platform_device *pdev)
+-{
+-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
+-
+-	usb_put_hcd(hcd);
+-
+-	return 0;
+-}
+-
+-#ifdef CONFIG_PM
+-static int ehci1_rk_pm_suspend(struct device *dev)
+-{
+-	struct usb_hcd *hcd = dev_get_drvdata(dev);
+-	bool do_wakeup = device_may_wakeup(dev);
+-	int ret;
+-
+-	dev_dbg(dev, "ehci1-rockchip PM suspend\n");
+-	ret = ehci_suspend(hcd, do_wakeup);
+-
+-	return ret;
+-}
+-
+-static int ehci1_rk_pm_resume(struct device *dev)
+-{
+-	struct usb_hcd *hcd = dev_get_drvdata(dev);
+-
+-	dev_dbg(dev, "ehci1-rockchip PM resume\n");
+-	ehci_resume(hcd, false);
+-
+-	return 0;
+-}
+-#else
+-#define ehci1_rk_pm_suspend	NULL
+-#define ehci1_rk_pm_resume	NULL
+-#endif
+-
+-static const struct dev_pm_ops ehci1_rk_dev_pm_ops = {
+-	.suspend = ehci1_rk_pm_suspend,
+-	.resume = ehci1_rk_pm_resume,
+-};
+-
+-static struct platform_driver ehci1_rk_driver = {
+-	.probe = ehci1_rk_probe,
+-	.remove = ehci1_rk_remove,
+-	.driver = {
+-		   .name = "rockchip_ehci1_host",
+-		   .of_match_table = of_match_ptr(rk_ehci1_of_match),
+-#ifdef CONFIG_PM
+-		   .pm = &ehci1_rk_dev_pm_ops,
+-#endif
+-		   },
+-};
+diff --git a/drivers/usb/host/ohci-rockchip.c b/drivers/usb/host/ohci-rockchip.c
+deleted file mode 100755
+index d63a1bbad2bc..000000000000
+--- a/drivers/usb/host/ohci-rockchip.c
++++ /dev/null
+@@ -1,244 +0,0 @@
+-/*
+- * ROCKCHIP USB HOST OHCI Controller
+- *
+- * This program is free software; you can redistribute  it and/or modify it
+- * under  the terms of  the GNU General  Public License as published by the
+- * Free Software Foundation;  either version 2 of the  License, or (at your
+- * option) any later version.
+- *
+- */
+-
+-#include <linux/platform_device.h>
+-#include <linux/pm_runtime.h>
+-#include <linux/of.h>
+-#include <linux/clk.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/of_platform.h>
+-#include "../dwc_otg_310/usbdev_rk.h"
+-
+-static int ohci_rk_init(struct usb_hcd *hcd)
+-{
+-	dev_dbg(hcd->self.controller, "starting OHCI controller\n");
+-
+-	return ohci_init(hcd_to_ohci(hcd));
+-}
+-
+-static int ohci_rk_start(struct usb_hcd *hcd)
+-{
+-	struct ohci_hcd *ohci = hcd_to_ohci(hcd);
+-	int ret;
+-
+-	/*
+-	 * RemoteWakeupConnected has to be set explicitly before
+-	 * calling ohci_run. The reset value of RWC is 0.
+-	 */
+-	ohci->hc_control = OHCI_CTRL_RWC;
+-	writel(OHCI_CTRL_RWC, &ohci->regs->control);
+-
+-	ret = ohci_run(ohci);
+-
+-	if (ret < 0) {
+-		dev_err(hcd->self.controller, "can't start\n");
+-		ohci_stop(hcd);
+-	}
+-
+-	return ret;
+-}
+-
+-static const struct hc_driver ohci_rk_hc_driver = {
+-	.description = hcd_name,
+-	.product_desc = "RK OHCI Host Controller",
+-	.hcd_priv_size = sizeof(struct ohci_hcd),
+-
+-	/*
+-	 * generic hardware linkage
+-	 */
+-	.irq = ohci_irq,
+-	.flags = HCD_USB11 | HCD_MEMORY,
+-
+-	/*
+-	 * basic lifecycle operations
+-	 */
+-	.reset = ohci_rk_init,
+-	.start = ohci_rk_start,
+-	.stop = ohci_stop,
+-	.shutdown = ohci_shutdown,
+-
+-	/*
+-	 * managing i/o requests and associated device resources
+-	 */
+-	.urb_enqueue = ohci_urb_enqueue,
+-	.urb_dequeue = ohci_urb_dequeue,
+-	.endpoint_disable = ohci_endpoint_disable,
+-
+-	/*
+-	 * scheduling support
+-	 */
+-	.get_frame_number = ohci_get_frame,
+-
+-	/*
+-	 * root hub support
+-	 */
+-	.hub_status_data = ohci_hub_status_data,
+-	.hub_control = ohci_hub_control,
+-#ifdef	CONFIG_PM
+-	.bus_suspend = ohci_bus_suspend,
+-	.bus_resume = ohci_bus_resume,
+-#endif
+-	.start_port_reset = ohci_start_port_reset,
+-};
+-
+-static struct of_device_id rk_ohci_of_match[] = {
+-#ifdef CONFIG_ARM
+-	{
+-	 .compatible = "rockchip,rk3126_ohci",
+-	 .data = &usb20ohci_pdata_rk3126,
+-	 },
+-#endif
+-#ifdef CONFIG_ARM64
+-	{
+-	 .compatible = "rockchip,rk3368_ohci",
+-	 .data = &usb20ohci_pdata_rk3368,
+-	 },
+-#endif
+-	{},
+-};
+-
+-MODULE_DEVICE_TABLE(of, rk_ohci_of_match);
+-
+-/* ohci_hcd_rk_probe - initialize RK-based HCDs
+- * Allocates basic resources for this USB host controller, and
+- * then invokes the start() method for the HCD associated with it
+- * through the hotplug entry's driver_data.
+- */
+-static int ohci_hcd_rk_probe(struct platform_device *pdev)
+-{
+-	struct device *dev = &pdev->dev;
+-	struct usb_hcd *hcd = NULL;
+-	void __iomem *regs = NULL;
+-	struct resource *res;
+-	int ret = -ENODEV;
+-	int irq;
+-	struct dwc_otg_platform_data *pldata;
+-	const struct of_device_id *match;
+-
+-	dev_dbg(&pdev->dev, "ohci_hcd_rk_probe\n");
+-
+-	if (usb_disabled())
+-		return -ENODEV;
+-
+-	match = of_match_device(of_match_ptr(rk_ohci_of_match), &pdev->dev);
+-	if (match && match->data) {
+-		pldata = (struct dwc_otg_platform_data *)match->data;
+-	} else {
+-		dev_err(dev, "ohci_rk match failed\n");
+-		return -EINVAL;
+-	}
+-
+-	pldata->dev = dev;
+-	dev->platform_data = pldata;
+-
+-	if (pldata->hw_init)
+-		pldata->hw_init();
+-
+-	if (pldata->clock_init) {
+-		pldata->clock_init(pldata);
+-		pldata->clock_enable(pldata, 1);
+-	}
+-
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "OHCI irq failed\n");
+-		ret = irq;
+-		goto clk_disable;
+-	}
+-
+-	if (!pdev->dev.dma_mask)
+-		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+-	dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+-
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(dev, "UHH OHCI get resource failed\n");
+-		ret = -ENOMEM;
+-		goto clk_disable;
+-	}
+-
+-	regs = devm_ioremap_resource(dev, res);
+-	if (!regs) {
+-		dev_err(dev, "UHH OHCI ioremap failed\n");
+-		ret = -ENOMEM;
+-		goto clk_disable;
+-	}
+-
+-	/*
+-	 * Right now device-tree probed devices don't get dma_mask set.
+-	 * Since shared usb code relies on it, set it here for now.
+-	 * Once we have dma capability bindings this can go away.
+-	 */
+-	if (!dev->dma_mask)
+-		dev->dma_mask = &dev->coherent_dma_mask;
+-	if (!dev->coherent_dma_mask)
+-		dev->coherent_dma_mask = DMA_BIT_MASK(32);
+-
+-	hcd = usb_create_hcd(&ohci_rk_hc_driver, dev, dev_name(dev));
+-	if (!hcd) {
+-		dev_err(dev, "usb_create_hcd failed\n");
+-		ret = -ENOMEM;
+-		goto clk_disable;
+-	}
+-
+-	hcd->rsrc_start = res->start;
+-	hcd->rsrc_len = resource_size(res);
+-	hcd->regs = regs;
+-
+-	ohci_hcd_init(hcd_to_ohci(hcd));
+-
+-	ret = usb_add_hcd(hcd, irq, 0);
+-	if (ret) {
+-		dev_dbg(dev, "failed to add hcd with err %d\n", ret);
+-		goto err_add_hcd;
+-	}
+-
+-	return 0;
+-
+-err_add_hcd:
+-	usb_put_hcd(hcd);
+-
+-clk_disable:
+-	if (pldata->clock_enable)
+-		pldata->clock_enable(pldata, 0);
+-
+-	return ret;
+-}
+-
+-static int ohci_hcd_rk_remove(struct platform_device *pdev)
+-{
+-	struct device *dev = &pdev->dev;
+-	struct usb_hcd *hcd = dev_get_drvdata(dev);
+-
+-	usb_remove_hcd(hcd);
+-	usb_put_hcd(hcd);
+-	return 0;
+-}
+-
+-static void ohci_hcd_rk_shutdown(struct platform_device *pdev)
+-{
+-	struct usb_hcd *hcd = dev_get_drvdata(&pdev->dev);
+-
+-	if (hcd->driver->shutdown)
+-		hcd->driver->shutdown(hcd);
+-}
+-
+-static struct platform_driver ohci_hcd_rk_driver = {
+-	.probe = ohci_hcd_rk_probe,
+-	.remove = ohci_hcd_rk_remove,
+-	.shutdown = ohci_hcd_rk_shutdown,
+-	.driver = {
+-		   .name = "ohci-rockchip",
+-		   .of_match_table = of_match_ptr(rk_ohci_of_match),
+-		   },
+-};
+-
+-MODULE_ALIAS("platform:rockchip-ohci");
+-- 
+2.35.3
+

@@ -1,0 +1,150 @@
+From 9b050a98b7eb120fe4c81aacaccf761a6818ba5c Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Thu, 1 Jun 2017 11:10:18 +0800
+Subject: [PATCH] usb: dwc_otg_310: pcd: fix force device mode issue
+
+When tested usb device through force device mode method,
+we found that usb device failed to connect to usb host
+in the following case.
+
+1. Use micro usb 2.0 OTG interface.
+2. Plug in otg cable, and the id pin was pulled down
+   to Ground.
+3. User space force usb to enter device mode through
+   'echo 2 > /sys/bus/platform/drivers/usb20_otg/force_usb_mode'
+4. Use usb 2.0 Standard-A to Standard-A cable assembly,
+   plug into otg cable receptor on one side, and connect
+   to PC on the other side.
+5. PC fail to enumerate our device, because of usb driver
+   logical issue.
+
+This is because that the dwc_otg_pcd_check_vbus_work()
+only enable usb to start connecting if check the bvalid
+and iddig is high. But in the above test case, the iddig
+is low, so fail to start connection work. In this patch,
+we enable usb to connect if iddig is high or usb is in
+force device mode.
+
+In addition, fix some coding style to increase the readability.
+
+Change-Id: I08f1a4e6e7e5fb246b1716a20d4572d8b866f238
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c | 45 ++++++++++++---------
+ 1 file changed, 27 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+index 203d3c93fa1f..631579722ab0 100644
+--- a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+@@ -1636,21 +1636,25 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 	    container_of(work, dwc_otg_pcd_t, check_vbus_work.work);
+ 	struct dwc_otg_device *otg_dev = _pcd->otg_dev;
+ 	struct dwc_otg_platform_data *pldata = otg_dev->pldata;
++	int bvalid = pldata->get_status(USB_STATUS_BVABLID);
++	int iddig = pldata->get_status(USB_STATUS_ID);
++	u8 usb_mode = otg_dev->core_if->usb_mode;
+ 
+-	if (pldata->get_status(USB_STATUS_BVABLID) &&
+-	    pldata->get_status(USB_STATUS_ID)) {
+-		/* if usb not connect before ,then start connect */
++	if (bvalid && (iddig || (usb_mode == USB_MODE_FORCE_DEVICE))) {
++		/* If usb not connect before, then start connect */
+ 		if (_pcd->vbus_status == USB_BC_TYPE_DISCNT) {
+ 			printk("***************vbus detect*****************\n");
+-			if( pldata->bc_detect_cb != NULL )
+-			 	pldata->bc_detect_cb(_pcd->vbus_status =
+-			 		usb_battery_charger_detect(1));
++
++			if (pldata->bc_detect_cb && iddig)
++				pldata->bc_detect_cb(_pcd->vbus_status =
++					usb_battery_charger_detect(1));
+ 			else
+ 				_pcd->vbus_status = USB_BC_TYPE_SDP;
++
+ 			if (_pcd->conn_en) {
+ 				goto connect;
+ 			} else if (pldata->phy_status == USB_PHY_ENABLED) {
+-				/* do not allow to connect, suspend phy */
++				/* Do not allow to connect, suspend phy */
+ 				pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+ 				udelay(3);
+ 				pldata->clock_enable(pldata, 0);
+@@ -1660,18 +1664,21 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 			printk("**************soft reconnect**************\n");
+ 			goto connect;
+ 		} else if (_pcd->conn_status == 2) {
+-			/* release pcd->wake_lock if fail to connect,
+-			 * allow system to enter second sleep.
++			/*
++			 * Release pcd->wake_lock if fail to connect,
++			 * and allow system to enter deep sleep.
+ 			 */
+ 			dwc_otg_msc_unlock(_pcd);
+ 			_pcd->conn_status++;
+-			if (pldata->bc_detect_cb != NULL) {
++
++			if (pldata->bc_detect_cb && iddig) {
+ 				pldata->bc_detect_cb(_pcd->vbus_status =
+ 						     usb_battery_charger_detect(1));
+ 			} else {
+ 				_pcd->vbus_status = USB_BC_TYPE_DCP;
+ 			}
+-			/* fail to connect, suspend usb phy and disable clk */
++
++			/* Fail to connect, suspend usb phy and disable clk */
+ 			if (pldata->phy_status == USB_PHY_ENABLED) {
+ 				pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+ 				udelay(3);
+@@ -1679,7 +1686,7 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 			}
+ 		}
+ 	} else {
+-		if (pldata->bc_detect_cb != NULL)
++		if (pldata->bc_detect_cb && iddig)
+ 			pldata->bc_detect_cb(_pcd->vbus_status =
+ 					     usb_battery_charger_detect(0));
+ 		else
+@@ -1690,22 +1697,23 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 		}
+ 
+ 		if (pldata->phy_status == USB_PHY_ENABLED) {
+-			/* release wake lock */
++			/* Release wake lock */
+ 			dwc_otg_msc_unlock(_pcd);
+-			if (pldata->get_status(USB_STATUS_ID)) {
+-				/* no vbus detect here , close usb phy  */
++
++			if (iddig || (usb_mode == USB_MODE_FORCE_DEVICE)) {
++				/* No vbus detect here , suspend usb phy */
+ 				pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+ 				udelay(3);
+ 				pldata->clock_enable(pldata, 0);
+ 			}
+ 		}
+ 
+-		/* usb phy bypass to uart mode  */
++		/* Bypass usb phy to uart mode  */
+ 		if (pldata->dwc_otg_uart_mode != NULL)
+ 			pldata->dwc_otg_uart_mode(pldata, PHY_UART_MODE);
+ 	}
+ 
+-	if (pldata->get_status(USB_STATUS_ID))
++	if (iddig || (usb_mode == USB_MODE_FORCE_DEVICE))
+ 		schedule_delayed_work(&_pcd->check_vbus_work, HZ);
+ 	return;
+ 
+@@ -1718,8 +1726,9 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 	if (_pcd->conn_status == 0)
+ 		dwc_otg_msc_lock(_pcd);
+ 
+-	schedule_delayed_work(&_pcd->reconnect, 8);	/* delay 8 jiffies */
++	schedule_delayed_work(&_pcd->reconnect, 8);
+ 	schedule_delayed_work(&_pcd->check_vbus_work, (HZ));
++
+ 	return;
+ }
+ 
+-- 
+2.35.3
+

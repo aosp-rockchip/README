@@ -1,0 +1,140 @@
+From ba1c0c58ac1567a6918b77244a86aa959c58eb69 Mon Sep 17 00:00:00 2001
+From: William wu <wulf@rock-chips.com>
+Date: Tue, 8 Nov 2016 15:15:34 +0800
+Subject: [PATCH] CHROMIUM: usb: dwc3: rockchip: avoid removing hcd while
+ system is frozen
+
+Refer to the commit 85fbd722ad0f ("libata, freezer: avoid
+block device removal while system is frozen"), when system
+enter suspend, it may freeze kthreads and workqueues, and
+do not restart them until complete PM resume all of devices.
+
+If we remove XHCI hcd while system is frozen, it may call
+usb_disconnect() to remove a usb block device which pluged
+in before, but has gone missing. Unfortunately, remove the
+block device can race with the rest of device resume. Since
+freezable kthreads and workqueues are thawed after all of
+devices resume are completed and block device removal depends
+on freezable workqueues and kthreads (e.g. bdi_wq) to make
+progress, this can lead to deadlock - block device removal
+can't proceed because kthreads and workqueues are frozen and
+can't be restarted because device resume is blocked behind
+block device removal.
+
+This patch must be used and tested with the commit bc68c26eff86
+("CHROMIUM: usb: dwc3: rockchip: fix NULL pointer dereference
+when resume"). This issue can be easily reproduced with USB-C
+HUB and USB2/3 flash drive, result in the following backtrace.
+
+[  360.201135] INFO: task kworker/u12:3:122 blocked for more than 120 seconds.
+[  360.208094]       Not tainted 4.4.21 #185
+[  360.212102] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  360.219923] kworker/u12:3   D ffffffc000204fd8     0   122      2 0x00000000
+[  360.227007] Workqueue: events_unbound async_run_entry_fn
+[  360.232326] Call trace:
+[  360.234776] [<ffffffc000204fd8>] __switch_to+0x9c/0xa8
+[  360.239918] [<ffffffc000915bf4>] __schedule+0x440/0x6d8
+[  360.245139] [<ffffffc000915f20>] schedule+0x94/0xb4
+[  360.250016] [<ffffffc00091909c>] schedule_timeout+0x44/0x27c
+[  360.255670] [<ffffffc000916b78>] wait_for_common+0xf8/0x198
+[  360.261237] [<ffffffc000916c40>] wait_for_completion+0x28/0x34
+[  360.267067] [<ffffffc0005f3f4c>] dpm_wait+0x40/0x4c
+[  360.271942] [<ffffffc0005f4770>] device_resume+0x60/0x1a4
+[  360.277337] [<ffffffc0005f48e4>] async_resume+0x30/0x60
+[  360.282558] [<ffffffc000242fc4>] async_run_entry_fn+0x50/0x104
+[  360.288387] [<ffffffc0002397f0>] process_one_work+0x240/0x424
+[  360.294128] [<ffffffc00023a28c>] worker_thread+0x2fc/0x424
+[  360.299608] [<ffffffc00023f5fc>] kthread+0x10c/0x114
+[  360.304570] [<ffffffc000203dd0>] ret_from_fork+0x10/0x40
+[  360.309876]   task                        PC stack   pid father
+[  360.315789] init            D ffffffc000204fd8     0     1      0 0x00400009
+...
+[  360.564124] [<ffffffc000204fd8>] __switch_to+0x9c/0xa8
+[  360.569259] [<ffffffc000915bf4>] __schedule+0x440/0x6d8
+[  360.574481] [<ffffffc000915f20>] schedule+0x94/0xb4
+[  360.579355] [<ffffffc00091909c>] schedule_timeout+0x44/0x27c
+[  360.585010] [<ffffffc000916b78>] wait_for_common+0xf8/0x198
+[  360.590580] [<ffffffc000916c40>] wait_for_completion+0x28/0x34
+[  360.596408] [<ffffffc000239270>] flush_work+0x168/0x1a4
+[  360.601629] [<ffffffc0002395a4>] flush_delayed_work+0x44/0x50
+[  360.607371] [<ffffffc000322f48>] bdi_unregister+0xa8/0xfc
+[  360.612766] [<ffffffc00049afdc>] blk_cleanup_queue+0xf4/0x10c
+[  360.618508] [<ffffffc000625d7c>] __scsi_remove_device+0x80/0xc8
+[  360.624423] [<ffffffc000623dec>] scsi_forget_host+0x5c/0x74
+[  360.629991] [<ffffffc000619a98>] scsi_remove_host+0x90/0x110
+[  360.635646] [<ffffffc000692940>] usb_stor_disconnect+0x78/0xec
+[  360.641474] [<ffffffc0006545e4>] usb_unbind_interface+0xa0/0x1f8
+[  360.647477] [<ffffffc0005e70cc>] __device_release_driver+0xb4/0x114
+[  360.653746] [<ffffffc0005e7158>] device_release_driver+0x2c/0x40
+[  360.659748] [<ffffffc0005e61f8>] bus_remove_device+0x110/0x128
+[  360.665575] [<ffffffc0005e3178>] device_del+0x164/0x1f4
+[  360.670797] [<ffffffc000652094>] usb_disable_device+0x94/0x1c8
+[  360.676625] [<ffffffc000649b74>] usb_disconnect+0x9c/0x1d0
+[  360.682106] [<ffffffc000649b60>] usb_disconnect+0x88/0x1d0
+[  360.687587] [<ffffffc00064e0e4>] usb_remove_hcd+0xc8/0x1e0
+[  360.693068] [<ffffffc000664b4c>] dwc3_rockchip_otg_extcon_evt_work+0x14c/0x198
+[  360.700284] [<ffffffc0002397f0>] process_one_work+0x240/0x424
+[  360.706026] [<ffffffc00023a28c>] worker_thread+0x2fc/0x424
+[  360.711506] [<ffffffc00023f5fc>] kthread+0x10c/0x114
+[  360.716467] [<ffffffc000203dd0>] ret_from_fork+0x10/0x40
+
+BUG=chrome-os-partner:58705, chrome-os-partner:59103
+TEST=Plug in USB-C HUB and USB2/3 flash drive, then set
+system to enter S3. After system suspend, plug out the
+USB-C HUB first, and then press keyboard or power key to
+check if system can wakeup successfully.
+
+Change-Id: I6cb8ea1a4399b9b69b522ec0ed5f0f7810118850
+Signed-off-by: William wu <wulf@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/408499
+Commit-Ready: Guenter Roeck <groeck@chromium.org>
+Tested-by: Guenter Roeck <groeck@chromium.org>
+Reviewed-by: Guenter Roeck <groeck@chromium.org>
+Reviewed-by: Matthias Kaehlcke <mka@chromium.org>
+Signed-off-by: William Wu <wulf@rock-chips.com>
+---
+ drivers/usb/dwc3/dwc3-rockchip.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/usb/dwc3/dwc3-rockchip.c b/drivers/usb/dwc3/dwc3-rockchip.c
+index 19b53f644be8..1bb95df6e7d6 100644
+--- a/drivers/usb/dwc3/dwc3-rockchip.c
++++ b/drivers/usb/dwc3/dwc3-rockchip.c
+@@ -27,6 +27,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/extcon.h>
++#include <linux/freezer.h>
+ #include <linux/reset.h>
+ #include <linux/usb.h>
+ #include <linux/usb/hcd.h>
+@@ -240,6 +241,26 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 					msleep(100);
+ 				}
+ 
++#ifdef CONFIG_FREEZER
++				/*
++				 * usb_remove_hcd() may call usb_disconnect() to
++				 * remove a block device pluged in before.
++				 * Unfortunately, the block layer suspend/resume
++				 * path is fundamentally broken due to freezable
++				 * kthreads and workqueue and may deadlock if a
++				 * block device gets removed while resume is in
++				 * progress.
++				 *
++				 * We need to add a ugly hack to avoid removing
++				 * hcd and kicking off device removal while
++				 * freezer is active. This is a joke but does
++				 * avoid this particular deadlock when test with
++				 * USB-C HUB and USB2/3 flash drive.
++				 */
++				while (pm_freezing)
++					usleep_range(10000, 11000);
++#endif
++
+ 				usb_remove_hcd(hcd->shared_hcd);
+ 				usb_remove_hcd(hcd);
+ 			}
+-- 
+2.35.3
+

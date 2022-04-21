@@ -1,0 +1,412 @@
+From f0ab5f44c05f2c760c1e49aa57411ef27028eb92 Mon Sep 17 00:00:00 2001
+From: CMY <cmy@rock-chips.com>
+Date: Tue, 14 Oct 2014 18:32:42 +0800
+Subject: [PATCH] rk: ion: add drm heap for secure buffer allocation
+
+---
+ drivers/staging/android/ion/Makefile          |   3 +-
+ drivers/staging/android/ion/ion_drm_heap.c    | 263 ++++++++++++++++++
+ drivers/staging/android/ion/ion_heap.c        |   6 +
+ drivers/staging/android/ion/ion_priv.h        |   5 +
+ .../android/ion/rockchip/rockchip_ion.c       |   7 +-
+ drivers/staging/android/uapi/ion.h            |   2 +
+ include/linux/rockchip_ion.h                  |   7 +-
+ 7 files changed, 282 insertions(+), 11 deletions(-)
+ create mode 100644 drivers/staging/android/ion/ion_drm_heap.c
+
+diff --git a/drivers/staging/android/ion/Makefile b/drivers/staging/android/ion/Makefile
+index 5c8fc6915b77..4abdaab03ab1 100644
+--- a/drivers/staging/android/ion/Makefile
++++ b/drivers/staging/android/ion/Makefile
+@@ -1,5 +1,6 @@
+ obj-$(CONFIG_ION) +=	ion.o ion_heap.o ion_page_pool.o ion_system_heap.o \
+-			ion_carveout_heap.o ion_chunk_heap.o ion_cma_heap.o
++			ion_carveout_heap.o ion_chunk_heap.o ion_cma_heap.o \
++			ion_drm_heap.o
+ obj-$(CONFIG_ION_TEST) += ion_test.o
+ ifdef CONFIG_COMPAT
+ obj-$(CONFIG_ION) += compat_ion.o
+diff --git a/drivers/staging/android/ion/ion_drm_heap.c b/drivers/staging/android/ion/ion_drm_heap.c
+new file mode 100644
+index 000000000000..b1c8a1829c44
+--- /dev/null
++++ b/drivers/staging/android/ion/ion_drm_heap.c
+@@ -0,0 +1,263 @@
++/*
++ * drivers/gpu/ion/ion_drm_heap.c
++ *
++ * Copyright (C) 2011 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/spinlock.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/genalloc.h>
++#include <linux/io.h>
++#include <linux/mm.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/rockchip-iovmm.h>
++#include "ion.h"
++#include "ion_priv.h"
++
++#define ION_DRM_ALLOCATE_FAILED -1
++
++struct ion_drm_heap {
++	struct ion_heap heap;
++	struct gen_pool *pool;
++	ion_phys_addr_t base;
++};
++
++ion_phys_addr_t ion_drm_allocate(struct ion_heap *heap,
++				      unsigned long size,
++				      unsigned long align)
++{
++	struct ion_drm_heap *drm_heap =
++		container_of(heap, struct ion_drm_heap, heap);
++	unsigned long offset = gen_pool_alloc(drm_heap->pool, size);
++
++	if (!offset)
++		return ION_DRM_ALLOCATE_FAILED;
++
++	return offset;
++}
++
++void ion_drm_free(struct ion_heap *heap, ion_phys_addr_t addr,
++		       unsigned long size)
++{
++	struct ion_drm_heap *drm_heap =
++		container_of(heap, struct ion_drm_heap, heap);
++
++	if (addr == ION_DRM_ALLOCATE_FAILED)
++		return;
++	gen_pool_free(drm_heap->pool, addr, size);
++}
++
++static int ion_drm_heap_phys(struct ion_heap *heap,
++				  struct ion_buffer *buffer,
++				  ion_phys_addr_t *addr, size_t *len)
++{
++	struct sg_table *table = buffer->priv_virt;
++	struct page *page = sg_page(table->sgl);
++	ion_phys_addr_t paddr = PFN_PHYS(page_to_pfn(page));
++
++	*addr = paddr;
++	*len = buffer->size;
++	return 0;
++}
++
++static int ion_drm_heap_allocate(struct ion_heap *heap,
++				      struct ion_buffer *buffer,
++				      unsigned long size, unsigned long align,
++				      unsigned long flags)
++{
++	struct sg_table *table;
++	ion_phys_addr_t paddr;
++	int ret;
++
++	if (align > PAGE_SIZE)
++		return -EINVAL;
++
++	if (ion_buffer_cached(buffer)) {
++		pr_err("%s: cannot allocate cached memory from secure heap %s\n",
++			__func__, heap->name);
++		return -ENOMEM;
++	}
++
++	table = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
++	if (!table)
++		return -ENOMEM;
++	ret = sg_alloc_table(table, 1, GFP_KERNEL);
++	if (ret)
++		goto err_free;
++
++	paddr = ion_drm_allocate(heap, size, align);
++	if (paddr == ION_DRM_ALLOCATE_FAILED) {
++		ret = -ENOMEM;
++		goto err_free_table;
++	}
++
++	sg_set_page(table->sgl, pfn_to_page(PFN_DOWN(paddr)), size, 0);
++	buffer->priv_virt = table;
++
++	return 0;
++
++err_free_table:
++	sg_free_table(table);
++err_free:
++	kfree(table);
++	return ret;
++}
++
++static void ion_drm_heap_free(struct ion_buffer *buffer)
++{
++	struct ion_heap *heap = buffer->heap;
++	struct sg_table *table = buffer->priv_virt;
++	struct page *page = sg_page(table->sgl);
++	ion_phys_addr_t paddr = PFN_PHYS(page_to_pfn(page));
++
++	ion_heap_buffer_zero(buffer);
++	ion_drm_free(heap, paddr, buffer->size);
++	sg_free_table(table);
++	kfree(table);
++}
++
++static struct sg_table *ion_drm_heap_map_dma(struct ion_heap *heap,
++						  struct ion_buffer *buffer)
++{
++	return buffer->priv_virt;
++}
++
++static void ion_drm_heap_unmap_dma(struct ion_heap *heap,
++					struct ion_buffer *buffer)
++{
++	return;
++}
++
++static int ion_drm_heap_mmap(struct ion_heap *mapper,
++                        struct ion_buffer *buffer,
++                        struct vm_area_struct *vma)
++{
++        pr_info("%s: mmaping from secure heap %s disallowed\n",
++                __func__, mapper->name);
++        return -EINVAL;
++}
++
++static void *ion_drm_heap_map_kernel(struct ion_heap *heap,
++                                struct ion_buffer *buffer)
++{
++        pr_info("%s: kernel mapping from secure heap %s disallowed\n",
++                __func__, heap->name);
++        return NULL;
++}
++
++static void ion_drm_heap_unmap_kernel(struct ion_heap *heap,
++                                 struct ion_buffer *buffer)
++{
++        return;
++}
++
++#ifdef CONFIG_ROCKCHIP_IOMMU
++static int ion_drm_heap_map_iommu(struct ion_buffer *buffer,
++				struct device *iommu_dev,
++				struct ion_iommu_map *data,
++				unsigned long iova_length,
++				unsigned long flags)
++{
++	int ret = 0;
++	struct sg_table *table = (struct sg_table*)buffer->priv_virt;
++
++	data->iova_addr = rockchip_iovmm_map(iommu_dev, table->sgl, 0, iova_length);
++	pr_debug("%s: map %x -> %lx\n", __func__, table->sgl->dma_address,
++		data->iova_addr);
++	if (IS_ERR_VALUE(data->iova_addr)) {
++		pr_err("%s: rockchip_iovmm_map() failed: %lx\n", __func__,
++			data->iova_addr);
++		ret = data->iova_addr;
++		goto out;
++	}
++
++	data->mapped_size = iova_length;
++
++out:
++	return ret;
++}
++
++void ion_drm_heap_unmap_iommu(struct device *iommu_dev,
++			struct ion_iommu_map *data)
++{
++	pr_debug("%s: unmap %x@%lx\n", __func__, data->mapped_size,
++		data->iova_addr);
++	rockchip_iovmm_unmap(iommu_dev, data->iova_addr);
++
++	return;
++}
++#endif
++
++static struct ion_heap_ops drm_heap_ops = {
++	.allocate = ion_drm_heap_allocate,
++	.free = ion_drm_heap_free,
++	.phys = ion_drm_heap_phys,
++	.map_dma = ion_drm_heap_map_dma,
++	.unmap_dma = ion_drm_heap_unmap_dma,
++	.map_user = ion_drm_heap_mmap,
++	.map_kernel = ion_drm_heap_map_kernel,
++	.unmap_kernel = ion_drm_heap_unmap_kernel,
++#ifdef CONFIG_ROCKCHIP_IOMMU
++	.map_iommu = ion_drm_heap_map_iommu,
++	.unmap_iommu = ion_drm_heap_unmap_iommu,
++#endif
++};
++
++struct ion_heap *ion_drm_heap_create(struct ion_platform_heap *heap_data)
++{
++	struct ion_drm_heap *drm_heap;
++	int ret;
++
++	struct page *page;
++	size_t size;
++
++	page = pfn_to_page(PFN_DOWN(heap_data->base));
++	size = heap_data->size;
++
++	printk("%s: %x@%lx\n", __func__, size, heap_data->base);
++
++	ion_pages_sync_for_device(NULL, page, size, DMA_BIDIRECTIONAL);
++
++	ret = ion_heap_pages_zero(page, size, pgprot_writecombine(PAGE_KERNEL));
++	if (ret)
++		return ERR_PTR(ret);
++
++	drm_heap = kzalloc(sizeof(struct ion_drm_heap), GFP_KERNEL);
++	if (!drm_heap)
++		return ERR_PTR(-ENOMEM);
++
++	drm_heap->pool = gen_pool_create(8, -1); // 256KB align
++	if (!drm_heap->pool) {
++		kfree(drm_heap);
++		return ERR_PTR(-ENOMEM);
++	}
++	drm_heap->base = heap_data->base;
++	gen_pool_add(drm_heap->pool, drm_heap->base, heap_data->size, -1);
++	drm_heap->heap.ops = &drm_heap_ops;
++	drm_heap->heap.type = ION_HEAP_TYPE_DRM;
++//	drm_heap->heap.flags = ION_HEAP_FLAG_DEFER_FREE;
++
++	return &drm_heap->heap;
++}
++
++void ion_drm_heap_destroy(struct ion_heap *heap)
++{
++	struct ion_drm_heap *drm_heap =
++	     container_of(heap, struct  ion_drm_heap, heap);
++
++	gen_pool_destroy(drm_heap->pool);
++	kfree(drm_heap);
++	drm_heap = NULL;
++}
+diff --git a/drivers/staging/android/ion/ion_heap.c b/drivers/staging/android/ion/ion_heap.c
+index 750b76af0cf3..5c838ee384f9 100755
+--- a/drivers/staging/android/ion/ion_heap.c
++++ b/drivers/staging/android/ion/ion_heap.c
+@@ -323,6 +323,9 @@ struct ion_heap *ion_heap_create(struct ion_platform_heap *heap_data)
+ 	case ION_HEAP_TYPE_DMA:
+ 		heap = ion_cma_heap_create(heap_data);
+ 		break;
++	case ION_HEAP_TYPE_DRM:
++		heap = ion_drm_heap_create(heap_data);
++		break;
+ 	default:
+ 		pr_err("%s: Invalid heap type %d\n", __func__,
+ 		       heap_data->type);
+@@ -362,6 +365,9 @@ void ion_heap_destroy(struct ion_heap *heap)
+ 	case ION_HEAP_TYPE_DMA:
+ 		ion_cma_heap_destroy(heap);
+ 		break;
++	case ION_HEAP_TYPE_DRM:
++		ion_drm_heap_destroy(heap);
++		break;
+ 	default:
+ 		pr_err("%s: Invalid heap type %d\n", __func__,
+ 		       heap->type);
+diff --git a/drivers/staging/android/ion/ion_priv.h b/drivers/staging/android/ion/ion_priv.h
+index 867003a9e080..12e615d1cd51 100755
+--- a/drivers/staging/android/ion/ion_priv.h
++++ b/drivers/staging/android/ion/ion_priv.h
+@@ -344,6 +344,7 @@ size_t ion_heap_freelist_size(struct ion_heap *heap);
+ 
+ struct ion_heap *ion_heap_create(struct ion_platform_heap *);
+ void ion_heap_destroy(struct ion_heap *);
++
+ struct ion_heap *ion_system_heap_create(struct ion_platform_heap *);
+ void ion_system_heap_destroy(struct ion_heap *);
+ 
+@@ -355,9 +356,13 @@ void ion_carveout_heap_destroy(struct ion_heap *);
+ 
+ struct ion_heap *ion_chunk_heap_create(struct ion_platform_heap *);
+ void ion_chunk_heap_destroy(struct ion_heap *);
++
+ struct ion_heap *ion_cma_heap_create(struct ion_platform_heap *);
+ void ion_cma_heap_destroy(struct ion_heap *);
+ 
++struct ion_heap *ion_drm_heap_create(struct ion_platform_heap *);
++void ion_drm_heap_destroy(struct ion_heap *);
++
+ /**
+  * kernel api to allocate/free from carveout -- used when carveout is
+  * used to back an architecture specific custom heap
+diff --git a/drivers/staging/android/ion/rockchip/rockchip_ion.c b/drivers/staging/android/ion/rockchip/rockchip_ion.c
+index 28cc13246b7f..cb957f9506a0 100755
+--- a/drivers/staging/android/ion/rockchip/rockchip_ion.c
++++ b/drivers/staging/android/ion/rockchip/rockchip_ion.c
+@@ -63,14 +63,9 @@ static struct ion_heap_desc ion_heap_meta[] = {
+ 		.type	= ION_HEAP_TYPE_DMA,
+ 		.name	= ION_CMA_HEAP_NAME,
+ 	},
+-	{
+-		.id	= ION_IOMMU_HEAP_ID,
+-		.type	= ION_HEAP_TYPE_DMA,
+-		.name	= ION_IOMMU_HEAP_NAME,
+-	},
+ 	{
+ 		.id 	= ION_DRM_HEAP_ID,
+-		.type	= ION_HEAP_TYPE_DMA,
++		.type	= ION_HEAP_TYPE_DRM,
+ 		.name	= ION_DRM_HEAP_NAME,
+ 	},
+ 	{
+diff --git a/drivers/staging/android/uapi/ion.h b/drivers/staging/android/uapi/ion.h
+index f09e7c154d69..c26af4f4946f 100755
+--- a/drivers/staging/android/uapi/ion.h
++++ b/drivers/staging/android/uapi/ion.h
+@@ -40,6 +40,7 @@ enum ion_heap_type {
+ 	ION_HEAP_TYPE_CARVEOUT,
+ 	ION_HEAP_TYPE_CHUNK,
+ 	ION_HEAP_TYPE_DMA,
++	ION_HEAP_TYPE_DRM,
+ 	ION_HEAP_TYPE_CUSTOM, /* must be last so device specific heaps always
+ 				 are at the end of this enum */
+ 	ION_NUM_HEAPS = 16,
+@@ -49,6 +50,7 @@ enum ion_heap_type {
+ #define ION_HEAP_SYSTEM_CONTIG_MASK	(1 << ION_HEAP_TYPE_SYSTEM_CONTIG)
+ #define ION_HEAP_CARVEOUT_MASK		(1 << ION_HEAP_TYPE_CARVEOUT)
+ #define ION_HEAP_TYPE_DMA_MASK		(1 << ION_HEAP_TYPE_DMA)
++#define ION_HEAP_TYPE_DRM_MASK		(1 << ION_HEAP_TYPE_DRM)
+ 
+ #define ION_NUM_HEAP_IDS		sizeof(unsigned int) * 8
+ 
+diff --git a/include/linux/rockchip_ion.h b/include/linux/rockchip_ion.h
+index c0b0ac6535c7..7ce449dea2b4 100644
+--- a/include/linux/rockchip_ion.h
++++ b/include/linux/rockchip_ion.h
+@@ -39,14 +39,13 @@ enum ion_heap_ids {
+ 
+ #define ION_CMA_HEAP_NAME		"cma"
+ #define ION_IOMMU_HEAP_NAME		"iommu"
+-#define ION_VMALLOC_HEAP_NAME	"vmalloc"
++#define ION_VMALLOC_HEAP_NAME		"vmalloc"
+ #define ION_DRM_HEAP_NAME		"drm"
+-#define ION_CARVEOUT_HEAP_NAME	"carveout"
++#define ION_CARVEOUT_HEAP_NAME		"carveout"
+ 
+ #define ION_SET_CACHED(__cache)		(__cache | ION_FLAG_CACHED)
+ #define ION_SET_UNCACHED(__cache)	(__cache & ~ION_FLAG_CACHED)
+-
+-#define ION_IS_CACHED(__flags)	((__flags) & ION_FLAG_CACHED)
++#define ION_IS_CACHED(__flags)		((__flags) & ION_FLAG_CACHED)
+ 
+ /* struct ion_flush_data - data passed to ion for flushing caches
+  *
+-- 
+2.35.3
+

@@ -1,0 +1,165 @@
+From 668e3ed51ff0211bd5fdf8915fde9ccd27eb4e69 Mon Sep 17 00:00:00 2001
+From: "Huang, Tao" <huangtao@rock-chips.com>
+Date: Tue, 2 Jun 2015 11:25:10 +0800
+Subject: [PATCH] Revert "zram: don't grab mutex in zram_slot_free_noity"
+
+This reverts commit 66db73c14bd16d8ad05ecb80e6bf6050d8828467.
+---
+ drivers/staging/zram/zram_drv.c | 60 ++-------------------------------
+ drivers/staging/zram/zram_drv.h | 10 ------
+ 2 files changed, 3 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/staging/zram/zram_drv.c b/drivers/staging/zram/zram_drv.c
+index daaa07193199..a333d44d0cff 100644
+--- a/drivers/staging/zram/zram_drv.c
++++ b/drivers/staging/zram/zram_drv.c
+@@ -278,14 +278,6 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 		goto out;
+ 	}
+ 
+-	/*
+-	 * zram_slot_free_notify could miss free so that let's
+-	 * double check.
+-	 */
+-	if (unlikely(meta->table[index].handle ||
+-			zram_test_flag(meta, index, ZRAM_ZERO)))
+-		zram_free_page(zram, index);
+-
+ 	ret = lzo1x_1_compress(uncmem, PAGE_SIZE, src, &clen,
+ 			       meta->compress_workmem);
+ 
+@@ -343,20 +335,6 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 	return ret;
+ }
+ 
+-static void handle_pending_slot_free(struct zram *zram)
+-{
+-	struct zram_slot_free *free_rq;
+-
+-	spin_lock(&zram->slot_free_lock);
+-	while (zram->slot_free_rq) {
+-		free_rq = zram->slot_free_rq;
+-		zram->slot_free_rq = free_rq->next;
+-		zram_free_page(zram, free_rq->index);
+-		kfree(free_rq);
+-	}
+-	spin_unlock(&zram->slot_free_lock);
+-}
+-
+ static int zram_bvec_rw(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 			int offset, struct bio *bio, int rw)
+ {
+@@ -364,12 +342,10 @@ static int zram_bvec_rw(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 
+ 	if (rw == READ) {
+ 		down_read(&zram->lock);
+-		handle_pending_slot_free(zram);
+ 		ret = zram_bvec_read(zram, bvec, index, offset, bio);
+ 		up_read(&zram->lock);
+ 	} else {
+ 		down_write(&zram->lock);
+-		handle_pending_slot_free(zram);
+ 		ret = zram_bvec_write(zram, bvec, index, offset);
+ 		up_write(&zram->lock);
+ 	}
+@@ -520,8 +496,6 @@ static void __zram_reset_device(struct zram *zram)
+ 
+ void zram_reset_device(struct zram *zram)
+ {
+-	flush_work(&zram->free_work);
+-
+ 	down_write(&zram->init_lock);
+ 	__zram_reset_device(zram);
+ 	up_write(&zram->init_lock);
+@@ -607,40 +581,16 @@ void zram_init_device(struct zram *zram, struct zram_meta *meta)
+ 	pr_debug("Initialization done!\n");
+ }
+ 
+-static void zram_slot_free(struct work_struct *work)
+-{
+-	struct zram *zram;
+-
+-	zram = container_of(work, struct zram, free_work);
+-	down_write(&zram->lock);
+-	handle_pending_slot_free(zram);
+-	up_write(&zram->lock);
+-}
+-
+-static void add_slot_free(struct zram *zram, struct zram_slot_free *free_rq)
+-{
+-	spin_lock(&zram->slot_free_lock);
+-	free_rq->next = zram->slot_free_rq;
+-	zram->slot_free_rq = free_rq;
+-	spin_unlock(&zram->slot_free_lock);
+-}
+-
+ static void zram_slot_free_notify(struct block_device *bdev,
+ 				unsigned long index)
+ {
+ 	struct zram *zram;
+-	struct zram_slot_free *free_rq;
+ 
+ 	zram = bdev->bd_disk->private_data;
++	down_write(&zram->lock);
++	zram_free_page(zram, index);
++	up_write(&zram->lock);
+ 	zram_stat64_inc(zram, &zram->stats.notify_free);
+-
+-	free_rq = kmalloc(sizeof(struct zram_slot_free), GFP_ATOMIC);
+-	if (!free_rq)
+-		return;
+-
+-	free_rq->index = index;
+-	add_slot_free(zram, free_rq);
+-	schedule_work(&zram->free_work);
+ }
+ 
+ static const struct block_device_operations zram_devops = {
+@@ -656,10 +606,6 @@ static int create_device(struct zram *zram, int device_id)
+ 	init_rwsem(&zram->init_lock);
+ 	spin_lock_init(&zram->stat64_lock);
+ 
+-	INIT_WORK(&zram->free_work, zram_slot_free);
+-	spin_lock_init(&zram->slot_free_lock);
+-	zram->slot_free_rq = NULL;
+-
+ 	zram->queue = blk_alloc_queue(GFP_KERNEL);
+ 	if (!zram->queue) {
+ 		pr_err("Error allocating disk queue for device %d\n",
+diff --git a/drivers/staging/zram/zram_drv.h b/drivers/staging/zram/zram_drv.h
+index ece3524ea403..d542eee81357 100644
+--- a/drivers/staging/zram/zram_drv.h
++++ b/drivers/staging/zram/zram_drv.h
+@@ -90,21 +90,12 @@ struct zram_meta {
+ 	struct zs_pool *mem_pool;
+ };
+ 
+-struct zram_slot_free {
+-	unsigned long index;
+-	struct zram_slot_free *next;
+-};
+-
+ struct zram {
+ 	struct zram_meta *meta;
+ 	spinlock_t stat64_lock;	/* protect 64-bit stats */
+ 	struct rw_semaphore lock; /* protect compression buffers, table,
+ 				   * 32bit stat counters against concurrent
+ 				   * notifications, reads and writes */
+-
+-	struct work_struct free_work;  /* handle pending free request */
+-	struct zram_slot_free *slot_free_rq; /* list head of free request */
+-
+ 	struct request_queue *queue;
+ 	struct gendisk *disk;
+ 	int init_done;
+@@ -115,7 +106,6 @@ struct zram {
+ 	 * we can store in a disk.
+ 	 */
+ 	u64 disksize;	/* bytes */
+-	spinlock_t slot_free_lock;
+ 
+ 	struct zram_stats stats;
+ };
+-- 
+2.35.3
+

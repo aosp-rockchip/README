@@ -1,0 +1,244 @@
+From 458874cea12d81230e4a65db64b9cd55f4c5231f Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Mon, 25 Mar 2019 20:08:51 +0800
+Subject: [PATCH] PM / devfreq: Add support for policy notifiers
+
+Change-Id: I6feff0c15d8685db91c8780ce90c4b31925f5abe
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/devfreq/devfreq.c | 29 +++++++++++++++++++-----
+ include/linux/devfreq.h   | 47 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/devfreq/devfreq.c b/drivers/devfreq/devfreq.c
+index a001f9c570b1..504c28d18636 100644
+--- a/drivers/devfreq/devfreq.c
++++ b/drivers/devfreq/devfreq.c
+@@ -252,6 +252,7 @@ static int devfreq_notify_transition(struct devfreq *devfreq,
+  */
+ int update_devfreq(struct devfreq *devfreq)
+ {
++	struct devfreq_policy *policy = &devfreq->policy;
+ 	struct devfreq_freqs freqs;
+ 	unsigned long freq, cur_freq, min_freq, max_freq;
+ 	int err = 0;
+@@ -265,6 +266,11 @@ int update_devfreq(struct devfreq *devfreq)
+ 	if (!devfreq->governor)
+ 		return -EINVAL;
+ 
++	policy->max = devfreq->scaling_max_freq;
++	policy->min = devfreq->scaling_min_freq;
++	srcu_notifier_call_chain(&devfreq->policy_notifier_list, DEVFREQ_ADJUST,
++				 policy);
++
+ 	/* Reevaluate the proper frequency */
+ 	err = devfreq->governor->get_target_freq(devfreq, &freq);
+ 	if (err)
+@@ -277,8 +283,8 @@ int update_devfreq(struct devfreq *devfreq)
+ 	 * max_freq
+ 	 * min_freq
+ 	 */
+-	max_freq = min(devfreq->scaling_max_freq, devfreq->max_freq);
+-	min_freq = max(devfreq->scaling_min_freq, devfreq->min_freq);
++	max_freq = min(policy->max, devfreq->max_freq);
++	min_freq = max(policy->min, devfreq->min_freq);
+ 
+ 	if (freq < min_freq) {
+ 		freq = min_freq;
+@@ -608,6 +614,7 @@ struct devfreq *devfreq_add_device(struct device *dev,
+ 		goto err_dev;
+ 	}
+ 	devfreq->min_freq = devfreq->scaling_min_freq;
++	devfreq->policy.min = devfreq->min_freq;
+ 
+ 	devfreq->scaling_max_freq = find_available_max_freq(devfreq);
+ 	if (!devfreq->scaling_max_freq) {
+@@ -616,6 +623,7 @@ struct devfreq *devfreq_add_device(struct device *dev,
+ 		goto err_dev;
+ 	}
+ 	devfreq->max_freq = devfreq->scaling_max_freq;
++	devfreq->policy.max = devfreq->max_freq;
+ 
+ 	dev_set_name(&devfreq->dev, "devfreq%d",
+ 				atomic_inc_return(&devfreq_no));
+@@ -639,6 +647,7 @@ struct devfreq *devfreq_add_device(struct device *dev,
+ 	devfreq->last_stat_updated = jiffies;
+ 
+ 	srcu_init_notifier_head(&devfreq->transition_notifier_list);
++	srcu_init_notifier_head(&devfreq->policy_notifier_list);
+ 
+ 	mutex_unlock(&devfreq->lock);
+ 
+@@ -1158,7 +1167,7 @@ static ssize_t min_freq_show(struct device *dev, struct device_attribute *attr,
+ {
+ 	struct devfreq *df = to_devfreq(dev);
+ 
+-	return sprintf(buf, "%lu\n", max(df->scaling_min_freq, df->min_freq));
++	return sprintf(buf, "%lu\n", max(df->policy.min, df->min_freq));
+ }
+ 
+ static ssize_t max_freq_store(struct device *dev, struct device_attribute *attr,
+@@ -1203,7 +1212,7 @@ static ssize_t max_freq_show(struct device *dev, struct device_attribute *attr,
+ {
+ 	struct devfreq *df = to_devfreq(dev);
+ 
+-	return sprintf(buf, "%lu\n", min(df->scaling_max_freq, df->max_freq));
++	return sprintf(buf, "%lu\n", min(df->policy.max, df->max_freq));
+ }
+ static DEVICE_ATTR_RW(max_freq);
+ 
+@@ -1432,7 +1441,7 @@ EXPORT_SYMBOL(devm_devfreq_unregister_opp_notifier);
+  * devfreq_register_notifier() - Register a driver with devfreq
+  * @devfreq:	The devfreq object.
+  * @nb:		The notifier block to register.
+- * @list:	DEVFREQ_TRANSITION_NOTIFIER.
++ * @list:	DEVFREQ_TRANSITION_NOTIFIER or DEVFREQ_POLICY_NOTIFIER.
+  */
+ int devfreq_register_notifier(struct devfreq *devfreq,
+ 				struct notifier_block *nb,
+@@ -1448,6 +1457,10 @@ int devfreq_register_notifier(struct devfreq *devfreq,
+ 		ret = srcu_notifier_chain_register(
+ 				&devfreq->transition_notifier_list, nb);
+ 		break;
++	case DEVFREQ_POLICY_NOTIFIER:
++		ret = srcu_notifier_chain_register(
++				&devfreq->policy_notifier_list, nb);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -1460,7 +1473,7 @@ EXPORT_SYMBOL(devfreq_register_notifier);
+  * devfreq_unregister_notifier() - Unregister a driver with devfreq
+  * @devfreq:	The devfreq object.
+  * @nb:		The notifier block to be unregistered.
+- * @list:	DEVFREQ_TRANSITION_NOTIFIER.
++ * @list:	DEVFREQ_TRANSITION_NOTIFIER or DEVFREQ_POLICY_NOTIFIER.
+  */
+ int devfreq_unregister_notifier(struct devfreq *devfreq,
+ 				struct notifier_block *nb,
+@@ -1476,6 +1489,10 @@ int devfreq_unregister_notifier(struct devfreq *devfreq,
+ 		ret = srcu_notifier_chain_unregister(
+ 				&devfreq->transition_notifier_list, nb);
+ 		break;
++	case DEVFREQ_POLICY_NOTIFIER:
++		ret = srcu_notifier_chain_unregister(
++				&devfreq->policy_notifier_list, nb);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+diff --git a/include/linux/devfreq.h b/include/linux/devfreq.h
+index 3aae5b3af87c..268d046f450b 100644
+--- a/include/linux/devfreq.h
++++ b/include/linux/devfreq.h
+@@ -28,11 +28,15 @@
+ 
+ /* DEVFREQ notifier interface */
+ #define DEVFREQ_TRANSITION_NOTIFIER	(0)
++#define DEVFREQ_POLICY_NOTIFIER		(1)
+ 
+ /* Transition notifiers of DEVFREQ_TRANSITION_NOTIFIER */
+ #define	DEVFREQ_PRECHANGE		(0)
+ #define DEVFREQ_POSTCHANGE		(1)
+ 
++/* Policy Notifiers  */
++#define	DEVFREQ_ADJUST			(0)
++
+ struct devfreq;
+ struct devfreq_governor;
+ 
+@@ -109,6 +113,16 @@ struct devfreq_dev_profile {
+ 	unsigned int max_state;
+ };
+ 
++/**
++ * struct devfreq_policy - Devfreq frequency limits
++ * @min_:	minimum frequency (adjustable by policy notifiers)
++ * @max:	maximum frequency (adjustable by policy notifiers)
++ */
++struct devfreq_policy {
++	unsigned long min;
++	unsigned long max;
++};
++
+ /**
+  * struct devfreq - Device devfreq structure
+  * @node:	list node - contains the devices with devfreq that have been
+@@ -126,6 +140,7 @@ struct devfreq_dev_profile {
+  * @previous_freq:	previously configured frequency value.
+  * @data:	Private data of the governor. The devfreq framework does not
+  *		touch this.
++ * @policy:	Frequency limits of the device
+  * @min_freq:	Limit minimum frequency requested by user (0: none)
+  * @max_freq:	Limit maximum frequency requested by user (0: none)
+  * @scaling_min_freq:	Limit minimum frequency requested by OPP interface
+@@ -136,6 +151,7 @@ struct devfreq_dev_profile {
+  * @time_in_state:	Statistics of devfreq states
+  * @last_stat_updated:	The last time stat updated
+  * @transition_notifier_list: list head of DEVFREQ_TRANSITION_NOTIFIER notifier
++ * @policy_notifier_list: list head of DEVFREQ_POLICY_NOTIFIER notifier
+  *
+  * This structure stores the devfreq information for a give device.
+  *
+@@ -161,6 +177,8 @@ struct devfreq {
+ 
+ 	void *data; /* private data for governors */
+ 
++	struct devfreq_policy policy;
++
+ 	unsigned long min_freq;
+ 	unsigned long max_freq;
+ 	unsigned long scaling_min_freq;
+@@ -174,6 +192,7 @@ struct devfreq {
+ 	unsigned long last_stat_updated;
+ 
+ 	struct srcu_notifier_head transition_notifier_list;
++	struct srcu_notifier_head policy_notifier_list;
+ };
+ 
+ struct devfreq_freqs {
+@@ -226,6 +245,29 @@ extern void devm_devfreq_unregister_notifier(struct device *dev,
+ extern struct devfreq *devfreq_get_devfreq_by_phandle(struct device *dev,
+ 						int index);
+ 
++/**
++ * devfreq_verify_within_limits() - Adjust a devfreq policy if needed to make
++ *                                  sure its min/max values are within a
++ *                                  specified range.
++ * @policy:	the policy
++ * @min:	the minimum frequency
++ * @max:	the maximum frequency
++ */
++static inline void devfreq_verify_within_limits(struct devfreq_policy *policy,
++		unsigned int min, unsigned int max)
++{
++	if (policy->min < min)
++		policy->min = min;
++	if (policy->max < min)
++		policy->max = min;
++	if (policy->min > max)
++		policy->min = max;
++	if (policy->max > max)
++		policy->max = max;
++	if (policy->min > policy->max)
++		policy->min = policy->max;
++}
++
+ #if IS_ENABLED(CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND)
+ /**
+  * struct devfreq_simple_ondemand_data - void *data fed to struct devfreq
+@@ -380,6 +422,11 @@ static inline struct devfreq *devfreq_get_devfreq_by_phandle(struct device *dev,
+ 	return ERR_PTR(-ENODEV);
+ }
+ 
++static inline void devfreq_verify_within_limits(struct devfreq_policy *policy,
++		unsigned int min, unsigned int max)
++{
++}
++
+ static inline int devfreq_update_stats(struct devfreq *df)
+ {
+ 	return -EINVAL;
+-- 
+2.35.3
+

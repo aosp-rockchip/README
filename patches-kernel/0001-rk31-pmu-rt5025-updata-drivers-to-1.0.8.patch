@@ -1,0 +1,412 @@
+From 649517279ebb7d2b7b5619f4438df6c6aaa0044e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=BC=A0=E6=99=B4?= <zhangqing@rock-chips.com>
+Date: Wed, 6 Nov 2013 10:29:57 +0800
+Subject: [PATCH] rk31;pmu:rt5025:updata drivers to 1.0.8
+
+---
+ arch/arm/mach-rk30/board-pmu-rt5025.c |  4 +-
+ drivers/mfd/rt5025-irq.c              | 28 ++++++--
+ drivers/mfd/rt5025-misc.c             | 15 +++++
+ drivers/power/rt5025-battery.c        | 93 +++++++++++++++++----------
+ drivers/power/rt5025-power.c          | 29 +++++++++
+ drivers/power/rt5025-swjeita.c        |  2 +-
+ include/linux/mfd/rt5025.h            |  4 +-
+ include/linux/power/rt5025-battery.h  | 36 +++++++++++
+ 8 files changed, 168 insertions(+), 43 deletions(-)
+ mode change 100755 => 100644 include/linux/power/rt5025-battery.h
+
+diff --git a/arch/arm/mach-rk30/board-pmu-rt5025.c b/arch/arm/mach-rk30/board-pmu-rt5025.c
+index 9c3c1260e7c0..e88c4875987c 100644
+--- a/arch/arm/mach-rk30/board-pmu-rt5025.c
++++ b/arch/arm/mach-rk30/board-pmu-rt5025.c
+@@ -290,8 +290,8 @@ static struct rt5025_power_data rt5025_power_data = {
+ 	.CHGControl4 = {
+ 		.bitfield = {
+ 			.AICR_CON = 1,
+-			.AICR = RT5025_AICR_1A,
+-			.ICC = RT5025_ICC_1A,
++			.AICR = RT5025_AICR_500MA,
++			.ICC = RT5025_ICC_0P5A,
+ 		},
+ 	},
+ 	.CHGControl5 = {
+diff --git a/drivers/mfd/rt5025-irq.c b/drivers/mfd/rt5025-irq.c
+index 76c50a9b1ce2..7a324c251a34 100644
+--- a/drivers/mfd/rt5025-irq.c
++++ b/drivers/mfd/rt5025-irq.c
+@@ -38,7 +38,8 @@ struct rt5025_irq_info {
+ 	int intr_pin;
+ 	int irq;
+ 	int suspend;
+-	int init_once;
++	int acin_cnt;
++	int usbin_cnt;
+ };
+ 
+ static void rt5025_work_func(struct work_struct *work)
+@@ -115,12 +116,24 @@ static void rt5025_work_func(struct work_struct *work)
+ 			if (chg_event & (CHG_EVENT_CHSLPI_INAC | CHG_EVENT_CHSLPI_INUSB))
+ 			{
+ 				ii->chip->power_info->chg_term = 0;
++				if (chg_event & CHG_EVENT_CHSLPI_INAC)
++					ii->acin_cnt = 0;
++				if (chg_event & CHG_EVENT_CHSLPI_INUSB)
++					ii->usbin_cnt = 0;
++				
+ 			}
+ 
+ 			if (chg_event & (CHG_EVENT_INAC_PLUGIN | CHG_EVENT_INUSB_PLUGIN))
+ 			{
+-				if (!ii->init_once)
++				RTINFO("acin_cnt %d, usbin_cnt %d\n", ii->acin_cnt, ii->usbin_cnt);
++				if (ii->acin_cnt == 0 && ii->usbin_cnt == 0)
+ 				{
++					#if 1
++					rt5025_charger_reset_and_reinit(ii->chip->power_info);
++					rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN1, irq_enable[0]);
++					rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN2, irq_enable[1]&(~RT5025_CHTERMI_MASK));
++					rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN3, irq_enable[2]);
++					#else
+ 					rt5025_set_charging_buck(ii->i2c, 0);
+ 					mdelay(50);
+ 					rt5025_set_charging_buck(ii->i2c, 1);
+@@ -129,7 +142,14 @@ static void rt5025_work_func(struct work_struct *work)
+ 					mdelay(50);
+ 					rt5025_set_charging_buck(ii->i2c, 1);
+ 					mdelay(400);
++					#endif /* #if 1 */
+ 				}
++
++				if (chg_event & CHG_EVENT_INAC_PLUGIN)
++					ii->acin_cnt = 1;
++				if (chg_event & CHG_EVENT_INUSB_PLUGIN)
++					ii->usbin_cnt = 1;
++				RTINFO("acin_cnt %d, usbin_cnt %d\n", ii->acin_cnt, ii->usbin_cnt);
+ 			}
+ 
+ 			if (ii->chip->power_info->chg_term <= 3)
+@@ -158,9 +178,6 @@ static void rt5025_work_func(struct work_struct *work)
+ 		rt5025_gauge_irq_handler(ii->chip->battery_info, irq_stat[5] & RT5025_FLG_VOLT);
+ 	#endif /* CONFIG_POWER_RT5025 */
+ 
+-	if (ii->init_once)
+-		ii->init_once = 0;
+-
+ 	#if 1
+ 	rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN2, irq_enable[1]);
+ 	#else
+@@ -273,7 +290,6 @@ static int __devinit rt5025_irq_probe(struct platform_device *pdev)
+ 	if (pdata->cb)
+ 		ii->event_cb = pdata->cb;
+ 	wake_lock_init(&ii->irq_wake_lock, WAKE_LOCK_SUSPEND, "rt_irq_wake");
+-	ii->init_once = 1;
+ 
+ 	rt5025_irq_reg_init(ii, pdata->irq_data);
+ 	rt5025_interrupt_init(ii);
+diff --git a/drivers/mfd/rt5025-misc.c b/drivers/mfd/rt5025-misc.c
+index 3b680eab4361..e84475afe518 100644
+--- a/drivers/mfd/rt5025-misc.c
++++ b/drivers/mfd/rt5025-misc.c
+@@ -33,6 +33,21 @@ void rt5025_power_off(void)
+ }
+ EXPORT_SYMBOL(rt5025_power_off);
+ 
++int rt5025_cable_exist(void)
++{
++	int ret = 0;
++	ret = rt5025_reg_read(g_shdn, 0x01);
++	if (ret < 0)
++		return 0;
++	else
++	{
++		if (ret&0x3)
++			return 1;
++		return 0;
++	}
++}
++EXPORT_SYMBOL(rt5025_cable_exist);
++
+ static int __devinit rt5025_misc_reg_init(struct i2c_client *client, struct rt5025_misc_data *md)
+ {
+ 	int ret = 0;
+diff --git a/drivers/power/rt5025-battery.c b/drivers/power/rt5025-battery.c
+index 6590417897a2..f6a290ebbba3 100644
+--- a/drivers/power/rt5025-battery.c
++++ b/drivers/power/rt5025-battery.c
+@@ -1177,37 +1177,69 @@ static void rt5025_pretrim(struct rt5025_battery_info *bi)
+ }
+ #endif
+ 
++static u16 get_crc16_value(u8* data, int size)
++{
++	u16 fcs = 0xffff;
++	int len = size;
++	int i = 0;
++	u16 temp = 0;
++
++	while (len > 0)
++	{
++		fcs = (u16)((fcs>>8)^crctab16[(fcs^data[i])&0xff]);
++		len--;
++		i++;
++	}
++	temp = (u16)~fcs;
++	return temp;
++}
++
++static int IsCrc16Good(u8* data, int size)
++{
++	u16 fcs = 0xffff;
++	int len = size;
++	int i = 0;
++
++	while (len>0)
++	{
++		fcs = (u16)((fcs>>8)^crctab16[((fcs^data[i])&0xff)]);
++		len--;
++		i++;
++	}
++	return (fcs == 0xf0b8);
++}
++
+ static int rt5025_battery_parameter_backup(struct rt5025_battery_info *bi)
+ {
+-	u8 data[4];
++	u16 crc_value = 0;
++	u8 data[12]= {0};
+ 	RTINFO("\n");
+ 	//backup fcc_aging, rm, cycle_count, acc_dchg_cap
+ 	//fcc_aging
+ 	data[0] = (bi->fcc_aging>>8)&0xff;
+ 	data[1] = (bi->fcc_aging)&0xff;
+-	rt5025_write_reg(bi->client, 0x21, data, 2);
+-	//rm
+-	data[0] = (bi->rm>>24)&0xff;
+-	data[1] = (bi->rm>>16)&0xff;
+-	data[2] = (bi->rm>>8)&0xff;
+-	data[3] = (bi->rm)&0xff;
+-	rt5025_write_reg(bi->client, 0x23, data, 4);
++	rt5025_write_reg(bi->client, 0x21, &data[0], 2);
+ 	//acc_dchg_cap
+-	data[0] = (bi->acc_dchg_cap>>24)&0xff;
+-	data[1] = (bi->acc_dchg_cap>>16)&0xff;
+-	data[2] = (bi->acc_dchg_cap>>8)&0xff;
+-	data[3] = (bi->acc_dchg_cap)&0xff;
+-	rt5025_write_reg(bi->client, 0x27, data, 4);
++	data[2] = (bi->acc_dchg_cap>>24)&0xff;
++	data[3] = (bi->acc_dchg_cap>>16)&0xff;
++	data[4] = (bi->acc_dchg_cap>>8)&0xff;
++	data[5] = (bi->acc_dchg_cap)&0xff;
++	rt5025_write_reg(bi->client, 0x23, &data[2], 4);
+ 	//cycle_count
+-	data[0] = (bi->cycle_cnt)&0xff;
+-	rt5025_write_reg(bi->client, 0x2B, data, 1);
++	data[6] = (bi->cycle_cnt)&0xff;
++	rt5025_write_reg(bi->client, 0x27, &data[6], 1);
+ 	//soc
+-	data[0] = (bi->soc)&0xff;
+-	rt5025_write_reg(bi->client, 0x2C, data, 1);
++	data[7] = (bi->soc)&0xff;
++	rt5025_write_reg(bi->client, 0x28, &data[7], 1);
+ 	//gauge_timer
+-	data[0] = (bi->pre_gauge_timer>>8)&0xff;
+-	data[1] = bi->pre_gauge_timer&0xff;
+-	rt5025_write_reg(bi->client, 0x2D, data, 2);
++	data[8] = (bi->pre_gauge_timer>>8)&0xff;
++	data[9] = bi->pre_gauge_timer&0xff;
++	rt5025_write_reg(bi->client, 0x29, &data[8], 2);
++	//CRC value
++	crc_value = get_crc16_value(data, 10);
++	data[10] = crc_value&0xff;
++	data[11] = (crc_value>>8)&0xff;
++	rt5025_write_reg(bi->client, 0x2b, &data[10], 2);
+ 	return 0;
+ }
+ 
+@@ -1219,20 +1251,17 @@ static int rt5025_battery_parameter_restore(struct rt5025_battery_info *bi)
+ 	//fcc_aging
+ 	rt5025_read_reg(bi->client, 0x21, data, 2);
+ 	bi->fcc = bi->fcc_aging = data[0]<<8 | data[1];
+-	//rm
+-	//rt5025_read_reg(bi->client, 0x23, data, 4);
+-	//bi->rm = data[0]<<24 | data[1]<<16 | data[2]<<8 | data[3];
+ 	//acc_dchg_cap
+-	rt5025_read_reg(bi->client, 0x27, data, 4);
++	rt5025_read_reg(bi->client, 0x23, data, 4);
+ 	bi->acc_dchg_cap = data[0]<<24 | data[1]<<16 | data[2]<<8 | data[3];
+ 	//cycle_count
+-	rt5025_read_reg(bi->client, 0x2B, data, 1);
++	rt5025_read_reg(bi->client, 0x27, data, 1);
+ 	bi->cycle_cnt = data[0];
+ 	//soc
+-	rt5025_read_reg(bi->client, 0x2C, data, 1);
++	rt5025_read_reg(bi->client, 0x28, data, 1);
+ 	bi->soc = bi->pre_soc = data[0];
+ 	//pre_gauge_timer
+-	rt5025_read_reg(bi->client, 0x2D, data, 2);
++	rt5025_read_reg(bi->client, 0x29, data, 2);
+ 	bi->pre_gauge_timer = bi->gauge_timer = (data[0]<<8) + data[1];
+ 	
+ 	return 0;
+@@ -1242,19 +1271,17 @@ static int rt5025_battery_parameter_restore(struct rt5025_battery_info *bi)
+ // return value; 1-> initialized, 0-> no initial value
+ static int rt5025_battery_parameter_initcheck(struct rt5025_battery_info *bi)
+ {
+-	u8 data[2];
+-	u16 value;
++	u8 data[12] = {0};
+ 	int ret = 0;
+ 
+-	if (rt5025_read_reg(bi->client, 0x21, data, 2) < 0)
++	if (rt5025_read_reg(bi->client, 0x21, data, 12)<0)
+ 	{
+ 		pr_err("%s: check initial value error\n", __func__);
++		return 0;
+ 	}
+ 	else
+ 	{
+-		value = data[1]<<8 | data[0];
+-		if (value)
+-			ret = 1;
++		ret = IsCrc16Good(data, 12);
+ 	}
+ 	RTINFO("initial check = %d\n", ret);
+ 
+diff --git a/drivers/power/rt5025-power.c b/drivers/power/rt5025-power.c
+index fbc55b7e8c89..6d654d7bbe38 100644
+--- a/drivers/power/rt5025-power.c
++++ b/drivers/power/rt5025-power.c
+@@ -78,6 +78,32 @@ int rt5025_ext_set_charging_buck(int onoff)
+ }
+ EXPORT_SYMBOL(rt5025_ext_set_charging_buck);
+ 
++int rt5025_charger_reset_and_reinit(struct rt5025_power_info *pi)
++{
++	struct rt5025_platform_data *pdata = pi->dev->parent->platform_data;
++	int ret;
++
++	RTINFO("\n");
++
++	//do charger reset
++	ret = rt5025_reg_read(pi->i2c, RT5025_REG_CHGCTL4);
++	if (ret < 0)
++		return ret;
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL4, ret|RT5025_CHGRST_MASK);
++	mdelay(200);
++
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL2, pdata->power_data->CHGControl2.val);
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL3, pdata->power_data->CHGControl3.val);
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL4, pdata->power_data->CHGControl4.val);
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL5, pdata->power_data->CHGControl5.val);
++	rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL6, pdata->power_data->CHGControl6.val);
++	//rt5025_reg_write(pi->i2c, RT5025_REG_CHGCTL7, pd->CHGControl7.val);
++	rt5025_assign_bits(pi->i2c, RT5025_REG_CHGCTL7, 0xEF, pdata->power_data->CHGControl7.val);
++	rt5025_reg_write(pi->i2c, 0xA9, 0x60 );
++	return 0;
++}
++EXPORT_SYMBOL(rt5025_charger_reset_and_reinit);
++
+ static int rt5025_set_charging_current(struct i2c_client *i2c, int cur_value)
+ {
+ 	int ret = 0;
+@@ -255,7 +281,10 @@ int rt5025_power_charge_detect(struct rt5025_power_info *info)
+ 
+ 	//if (old_acval != new_acval || old_usbval != new_usbval)
+ 	if (new_acval || new_usbval)
++	{
++		info->usb_cnt = 0;
+ 		schedule_delayed_work(&info->usb_detect_work, 0); //no delay
++	}
+ 
+ 	new_chgval = (chgstatval&RT5025_CHGSTAT_MASK)>>RT5025_CHGSTAT_SHIFT;
+ 	
+diff --git a/drivers/power/rt5025-swjeita.c b/drivers/power/rt5025-swjeita.c
+index cb72a33a50dd..52e777c0044f 100644
+--- a/drivers/power/rt5025-swjeita.c
++++ b/drivers/power/rt5025-swjeita.c
+@@ -22,7 +22,7 @@
+ #include <linux/mfd/rt5025.h>
+ #include <linux/power/rt5025-swjeita.h>
+ 
+-#define TEMP_TOLERANCE	0  // 'c*10 gap for tolerance
++#define TEMP_TOLERANCE	30  // 'c*10 gap for tolerance
+ 
+ static int rt5025_set_charging_cc_switch (struct i2c_client *i2c, int onoff)
+ {
+diff --git a/include/linux/mfd/rt5025.h b/include/linux/mfd/rt5025.h
+index fd8b9fe8a3e9..3d5ba95de0d9 100644
+--- a/include/linux/mfd/rt5025.h
++++ b/include/linux/mfd/rt5025.h
+@@ -17,7 +17,7 @@
+ #include <linux/android_alarm.h>
+ 
+ #define RT5025_DEVICE_NAME "RT5025"
+-#define RT5025_DRV_VER	   "1.0.6_R"
++#define RT5025_DRV_VER	   "1.0.8_R"
+ 
+ enum {
+ 	RT5025_RSTDELAY1_100MS,
+@@ -619,9 +619,11 @@ struct rt5025_platform_data {
+ 
+ #ifdef CONFIG_MFD_RT5025_MISC
+ extern void rt5025_power_off(void);
++extern int rt5025_cable_exist(void);
+ #endif /* CONFIG_MFD_RT5025_MISC */
+ 
+ #ifdef CONFIG_POWER_RT5025
++extern int rt5025_charger_reset_and_reinit(struct rt5025_power_info *);
+ extern int rt5025_ext_set_charging_buck(int);
+ extern int rt5025_set_charging_buck(struct i2c_client *, int);
+ extern int rt5025_set_charging_current_switch(struct i2c_client *, int);
+diff --git a/include/linux/power/rt5025-battery.h b/include/linux/power/rt5025-battery.h
+old mode 100755
+new mode 100644
+index 6ac5757059f6..b9577459dc83
+--- a/include/linux/power/rt5025-battery.h
++++ b/include/linux/power/rt5025-battery.h
+@@ -91,6 +91,42 @@
+ 
+ //#define SLEEP_CURRENT 3 //mA
+ 
++u16 crctab16[256] =
++{
++                0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf, 
++                0x8c48, 0x9dc1, 0xaf5a, 0xbed3, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7, 
++                0x1081, 0x0108, 0x3393, 0x221a, 0x56a5, 0x472c, 0x75b7, 0x643e, 
++                0x9cc9, 0x8d40, 0xbfdb, 0xae52, 0xdaed, 0xcb64, 0xf9ff, 0xe876, 
++                0x2102, 0x308b, 0x0210, 0x1399, 0x6726, 0x76af, 0x4434, 0x55bd, 
++                0xad4a, 0xbcc3, 0x8e58, 0x9fd1, 0xeb6e, 0xfae7, 0xc87c, 0xd9f5, 
++                0x3183, 0x200a, 0x1291, 0x0318, 0x77a7, 0x662e, 0x54b5, 0x453c, 
++                0xbdcb, 0xac42, 0x9ed9, 0x8f50, 0xfbef, 0xea66, 0xd8fd, 0xc974, 
++                0x4204, 0x538d, 0x6116, 0x709f, 0x0420, 0x15a9, 0x2732, 0x36bb, 
++                0xce4c, 0xdfc5, 0xed5e, 0xfcd7, 0x8868, 0x99e1, 0xab7a, 0xbaf3, 
++                0x5285, 0x430c, 0x7197, 0x601e, 0x14a1, 0x0528, 0x37b3, 0x263a, 
++                0xdecd, 0xcf44, 0xfddf, 0xec56, 0x98e9, 0x8960, 0xbbfb, 0xaa72, 
++                0x6306, 0x728f, 0x4014, 0x519d, 0x2522, 0x34ab, 0x0630, 0x17b9, 
++                0xef4e, 0xfec7, 0xcc5c, 0xddd5, 0xa96a, 0xb8e3, 0x8a78, 0x9bf1, 
++                0x7387, 0x620e, 0x5095, 0x411c, 0x35a3, 0x242a, 0x16b1, 0x0738, 
++                0xffcf, 0xee46, 0xdcdd, 0xcd54, 0xb9eb, 0xa862, 0x9af9, 0x8b70, 
++                0x8408, 0x9581, 0xa71a, 0xb693, 0xc22c, 0xd3a5, 0xe13e, 0xf0b7, 
++                0x0840, 0x19c9, 0x2b52, 0x3adb, 0x4e64, 0x5fed, 0x6d76, 0x7cff, 
++                0x9489, 0x8500, 0xb79b, 0xa612, 0xd2ad, 0xc324, 0xf1bf, 0xe036, 
++                0x18c1, 0x0948, 0x3bd3, 0x2a5a, 0x5ee5, 0x4f6c, 0x7df7, 0x6c7e, 
++                0xa50a, 0xb483, 0x8618, 0x9791, 0xe32e, 0xf2a7, 0xc03c, 0xd1b5, 
++                0x2942, 0x38cb, 0x0a50, 0x1bd9, 0x6f66, 0x7eef, 0x4c74, 0x5dfd, 
++                0xb58b, 0xa402, 0x9699, 0x8710, 0xf3af, 0xe226, 0xd0bd, 0xc134, 
++                0x39c3, 0x284a, 0x1ad1, 0x0b58, 0x7fe7, 0x6e6e, 0x5cf5, 0x4d7c, 
++                0xc60c, 0xd785, 0xe51e, 0xf497, 0x8028, 0x91a1, 0xa33a, 0xb2b3, 
++                0x4a44, 0x5bcd, 0x6956, 0x78df, 0x0c60, 0x1de9, 0x2f72, 0x3efb, 
++                0xd68d, 0xc704, 0xf59f, 0xe416, 0x90a9, 0x8120, 0xb3bb, 0xa232, 
++                0x5ac5, 0x4b4c, 0x79d7, 0x685e, 0x1ce1, 0x0d68, 0x3ff3, 0x2e7a, 
++                0xe70e, 0xf687, 0xc41c, 0xd595, 0xa12a, 0xb0a3, 0x8238, 0x93b1, 
++                0x6b46, 0x7acf, 0x4854, 0x59dd, 0x2d62, 0x3ceb, 0x0e70, 0x1ff9, 
++                0xf78f, 0xe606, 0xd49d, 0xc514, 0xb1ab, 0xa022, 0x92b9, 0x8330, 
++                0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78,
++};
++
+ typedef enum{
+ 	CHG,
+ 	DCHG
+-- 
+2.35.3
+

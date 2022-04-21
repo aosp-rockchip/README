@@ -1,0 +1,226 @@
+From 1967ba803dee037657fc16defac00bb60bb3c1a9 Mon Sep 17 00:00:00 2001
+From: Simon Xue <xxm@rock-chips.com>
+Date: Tue, 1 Dec 2020 15:34:14 +0800
+Subject: [PATCH] BACKPORT: PCI: dwc: Centralize link gen setting
+
+keystone would force gen2 if no DT property. Now it relies on the
+PCI_EXP_LNKCAP value.
+
+Change-Id: I055e2ac26947caedc0cac93a535116d655d522f6
+Link: https://lore.kernel.org/r/20200821035420.380495-35-robh@kernel.org
+Signed-off-by: Rob Herring <robh@kernel.org>
+Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+Cc: Kishon Vijay Abraham I <kishon@ti.com>
+Cc: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+Cc: Bjorn Helgaas <bhelgaas@google.com>
+Cc: Richard Zhu <hongxing.zhu@nxp.com>
+Cc: Lucas Stach <l.stach@pengutronix.de>
+Cc: Shawn Guo <shawnguo@kernel.org>
+Cc: Sascha Hauer <s.hauer@pengutronix.de>
+Cc: Pengutronix Kernel Team <kernel@pengutronix.de>
+Cc: Fabio Estevam <festevam@gmail.com>
+Cc: NXP Linux Team <linux-imx@nxp.com>
+Cc: Murali Karicheri <m-karicheri2@ti.com>
+Cc: Jingoo Han <jingoohan1@gmail.com>
+Cc: Gustavo Pimentel <gustavo.pimentel@synopsys.com>
+Cc: Stanimir Varbanov <svarbanov@mm-sol.com>
+Cc: Andy Gross <agross@kernel.org>
+Cc: Bjorn Andersson <bjorn.andersson@linaro.org>
+Cc: Pratyush Anand <pratyush.anand@gmail.com>
+Cc: Thierry Reding <thierry.reding@gmail.com>
+Cc: Jonathan Hunter <jonathanh@nvidia.com>
+Cc: linux-omap@vger.kernel.org
+Cc: linux-arm-kernel@lists.infradead.org
+Cc: linux-arm-msm@vger.kernel.org
+Cc: linux-tegra@vger.kernel.org
+Signed-off-by: Simon Xue <xxm@rock-chips.com>
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+(cherry picked from commit 39bc5006501cc31987f4fc249c5ce07286b84768)
+---
+ .../pci/controller/dwc/pcie-designware-host.c |  3 +
+ drivers/pci/controller/dwc/pcie-designware.c  | 79 +++++++++++++++++++
+ drivers/pci/controller/dwc/pcie-designware.h  |  3 +
+ drivers/pci/pci.h                             |  1 +
+ include/uapi/linux/pci_regs.h                 |  1 +
+ 5 files changed, 87 insertions(+)
+
+diff --git a/drivers/pci/controller/dwc/pcie-designware-host.c b/drivers/pci/controller/dwc/pcie-designware-host.c
+index 4f9a76f8ef7c..98d3aa8cc6a5 100644
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -450,6 +450,9 @@ int dw_pcie_host_init(struct pcie_port *pp)
+ 	if (ret)
+ 		pci->num_viewport = 2;
+ 
++	if (pci->link_gen < 1)
++		pci->link_gen = of_pci_get_max_link_speed(np);
++
+ 	if (pci_msi_enabled() &&
+ 	    !pp->msi_ext) {
+ 		/*
+diff --git a/drivers/pci/controller/dwc/pcie-designware.c b/drivers/pci/controller/dwc/pcie-designware.c
+index 2153956a0b20..c7f70a76d8cd 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.c
++++ b/drivers/pci/controller/dwc/pcie-designware.c
+@@ -12,6 +12,7 @@
+ #include <linux/of.h>
+ #include <linux/types.h>
+ 
++#include "../../pci.h"
+ #include "pcie-designware.h"
+ 
+ /* PCIe Port Logic registers */
+@@ -20,6 +21,45 @@
+ #define PCIE_PHY_DEBUG_R1_LINK_UP	(0x1 << 4)
+ #define PCIE_PHY_DEBUG_R1_LINK_IN_TRAINING	(0x1 << 29)
+ 
++/*
++ * These interfaces resemble the pci_find_*capability() interfaces, but these
++ * are for configuring host controllers, which are bridges *to* PCI devices but
++ * are not PCI devices themselves.
++ */
++static u8 __dw_pcie_find_next_cap(struct dw_pcie *pci, u8 cap_ptr,
++				  u8 cap)
++{
++	u8 cap_id, next_cap_ptr;
++	u16 reg;
++
++	if (!cap_ptr)
++		return 0;
++
++	reg = dw_pcie_readw_dbi(pci, cap_ptr);
++	cap_id = (reg & 0x00ff);
++
++	if (cap_id > PCI_CAP_ID_MAX)
++		return 0;
++
++	if (cap_id == cap)
++		return cap_ptr;
++
++	next_cap_ptr = (reg & 0xff00) >> 8;
++	return __dw_pcie_find_next_cap(pci, next_cap_ptr, cap);
++}
++
++u8 dw_pcie_find_capability(struct dw_pcie *pci, u8 cap)
++{
++	u8 next_cap_ptr;
++	u16 reg;
++
++	reg = dw_pcie_readw_dbi(pci, PCI_CAPABILITY_LIST);
++	next_cap_ptr = (reg & 0x00ff);
++
++	return __dw_pcie_find_next_cap(pci, next_cap_ptr, cap);
++}
++EXPORT_SYMBOL_GPL(dw_pcie_find_capability);
++
+ int dw_pcie_read(void __iomem *addr, int size, u32 *val)
+ {
+ 	if ((uintptr_t)addr & (size - 1)) {
+@@ -339,6 +379,42 @@ int dw_pcie_link_up(struct dw_pcie *pci)
+ 		(!(val & PCIE_PHY_DEBUG_R1_LINK_IN_TRAINING)));
+ }
+ 
++static void dw_pcie_link_set_max_speed(struct dw_pcie *pci, u32 link_gen)
++{
++	u32 cap, ctrl2, link_speed;
++	u8 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++
++	cap = dw_pcie_readl_dbi(pci, offset + PCI_EXP_LNKCAP);
++	ctrl2 = dw_pcie_readl_dbi(pci, offset + PCI_EXP_LNKCTL2);
++	ctrl2 &= ~PCI_EXP_LNKCTL2_TLS;
++
++	switch (pcie_link_speed[link_gen]) {
++	case PCIE_SPEED_2_5GT:
++		link_speed = PCI_EXP_LNKCTL2_TLS_2_5GT;
++		break;
++	case PCIE_SPEED_5_0GT:
++		link_speed = PCI_EXP_LNKCTL2_TLS_5_0GT;
++		break;
++	case PCIE_SPEED_8_0GT:
++		link_speed = PCI_EXP_LNKCTL2_TLS_8_0GT;
++		break;
++	case PCIE_SPEED_16_0GT:
++		link_speed = PCI_EXP_LNKCTL2_TLS_16_0GT;
++		break;
++	default:
++		/* Use hardware capability */
++		link_speed = FIELD_GET(PCI_EXP_LNKCAP_SLS, cap);
++		ctrl2 &= ~PCI_EXP_LNKCTL2_HASD;
++		break;
++	}
++
++	dw_pcie_writel_dbi(pci, offset + PCI_EXP_LNKCTL2, ctrl2 | link_speed);
++
++	cap &= ~((u32)PCI_EXP_LNKCAP_SLS);
++	dw_pcie_writel_dbi(pci, offset + PCI_EXP_LNKCAP, cap | link_speed);
++
++}
++
+ void dw_pcie_setup(struct dw_pcie *pci)
+ {
+ 	int ret;
+@@ -347,6 +423,9 @@ void dw_pcie_setup(struct dw_pcie *pci)
+ 	struct device *dev = pci->dev;
+ 	struct device_node *np = dev->of_node;
+ 
++	if (pci->link_gen > 0)
++		dw_pcie_link_set_max_speed(pci, pci->link_gen);
++
+ 	ret = of_property_read_u32(np, "num-lanes", &lanes);
+ 	if (ret)
+ 		lanes = 0;
+diff --git a/drivers/pci/controller/dwc/pcie-designware.h b/drivers/pci/controller/dwc/pcie-designware.h
+index 6ff5affb278b..2d7d64fdff76 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -11,6 +11,7 @@
+ #ifndef _PCIE_DESIGNWARE_H
+ #define _PCIE_DESIGNWARE_H
+ 
++#include <linux/bitfield.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/irq.h>
+ #include <linux/msi.h>
+@@ -225,6 +226,7 @@ struct dw_pcie {
+ 	struct pcie_port	pp;
+ 	struct dw_pcie_ep	ep;
+ 	const struct dw_pcie_ops *ops;
++	int			link_gen;
+ };
+ 
+ #define to_dw_pcie_from_pp(port) container_of((port), struct dw_pcie, pp)
+@@ -232,6 +234,7 @@ struct dw_pcie {
+ #define to_dw_pcie_from_ep(endpoint)   \
+ 		container_of((endpoint), struct dw_pcie, ep)
+ 
++u8 dw_pcie_find_capability(struct dw_pcie *pci, u8 cap);
+ int dw_pcie_read(void __iomem *addr, int size, u32 *val);
+ int dw_pcie_write(void __iomem *addr, int size, u32 val);
+ 
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index 6109afcdc549..67b4979bfadf 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -3,6 +3,7 @@
+ #define DRIVERS_PCI_H
+ 
+ #include <linux/android_kabi.h>
++#include <linux/pci.h>
+ 
+ #define PCI_FIND_CAP_TTL	48
+ 
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index ee556ccc93f4..62a30afbe0c8 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -663,6 +663,7 @@
+ #define PCI_EXP_LNKCTL2_TLS_5_0GT	0x0002 /* Supported Speed 5GT/s */
+ #define PCI_EXP_LNKCTL2_TLS_8_0GT	0x0003 /* Supported Speed 8GT/s */
+ #define PCI_EXP_LNKCTL2_TLS_16_0GT	0x0004 /* Supported Speed 16GT/s */
++#define PCI_EXP_LNKCTL2_HASD		0x0020 /* HW Autonomous Speed Disable */
+ #define PCI_EXP_LNKSTA2		50	/* Link Status 2 */
+ #define PCI_CAP_EXP_ENDPOINT_SIZEOF_V2	52	/* v2 endpoints with link end here */
+ #define PCI_EXP_SLTCAP2		52	/* Slot Capabilities 2 */
+-- 
+2.35.3
+

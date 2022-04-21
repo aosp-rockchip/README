@@ -1,0 +1,195 @@
+From 923b9f5752206010cb7d72e6654845de4126b11b Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Tue, 11 Sep 2018 14:58:15 +0800
+Subject: [PATCH] media: rockchip: isp1: MP/SP burst config with resolution
+
+1.CIF_MI_CTRL_BURST_LEN same to isp specification define
+2.memory base addresses are burst aligned with respect
+to the configured burst length. configure different burst
+length with different resolution.
+
+Change-Id: I982cbef418cc55704049b2d113df923bee7cf9ef
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 62 ++++++++++++++++++-
+ .../media/platform/rockchip/isp1/capture.h    |  1 +
+ drivers/media/platform/rockchip/isp1/regs.c   |  8 +--
+ drivers/media/platform/rockchip/isp1/regs.h   | 14 ++---
+ 4 files changed, 70 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index f191d4153301..74a7c9155bf4 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -743,6 +743,56 @@ static int rkisp1_config_rsz(struct rkisp1_stream *stream, bool async)
+ 
+ /***************************** stream operations*******************************/
+ 
++/*
++ * memory base addresses should be with respect
++ * to the burst alignment restriction for AXI.
++ */
++static u32 calc_burst_len(struct rkisp1_stream *stream)
++{
++	struct rkisp1_device *dev = stream->ispdev;
++	u32 y_size = stream->out_fmt.plane_fmt[0].bytesperline *
++		stream->out_fmt.height;
++	u32 cb_size = stream->out_fmt.plane_fmt[1].sizeimage;
++	u32 cr_size = stream->out_fmt.plane_fmt[2].sizeimage;
++	u32 cb_offs, cr_offs;
++	u32 bus, burst;
++	int i;
++
++	/* MI128bit and MI64bit */
++	bus = (dev->isp_ver == ISP_V12) ? 16 : 8;
++
++	/* y/c base addr: burstN * bus alignment */
++	cb_offs = y_size;
++	cr_offs = cr_size ? (cb_size + cb_offs) : 0;
++
++	if (!(cb_offs % (bus * 16)) &&
++		!(cr_offs % (bus * 16)))
++		burst = CIF_MI_CTRL_BURST_LEN_LUM_16 |
++			CIF_MI_CTRL_BURST_LEN_CHROM_16;
++	else if (!(cb_offs % (bus * 8)) &&
++		!(cr_offs % (bus * 8)))
++		burst = CIF_MI_CTRL_BURST_LEN_LUM_8 |
++			CIF_MI_CTRL_BURST_LEN_CHROM_8;
++	else
++		burst = CIF_MI_CTRL_BURST_LEN_LUM_4 |
++			CIF_MI_CTRL_BURST_LEN_CHROM_4;
++
++	if (cb_offs % (bus * 4) ||
++		cr_offs % (bus * 4))
++		v4l2_warn(&dev->v4l2_dev,
++			"%dx%d fmt:0x%x not support, should be %d aligned\n",
++			stream->out_fmt.width,
++			stream->out_fmt.height,
++			stream->out_fmt.pixelformat,
++			(cr_offs == 0) ? bus * 4 : bus * 16);
++
++	stream->burst = burst;
++	for (i = 0; i < RKISP1_MAX_STREAM; i++)
++		if (burst > dev->stream[i].burst)
++			burst = dev->stream[i].burst;
++	return burst;
++}
++
+ /*
+  * configure memory interface for mainpath
+  * This should only be called when stream-on
+@@ -759,12 +809,11 @@ static int mp_config_mi(struct rkisp1_stream *stream)
+ 			 stream->out_fmt.height);
+ 	mi_set_cb_size(stream, stream->out_fmt.plane_fmt[1].sizeimage);
+ 	mi_set_cr_size(stream, stream->out_fmt.plane_fmt[2].sizeimage);
+-
+ 	mi_frame_end_int_enable(stream);
+ 	if (stream->out_isp_fmt.uv_swap)
+ 		mp_set_uv_swap(base);
+ 
+-	config_mi_ctrl(stream);
++	config_mi_ctrl(stream, calc_burst_len(stream));
+ 	mp_mi_ctrl_set_format(base, stream->out_isp_fmt.write_format);
+ 	mp_mi_ctrl_autoupdate_en(base);
+ 
+@@ -805,7 +854,7 @@ static int sp_config_mi(struct rkisp1_stream *stream)
+ 	if (output_isp_fmt->uv_swap)
+ 		sp_set_uv_swap(base);
+ 
+-	config_mi_ctrl(stream);
++	config_mi_ctrl(stream, calc_burst_len(stream));
+ 	sp_mi_ctrl_set_format(base, stream->out_isp_fmt.write_format |
+ 			      sp_in_fmt | output_isp_fmt->output_format);
+ 
+@@ -983,6 +1032,9 @@ static void rkisp1_stream_stop(struct rkisp1_stream *stream)
+ 	}
+ 	disable_dcrop(stream, true);
+ 	disable_rsz(stream, true);
++	stream->burst =
++		CIF_MI_CTRL_BURST_LEN_LUM_16 |
++		CIF_MI_CTRL_BURST_LEN_CHROM_16;
+ }
+ 
+ /*
+@@ -1471,6 +1523,10 @@ void rkisp1_stream_init(struct rkisp1_device *dev, u32 id)
+ 	stream->dcrop.top = 0;
+ 	stream->dcrop.width = RKISP1_DEFAULT_WIDTH;
+ 	stream->dcrop.height = RKISP1_DEFAULT_HEIGHT;
++
++	stream->burst =
++		CIF_MI_CTRL_BURST_LEN_LUM_16 |
++		CIF_MI_CTRL_BURST_LEN_CHROM_16;
+ }
+ 
+ static const struct v4l2_file_operations rkisp1_fops = {
+diff --git a/drivers/media/platform/rockchip/isp1/capture.h b/drivers/media/platform/rockchip/isp1/capture.h
+index 6fadc3e30615..8387e3f1173a 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.h
++++ b/drivers/media/platform/rockchip/isp1/capture.h
+@@ -177,6 +177,7 @@ struct rkisp1_stream {
+ 	bool streaming;
+ 	bool stopping;
+ 	wait_queue_head_t done;
++	unsigned int burst;
+ 	union {
+ 		struct rkisp1_stream_sp sp;
+ 		struct rkisp1_stream_mp mp;
+diff --git a/drivers/media/platform/rockchip/isp1/regs.c b/drivers/media/platform/rockchip/isp1/regs.c
+index 675c2d75c9b7..82f6cd92475e 100644
+--- a/drivers/media/platform/rockchip/isp1/regs.c
++++ b/drivers/media/platform/rockchip/isp1/regs.c
+@@ -216,16 +216,14 @@ void disable_rsz(struct rkisp1_stream *stream, bool async)
+ 		update_rsz_shadow(stream, async);
+ }
+ 
+-void config_mi_ctrl(struct rkisp1_stream *stream)
++void config_mi_ctrl(struct rkisp1_stream *stream, u32 burst)
+ {
+ 	void __iomem *base = stream->ispdev->base_addr;
+ 	void __iomem *addr = base + CIF_MI_CTRL;
+ 	u32 reg;
+ 
+-	reg = readl(addr) & ~GENMASK(17, 16);
+-	writel(reg | CIF_MI_CTRL_BURST_LEN_LUM_64, addr);
+-	reg = readl(addr) & ~GENMASK(19, 18);
+-	writel(reg | CIF_MI_CTRL_BURST_LEN_CHROM_64, addr);
++	reg = readl(addr) & ~GENMASK(19, 16);
++	writel(reg | burst, addr);
+ 	reg = readl(addr);
+ 	writel(reg | CIF_MI_CTRL_INIT_BASE_EN, addr);
+ 	reg = readl(addr);
+diff --git a/drivers/media/platform/rockchip/isp1/regs.h b/drivers/media/platform/rockchip/isp1/regs.h
+index 1b658c615f0f..bacc967742e6 100644
+--- a/drivers/media/platform/rockchip/isp1/regs.h
++++ b/drivers/media/platform/rockchip/isp1/regs.h
+@@ -139,12 +139,12 @@
+ #define CIF_MI_MP_AUTOUPDATE_ENABLE		BIT(13)
+ #define CIF_MI_SP_AUTOUPDATE_ENABLE		BIT(14)
+ #define CIF_MI_LAST_PIXEL_SIG_ENABLE		BIT(15)
+-#define CIF_MI_CTRL_BURST_LEN_LUM_16		(0 << 16)
+-#define CIF_MI_CTRL_BURST_LEN_LUM_32		(1 << 16)
+-#define CIF_MI_CTRL_BURST_LEN_LUM_64		(2 << 16)
+-#define CIF_MI_CTRL_BURST_LEN_CHROM_16		(0 << 18)
+-#define CIF_MI_CTRL_BURST_LEN_CHROM_32		(1 << 18)
+-#define CIF_MI_CTRL_BURST_LEN_CHROM_64		(2 << 18)
++#define CIF_MI_CTRL_BURST_LEN_LUM_4		(0 << 16)
++#define CIF_MI_CTRL_BURST_LEN_LUM_8		(1 << 16)
++#define CIF_MI_CTRL_BURST_LEN_LUM_16		(2 << 16)
++#define CIF_MI_CTRL_BURST_LEN_CHROM_4		(0 << 18)
++#define CIF_MI_CTRL_BURST_LEN_CHROM_8		(1 << 18)
++#define CIF_MI_CTRL_BURST_LEN_CHROM_16		(2 << 18)
+ #define CIF_MI_CTRL_INIT_BASE_EN		BIT(20)
+ #define CIF_MI_CTRL_INIT_OFFSET_EN		BIT(21)
+ #define MI_CTRL_MP_WRITE_YUV_PLA_OR_RAW8	(0 << 22)
+@@ -1448,7 +1448,7 @@ void config_rsz(struct rkisp1_stream *stream, struct v4l2_rect *in_y,
+ 		struct v4l2_rect *in_c, struct v4l2_rect *out_y,
+ 		struct v4l2_rect *out_c, bool async);
+ 
+-void config_mi_ctrl(struct rkisp1_stream *stream);
++void config_mi_ctrl(struct rkisp1_stream *stream, u32 burst);
+ 
+ void mp_clr_frame_end_int(void __iomem *base);
+ void sp_clr_frame_end_int(void __iomem *base);
+-- 
+2.35.3
+

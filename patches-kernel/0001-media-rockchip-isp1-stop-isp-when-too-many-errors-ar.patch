@@ -1,0 +1,284 @@
+From a8df7f5d8b45ca49e4656c06d1271d4d413263be Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Mon, 17 Dec 2018 11:08:06 +0800
+Subject: [PATCH] media: rockchip: isp1: stop isp when too many errors are
+ reported
+
+when use hdmi-in chip with isp, it needs to pull out/plug in hdmi cable
+when stream is on.
+many error logs are reported in interrupt function when pull out/plug in
+hdmi cable, then the system will be dead.
+so we stop isp when too many error logs are reported.
+
+Change-Id: Ic19eddfc952954a11a176b91c16ce4c9b6372418
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 17 ++--
+ drivers/media/platform/rockchip/isp1/dev.h    | 10 +++
+ drivers/media/platform/rockchip/isp1/regs.h   | 13 ++-
+ drivers/media/platform/rockchip/isp1/rkisp1.c | 89 +++++++++++++++----
+ 4 files changed, 103 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index 150cf133878c..e1a4b51a7e7d 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -1174,18 +1174,25 @@ static void rkisp1_stream_stop(struct rkisp1_stream *stream)
+ 
+ 	stream->stopping = true;
+ 	stream->ops->stop_mi(stream);
+-	ret = wait_event_timeout(stream->done,
+-				 !stream->streaming,
+-				 msecs_to_jiffies(1000));
+-	if (!ret) {
+-		v4l2_warn(v4l2_dev, "waiting on event return error %d\n", ret);
++	if (dev->isp_state == ISP_START) {
++		ret = wait_event_timeout(stream->done,
++					 !stream->streaming,
++					 msecs_to_jiffies(1000));
++		if (!ret) {
++			v4l2_warn(v4l2_dev, "waiting on event return error %d\n", ret);
++			stream->stopping = false;
++			stream->streaming = false;
++		}
++	} else {
+ 		stream->stopping = false;
+ 		stream->streaming = false;
+ 	}
++
+ 	if (stream->id != RKISP1_STREAM_RAW) {
+ 		disable_dcrop(stream, true);
+ 		disable_rsz(stream, true);
+ 	}
++
+ 	stream->burst =
+ 		CIF_MI_CTRL_BURST_LEN_LUM_16 |
+ 		CIF_MI_CTRL_BURST_LEN_CHROM_16;
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index d4c91966ca7e..9f075f2a532d 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -60,6 +60,8 @@
+ #define RKISP1_MEDIA_BUS_FMT_MASK	0xF000
+ #define RKISP1_MEDIA_BUS_FMT_BAYER	0x3000
+ 
++#define RKISP1_CONTI_ERR_MAX		50
++
+ /* ISP_V10_1 for only support MP */
+ enum rkisp1_isp_ver {
+ 	ISP_V10 = 0x00,
+@@ -69,6 +71,12 @@ enum rkisp1_isp_ver {
+ 	ISP_V13 = 0x30,
+ };
+ 
++enum rkisp1_isp_state {
++	ISP_STOP = 0,
++	ISP_START,
++	ISP_ERROR
++};
++
+ /*
+  * struct rkisp1_pipeline - An ISP hardware pipeline
+  *
+@@ -142,6 +150,8 @@ struct rkisp1_device {
+ 	int vs_irq;
+ 	struct gpio_desc *vs_irq_gpio;
+ 	struct v4l2_subdev *hdr_sensor;
++	enum rkisp1_isp_state isp_state;
++	unsigned int isp_err_cnt;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/regs.h b/drivers/media/platform/rockchip/isp1/regs.h
+index a004bf05b17a..37430d9d79f7 100644
+--- a/drivers/media/platform/rockchip/isp1/regs.h
++++ b/drivers/media/platform/rockchip/isp1/regs.h
+@@ -413,10 +413,10 @@
+ 	CIF_MIPI_ERR_ECC2 | \
+ 	CIF_MIPI_ERR_CS)
+ 
+-#define CIF_MIPI_ERR_DPHY  (CIF_MIPI_ERR_SOT(3) | \
+-	CIF_MIPI_ERR_SOT_SYNC(3) | \
+-	CIF_MIPI_ERR_EOT_SYNC(3) | \
+-	CIF_MIPI_ERR_CTRL(3))
++#define CIF_MIPI_ERR_DPHY  (CIF_MIPI_ERR_SOT(0xF) | \
++	CIF_MIPI_ERR_SOT_SYNC(0xF) | \
++	CIF_MIPI_ERR_EOT_SYNC(0xF) | \
++	CIF_MIPI_ERR_CTRL(0xF))
+ 
+ /* SUPER_IMPOSE */
+ #define CIF_SUPER_IMP_CTRL_NORMAL_MODE		BIT(0)
+@@ -745,6 +745,11 @@
+ #define CIF_ISP_CSI0_IMASK_RAW0_OUT_V_END	BIT(10)
+ #define CIF_ISP_CSI0_IMASK_FRAME_END(a)		(((a) & 0x3F) << 0)
+ 
++#define CIF_ISP_CSI0_IMASK2_PHY_ERRSOTHS(a)	(((a) & 0x0F) << 4)
++#define CIF_ISP_CSI0_IMASK2_PHY_ERRCONTROL(a)	(((a) & 0x0F) << 16)
++#define CIF_ISP_CSI0_IMASK1_PHY_ERRSOTSYNC(a)	(((a) & 0x0F) << 8)
++#define CIF_ISP_CSI0_IMASK1_PHY_ERREOTSYNC(a)	(((a) & 0x0F) << 4)
++
+ #define CIF_ISP_CSI0_DMATX0_VC(a)		(((a) & 0xFF) << 8)
+ #define CIF_ISP_CSI0_DMATX0_SIMG_SWP		BIT(2)
+ #define CIF_ISP_CSI0_DMATX0_SIMG_MODE		BIT(1)
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index c6c5bd3fb79b..6c280728e265 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -488,7 +488,7 @@ static int rkisp1_config_mipi(struct rkisp1_device *dev)
+ 		 * isp bus may be dead when switch isp.
+ 		 */
+ 		writel(CIF_MIPI_FRAME_END | CIF_MIPI_ERR_CSI | CIF_MIPI_ERR_DPHY |
+-		       CIF_MIPI_SYNC_FIFO_OVFLW(0x03) | CIF_MIPI_ADD_DATA_OVFLW,
++		       CIF_MIPI_SYNC_FIFO_OVFLW(0x0F) | CIF_MIPI_ADD_DATA_OVFLW,
+ 		       base + CIF_MIPI_IMSC);
+ 	}
+ 
+@@ -624,6 +624,7 @@ static int rkisp1_isp_stop(struct rkisp1_device *dev)
+ 		writel(0, base + CIF_ISP_CSI0_MASK2);
+ 		writel(0, base + CIF_ISP_CSI0_MASK3);
+ 	}
++	dev->isp_state = ISP_STOP;
+ 
+ 	if (dev->emd_vc <= CIF_ISP_ADD_DATA_VC_MAX) {
+ 		for (i = 0; i < RKISP1_EMDDATA_FIFO_MAX; i++)
+@@ -676,6 +677,9 @@ static int rkisp1_isp_start(struct rkisp1_device *dev)
+ 	       CIF_ISP_CTRL_ISP_INFORM_ENABLE | CIF_ISP_CTRL_ISP_CFG_UPD_PERMANENT;
+ 	writel(val, base + CIF_ISP_CTRL);
+ 
++	dev->isp_err_cnt = 0;
++	dev->isp_state = ISP_START;
++
+ 	/* XXX: Is the 1000us too long?
+ 	 * CIF spec says to wait for sufficient time after enabling
+ 	 * the MIPI interface and before starting the sensor output.
+@@ -1441,6 +1445,7 @@ int rkisp1_register_isp_subdev(struct rkisp1_device *isp_dev,
+ 
+ 	rkisp1_isp_sd_init_default_fmt(isp_sdev);
+ 	isp_dev->hdr_sensor = NULL;
++	isp_dev->isp_state = ISP_STOP;
+ 
+ 	return 0;
+ err_cleanup_media_entity:
+@@ -1472,9 +1477,9 @@ void rkisp1_mipi_isr(unsigned int mis, struct rkisp1_device *dev)
+ 	 * of line state. This time is may be too long and cpu
+ 	 * is hold in this interrupt.
+ 	 */
+-	if (mis & CIF_MIPI_ERR_CTRL(0x0f)) {
++	if (mis & CIF_MIPI_ERR_DPHY) {
+ 		val = readl(base + CIF_MIPI_IMSC);
+-		writel(val & ~CIF_MIPI_ERR_CTRL(0x0f), base + CIF_MIPI_IMSC);
++		writel(val & ~CIF_MIPI_ERR_DPHY, base + CIF_MIPI_IMSC);
+ 		dev->isp_sdev.dphy_errctrl_disabled = true;
+ 	}
+ 
+@@ -1489,7 +1494,7 @@ void rkisp1_mipi_isr(unsigned int mis, struct rkisp1_device *dev)
+ 		 */
+ 		if (dev->isp_sdev.dphy_errctrl_disabled) {
+ 			val = readl(base + CIF_MIPI_IMSC);
+-			val |= CIF_MIPI_ERR_CTRL(0x0f);
++			val |= CIF_MIPI_ERR_DPHY;
+ 			writel(val, base + CIF_MIPI_IMSC);
+ 			dev->isp_sdev.dphy_errctrl_disabled = false;
+ 		}
+@@ -1501,9 +1506,46 @@ void rkisp1_mipi_isr(unsigned int mis, struct rkisp1_device *dev)
+ }
+ 
+ void rkisp1_mipi_v13_isr(unsigned int err1, unsigned int err2,
+-			       unsigned int err3, struct rkisp1_device *dev)
++			 unsigned int err3, struct rkisp1_device *dev)
+ {
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
++	void __iomem *base = dev->base_addr;
++	u32 val, mask;
++
++	/*
++	 * Disable DPHY errctrl interrupt, because this dphy
++	 * erctrl signal is asserted until the next changes
++	 * of line state. This time is may be too long and cpu
++	 * is hold in this interrupt.
++	 */
++	mask = CIF_ISP_CSI0_IMASK1_PHY_ERRSOTSYNC(0x0F) |
++	       CIF_ISP_CSI0_IMASK1_PHY_ERREOTSYNC(0x0F);
++	if (mask & err1) {
++		val = readl(base + CIF_ISP_CSI0_MASK1);
++		writel(val & ~mask, base + CIF_ISP_CSI0_MASK1);
++		dev->isp_sdev.dphy_errctrl_disabled = true;
++	}
++
++	mask = CIF_ISP_CSI0_IMASK2_PHY_ERRSOTHS(0x0F) |
++	       CIF_ISP_CSI0_IMASK2_PHY_ERRCONTROL(0x0F);
++	if (mask & err2) {
++		val = readl(base + CIF_ISP_CSI0_MASK2);
++		writel(val & ~mask, base + CIF_ISP_CSI0_MASK2);
++		dev->isp_sdev.dphy_errctrl_disabled = true;
++	}
++
++	mask = CIF_ISP_CSI0_IMASK_FRAME_END(0x3F);
++	if ((err3 & mask) && !err1 && !err2) {
++		/*
++		 * Enable DPHY errctrl interrupt again, if mipi have receive
++		 * the whole frame without any error.
++		 */
++		if (dev->isp_sdev.dphy_errctrl_disabled) {
++			writel(0x1FFFFFF0, base + CIF_ISP_CSI0_MASK1);
++			writel(0x03FFFFFF, base + CIF_ISP_CSI0_MASK2);
++			dev->isp_sdev.dphy_errctrl_disabled = false;
++		}
++	}
+ 
+ 	if (err1)
+ 		v4l2_warn(v4l2_dev, "MIPI error: err1: 0x%08x\n", err1);
+@@ -1540,18 +1582,29 @@ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev)
+ 				 isp_mis_tmp);
+ 	}
+ 
+-	if ((isp_mis & CIF_ISP_PIC_SIZE_ERROR)) {
+-		/* Clear pic_size_error */
+-		writel(CIF_ISP_PIC_SIZE_ERROR, base + CIF_ISP_ICR);
+-		isp_err = readl(base + CIF_ISP_ERR);
+-		v4l2_err(&dev->v4l2_dev,
+-				"CIF_ISP_PIC_SIZE_ERROR (0x%08x)", isp_err);
+-		writel(isp_err, base + CIF_ISP_ERR_CLR);
+-	} else if ((isp_mis & CIF_ISP_DATA_LOSS)) {
+-		/* Clear data_loss */
+-		writel(CIF_ISP_DATA_LOSS, base + CIF_ISP_ICR);
+-		v4l2_err(&dev->v4l2_dev, "CIF_ISP_DATA_LOSS\n");
+-		writel(CIF_ISP_DATA_LOSS, base + CIF_ISP_ICR);
++	if ((isp_mis & (CIF_ISP_DATA_LOSS | CIF_ISP_PIC_SIZE_ERROR))) {
++		if ((isp_mis & CIF_ISP_PIC_SIZE_ERROR)) {
++			/* Clear pic_size_error */
++			writel(CIF_ISP_PIC_SIZE_ERROR, base + CIF_ISP_ICR);
++			isp_err = readl(base + CIF_ISP_ERR);
++			v4l2_err(&dev->v4l2_dev,
++				 "CIF_ISP_PIC_SIZE_ERROR (0x%08x)", isp_err);
++			writel(isp_err, base + CIF_ISP_ERR_CLR);
++		}
++
++		if ((isp_mis & CIF_ISP_DATA_LOSS)) {
++			/* Clear data_loss */
++			writel(CIF_ISP_DATA_LOSS, base + CIF_ISP_ICR);
++			v4l2_err(&dev->v4l2_dev, "CIF_ISP_DATA_LOSS\n");
++			writel(CIF_ISP_DATA_LOSS, base + CIF_ISP_ICR);
++		}
++
++		if (dev->isp_err_cnt++ > RKISP1_CONTI_ERR_MAX) {
++			rkisp1_isp_stop(dev);
++			dev->isp_state = ISP_ERROR;
++			v4l2_err(&dev->v4l2_dev,
++				 "Too many isp error, stop isp!\n");
++		}
+ 	}
+ 
+ 	/* sampled input frame is complete */
+@@ -1561,6 +1614,8 @@ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev)
+ 		if (isp_mis_tmp & CIF_ISP_FRAME_IN)
+ 			v4l2_err(&dev->v4l2_dev, "isp icr frame_in err: 0x%x\n",
+ 				 isp_mis_tmp);
++
++		dev->isp_err_cnt = 0;
+ 	}
+ 
+ 	/* frame was completely put out */
+-- 
+2.35.3
+

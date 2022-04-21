@@ -1,0 +1,223 @@
+From 69f3c341d9dfd3704528a1f141f1f0b4cf5600ed Mon Sep 17 00:00:00 2001
+From: Jon Lin <jon.lin@rock-chips.com>
+Date: Thu, 17 Sep 2020 16:13:51 +0800
+Subject: [PATCH] drivers: rkflash: Support spinand non aligned read
+
+Change-Id: I185838a57024af141fdd24f076186e3e068df3b1
+Signed-off-by: Jon Lin <jon.lin@rock-chips.com>
+---
+ drivers/rkflash/sfc_nand.c     | 32 ++++++++++++++---------
+ drivers/rkflash/sfc_nand.h     |  1 +
+ drivers/rkflash/sfc_nand_mtd.c | 46 ++++++++--------------------------
+ 3 files changed, 31 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/rkflash/sfc_nand.c b/drivers/rkflash/sfc_nand.c
+index d2f45a3d1511..9bc02fab7e9e 100644
+--- a/drivers/rkflash/sfc_nand.c
++++ b/drivers/rkflash/sfc_nand.c
+@@ -649,13 +649,12 @@ u32 sfc_nand_prog_page(u8 cs, u32 addr, u32 *p_data, u32 *p_spare)
+ 	return ret;
+ }
+ 
+-u32 sfc_nand_read_page_raw(u8 cs, u32 addr, u32 *p_page_buf)
++u32 sfc_nand_read(u32 row, u32 *p_page_buf, u32 column, u32 len)
+ {
+ 	int ret;
+ 	u32 plane;
+ 	struct rk_sfc_op op;
+ 	u32 ecc_result;
+-	u32 page_size = SFC_NAND_SECTOR_FULL_SIZE * p_nand_info->sec_per_page;
+ 	u8 status;
+ 
+ 	op.sfcmd.d32 = 0;
+@@ -665,7 +664,7 @@ u32 sfc_nand_read_page_raw(u8 cs, u32 addr, u32 *p_page_buf)
+ 
+ 	op.sfctrl.d32 = 0;
+ 
+-	sfc_request(&op, addr, p_page_buf, 0);
++	sfc_request(&op, row, p_page_buf, 0);
+ 
+ 	if (sfc_nand_dev.read_lines == DATA_LINES_X4 &&
+ 	    p_nand_info->feature & FEA_SOFT_QOP_BIT &&
+@@ -677,14 +676,16 @@ u32 sfc_nand_read_page_raw(u8 cs, u32 addr, u32 *p_page_buf)
+ 
+ 	op.sfcmd.d32 = 0;
+ 	op.sfcmd.b.cmd = sfc_nand_dev.page_read_cmd;
+-	op.sfcmd.b.addrbits = SFC_ADDR_24BITS;
++	op.sfcmd.b.addrbits = SFC_ADDR_XBITS;
++	op.sfcmd.b.dummybits = 8;
+ 
+ 	op.sfctrl.d32 = 0;
+ 	op.sfctrl.b.datalines = sfc_nand_dev.read_lines;
++	op.sfctrl.b.addrbits = 16;
+ 
+-	plane = p_nand_info->plane_per_die == 2 ? ((addr >> 6) & 0x1) << 12 : 0;
+-	ret = sfc_request(&op, plane << 8, p_page_buf, page_size);
+-	rkflash_print_dio("%s %x %x\n", __func__, addr, p_page_buf[0]);
++	plane = p_nand_info->plane_per_die == 2 ? ((row >> 6) & 0x1) << 12 : 0;
++	ret = sfc_request(&op, plane | column, p_page_buf, len);
++	rkflash_print_dio("%s %x %x\n", __func__, row, p_page_buf[0]);
+ 
+ 	if (ret != SFC_OK)
+ 		return SFC_NAND_HW_ERROR;
+@@ -692,6 +693,13 @@ u32 sfc_nand_read_page_raw(u8 cs, u32 addr, u32 *p_page_buf)
+ 	return ecc_result;
+ }
+ 
++u32 sfc_nand_read_page_raw(u8 cs, u32 addr, u32 *p_page_buf)
++{
++	u32 page_size = SFC_NAND_SECTOR_FULL_SIZE * p_nand_info->sec_per_page;
++
++	return sfc_nand_read(addr, gp_page_buf, 0, page_size);
++}
++
+ u32 sfc_nand_read_page(u8 cs, u32 addr, u32 *p_data, u32 *p_spare)
+ {
+ 	u32 ret;
+@@ -729,17 +737,17 @@ u32 sfc_nand_check_bad_block(u8 cs, u32 addr)
+ {
+ 	u32 ret;
+ 	u32 data_size = p_nand_info->sec_per_page * SFC_NAND_SECTOR_SIZE;
++	u32 marker = 0;
+ 
+-	ret = sfc_nand_read_page_raw(cs, addr, gp_page_buf);
++	ret = sfc_nand_read(addr, &marker, data_size, 2);
+ 
+ 	/* unify with mtd framework */
+ 	if (ret == SFC_NAND_ECC_ERROR)
+-		rkflash_print_error("%s page= %x ret= %x data0= %x, spare0= %x\n",
+-				    __func__, addr, ret, gp_page_buf[0],
+-				    (gp_page_buf[data_size / 4] & 0xFF));
++		rkflash_print_error("%s page= %x ret= %x spare= %x\n",
++				    __func__, addr, ret, marker);
+ 
+ 	/* Original bad block */
+-	if ((gp_page_buf[data_size / 4] & 0xFFFF) != 0xFFFF)
++	if ((u16)marker != 0xffff)
+ 		return true;
+ 
+ 	return false;
+diff --git a/drivers/rkflash/sfc_nand.h b/drivers/rkflash/sfc_nand.h
+index b9d25db43d92..4ce53157b86b 100644
+--- a/drivers/rkflash/sfc_nand.h
++++ b/drivers/rkflash/sfc_nand.h
+@@ -125,5 +125,6 @@ u32 sfc_nand_mark_bad_block(u8 cs, u32 addr);
+ void sfc_nand_ftl_ops_init(void);
+ struct SFNAND_DEV *sfc_nand_get_private_dev(void);
+ struct nand_info *sfc_nand_get_nand_info(void);
++u32 sfc_nand_read(u32 row, u32 *p_page_buf, u32 column, u32 len);
+ 
+ #endif
+diff --git a/drivers/rkflash/sfc_nand_mtd.c b/drivers/rkflash/sfc_nand_mtd.c
+index 0076b9f1a509..6d2cd7dc910d 100644
+--- a/drivers/rkflash/sfc_nand_mtd.c
++++ b/drivers/rkflash/sfc_nand_mtd.c
+@@ -39,27 +39,21 @@ static int sfc_nand_write_mtd(struct mtd_info *mtd, loff_t to,
+ {
+ 	struct snand_mtd_dev *p_dev = mtd_to_priv(mtd);
+ 	u8 *data = (u8 *)ops->datbuf;
+-	u8 *oob_buf = (u8 *)ops->oobbuf;
+ 	size_t remaining = ops->len;
+-	size_t oob_left = ops->ooblen, oob_real;
+ 	u32 ret = 0;
+ 
+ 	rkflash_print_dio("%s addr= %llx len= %x\n", __func__, to, (u32)remaining);
+ 	if ((to + remaining) > mtd->size || to & mtd->writesize_mask ||
+-	    remaining & mtd->writesize_mask) {
++	    remaining & mtd->writesize_mask || ops->ooblen) {
+ 		rkflash_print_error("%s input error, %llx %x\n", __func__, to, (u32)remaining);
+ 
+ 		return -EINVAL;
+ 	}
+ 
+ 	ops->retlen = 0;
+-	ops->oobretlen = 0;
+ 	while (remaining) {
+ 		memcpy(p_dev->dma_buf, data, mtd->writesize);
+ 		memset(p_dev->dma_buf + mtd->writesize, 0xff, mtd->oobsize);
+-		oob_real = min((u32)oob_left, mtd->oobsize - ops->ooboffs);
+-		if (oob_real)
+-			memcpy(p_dev->dma_buf + mtd->writesize + ops->ooboffs, oob_buf, oob_real);
+ 		ret = sfc_nand_prog_page_raw(0, to >> mtd->writesize_shift,
+ 					     (u32 *)p_dev->dma_buf);
+ 		if (ret != SFC_OK) {
+@@ -73,10 +67,6 @@ static int sfc_nand_write_mtd(struct mtd_info *mtd, loff_t to,
+ 		ops->retlen += mtd->writesize;
+ 		remaining -= mtd->writesize;
+ 		to += mtd->writesize;
+-		if (oob_real) {
+-			ops->oobretlen += oob_real;
+-			oob_buf += oob_real;
+-		}
+ 	}
+ 
+ 	return ret;
+@@ -85,28 +75,28 @@ static int sfc_nand_write_mtd(struct mtd_info *mtd, loff_t to,
+ static int sfc_nand_read_mtd(struct mtd_info *mtd, loff_t from,
+ 			     struct mtd_oob_ops *ops)
+ {
+-	struct snand_mtd_dev *p_dev = mtd_to_priv(mtd);
+ 	u8 *data = (u8 *)ops->datbuf;
+-	u8 *oob_buf = (u8 *)ops->oobbuf;
+ 	size_t remaining = ops->len;
+-	size_t oob_left = ops->ooblen, oob_real;
+ 	u32 ret = 0;
+ 	bool ecc_failed = false;
+-	size_t off, real_size;
++	size_t page, off, real_size;
+ 	int max_bitflips = 0;
+ 
+ 	rkflash_print_dio("%s addr= %llx len= %x\n", __func__, from, (u32)remaining);
+-	if ((from + remaining) > mtd->size) {
+-		rkflash_print_error("%s input error, %llx %x\n", __func__, from, (u32)remaining);
++	if ((from + remaining) > mtd->size || ops->ooblen) {
++		rkflash_print_error("%s input error, from= %llx len= %x oob= %x\n",
++				    __func__, from, (u32)remaining, (u32)ops->ooblen);
+ 
+ 		return -EINVAL;
+ 	}
+ 
+ 	ops->retlen = 0;
+-	ops->oobretlen = 0;
+ 	while (remaining) {
+-		ret = sfc_nand_read_page_raw(0, from >> mtd->writesize_shift,
+-					     (u32 *)p_dev->dma_buf);
++		page = from >> mtd->writesize_shift;
++		off = from & mtd->writesize_mask;
++		real_size = min_t(u32, remaining, mtd->writesize - off);
++
++		ret = sfc_nand_read(page, (u32 *)data, off, real_size);
+ 		if (ret == SFC_NAND_HW_ERROR) {
+ 			rkflash_print_error("%s addr %llx ret= %d\n",
+ 					    __func__, from, ret);
+@@ -124,27 +114,11 @@ static int sfc_nand_read_mtd(struct mtd_info *mtd, loff_t from,
+ 			max_bitflips = 1;
+ 		}
+ 
+-		off = from & mtd->writesize_mask;
+-		real_size = min_t(u32, remaining, mtd->writesize);
+-		if ((from >> mtd->writesize_shift) !=
+-		    (loff_t)((from + real_size - 1) >> mtd->writesize_shift))
+-			real_size = mtd->writesize - off;
+-
+-		memcpy(data, p_dev->dma_buf + off, real_size);
+-		oob_real = min((u32)oob_left, mtd->oobsize - ops->ooboffs);
+-		if (oob_real)
+-			memcpy(oob_buf, p_dev->dma_buf + mtd->writesize + ops->ooboffs,
+-			       oob_real);
+-
+ 		ret = 0;
+ 		data += real_size;
+ 		ops->retlen += real_size;
+ 		remaining -= real_size;
+ 		from += real_size;
+-		if (oob_real) {
+-			ops->oobretlen += oob_real;
+-			oob_buf += oob_real;
+-		}
+ 	}
+ 
+ 	if (ecc_failed && !ret)
+-- 
+2.35.3
+

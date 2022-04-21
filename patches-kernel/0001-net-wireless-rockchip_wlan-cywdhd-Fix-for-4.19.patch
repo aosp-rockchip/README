@@ -1,0 +1,413 @@
+From 256935085d0302d3c161e974ffc397ed8c7d5ddd Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Tue, 8 Oct 2019 10:44:13 +0800
+Subject: [PATCH] net: wireless: rockchip_wlan: cywdhd: Fix for 4.19
+
+According to commits:
+b9eaf1872222 ("treewide: init_timer() -> setup_timer()")
+e99e88a9d2b0 ("treewide: setup_timer() -> timer_setup()")
+bdd1d2d3d251 ("fs: fix kernel_read prototype")
+29ce6ecbb83c ("cfg80211: unify cfg80211_roamed() and cfg80211_roamed_bss()")
+818a986e4eba ("cfg80211: move add/change interface monitor flags into params")
+cf124db566e6 ("net: Fix inconsistent teardown and release of private netdev state.")
+4a7c972644c1 ("net: Remove usage of net_device last_rx member")
+ae7e81c077d6 ("sched/headers: Prepare for new header dependencies before moving code to <uapi/linux/sched/types.h>")
+
+Change-Id: Ic534a0e18e2af8d430a73d65668bf97ca4ec013d
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+---
+ .../cywdhd/bcmdhd/dhd_cfg80211.c              |  3 --
+ .../rockchip_wlan/cywdhd/bcmdhd/dhd_ip.c      | 11 +++---
+ .../rockchip_wlan/cywdhd/bcmdhd/dhd_linux.c   | 37 +++++--------------
+ .../rockchip_wlan/cywdhd/bcmdhd/linux_osl.c   |  4 +-
+ .../rockchip_wlan/cywdhd/bcmdhd/wl_cfg80211.c | 37 +++++++++----------
+ .../cywdhd/bcmdhd/wl_cfg_btcoex.c             |  8 ++--
+ .../rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.c   |  5 ++-
+ .../rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.h   |  6 +--
+ .../rockchip_wlan/cywdhd/bcmdhd/wl_iw.c       | 10 ++---
+ 9 files changed, 47 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_cfg80211.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_cfg80211.c
+index 9bcc2b9638a6..339bd276289d 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_cfg80211.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_cfg80211.c
+@@ -149,7 +149,6 @@ struct net_device * dhd_cfg80211_netdev_free(struct net_device *ndev)
+ 			kfree(ndev->ieee80211_ptr);
+ 			ndev->ieee80211_ptr = NULL;
+ 		}
+-		free_netdev(ndev);
+ 		return NULL;
+ 	}
+ 
+@@ -161,8 +160,6 @@ void dhd_netdev_free(struct net_device *ndev)
+ #ifdef WL_CFG80211
+ 	ndev = dhd_cfg80211_netdev_free(ndev);
+ #endif
+-	if (ndev)
+-		free_netdev(ndev);
+ }
+ 
+ static s32
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_ip.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_ip.c
+index a363ee72edcb..d0b0b1f2c5bb 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_ip.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_ip.c
+@@ -289,10 +289,10 @@ static void _tdata_psh_info_pool_deinit(dhd_pub_t *dhdp,
+ }
+ #endif /* BCMSDIO */
+ 
+-static void dhd_tcpack_send(ulong data)
++static void dhd_tcpack_send(struct timer_list *t)
+ {
+ 	tcpack_sup_module_t *tcpack_sup_mod;
+-	tcpack_info_t *cur_tbl = (tcpack_info_t *)data;
++	tcpack_info_t *cur_tbl = from_timer(cur_tbl, t, timer);
+ 	dhd_pub_t *dhdp;
+ 	int ifidx;
+ 	void* pkt;
+@@ -418,10 +418,9 @@ int dhd_tcpack_suppress_set(dhd_pub_t *dhdp, uint8 mode)
+ 		for (i = 0; i < TCPACK_INFO_MAXNUM; i++)
+ 		{
+ 			tcpack_sup_mod->tcpack_info_tbl[i].dhdp = dhdp;
+-			init_timer(&tcpack_sup_mod->tcpack_info_tbl[i].timer);
+-			tcpack_sup_mod->tcpack_info_tbl[i].timer.data =
+-				(ulong)&tcpack_sup_mod->tcpack_info_tbl[i];
+-			tcpack_sup_mod->tcpack_info_tbl[i].timer.function = dhd_tcpack_send;
++			timer_setup(&tcpack_sup_mod->tcpack_info_tbl[i].timer,
++				    dhd_tcpack_send,
++				    0);
+ 		}
+ 	}
+ 
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_linux.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_linux.c
+index ab17c018bb86..961b93333e50 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_linux.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/dhd_linux.c
+@@ -53,6 +53,7 @@
+ #include <linux/ip.h>
+ #include <linux/reboot.h>
+ #include <linux/notifier.h>
++#include <uapi/linux/sched/types.h>
+ #include <net/addrconf.h>
+ #ifdef ENABLE_ADAPTIVE_SCHED
+ #include <linux/cpufreq.h>
+@@ -4570,9 +4571,6 @@ dhd_rx_frame(dhd_pub_t *dhdp, int ifidx, void *pktbuf, int numpkt, uint8 chan)
+ #endif /* PROP_TXSTATUS */
+ 		}
+ 
+-		if (ifp->net)
+-			ifp->net->last_rx = jiffies;
+-
+ 		if (ntoh16(skb->protocol) != ETHER_TYPE_BRCM) {
+ 			dhdp->dstats.rx_bytes += skb->len;
+ 			dhdp->rx_packets++; /* Local count */
+@@ -4761,9 +4759,9 @@ dhd_watchdog_thread(void *data)
+ 	complete_and_exit(&tsk->completed, 0);
+ }
+ 
+-static void dhd_watchdog(ulong data)
++static void dhd_watchdog(struct timer_list *t)
+ {
+-	dhd_info_t *dhd = (dhd_info_t *)data;
++	dhd_info_t *dhd = from_timer(dhd, t, timer);
+ 	unsigned long flags;
+ 
+ 	if (dhd->pub.dongle_reset) {
+@@ -6215,13 +6213,11 @@ dhd_allocate_if(dhd_pub_t *dhdpub, int ifidx, char *name,
+ 		ifp->net->name[IFNAMSIZ - 1] = '\0';
+ 	}
+ 
++	ifp->net->needs_free_netdev = true;
+ #ifdef WL_CFG80211
+-	if (ifidx == 0)
+-		ifp->net->destructor = free_netdev;
+-	else
+-		ifp->net->destructor = dhd_netdev_free;
++	if (ifidx != 0)
++		ifp->net->priv_destructor = dhd_netdev_free;
+ #else
+-	ifp->net->destructor = free_netdev;
+ #endif /* WL_CFG80211 */
+ 	strncpy(ifp->name, ifp->net->name, IFNAMSIZ);
+ 	ifp->name[IFNAMSIZ - 1] = '\0';
+@@ -6959,9 +6955,7 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
+ 
+ 
+ 	/* Set up the watchdog timer */
+-	init_timer(&dhd->timer);
+-	dhd->timer.data = (ulong)dhd;
+-	dhd->timer.function = dhd_watchdog;
++	timer_setup(&dhd->timer, dhd_watchdog, 0);
+ 	dhd->default_wd_interval = dhd_watchdog_ms;
+ 
+ 	if (dhd_watchdog_prio >= 0) {
+@@ -9571,11 +9565,6 @@ int rockchip_wifi_init_module_rkwifi(void)
+ {
+ #ifdef CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP
+     struct task_struct *kthread;
+-    int type = get_wifi_chip_type();
+-
+-    if (type > WIFI_AP6XXX_SERIES) {
+-        return 0;
+-    }
+ #endif /* CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP */
+ 
+     printk("=======================================================\n");
+@@ -9598,14 +9587,6 @@ int rockchip_wifi_init_module_rkwifi(void)
+ 
+ void rockchip_wifi_exit_module_rkwifi(void)
+ {
+-#ifdef CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP
+-    int type = get_wifi_chip_type();    
+-
+-    if (type > WIFI_AP6XXX_SERIES) {
+-        return;
+-    }
+-#endif /* CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP */
+-
+     printk("=======================================================\n");
+     printk("== Dis-launching Wi-Fi driver! (Powered by Rockchip) ==\n");
+     printk("=======================================================\n");
+@@ -9856,11 +9837,13 @@ dhd_os_get_image_block(char *buf, int len, void *image)
+ {
+ 	struct file *fp = (struct file *)image;
+ 	int rdlen;
++	loff_t pos;
+ 
+ 	if (!image)
+ 		return 0;
+ 
+-	rdlen = kernel_read(fp, fp->f_pos, buf, len);
++	pos = fp->f_pos;
++	rdlen = kernel_read(fp, buf, len, &pos);
+ 	if (rdlen > 0)
+ 		fp->f_pos += rdlen;
+ 
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/linux_osl.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/linux_osl.c
+index bca930d53744..c96d3c509002 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/linux_osl.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/linux_osl.c
+@@ -1978,11 +1978,13 @@ osl_os_get_image_block(char *buf, int len, void *image)
+ {
+ 	struct file *fp = (struct file *)image;
+ 	int rdlen;
++	loff_t pos;
+ 
+ 	if (!image)
+ 		return 0;
+ 
+-	rdlen = kernel_read(fp, fp->f_pos, buf, len);
++	pos = fp->f_pos;
++	rdlen = kernel_read(fp, buf, len, &pos);
+ 	if (rdlen > 0)
+ 		fp->f_pos += rdlen;
+ 
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg80211.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg80211.c
+index 18348e6eaa44..33451848f8c2 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg80211.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg80211.c
+@@ -1454,7 +1454,7 @@ wl_cfg80211_add_virtual_iface(struct wiphy *wiphy,
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
+ 	unsigned char name_assign_type,
+ #endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)) */
+-	enum nl80211_iftype type, u32 *flags,
++	enum nl80211_iftype type,
+ 	struct vif_params *params)
+ {
+ 	s32 err = -ENODEV;
+@@ -1923,7 +1923,7 @@ wl_cfg80211_del_virtual_iface(struct wiphy *wiphy, bcm_struct_cfgdev *cfgdev)
+ 
+ static s32
+ wl_cfg80211_change_virtual_iface(struct wiphy *wiphy, struct net_device *ndev,
+-	enum nl80211_iftype type, u32 *flags,
++	enum nl80211_iftype type,
+ 	struct vif_params *params)
+ {
+ 	s32 ap = 0;
+@@ -9900,7 +9900,7 @@ wl_bss_roaming_done(struct bcm_cfg80211 *cfg, struct net_device *ndev,
+ 	u32 *channel;
+ 	u32 freq;
+ #endif 
+-
++	struct cfg80211_roam_info roam_info = {};
+ 
+ 	wl_get_assoc_ies(cfg, ndev);
+ 	wl_update_prof(cfg, ndev, NULL, (const void *)(e->addr.octet), WL_PROF_BSSID);
+@@ -9921,13 +9921,14 @@ wl_bss_roaming_done(struct bcm_cfg80211 *cfg, struct net_device *ndev,
+ 	printk("wl_bss_roaming_done succeeded to " MACDBG "\n",
+ 		MAC2STRDBG((const u8*)(&e->addr)));
+ 
+-	cfg80211_roamed(ndev,
+-#if (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 39))
+-		notify_channel,
+-#endif
+-		curbssid,
+-		conn_info->req_ie, conn_info->req_ie_len,
+-		conn_info->resp_ie, conn_info->resp_ie_len, GFP_KERNEL);
++	roam_info.channel = notify_channel;
++	roam_info.bssid = curbssid;
++	roam_info.req_ie = conn_info->req_ie;
++	roam_info.req_ie_len = conn_info->req_ie_len;
++	roam_info.resp_ie = conn_info->resp_ie;
++	roam_info.resp_ie_len = conn_info->resp_ie_len;
++
++	cfg80211_roamed(ndev, &roam_info, GFP_KERNEL);
+ 	WL_DBG(("Report roaming result\n"));
+ 
+ 	wl_set_drv_status(cfg, CONNECTED, ndev);
+@@ -10973,10 +10974,10 @@ void wl_terminate_event_handler(void)
+ 	}
+ }
+ 
+-static void wl_scan_timeout(unsigned long data)
++static void wl_scan_timeout(struct timer_list *t)
+ {
+ 	wl_event_msg_t msg;
+-	struct bcm_cfg80211 *cfg = (struct bcm_cfg80211 *)data;
++	struct bcm_cfg80211 *cfg = from_timer(cfg, t, scan_timeout);
+ 	struct wireless_dev *wdev = NULL;
+ 	struct net_device *ndev = NULL;
+ 	struct wl_scan_results *bss_list;
+@@ -11047,9 +11048,9 @@ static void wl_del_roam_timeout(struct bcm_cfg80211 *cfg)
+ 
+ }
+ 
+-static void wl_roam_timeout(unsigned long data)
++static void wl_roam_timeout(struct timer_list *t)
+ {
+-	struct bcm_cfg80211 *cfg = (struct bcm_cfg80211 *)data;
++	struct bcm_cfg80211 *cfg = from_timer(cfg, t, roam_timeout);
+ 	dhd_pub_t *dhdp = (dhd_pub_t *)(cfg->pub);
+ 
+ 	WL_ERR(("roam timer expired\n"));
+@@ -11999,9 +12000,7 @@ static s32 wl_init_scan(struct bcm_cfg80211 *cfg)
+ 	wl_escan_init_sync_id(cfg);
+ 
+ 	/* Init scan_timeout timer */
+-	init_timer(&cfg->scan_timeout);
+-	cfg->scan_timeout.data = (unsigned long) cfg;
+-	cfg->scan_timeout.function = wl_scan_timeout;
++	timer_setup(&cfg->scan_timeout, wl_scan_timeout, 0);
+ 
+ 	return err;
+ }
+@@ -12012,9 +12011,7 @@ static s32 wl_init_roam_timeout(struct bcm_cfg80211 *cfg)
+ 	int err = 0;
+ 
+ 	/* Init roam timer */
+-	init_timer(&cfg->roam_timeout);
+-	cfg->roam_timeout.data = (unsigned long) cfg;
+-	cfg->roam_timeout.function = wl_roam_timeout;
++	timer_setup(&cfg->roam_timeout, wl_roam_timeout, 0);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg_btcoex.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg_btcoex.c
+index dbc41ed57cd3..321c7ad43fd8 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg_btcoex.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfg_btcoex.c
+@@ -298,9 +298,9 @@ wl_cfg80211_bt_setflag(struct net_device *dev, bool set)
+ #endif
+ }
+ 
+-static void wl_cfg80211_bt_timerfunc(ulong data)
++static void wl_cfg80211_bt_timerfunc(struct timer_list *t)
+ {
+-	struct btcoex_info *bt_local = (struct btcoex_info *)data;
++	struct btcoex_info *bt_local = from_timer(bt_local, t, timer);
+ 	WL_TRACE(("Enter\n"));
+ 	bt_local->timer_on = 0;
+ 	schedule_work(&bt_local->work);
+@@ -390,9 +390,7 @@ void* wl_cfg80211_btcoex_init(struct net_device *ndev)
+ 	btco_inf->ts_dhcp_ok = 0;
+ 	/* Set up timer for BT  */
+ 	btco_inf->timer_ms = 10;
+-	init_timer(&btco_inf->timer);
+-	btco_inf->timer.data = (ulong)btco_inf;
+-	btco_inf->timer.function = wl_cfg80211_bt_timerfunc;
++	timer_setup(&btco_inf->timer, wl_cfg80211_bt_timerfunc, 0);
+ 
+ 	btco_inf->dev = ndev;
+ 
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.c
+index 5c893d32ac77..de987f9554a4 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.c
+@@ -1348,10 +1348,11 @@ wl_cfgp2p_listen_complete(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
+  *  so lets do it from thread context.
+  */
+ void
+-wl_cfgp2p_listen_expired(unsigned long data)
++wl_cfgp2p_listen_expired(struct timer_list *t)
+ {
+ 	wl_event_msg_t msg;
+-	struct bcm_cfg80211 *cfg = (struct bcm_cfg80211 *) data;
++	struct p2p_info *p2p = from_timer(p2p, t, listen_timer);
++	struct bcm_cfg80211 *cfg = container_of(&p2p, typeof(*cfg), p2p);
+ 	CFGP2P_DBG((" Enter\n"));
+ 	bzero(&msg, sizeof(wl_event_msg_t));
+ 	msg.event_type =  hton32(WLC_E_P2P_DISC_LISTEN_COMPLETE);
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.h b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.h
+index 1310b9231eb2..429c3e653961 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.h
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_cfgp2p.h
+@@ -169,10 +169,8 @@ enum wl_cfgp2p_status {
+ 	} while (0)
+ #define INIT_TIMER(timer, func, duration, extra_delay)	\
+ 	do {				   \
+-		init_timer(timer); \
+-		timer->function = func; \
++		timer_setup(timer, func, 0); \
+ 		timer->expires = jiffies + msecs_to_jiffies(duration + extra_delay); \
+-		timer->data = (unsigned long) cfg; \
+ 		add_timer(timer); \
+ 	} while (0);
+ 
+@@ -217,7 +215,7 @@ enum wl_cfgp2p_status {
+ #define P2P_ECSA_CNT 50
+ 
+ extern void
+-wl_cfgp2p_listen_expired(unsigned long data);
++wl_cfgp2p_listen_expired(struct timer_list *t);
+ extern bool
+ wl_cfgp2p_is_pub_action(void *frame, u32 frame_len);
+ extern bool
+diff --git a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_iw.c b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_iw.c
+index ff1e840a14f4..11961dbaa591 100644
+--- a/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_iw.c
++++ b/drivers/net/wireless/rockchip_wlan/cywdhd/bcmdhd/wl_iw.c
+@@ -157,7 +157,7 @@ typedef struct iscan_info {
+ 	char ioctlbuf[WLC_IOCTL_SMLEN];
+ } iscan_info_t;
+ iscan_info_t *g_iscan = NULL;
+-static void wl_iw_timerfunc(ulong data);
++static void wl_iw_timerfunc(struct timer_list *t);
+ static void wl_iw_set_event_mask(struct net_device *dev);
+ static int wl_iw_iscan(iscan_info_t *iscan, wlc_ssid_t *ssid, uint16 action);
+ 
+@@ -3522,9 +3522,9 @@ int wl_iw_get_wireless_stats(struct net_device *dev, struct iw_statistics *wstat
+ }
+ 
+ static void
+-wl_iw_timerfunc(ulong data)
++wl_iw_timerfunc(struct timer_list *t)
+ {
+-	iscan_info_t *iscan = (iscan_info_t *)data;
++	iscan_info_t *iscan = from_timer(iscan, t, timer);
+ 	iscan->timer_on = 0;
+ 	if (iscan->iscan_state != ISCAN_STATE_IDLE) {
+ 		WL_TRACE(("timer trigger\n"));
+@@ -3757,9 +3757,7 @@ wl_iw_attach(struct net_device *dev, void * dhdp)
+ 
+ 	/* Set up the timer */
+ 	iscan->timer_ms    = 2000;
+-	init_timer(&iscan->timer);
+-	iscan->timer.data = (ulong)iscan;
+-	iscan->timer.function = wl_iw_timerfunc;
++	timer_setup(&iscan->timer, wl_iw_timerfunc, 0);
+ 
+ 	sema_init(&iscan->sysioc_sem, 0);
+ 	init_completion(&iscan->sysioc_exited);
+-- 
+2.35.3
+

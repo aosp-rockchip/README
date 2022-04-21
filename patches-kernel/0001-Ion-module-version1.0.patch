@@ -1,0 +1,907 @@
+From 04ef98d611e8e0c936d7bb00f9259536ecb88907 Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Mon, 26 Mar 2012 09:30:42 +0800
+Subject: [PATCH] Ion module: version1.0
+
+---
+ drivers/gpu/ion/ion.c                   | 222 +++++++++++++++---------
+ drivers/gpu/ion/ion_carveout_heap.c     | 166 ++++++++----------
+ drivers/gpu/ion/ion_priv.h              |  21 ++-
+ drivers/gpu/ion/ion_system_heap.c       |   5 +-
+ drivers/gpu/ion/ion_system_mapper.c     |   3 +-
+ drivers/gpu/ion/rockchip/rockchip_ion.c |   1 +
+ include/linux/ion.h                     |  70 ++++----
+ 7 files changed, 271 insertions(+), 217 deletions(-)
+
+diff --git a/drivers/gpu/ion/ion.c b/drivers/gpu/ion/ion.c
+index 90316b5613aa..abf2dbe884fa 100755
+--- a/drivers/gpu/ion/ion.c
++++ b/drivers/gpu/ion/ion.c
+@@ -29,7 +29,6 @@
+ #include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ #include <linux/debugfs.h>
+-#include <linux/android_pmem.h>
+ #include <linux/dma-mapping.h>
+ #include <asm/cacheflush.h>
+ #include "ion_priv.h"
+@@ -156,8 +155,8 @@ static struct ion_buffer *ion_buffer_create(struct ion_heap *heap,
+ 	}
+ 	buffer->dev = dev;
+ 	buffer->size = len;
+-	buffer->flags = flags;
+ 	mutex_init(&buffer->lock);
++	INIT_LIST_HEAD(&buffer->map_addr);
+ 	ion_buffer_add(dev, buffer);
+ 	return buffer;
+ }
+@@ -328,7 +327,9 @@ struct ion_handle *ion_alloc(struct ion_client *client, size_t len,
+ 
+ 	mutex_lock(&client->lock);
+ 	ion_handle_add(client, handle);
++	buffer->pid = client->pid;
+ 	mutex_unlock(&client->lock);
++
+ 	return handle;
+ 
+ end:
+@@ -808,6 +809,7 @@ static void ion_vma_close(struct vm_area_struct *vma)
+ 	struct ion_handle *handle = vma->vm_private_data;
+ 	struct ion_buffer *buffer = vma->vm_file->private_data;
+ 	struct ion_client *client;
++	struct ion_user_map_addr *map = NULL;
+ 
+ 	pr_debug("%s: %d\n", __func__, __LINE__);
+ 	/* this indicates the client is gone, nothing to do here */
+@@ -826,6 +828,11 @@ static void ion_vma_close(struct vm_area_struct *vma)
+ 		 atomic_read(&client->ref.refcount),
+ 		 atomic_read(&handle->ref.refcount),
+ 		 atomic_read(&buffer->ref.refcount));
++	list_for_each_entry(map, &buffer->map_addr, list)
++		if(map->vaddr == vma->vm_start){
++			list_del(&map->list);
++			break;
++		}
+ }
+ 
+ static struct vm_operations_struct ion_vm_ops = {
+@@ -840,9 +847,7 @@ static int ion_share_mmap(struct file *file, struct vm_area_struct *vma)
+ 	struct ion_client *client;
+ 	struct ion_handle *handle;
+ 	int ret;
+-	unsigned long flags = file->f_flags & O_DSYNC ?
+-				ION_SET_CACHE(UNCACHED) :
+-				ION_SET_CACHE(CACHED);
++	struct ion_user_map_addr *map = NULL;
+ 
+ 	pr_debug("%s: %d\n", __func__, __LINE__);
+ 	/* make sure the client still exists, it's possible for the client to
+@@ -879,7 +884,7 @@ static int ion_share_mmap(struct file *file, struct vm_area_struct *vma)
+ 
+ 	mutex_lock(&buffer->lock);
+ 	/* now map it to userspace */
+-	ret = buffer->heap->ops->map_user(buffer->heap, buffer, vma, flags);
++	ret = buffer->heap->ops->map_user(buffer->heap, buffer, vma);
+ 	mutex_unlock(&buffer->lock);
+ 	if (ret) {
+ 		pr_err("%s: failure mapping buffer to userspace\n",
+@@ -891,11 +896,19 @@ static int ion_share_mmap(struct file *file, struct vm_area_struct *vma)
+ 	/* move the handle into the vm_private_data so we can access it from
+ 	   vma_open/close */
+ 	vma->vm_private_data = handle;
++
++	map = kzalloc(sizeof(struct ion_user_map_addr), GFP_KERNEL);
++	if(!map)
++		goto err1;
++	map->vaddr = vma->vm_start;
++	map->size = buffer->size;
++	list_add_tail(&map->list, &buffer->map_addr);
+ 	pr_debug("%s: %d client_cnt %d handle_cnt %d alloc_cnt %d\n",
+ 		 __func__, __LINE__,
+ 		 atomic_read(&client->ref.refcount),
+ 		 atomic_read(&handle->ref.refcount),
+ 		 atomic_read(&buffer->ref.refcount));
++
+ 	return 0;
+ 
+ err1:
+@@ -907,33 +920,37 @@ static int ion_share_mmap(struct file *file, struct vm_area_struct *vma)
+ 	return ret;
+ }
+ 
++/* Compatible with pmem */
+ static long ion_share_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct ion_buffer *buffer = filp->private_data;
+-
++	
+ 	switch (cmd) {
+-	case PMEM_GET_PHYS:
++	case ION_PMEM_GET_PHYS:
+ 	{
+-		struct pmem_region region;
++		struct ion_pmem_region region;
+ 		region.offset = buffer->priv_phys;
+ 		region.len = buffer->size;
+ 
+ 		if (copy_to_user((void __user *)arg, &region,
+-				sizeof(struct pmem_region)))
++				sizeof(struct ion_pmem_region)))
+ 			return -EFAULT;
+ 		break;
+ 	}
+-	case PMEM_CACHE_FLUSH:
++	case ION_PMEM_CACHE_FLUSH:
+ 	{
+-		struct pmem_region region;
++		struct ion_pmem_region region;
++                struct ion_user_map_addr *map = NULL;
+ 		if (copy_from_user(&region, (void __user *)arg,
+-				sizeof(struct pmem_region)))
++				sizeof(struct ion_pmem_region)))
+ 			return -EFAULT;
+-                if(!(region.offset & 0xf0000000))
+-                        region.offset = buffer->vm_start;
+-
+-		dmac_flush_range((void *)region.offset, (void *)(region.offset + region.len));
+-
++                if(!(region.offset & 0xf0000000)) {
++                        list_for_each_entry(map, &buffer->map_addr, list) {
++		                dmac_flush_range((void *)map->vaddr, (void *)(map->vaddr + map->size));
++                        }
++                }else {
++		        dmac_flush_range((void *)region.offset, (void *)(region.offset + region.len));
++                }
+ 		break;
+ 	}
+ 	default:
+@@ -965,7 +982,7 @@ static int ion_ioctl_share(struct file *parent, struct ion_client *client,
+ 
+ 	if (parent->f_flags & O_DSYNC)
+ 		file->f_flags |= O_DSYNC;
+-
++	
+ 	ion_buffer_get(handle->buffer);
+ 	fd_install(fd, file);
+ 
+@@ -984,15 +1001,15 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	case ION_IOC_ALLOC:
+ 	{
+ 		struct ion_allocation_data data;
+-
+ 		if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+ 			return -EFAULT;
++
+ 		data.handle = ion_alloc(client, data.len, data.align,
+ 					     data.flags);
+ 		if (IS_ERR_OR_NULL(data.handle)) {
+-			printk("%s: alloc 0x%x bytes failed\n", __func__, data.len);
+-			return -ENOMEM;
+-		}
++			pr_err("%s: alloc 0x%x bytes failed\n", __func__, data.len);
++            return -ENOMEM;
++		} 
+ 		if (copy_to_user((void __user *)arg, &data, sizeof(data)))
+ 			return -EFAULT;
+ 		break;
+@@ -1017,6 +1034,7 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	case ION_IOC_SHARE:
+ 	{
+ 		struct ion_fd_data data;
++
+ 		if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+ 			return -EFAULT;
+ 		mutex_lock(&client->lock);
+@@ -1061,89 +1079,124 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 			return -EFAULT;
+ 		return dev->custom_ioctl(client, data.cmd, data.arg);
+ 	}
+-	case ION_GET_PHYS:
++	case ION_CUSTOM_GET_PHYS:
+ 	{
+ 		int err = 0;
+ 		struct ion_phys_data data;
++		
+ 		if (copy_from_user(&data, (void __user *)arg,
+-				   sizeof(struct ion_phys_data)))
++				sizeof(struct ion_phys_data)))
+ 			return -EFAULT;
+-		err = ion_phys(client, data.handle, &data.phys, &data.size);
+-		if(err < 0){
++		err = ion_phys(client, data.handle, &data.phys, (size_t *)&data.size);
++		if(err < 0)
+ 			return err;
+-		}
+ 		if (copy_to_user((void __user *)arg, &data,
+-				 sizeof(struct ion_phys_data)))
++			 	sizeof(struct ion_phys_data)))
+ 			return -EFAULT;
+ 		break;
+ 	}
+-	case ION_CACHE_FLUSH:
+-	case ION_CACHE_CLEAN:
+-	case ION_CACHE_INVALID:
++	case ION_CUSTOM_CACHE_OP:
+ 	{
+-		int err = 0;
+-		bool valid;
++		struct ion_cacheop_data data;
+ 		struct ion_buffer *buffer;
+-		struct ion_flush_data data;
++		int err = -EINVAL;
++		
+ 		if (copy_from_user(&data, (void __user *)arg,
+-				   sizeof(struct ion_flush_data)))
++				sizeof(struct ion_cacheop_data)))
+ 			return -EFAULT;
+ 		mutex_lock(&client->lock);
+-		valid = ion_handle_validate(client, data.handle);
+-		if (!valid){
+-		    mutex_unlock(&client->lock);
+-			return -EINVAL;
+-        }
+-		buffer = data.handle->buffer;
+-		if (!buffer->heap->ops->cache_op) {
+-			pr_err("%s: cache_op is not implemented by this heap.\n",
+-		       __func__);
+-			err = -ENODEV;
+-			mutex_unlock(&client->lock);
+-			return err;
++		if(ion_handle_validate(client, data.handle)){
++			buffer = data.handle->buffer;
++			if(buffer->heap->ops->cache_op){
++				buffer->heap->ops->cache_op(buffer->heap, buffer, data.virt, data.type);
++				err = 0;
++			}
+ 		}
+-
+-		err = data.handle->buffer->heap->ops->cache_op(buffer->heap, buffer,
+-			data.virt, data.size, cmd);
+ 		mutex_unlock(&client->lock);
+-		if(err < 0)
+-			return err;
+ 		break;
+ 	}
+-        case ION_GET_CLIENT:
+-        {
+-                struct ion_handle *handle;
+-		struct ion_client_data data;
+-                struct rb_node *n;
++	case ION_CUSTOM_GET_CLIENT_INFO:
++	{
++		struct rb_node *n;
++		struct ion_client_info info;
++#if 0
++		int i;
+ 
+-		if (copy_from_user(&data, (void __user *)arg,
+-				   sizeof(struct ion_client_data)))
++		mutex_lock(&client->lock);
++		info.total_size = 0;
++		info.count = atomic_read(&client->ref.refcount);
++		if(info.count > MAX_BUFFER_COUNT){
++			pr_err("%s: buffer count(%u) ge MAX_BUFFER_COUNT(%d)\n",
++				__func__, info.count, MAX_BUFFER_COUNT);
++			mutex_unlock(&client->lock);
+ 			return -EFAULT;
++		}
++		for (i = 0, n = rb_first(&client->handles); n; i++, n = rb_next(n)) {
++			struct ion_handle *handle = rb_entry(n, struct ion_handle,
++						     node);
++			info.buf[i].phys = handle->buffer->priv_phys;
++			info.buf[i].size = handle->buffer->size;
++			info.total_size += handle->buffer->size;
+ 
++		}
++#else
+ 		mutex_lock(&client->lock);
+-                switch (data.type) {
+-                        case ION_TYPE_GET_TOTAL_SIZE:
+-                                data.total_size = 0;
+-	                        for (n = rb_first(&client->handles); n; n = rb_next(n)) {
+-		                        handle = rb_entry(n, struct ion_handle, node);
+-                                        data.total_size += handle->buffer->size;
+-                                }
+-                                break;
+-                        case ION_TYPE_SIZE_GET_COUNT:
+-                                data.count = 0;
+-	                        for (n = rb_first(&client->handles); n; n = rb_next(n)) {
+-		                        handle = rb_entry(n, struct ion_handle, node);
+-                                        if(handle->buffer->size == data.size)
+-                                                data.count++;
+-                                }
+-                                break;
+-                }
++		info.total_size = 0;
++		info.count = 0;
++		for (n = rb_first(&client->dev->buffers); n; n = rb_next(n)) {
++			struct ion_buffer *buf = rb_entry(n, struct ion_buffer,
++						     node);
++
++			if(info.count > MAX_BUFFER_COUNT){
++				pr_err("%s: buffer count(%u) ge MAX_BUFFER_COUNT(%d)\n",
++					__func__, info.count, MAX_BUFFER_COUNT);
++				mutex_unlock(&client->lock);
++				return -EFAULT;
++			}
++			if(buf->pid == client->pid) {
++				info.buf[info.count].phys = buf->priv_phys;
++				info.buf[info.count].size = buf->size;
++				info.total_size += buf->size;
++				info.count++;
++			}
++		}
++#endif
+ 		mutex_unlock(&client->lock);
+-		if (copy_to_user((void __user *)arg, &data,
+-				 sizeof(struct ion_client_data)))
++		if (copy_to_user((void __user *)arg, &info,
++			 	sizeof(struct ion_client_info)))
++			return -EFAULT;
++		break;
++	}
++	case ION_CUSTOM_GET_HEAP_INFO:
++	{
++		struct rb_node *n;
++		struct ion_heap_info info;
++		struct ion_heap *heap = NULL;
++		int err = -EINVAL;
++		
++		if (copy_from_user(&info, (void __user *)arg,
++				sizeof(struct ion_heap_info)))
+ 			return -EFAULT;
+-                break;
+-        }
++		mutex_lock(&client->dev->lock);
++		for (n = rb_first(&client->dev->heaps); n != NULL; n = rb_next(n)) {
++			heap = rb_entry(n, struct ion_heap, node);
++
++			if(heap->id == info.id){
++				info.allocated_size = heap->allocated_size;
++				info.max_allocated = heap->max_allocated;
++				info.total_size = heap->total_size;
++
++				err = 0;
++			}
++				
++		}
++		mutex_unlock(&client->dev->lock);
++
++		if (copy_to_user((void __user *)arg, &info,
++			 	sizeof(struct ion_heap_info)))
++			err = -EFAULT;
++		break;
++	}
+ 	default:
+ 		return -ENOTTY;
+ 	}
+@@ -1284,7 +1337,7 @@ static int ion_debug_leak_show(struct seq_file *s, void *unused)
+ 	struct rb_node *n2;
+ 
+ 	/* mark all buffers as 1 */
+-	seq_printf(s, "%16.s %16.s %16.s %16.s\n", "buffer", "heap", "size(K)",
++	seq_printf(s, "%16.s %16.s %16.s %16.s %16.s\n", "pid", "buffer", "heap", "size(K)",
+ 		"ref_count");
+ 	mutex_lock(&dev->lock);
+ 	for (n = rb_first(&dev->buffers); n; n = rb_next(n)) {
+@@ -1332,8 +1385,8 @@ static int ion_debug_leak_show(struct seq_file *s, void *unused)
+ 						     node);
+ 
+ 		if (buf->marked == 1)
+-			seq_printf(s, "%16.x %16.s %16.d %16.d\n",
+-				(int)buf, buf->heap->name, buf->size/SZ_1K,
++			seq_printf(s, "%16.u %16.x %16.s %16.d %16.d\n",
++				buf->pid, (int)buf, buf->heap->name, buf->size/SZ_1K,
+ 				atomic_read(&buf->ref.refcount));
+ 	}
+ 	mutex_unlock(&dev->lock);
+@@ -1351,7 +1404,6 @@ static const struct file_operations debug_leak_fops = {
+ 	.llseek = seq_lseek,
+ 	.release = single_release,
+ };
+-
+ struct ion_device *ion_device_create(long (*custom_ioctl)
+ 				     (struct ion_client *client,
+ 				      unsigned int cmd,
+diff --git a/drivers/gpu/ion/ion_carveout_heap.c b/drivers/gpu/ion/ion_carveout_heap.c
+index 38080f12aee5..76aaa3b6f8e9 100755
+--- a/drivers/gpu/ion/ion_carveout_heap.c
++++ b/drivers/gpu/ion/ion_carveout_heap.c
+@@ -13,8 +13,8 @@
+  * GNU General Public License for more details.
+  *
+  */
+-#include <linux/spinlock.h>
+ 
++ #include <linux/spinlock.h>
+ #include <linux/err.h>
+ #include <linux/genalloc.h>
+ #include <linux/io.h>
+@@ -25,76 +25,55 @@
+ #include <linux/vmalloc.h>
+ #include <linux/iommu.h>
+ #include <linux/seq_file.h>
++#include <asm/mach/map.h>
+ #include <linux/dma-mapping.h>
+ #include <asm/cacheflush.h>
+ #include "ion_priv.h"
+ 
+-#include <asm/mach/map.h>
+-
+-#define RESERVED_SIZE(total)	((total)/10)
+-
+ struct ion_carveout_heap {
+ 	struct ion_heap heap;
+ 	struct gen_pool *pool;
+ 	ion_phys_addr_t base;
+-	unsigned long allocated_bytes;
+-	unsigned long vpu_allocated_bytes;
+-	unsigned long max_allocated;
+-	unsigned long total_size;
+ 	unsigned long bit_nr;
+ 	unsigned long *bits;
+ };
+-
+ ion_phys_addr_t ion_carveout_allocate(struct ion_heap *heap,
+ 				      unsigned long size,
+-				      unsigned long align,
+-				      unsigned long flags)
++				      unsigned long align)
+ {
+ 	struct ion_carveout_heap *carveout_heap =
+ 		container_of(heap, struct ion_carveout_heap, heap);
+-	unsigned long offset;
+-	unsigned long free_size = carveout_heap->total_size - carveout_heap->allocated_bytes;
+-
+-	if ((flags & (1<<ION_VPU_ID)) &&
+-		(free_size < RESERVED_SIZE(carveout_heap->total_size))) {
+-		printk("%s: heap %s has not enough memory for vpu: vpu allocated(%luM)\n",
+-			__func__, heap->name, carveout_heap->vpu_allocated_bytes/SZ_1M);
+-		return ION_CARVEOUT_ALLOCATE_FAIL;
+-	}
+-	offset = gen_pool_alloc(carveout_heap->pool, size);
++	unsigned long offset = gen_pool_alloc(carveout_heap->pool, size);
+ 
+ 	if (!offset) {
+-		if ((carveout_heap->total_size -
+-		      carveout_heap->allocated_bytes) > size)
++		if ((heap->total_size - heap->allocated_size) > size)
+ 			printk("%s: heap %s has enough memory (%luK) but"
+-				" the allocation of size %lu pages still failed."
++				" the allocation of size(%luK) still failed."
+ 				" Memory is probably fragmented.\n",
+ 				__func__, heap->name,
+-				(carveout_heap->total_size - carveout_heap->allocated_bytes)/SZ_1K,
++				(heap->total_size - heap->allocated_size)/SZ_1K, 
+ 				size/SZ_1K);
+ 		else
+ 			printk("%s: heap %s has not enough memory(%luK)"
+ 				"the alloction of size is %luK.\n",
+ 				__func__, heap->name,
+-				(carveout_heap->total_size - carveout_heap->allocated_bytes)/SZ_1K,
++				(heap->total_size - heap->allocated_size)/SZ_1K, 
+ 				size/SZ_1K);
+ 		return ION_CARVEOUT_ALLOCATE_FAIL;
+ 	}
+ 
+-	if(flags & (1<<ION_VPU_ID))
+-		carveout_heap->vpu_allocated_bytes += size;
+-	carveout_heap->allocated_bytes += size;
++	heap->allocated_size += size;
+ 
+-	if((offset + size - carveout_heap->base) > carveout_heap->max_allocated)
+-		carveout_heap->max_allocated = offset + size - carveout_heap->base;
++	if((offset + size - carveout_heap->base) > heap->max_allocated)
++		heap->max_allocated = offset + size - carveout_heap->base;
+ 
+-	bitmap_set(carveout_heap->bits,
++	bitmap_set(carveout_heap->bits, 
+ 		(offset - carveout_heap->base)/PAGE_SIZE , size/PAGE_SIZE);
+ 	return offset;
+ }
+ 
+ void ion_carveout_free(struct ion_heap *heap, ion_phys_addr_t addr,
+-		       unsigned long size, unsigned long flags)
++		       unsigned long size)
+ {
+ 	struct ion_carveout_heap *carveout_heap =
+ 		container_of(heap, struct ion_carveout_heap, heap);
+@@ -102,10 +81,9 @@ void ion_carveout_free(struct ion_heap *heap, ion_phys_addr_t addr,
+ 	if (addr == ION_CARVEOUT_ALLOCATE_FAIL)
+ 		return;
+ 	gen_pool_free(carveout_heap->pool, addr, size);
+-	if(flags & (1<<ION_VPU_ID))
+-		carveout_heap->vpu_allocated_bytes -= size;
+-	carveout_heap->allocated_bytes -= size;
+-	bitmap_clear(carveout_heap->bits,
++
++	heap->allocated_size -= size;
++	bitmap_clear(carveout_heap->bits, 
+ 		(addr - carveout_heap->base)/PAGE_SIZE, size/PAGE_SIZE);
+ }
+ 
+@@ -123,7 +101,7 @@ static int ion_carveout_heap_allocate(struct ion_heap *heap,
+ 				      unsigned long size, unsigned long align,
+ 				      unsigned long flags)
+ {
+-	buffer->priv_phys = ion_carveout_allocate(heap, size, align, flags);
++	buffer->priv_phys = ion_carveout_allocate(heap, size, align);
+ 	return buffer->priv_phys == ION_CARVEOUT_ALLOCATE_FAIL ? -ENOMEM : 0;
+ }
+ 
+@@ -131,7 +109,7 @@ static void ion_carveout_heap_free(struct ion_buffer *buffer)
+ {
+ 	struct ion_heap *heap = buffer->heap;
+ 
+-	ion_carveout_free(heap, buffer->priv_phys, buffer->size, buffer->flags);
++	ion_carveout_free(heap, buffer->priv_phys, buffer->size);
+ 	buffer->priv_phys = ION_CARVEOUT_ALLOCATE_FAIL;
+ }
+ 
+@@ -163,52 +141,58 @@ void ion_carveout_heap_unmap_kernel(struct ion_heap *heap,
+ }
+ 
+ int ion_carveout_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
+-			       struct vm_area_struct *vma, unsigned long flags)
++			       struct vm_area_struct *vma)
+ {
+-	int err = 0;
+-	if (ION_IS_CACHED(flags))
+-		err = remap_pfn_range(vma, vma->vm_start,
++	return remap_pfn_range(vma, vma->vm_start,
+ 			       __phys_to_pfn(buffer->priv_phys) + vma->vm_pgoff,
+-			       vma->vm_end - vma->vm_start,
+-			       vma->vm_page_prot);
+-	else
+-		err = remap_pfn_range(vma, vma->vm_start,
+-			       __phys_to_pfn(buffer->priv_phys) + vma->vm_pgoff,
+-					vma->vm_end - vma->vm_start,
+-					pgprot_noncached(vma->vm_page_prot));
+-
+-        buffer->vm_start = vma->vm_start;
+-	return err;
++			       buffer->size,
++					vma->vm_page_prot);
+ }
+-
+ int ion_carveout_cache_op(struct ion_heap *heap, struct ion_buffer *buffer,
+-			void *virt, size_t size, unsigned int cmd)
++			void *virt, unsigned int type)
+ {
+-	unsigned long start, end;
+-
+-	start = (unsigned long)virt;
+-	end = start + size;
+-	switch(cmd) {
+-		case ION_CACHE_FLUSH:
+-			dmac_flush_range((void *)start, (void *)end);
+-			outer_flush_range(buffer->priv_phys,buffer->priv_phys + size);
+-			break;
+-		case ION_CACHE_CLEAN:
+-            /* When cleaning, always clean the innermost (L1) cache first
+-             * and then clean the outer cache(s).
+-             */
+-			dmac_clean_range((void *)start, (void *)end);
+-			outer_clean_range(buffer->priv_phys,buffer->priv_phys + size);
++	unsigned long phys_start = 0, phys_end = 0;
++	void *virt_start = NULL, *virt_end = NULL;
++	struct ion_user_map_addr *map = NULL;
++
++        if(!buffer)
++                return -EINVAL;
++	phys_start = buffer->priv_phys;
++	phys_end = buffer->priv_phys + buffer->size;
++	
++	list_for_each_entry(map, &buffer->map_addr, list) {
++		if(map->vaddr == (unsigned long)virt){
++			virt_start = virt;
++			virt_end = (void *)((unsigned long)virt + map->size);
+ 			break;
+-		case ION_CACHE_INVALID:
+-            /* When invalidating, always invalidate the outermost cache first
+-             * and the L1 cache last.
+-             */
+-			outer_inv_range(buffer->priv_phys,buffer->priv_phys + size);
+-			dmac_inv_range((void *)start, (void *)end);
+-			break;
+-		default:
+-			return -EINVAL;
++		}
++	}
++	if(!virt_start){
++		pr_err("%s: virt(%p) has not been maped or has been unmaped\n",
++			__func__, virt);
++		return -EINVAL;
++	}
++	switch(type) {
++	case ION_CACHE_FLUSH:
++		dmac_flush_range(virt_start, virt_end);
++		outer_flush_range(phys_start,phys_end); 
++		break;
++	case ION_CACHE_CLEAN:
++		/* When cleaning, always clean the innermost (L1) cache first 
++		* and then clean the outer cache(s).
++		*/
++		dmac_clean_range(virt_start, virt_end);
++		outer_clean_range(phys_start,phys_end); 
++		break;
++	case ION_CACHE_INV:
++		/* When invalidating, always invalidate the outermost cache first 
++		* and the L1 cache last.
++		*/
++		outer_inv_range(phys_start,phys_end); 
++		dmac_inv_range(virt_start, virt_end);
++		break;
++	default:
++		return -EINVAL;
+ 	}
+ 	return 0;
+ }
+@@ -220,7 +204,7 @@ static int ion_carveout_print_debug(struct ion_heap *heap, struct seq_file *s)
+ 		container_of(heap, struct ion_carveout_heap, heap);
+ 
+ 	for(i = carveout_heap->bit_nr/8 - 1; i>= 0; i--){
+-		seq_printf(s, "%.3uM> Bits[%.3d - %.3d]: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n",
++		seq_printf(s, "%.3uM> Bits[%.3d - %.3d]: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n", 
+ 				i+1, i*8 + 7, i*8,
+ 				carveout_heap->bits[i*8 + 7],
+ 				carveout_heap->bits[i*8 + 6],
+@@ -231,17 +215,14 @@ static int ion_carveout_print_debug(struct ion_heap *heap, struct seq_file *s)
+ 				carveout_heap->bits[i*8 + 1],
+ 				carveout_heap->bits[i*8]);
+ 	}
+-	seq_printf(s, "VPU allocated: %luM\n",
+-		carveout_heap->vpu_allocated_bytes/SZ_1M);
+ 	seq_printf(s, "Total allocated: %luM\n",
+-		carveout_heap->allocated_bytes/SZ_1M);
++		heap->allocated_size/SZ_1M);
+ 	seq_printf(s, "max_allocated: %luM\n",
+-		carveout_heap->max_allocated/SZ_1M);
+-	seq_printf(s, "Heap size: %luM, heap base: 0x%lx\n",
+-		carveout_heap->total_size/SZ_1M, carveout_heap->base);
++		heap->max_allocated/SZ_1M);
++	seq_printf(s, "Heap size: %luM, heap base: 0x%lx\n", 
++		heap->total_size/SZ_1M, carveout_heap->base);
+ 	return 0;
+ }
+-
+ static struct ion_heap_ops carveout_heap_ops = {
+ 	.allocate = ion_carveout_heap_allocate,
+ 	.free = ion_carveout_heap_free,
+@@ -271,12 +252,11 @@ struct ion_heap *ion_carveout_heap_create(struct ion_platform_heap *heap_data)
+ 		     -1);
+ 	carveout_heap->heap.ops = &carveout_heap_ops;
+ 	carveout_heap->heap.type = ION_HEAP_TYPE_CARVEOUT;
+-	carveout_heap->vpu_allocated_bytes = 0;
+-	carveout_heap->allocated_bytes = 0;
+-	carveout_heap->max_allocated = 0;
+-	carveout_heap->total_size = heap_data->size;
++	carveout_heap->heap.allocated_size = 0;
++	carveout_heap->heap.max_allocated = 0;
++	carveout_heap->heap.total_size = heap_data->size;
+ 	carveout_heap->bit_nr = heap_data->size/(PAGE_SIZE * sizeof(unsigned long) * 8);
+-	carveout_heap->bits =
++	carveout_heap->bits = 
+ 		(unsigned long *)kzalloc(carveout_heap->bit_nr * sizeof(unsigned long), GFP_KERNEL);
+ 
+ 	return &carveout_heap->heap;
+diff --git a/drivers/gpu/ion/ion_priv.h b/drivers/gpu/ion/ion_priv.h
+index 75b1e753628e..3dbe298e1149 100755
+--- a/drivers/gpu/ion/ion_priv.h
++++ b/drivers/gpu/ion/ion_priv.h
+@@ -26,6 +26,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ #include <linux/debugfs.h>
++#include <linux/list.h>
+ 
+ struct ion_mapping;
+ 
+@@ -39,6 +40,11 @@ struct ion_kernel_mapping {
+ 	void *vaddr;
+ };
+ 
++struct ion_user_map_addr {
++	unsigned long vaddr;
++	unsigned long size;
++	struct list_head list;
++};
+ struct ion_buffer *ion_handle_buffer(struct ion_handle *handle);
+ 
+ /**
+@@ -75,7 +81,8 @@ struct ion_buffer {
+ 	void *vaddr;
+ 	int dmap_cnt;
+ 	struct scatterlist *sglist;
+-	unsigned long vm_start;
++        struct list_head map_addr;
++	pid_t pid;
+ 	int marked;
+ };
+ 
+@@ -104,9 +111,9 @@ struct ion_heap_ops {
+ 	void * (*map_kernel) (struct ion_heap *heap, struct ion_buffer *buffer);
+ 	void (*unmap_kernel) (struct ion_heap *heap, struct ion_buffer *buffer);
+ 	int (*map_user) (struct ion_heap *mapper, struct ion_buffer *buffer,
+-			 struct vm_area_struct *vma, unsigned long flags);
++			 struct vm_area_struct *vma);
+ 	int (*cache_op)(struct ion_heap *heap, struct ion_buffer *buffer,
+-			void *virt, size_t size, unsigned int cmd);
++			void *virt, unsigned int type);
+ 	int (*print_debug)(struct ion_heap *heap, struct seq_file *s);
+ };
+ 
+@@ -133,6 +140,10 @@ struct ion_heap {
+ 	struct ion_heap_ops *ops;
+ 	int id;
+ 	const char *name;
++
++	unsigned long allocated_size;
++	unsigned long max_allocated;
++	unsigned long total_size;
+ };
+ 
+ /**
+@@ -181,9 +192,9 @@ void ion_carveout_heap_destroy(struct ion_heap *);
+  * used to back an architecture specific custom heap
+  */
+ ion_phys_addr_t ion_carveout_allocate(struct ion_heap *heap, unsigned long size,
+-				      unsigned long align, unsigned long flags);
++				      unsigned long align);
+ void ion_carveout_free(struct ion_heap *heap, ion_phys_addr_t addr,
+-		       unsigned long size, unsigned long flags);
++		       unsigned long size);
+ /**
+  * The carveout heap returns physical addresses, since 0 may be a valid
+  * physical address, this is used to indicate allocation failed
+diff --git a/drivers/gpu/ion/ion_system_heap.c b/drivers/gpu/ion/ion_system_heap.c
+index 2756f3054ec2..c046cf1a3219 100755
+--- a/drivers/gpu/ion/ion_system_heap.c
++++ b/drivers/gpu/ion/ion_system_heap.c
+@@ -86,7 +86,7 @@ void ion_system_heap_unmap_kernel(struct ion_heap *heap,
+ }
+ 
+ int ion_system_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
+-			     struct vm_area_struct *vma, unsigned long flags)
++			     struct vm_area_struct *vma)
+ {
+ 	return remap_vmalloc_range(vma, buffer->priv_virt, vma->vm_pgoff);
+ }
+@@ -159,8 +159,7 @@ struct scatterlist *ion_system_contig_heap_map_dma(struct ion_heap *heap,
+ 
+ int ion_system_contig_heap_map_user(struct ion_heap *heap,
+ 				    struct ion_buffer *buffer,
+-				    struct vm_area_struct *vma,
+-				    unsigned long flags)
++				    struct vm_area_struct *vma)
+ {
+ 	unsigned long pfn = __phys_to_pfn(virt_to_phys(buffer->priv_virt));
+ 	return remap_pfn_range(vma, vma->vm_start, pfn + vma->vm_pgoff,
+diff --git a/drivers/gpu/ion/ion_system_mapper.c b/drivers/gpu/ion/ion_system_mapper.c
+index 0a1fc49a80c7..692458e07b5e 100755
+--- a/drivers/gpu/ion/ion_system_mapper.c
++++ b/drivers/gpu/ion/ion_system_mapper.c
+@@ -63,8 +63,7 @@ static void *ion_kernel_mapper_map_kernel(struct ion_mapper *mapper,
+ static int ion_kernel_mapper_map_user(struct ion_mapper *mapper,
+ 				      struct ion_buffer *buffer,
+ 				      struct vm_area_struct *vma,
+-				      struct ion_mapping *mapping,
+-				      unsigned long flags)
++				      struct ion_mapping *mapping)
+ {
+ 	int ret;
+ 
+diff --git a/drivers/gpu/ion/rockchip/rockchip_ion.c b/drivers/gpu/ion/rockchip/rockchip_ion.c
+index 3e8f86745e28..1fa448688fde 100755
+--- a/drivers/gpu/ion/rockchip/rockchip_ion.c
++++ b/drivers/gpu/ion/rockchip/rockchip_ion.c
+@@ -55,6 +55,7 @@ static int rockchip_ion_probe(struct platform_device *pdev)
+ 		ion_device_add_heap(idev, heaps[i]);
+ 	}
+ 	platform_set_drvdata(pdev, idev);
++        pr_info("Rockchip ion module(version: %s) is successfully loaded\n", ION_VERSION);
+ 	return 0;
+ err:
+ 	for (i = 0; i < num_heaps; i++) {
+diff --git a/include/linux/ion.h b/include/linux/ion.h
+index da979c28eb53..1e94610735ae 100755
+--- a/include/linux/ion.h
++++ b/include/linux/ion.h
+@@ -18,16 +18,8 @@
+ #define _LINUX_ION_H
+ 
+ #include <linux/types.h>
++#define ION_VERSION     "1.0"
+ 
+-
+-#define CACHED          1
+-#define UNCACHED        0
+-
+-#define ION_CACHE_SHIFT 0
+-
+-#define ION_SET_CACHE(__cache)  ((__cache) << ION_CACHE_SHIFT)
+-
+-#define ION_IS_CACHED(__flags)	((__flags) & (1 << ION_CACHE_SHIFT))
+ struct ion_handle;
+ /**
+  * enum ion_heap_types - list of all possible types of heaps
+@@ -305,24 +297,31 @@ struct ion_custom_data {
+ struct ion_phys_data {
+ 	struct ion_handle *handle;
+ 	unsigned long phys;
+-	size_t size;
++	unsigned long size;
+ };
+-
+-struct ion_flush_data {
++struct ion_cacheop_data {
++#define ION_CACHE_FLUSH		0
++#define ION_CACHE_CLEAN		1
++#define ION_CACHE_INV		2
++	unsigned int type;
+ 	struct ion_handle *handle;
+ 	void *virt;
+-	size_t size;
+ };
+-
+-struct ion_client_data {
+-#define ION_TYPE_GET_TOTAL_SIZE  0
+-#define ION_TYPE_SIZE_GET_COUNT  1
+-	unsigned int type;
+-	union {
+-		size_t size;
+-		size_t total_size;
+-	};
++struct ion_buffer_info {
++	unsigned long phys;
++	unsigned long size;
++};
++struct ion_client_info {
++#define MAX_BUFFER_COUNT	127
+ 	unsigned int count;
++	unsigned long total_size;
++	struct ion_buffer_info buf[MAX_BUFFER_COUNT];
++};
++struct ion_heap_info {
++	unsigned int id;
++	unsigned long allocated_size;
++	unsigned long max_allocated;
++	unsigned long total_size;
+ };
+ 
+ #define ION_IOC_MAGIC		'I'
+@@ -379,11 +378,24 @@ struct ion_client_data {
+  * Takes the argument of the architecture specific ioctl to call and
+  * passes appropriate userdata for that ioctl
+  */
+-#define ION_IOC_CUSTOM		_IOWR(ION_IOC_MAGIC, 6, struct ion_custom_data)
+-#define ION_CACHE_FLUSH		_IOWR(ION_IOC_MAGIC, 7, struct ion_flush_data)
+-#define ION_CACHE_CLEAN		_IOWR(ION_IOC_MAGIC, 8, struct ion_flush_data)
+-#define ION_CACHE_INVALID	_IOWR(ION_IOC_MAGIC, 9, struct ion_flush_data)
+-#define ION_GET_PHYS		_IOWR(ION_IOC_MAGIC, 10, unsigned long)
+-#define ION_GET_CLIENT		_IOWR(ION_IOC_MAGIC, 11, struct ion_client_data)
+-
++#define ION_IOC_CUSTOM			_IOWR(ION_IOC_MAGIC, 6, struct ion_custom_data)
++
++#define ION_CUSTOM_GET_PHYS		_IOWR(ION_IOC_MAGIC, 7, \
++				      		struct ion_phys_data)
++				      
++#define ION_CUSTOM_CACHE_OP		_IOWR(ION_IOC_MAGIC, 8, \
++				      		struct ion_cacheop_data) 				     
++
++#define ION_CUSTOM_GET_CLIENT_INFO	_IOWR(ION_IOC_MAGIC, 9, \
++				      		struct ion_client_info) 
++
++#define ION_CUSTOM_GET_HEAP_INFO	_IOWR(ION_IOC_MAGIC, 10, \
++				      		struct ion_heap_info) 
++/* Compatible with pmem */
++struct ion_pmem_region {
++	unsigned long offset;
++	unsigned long len;
++};
++#define ION_PMEM_GET_PHYS		_IOW('p', 1, unsigned int)
++#define ION_PMEM_CACHE_FLUSH		_IOW('p', 8, unsigned int)
+ #endif /* _LINUX_ION_H */
+-- 
+2.35.3
+

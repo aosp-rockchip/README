@@ -1,0 +1,180 @@
+From 663848d8305cff6d5607e15bf5e4b25eff0730e4 Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Wed, 11 Feb 2015 18:15:42 +0800
+Subject: [PATCH] usb: rk3368: support usb battery charger detect
+
+Signed-off-by: lyz <lyz@rock-chips.com>
+---
+ arch/arm64/boot/dts/rk3368.dtsi         |  5 ++--
+ drivers/usb/dwc_otg_310/usbdev_bc.c     | 39 +++++++++++++++++++++----
+ drivers/usb/dwc_otg_310/usbdev_rk3368.c |  6 ++--
+ drivers/usb/dwc_otg_310/usbdev_rkuoc.h  | 20 +++++++++++++
+ 4 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rk3368.dtsi b/arch/arm64/boot/dts/rk3368.dtsi
+index 25a73752d0cd..4b0b4c6a9091 100644
+--- a/arch/arm64/boot/dts/rk3368.dtsi
++++ b/arch/arm64/boot/dts/rk3368.dtsi
+@@ -1190,6 +1190,7 @@
+ 		clock-names = "clk_crypto", "sclk_crypto", "mclk_crypto";
+ 		status = "okay";
+ 	};
++
+ 	dwc_control_usb: dwc-control-usb {
+ 		compatible = "rockchip,rk3368-dwc-control-usb";
+ 		rockchip,grf = <&grf>;
+@@ -1204,8 +1205,8 @@
+ 		usb_bc{
+ 			compatible = "inno,phy";
+ 			regbase = &dwc_control_usb;
+-			rk_usb,bvalid     = <0x04b 23 1>;
+-			rk_usb,iddig      = <0x04b 26 1>;
++			rk_usb,bvalid     = <0x4bc 23 1>;
++			rk_usb,iddig      = <0x4bc 26 1>;
+ 			rk_usb,vdmsrcen   = <0x718 12 1>;
+ 			rk_usb,vdpsrcen   = <0x718 11 1>;
+ 			rk_usb,rdmpden    = <0x718 10 1>;
+diff --git a/drivers/usb/dwc_otg_310/usbdev_bc.c b/drivers/usb/dwc_otg_310/usbdev_bc.c
+index 0cad8b970d01..648bd9349a48 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_bc.c
++++ b/drivers/usb/dwc_otg_310/usbdev_bc.c
+@@ -28,6 +28,7 @@ char *bc_string[USB_BC_TYPE_MAX] = {"DISCONNECT",
+ 
+ uoc_field_t *pBC_UOC_FIELDS;
+ static void *pGRF_BASE;
++static void *pGRF_REGMAP;
+ static struct mutex bc_mutex;
+ 
+ static enum bc_port_type usb_charger_status = USB_BC_TYPE_DISCNT;
+@@ -46,18 +47,43 @@ static inline void *get_grf_base(struct device_node *np)
+ 	return grf_base;
+ }
+ 
++static inline struct regmap *get_grf_regmap(struct device_node *np)
++{
++	struct regmap *grf;
++
++	grf = syscon_regmap_lookup_by_phandle(of_get_parent(np),
++					      "rockchip,grf");
++	if (IS_ERR(grf))
++		return NULL;
++	return grf;
++}
++
+ void grf_uoc_set_field(uoc_field_t *field, u32 value)
+ {
+ 	if (!uoc_field_valid(field))
+ 		return;
+-	grf_uoc_set(pGRF_BASE, field->b.offset, field->b.bitmap, field->b.mask,
+-		    value);
++
++	if (pGRF_BASE) {
++		grf_uoc_set(pGRF_BASE, field->b.offset, field->b.bitmap,
++			    field->b.mask, value);
++	} else if (pGRF_REGMAP) {
++		regmap_grf_uoc_set(pGRF_REGMAP, field->b.offset,
++				   field->b.bitmap,
++				   field->b.mask, value);
++	}
+ }
+ 
+ u32 grf_uoc_get_field(uoc_field_t *field)
+ {
+-	return grf_uoc_get(pGRF_BASE, field->b.offset, field->b.bitmap,
+-			   field->b.mask);
++	if (pGRF_BASE) {
++		return grf_uoc_get(pGRF_BASE, field->b.offset, field->b.bitmap,
++				   field->b.mask);
++	} else if (pGRF_REGMAP) {
++		return regmap_grf_uoc_get(pGRF_REGMAP, field->b.offset,
++					  field->b.bitmap, field->b.mask);
++	} else {
++		return 0;
++	}
+ }
+ 
+ static inline int uoc_init_field(struct device_node *np, const char *name,
+@@ -136,7 +162,7 @@ static inline void uoc_init_inno(struct device_node *np)
+ /****** BATTERY CHARGER DETECT FUNCTIONS ******/
+ bool is_connected(void)
+ {
+-	if (!pGRF_BASE)
++	if (!pGRF_BASE && !pGRF_REGMAP)
+ 		return false;
+ 	if (BC_GET(BC_BVALID) && BC_GET(BC_IDDIG))
+ 		return true;
+@@ -346,8 +372,9 @@ enum bc_port_type usb_battery_charger_detect(bool wait)
+ 		np = of_find_node_by_name(NULL, "usb_bc");
+ 	if (!np)
+ 		return -1;
+-	if (!pGRF_BASE) {
++	if (!pGRF_BASE && !pGRF_REGMAP) {
+ 		pGRF_BASE = get_grf_base(np);
++		pGRF_REGMAP = get_grf_regmap(np);
+ 		mutex_init(&bc_mutex);
+ 	}
+ 
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk3368.c b/drivers/usb/dwc_otg_310/usbdev_rk3368.c
+index 8be87337097a..af08389972c8 100644
+--- a/drivers/usb/dwc_otg_310/usbdev_rk3368.c
++++ b/drivers/usb/dwc_otg_310/usbdev_rk3368.c
+@@ -1,6 +1,6 @@
+ #include "usbdev_rk.h"
+-#include "usbdev_grf_regs.h"
+ #include "dwc_otg_regs.h"
++
+ static struct dwc_otg_control_usb *control_usb;
+ 
+ static u32 uoc_read(u32 reg)
+@@ -197,7 +197,7 @@ struct dwc_otg_platform_data usb20otg_pdata_rk3368 = {
+ 	.get_status = usb20otg_get_status,
+ 	.power_enable = usb20otg_power_enable,
+ 	.dwc_otg_uart_mode = dwc_otg_uart_mode,
+-	/* .bc_detect_cb = rk_battery_charger_detect_cb, */
++	.bc_detect_cb = rk_battery_charger_detect_cb,
+ };
+ #endif
+ 
+@@ -321,7 +321,7 @@ static inline void do_wakeup(struct work_struct *work)
+ 
+ static void usb_battery_charger_detect_work(struct work_struct *work)
+ {
+-	/* rk_battery_charger_detect_cb(usb_battery_charger_detect(1)); */
++	rk_battery_charger_detect_cb(usb_battery_charger_detect(1));
+ }
+ 
+ /********** handler for bvalid irq **********/
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rkuoc.h b/drivers/usb/dwc_otg_310/usbdev_rkuoc.h
+index 41bcc155b73f..6ff88f80e306 100644
+--- a/drivers/usb/dwc_otg_310/usbdev_rkuoc.h
++++ b/drivers/usb/dwc_otg_310/usbdev_rkuoc.h
+@@ -31,6 +31,26 @@ static inline u32 grf_uoc_get(void *base, u32 offset, u32 bitmap, u32 mask)
+ 	return ret;
+ }
+ 
++static inline void regmap_grf_uoc_set(struct regmap *grf, u32 offset,
++				      u32 bitmap, u32 mask, u32 val)
++{
++	unsigned int reg_val;
++
++	reg_val = (((((1 << mask) - 1) & val) |
++		   (((1 << mask) - 1) << 16)) << bitmap);
++	regmap_write(grf, offset, reg_val);
++}
++
++static inline u32 regmap_grf_uoc_get(struct regmap *grf, u32 offset,
++				     u32 bitmap, u32 mask)
++{
++	unsigned int ret;
++
++	regmap_read(grf, offset, &ret);
++	ret = (ret >> bitmap) & ((1 << mask) - 1);
++	return ret;
++}
++
+ static inline bool uoc_field_valid(uoc_field_t *f)
+ {
+ 	if ((f->b.bitmap < 32) && (f->b.mask < 32))
+-- 
+2.35.3
+

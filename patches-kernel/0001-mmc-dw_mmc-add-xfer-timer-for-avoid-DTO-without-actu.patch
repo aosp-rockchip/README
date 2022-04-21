@@ -1,0 +1,181 @@
+From 75e03927eee6cca1c0878e579b4876544e770179 Mon Sep 17 00:00:00 2001
+From: Ziyuan Xu <xzy.xu@rock-chips.com>
+Date: Thu, 5 Apr 2018 18:34:03 +0800
+Subject: [PATCH] mmc: dw_mmc: add xfer timer for avoid DTO without actual data
+ payload
+
+It has proved the controller has a potention broken state with a DTO
+interrupt comes while the data payload is missing, which was not covered
+by current software state machine. Add a xfer timer to work around
+this buggy behaviour introduced by broken design.
+
+Change-Id: I5019c5ba0cdeb59adcdd3a5231a2000b448762bc
+Signed-off-by: Ziyuan Xu <xzy.xu@rock-chips.com>
+---
+ drivers/mmc/host/dw_mmc-rockchip.c |  4 ++
+ drivers/mmc/host/dw_mmc.c          | 71 ++++++++++++++++++++++++++++++
+ include/linux/mmc/dw_mmc.h         |  2 +
+ 3 files changed, 77 insertions(+)
+
+diff --git a/drivers/mmc/host/dw_mmc-rockchip.c b/drivers/mmc/host/dw_mmc-rockchip.c
+index 35ea74200627..1b4b62c4f91f 100644
+--- a/drivers/mmc/host/dw_mmc-rockchip.c
++++ b/drivers/mmc/host/dw_mmc-rockchip.c
+@@ -236,6 +236,10 @@ static int dw_mci_rockchip_init(struct dw_mci *host)
+ 	/* It needs this quirk on all Rockchip SoCs */
+ 	host->pdata->quirks |= DW_MCI_QUIRK_BROKEN_DTO;
+ 
++	if (of_device_is_compatible(host->dev->of_node,
++				    "rockchip,rk3308-dw-mshc"))
++		host->pdata->quirks |= DW_MCI_QUIRK_BROKEN_XFER;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index b83e107b6891..e5fd25b91411 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -510,6 +510,10 @@ static void dw_mci_dmac_complete_dma(void *arg)
+ 		set_bit(EVENT_XFER_COMPLETE, &host->pending_events);
+ 		tasklet_schedule(&host->tasklet);
+ 	}
++
++	if ((host->quirks & DW_MCI_QUIRK_BROKEN_XFER) &&
++	    host->dir_status == DW_MCI_RECV_STATUS)
++		del_timer(&host->xfer_timer);
+ }
+ 
+ static void dw_mci_translate_sglist(struct dw_mci *host, struct mmc_data *data,
+@@ -1789,6 +1793,30 @@ static void dw_mci_set_drto(struct dw_mci *host)
+ 	spin_unlock_irqrestore(&host->irq_lock, irqflags);
+ }
+ 
++static void dw_mci_set_xfer_timeout(struct dw_mci *host)
++{
++	unsigned int xfer_clks;
++	unsigned int xfer_div;
++	unsigned int xfer_ms;
++	unsigned long irqflags;
++
++	xfer_clks = mci_readl(host, TMOUT) >> 8;
++	xfer_div = (mci_readl(host, CLKDIV) & 0xff) * 2;
++	if (xfer_div == 0)
++		xfer_div = 1;
++	xfer_ms = DIV_ROUND_UP_ULL((u64)MSEC_PER_SEC * xfer_clks * xfer_div,
++				   host->bus_hz);
++
++	/* add a bit spare time */
++	xfer_ms += 10;
++
++	spin_lock_irqsave(&host->irq_lock, irqflags);
++	if (!test_bit(EVENT_XFER_COMPLETE, &host->pending_events))
++		mod_timer(&host->xfer_timer,
++			  jiffies + msecs_to_jiffies(xfer_ms));
++	spin_unlock_irqrestore(&host->irq_lock, irqflags);
++}
++
+ static bool dw_mci_clear_pending_cmd_complete(struct dw_mci *host)
+ {
+ 	if (!test_bit(EVENT_CMD_COMPLETE, &host->pending_events))
+@@ -1923,6 +1951,9 @@ static void dw_mci_tasklet_func(unsigned long priv)
+ 				if ((host->quirks & DW_MCI_QUIRK_BROKEN_DTO) &&
+ 				    (host->dir_status == DW_MCI_RECV_STATUS))
+ 					dw_mci_set_drto(host);
++				if ((host->quirks & DW_MCI_QUIRK_BROKEN_XFER) &&
++				    host->dir_status == DW_MCI_RECV_STATUS)
++					dw_mci_set_xfer_timeout(host);
+ 				break;
+ 			}
+ 
+@@ -2399,6 +2430,9 @@ static void dw_mci_read_data_pio(struct dw_mci *host, bool dto)
+ 	host->sg = NULL;
+ 	smp_wmb(); /* drain writebuffer */
+ 	set_bit(EVENT_XFER_COMPLETE, &host->pending_events);
++
++	if (host->quirks & DW_MCI_QUIRK_BROKEN_XFER)
++		del_timer(&host->xfer_timer);
+ }
+ 
+ static void dw_mci_write_data_pio(struct dw_mci *host)
+@@ -2528,6 +2562,9 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ 			del_timer(&host->cto_timer);
+ 			mci_writel(host, RINTSTS, DW_MCI_CMD_ERROR_FLAGS);
+ 			host->cmd_status = pending;
++			if ((host->quirks & DW_MCI_QUIRK_BROKEN_XFER) &&
++			    host->dir_status == DW_MCI_RECV_STATUS)
++				del_timer(&host->xfer_timer);
+ 			smp_wmb(); /* drain writebuffer */
+ 			set_bit(EVENT_CMD_COMPLETE, &host->pending_events);
+ 
+@@ -3090,6 +3127,36 @@ static void dw_mci_dto_timer(unsigned long arg)
+ 	spin_unlock_irqrestore(&host->irq_lock, irqflags);
+ }
+ 
++static void dw_mci_xfer_timer(unsigned long arg)
++{
++	struct dw_mci *host = (struct dw_mci *)arg;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&host->irq_lock, irqflags);
++
++	if (test_bit(EVENT_XFER_COMPLETE, &host->pending_events)) {
++		/* Presumably interrupt handler couldn't delete the timer */
++		dev_warn(host->dev, "xfer when already completed\n");
++		goto exit;
++	}
++
++	switch (host->state) {
++	case STATE_SENDING_DATA:
++		host->data_status = SDMMC_INT_DRTO;
++		set_bit(EVENT_DATA_ERROR, &host->pending_events);
++		set_bit(EVENT_DATA_COMPLETE, &host->pending_events);
++		tasklet_schedule(&host->tasklet);
++		break;
++	default:
++		dev_warn(host->dev, "Unexpected xfer timeout, state %d\n",
++			 host->state);
++		break;
++	}
++
++exit:
++	spin_unlock_irqrestore(&host->irq_lock, irqflags);
++}
++
+ #ifdef CONFIG_OF
+ static struct dw_mci_of_quirks {
+ 	char *quirk;
+@@ -3275,6 +3342,10 @@ int dw_mci_probe(struct dw_mci *host)
+ 		setup_timer(&host->dto_timer,
+ 			    dw_mci_dto_timer, (unsigned long)host);
+ 
++	if (host->quirks & DW_MCI_QUIRK_BROKEN_XFER)
++		setup_timer(&host->xfer_timer,
++			    dw_mci_xfer_timer, (unsigned long)host);
++
+ 	spin_lock_init(&host->lock);
+ 	spin_lock_init(&host->irq_lock);
+ 	INIT_LIST_HEAD(&host->queue);
+diff --git a/include/linux/mmc/dw_mmc.h b/include/linux/mmc/dw_mmc.h
+index 1accb8ca4fde..0cf1b2a2161b 100644
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@ -223,6 +223,7 @@ struct dw_mci {
+ 	struct timer_list       cmd11_timer;
+ 	struct timer_list       cto_timer;
+ 	struct timer_list       dto_timer;
++	struct timer_list	xfer_timer;
+ };
+ 
+ /* DMA ops for Internal/External DMAC interface */
+@@ -247,6 +248,7 @@ struct dw_mci_dma_ops {
+ #define DW_MCI_QUIRK_BROKEN_CARD_DETECTION	BIT(3)
+ /* Timer for broken data transfer over scheme */
+ #define DW_MCI_QUIRK_BROKEN_DTO			BIT(4)
++#define DW_MCI_QUIRK_BROKEN_XFER		BIT(5)
+ 
+ struct dma_pdata;
+ 
+-- 
+2.35.3
+

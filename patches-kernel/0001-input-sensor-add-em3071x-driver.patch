@@ -1,0 +1,659 @@
+From cc2cea6a8a1fbd54cb2fc3497224e11f76226c96 Mon Sep 17 00:00:00 2001
+From: Wang Jie <dave.wang@rock-chips.com>
+Date: Mon, 23 Nov 2020 17:50:25 +0800
+Subject: [PATCH] input: sensor: add em3071x driver
+
+Signed-off-by: Wang Jie <dave.wang@rock-chips.com>
+Change-Id: Ie71bf633a673d063f7275635b765cb200bc3722b
+---
+ drivers/input/sensors/lsensor/Kconfig      |   2 +
+ drivers/input/sensors/lsensor/Makefile     |   1 +
+ drivers/input/sensors/lsensor/ls_em3071x.c | 283 +++++++++++++++++++++
+ drivers/input/sensors/psensor/Kconfig      |   3 +
+ drivers/input/sensors/psensor/Makefile     |   1 +
+ drivers/input/sensors/psensor/ps_em3071x.c | 280 ++++++++++++++++++++
+ include/linux/sensor-dev.h                 |   2 +
+ 7 files changed, 572 insertions(+)
+ create mode 100644 drivers/input/sensors/lsensor/ls_em3071x.c
+ create mode 100644 drivers/input/sensors/psensor/ps_em3071x.c
+
+diff --git a/drivers/input/sensors/lsensor/Kconfig b/drivers/input/sensors/lsensor/Kconfig
+index 38e9b3956718..8ea493862dd3 100644
+--- a/drivers/input/sensors/lsensor/Kconfig
++++ b/drivers/input/sensors/lsensor/Kconfig
+@@ -44,5 +44,7 @@ config LS_STK3410
+ 	tristate "light sensor stk3410"
+ 	default n
+ 
++config LS_EM3071X
++	tristate "light sensor em3071x"
+ endif
+ 
+diff --git a/drivers/input/sensors/lsensor/Makefile b/drivers/input/sensors/lsensor/Makefile
+index 50375a889049..aa8bf78f440c 100644
+--- a/drivers/input/sensors/lsensor/Makefile
++++ b/drivers/input/sensors/lsensor/Makefile
+@@ -10,3 +10,4 @@ obj-$(CONFIG_LS_ISL29023) 		+= isl29023.o
+ obj-$(CONFIG_LS_AP321XX) 		+= ls_ap321xx.o
+ obj-$(CONFIG_LS_US5152)  		+= ls_us5152.o
+ obj-$(CONFIG_LS_STK3410) 		+= ls_stk3410.o
++obj-$(CONFIG_LS_EM3071X)		+= ls_em3071x.o
+diff --git a/drivers/input/sensors/lsensor/ls_em3071x.c b/drivers/input/sensors/lsensor/ls_em3071x.c
+new file mode 100644
+index 000000000000..fc7500963ab5
+--- /dev/null
++++ b/drivers/input/sensors/lsensor/ls_em3071x.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel/drivers/input/sensors/lsensor/ls_em3071x.c
++ *
++ * Copyright (C) 2020 Rockchip Co.,Ltd.
++ * Author: Wang Jie <dave.wang@rock-chips.com>
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++#define ALS_CMD		0x01
++#define STA_TUS		0X02
++#define ALS_DT1		0x09
++#define ALS_DT2		0X0a
++#define ALS_THDL1	0X05
++#define ALS_THDL2	0X06
++#define ALS_THDH1	0X07
++
++#define SW_RESET	0X0E
++
++/* ALS_CMD */
++#define ALS_SD_ENABLE	0x06
++#define ALS_SD_DISABLE	0xF8
++#define ALS_INT_DISABLE	(0 << 1)
++#define ALS_INT_ENABLE	(1 << 1)
++#define ALS_1T_100MS	(0 << 2)
++#define ALS_2T_200MS	(1 << 2)
++#define ALS_4T_400MS	(2 << 2)
++#define ALS_8T_800MS	(3 << 2)
++#define ALS_RANGE_57671	(0 << 6)
++#define ALS_RANGE_28836	(1 << 6)
++
++/* PS_CMD */
++#define PS_SD_ENABLE	(0 << 0)
++#define PS_SD_DISABLE	(1 << 0)
++#define PS_INT_DISABLE	(0 << 1)
++#define PS_INT_ENABLE	(1 << 1)
++#define PS_10T_2MS	(0 << 2)
++#define PS_15T_3MS	(1 << 2)
++#define PS_20T_4MS	(2 << 2)
++#define PS_25T_5MS	(3 << 2)
++#define PS_CUR_100MA	(0 << 4)
++#define PS_CUR_200MA	(1 << 4)
++#define PS_SLP_10MS	(0 << 5)
++#define PS_SLP_30MS	(1 << 5)
++#define PS_SLP_90MS	(2 << 5)
++#define PS_SLP_270MS	(3 << 5)
++#define TRIG_PS_OR_LS	(0 << 7)
++#define TRIG_PS_AND_LS	(1 << 7)
++
++/* STA_TUS */
++#define STA_PS_INT	(1 << 5)
++#define	STA_ALS_INT	(1 << 4)
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	int status = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	if (enable) {
++		status = ALS_SD_ENABLE;
++		sensor->ops->ctrl_data |= status;
++	} else {
++		status = ~ALS_SD_ENABLE;
++		sensor->ops->ctrl_data &= status;
++	}
++
++	result = sensor_write_reg(client, sensor->ops->ctrl_reg,
++					sensor->ops->ctrl_data);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to active sensor\n", __func__);
++		return result;
++	}
++
++	dev_dbg(&client->dev, "%s:reg = 0x%x, reg_ctrl = 0x%x, enable= %d\n",
++		  __func__,
++		  sensor->ops->ctrl_reg, sensor->ops->ctrl_data, enable);
++
++	return result;
++}
++
++
++static int sensor_init(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++
++	result = sensor->ops->active(client, 0, 0);
++	if (result) {
++		dev_err(&client->dev, "%s: line = %d, result = %d\n",
++			__func__, __LINE__, result);
++		return result;
++	}
++
++	sensor->status_cur = SENSOR_OFF;
++	result = sensor_write_reg(client, SW_RESET, 0);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set SW_RESET(%d)\n", __func__, result);
++		return result;
++	}
++
++	/* it is important,if not then als can not trig intterupt */
++	result = sensor_write_reg(client, ALS_THDL1, 0);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set ALS_THDL1(%d)\n", __func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, ALS_THDL2, 0XF0);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set ALS_THDL2(%d)\n", __func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, ALS_THDH1, 0XFF);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set ALS_THDH1(%d)\n", __func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, STA_TUS, 0X00);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set STA_TUS(%d)\n", __func__, result);
++		return result;
++	}
++
++	return result;
++}
++
++
++static int light_report_value(struct input_dev *input, int data)
++{
++	unsigned char index = 0;
++
++	if (data <= 10) {
++		index = 0;
++		goto report;
++	} else if (data <= 60) {
++		index = 1;
++		goto report;
++	} else if (data <= 122) {
++		index = 2;
++		goto report;
++	} else if (data <= 200) {
++		index = 3;
++		goto report;
++	} else if (data <= 400) {
++		index = 4;
++		goto report;
++	} else if (data <= 800) {
++		index = 5;
++		goto report;
++	} else if (data <= 1260) {
++		index = 6;
++		goto report;
++	} else {
++		index = 7;
++		goto report;
++	}
++
++report:
++	input_report_abs(input, ABS_MISC, index);
++	input_sync(input);
++
++	return index;
++}
++
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	int value = 0;
++	char buffer[2] = {0};
++	char index = 0;
++
++	buffer[0] = sensor_read_reg(client, 0X09);
++	buffer[1] = sensor_read_reg(client, 0X0A);
++	value = ((buffer[1] & 0X0F) << 8) | buffer[0];
++
++	index = light_report_value(sensor->input_dev, value);
++
++	dev_dbg(&client->dev,
++		 "%s: value = %d, index = %d\n", __func__, value, index);
++
++	if (sensor->pdata->irq_enable) {
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++		if (value & STA_ALS_INT) {
++			value &= ~STA_ALS_INT;
++			result = sensor_write_reg(client,
++					sensor->ops->int_status_reg, value);
++			if (result) {
++				dev_err(&client->dev,
++					"%s:write status reg error(%d)\n",
++					__func__, result);
++				return result;
++			}
++		}
++	}
++
++	return result;
++}
++
++struct sensor_operate light_em3071x_ops = {
++	.name		= "ls_em3071x",
++	.type		= SENSOR_TYPE_LIGHT,
++	.id_i2c		= LIGHT_ID_EM3071X,
++	.read_reg	= ALS_DT1,
++	.read_len	= 2,
++	.id_reg		= SENSOR_UNKNOW_DATA,
++	.id_data	= SENSOR_UNKNOW_DATA,
++	.precision	= 16,
++	.ctrl_reg	= ALS_CMD,
++	.int_status_reg = STA_TUS,
++	.range		= {100, 65535},
++	.brightness	= {10, 255},
++	.trig		= IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_SHARED,
++	.active		= sensor_active,
++	.init		= sensor_init,
++	.report		= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++static int light_em3071x_probe(struct i2c_client *client,
++				   const struct i2c_device_id *devid)
++{
++	return sensor_register_device(client, NULL, devid, &light_em3071x_ops);
++}
++
++static int light_em3071x_remove(struct i2c_client *client)
++{
++	return sensor_unregister_device(client, NULL, &light_em3071x_ops);
++}
++
++static const struct i2c_device_id light_em3071x_id[] = {
++	{"ls_em3071x", LIGHT_ID_EM3071X},
++	{}
++};
++
++static struct i2c_driver light_em3071x_driver = {
++	.probe = light_em3071x_probe,
++	.remove = light_em3071x_remove,
++	.shutdown = sensor_shutdown,
++	.id_table = light_em3071x_id,
++	.driver = {
++		.name = "light_em3071x",
++#ifdef CONFIG_PM
++		.pm = &sensor_pm_ops,
++#endif
++	},
++};
++
++module_i2c_driver(light_em3071x_driver);
++
++MODULE_AUTHOR("Wang Jie <dave.wang@rock-chips.com>");
++MODULE_DESCRIPTION("em3071x light driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/sensors/psensor/Kconfig b/drivers/input/sensors/psensor/Kconfig
+index 9c5527078a91..c7d32f51e7d0 100644
+--- a/drivers/input/sensors/psensor/Kconfig
++++ b/drivers/input/sensors/psensor/Kconfig
+@@ -25,5 +25,8 @@ config PS_STK3410
+ 	tristate "proximity sensor stk3410"
+ 	default n
+ 
++config PS_EM3071X
++	tristate "proximity sensor em3071x"
++
+ endif
+ 
+diff --git a/drivers/input/sensors/psensor/Makefile b/drivers/input/sensors/psensor/Makefile
+index 3a2e2ff4f66d..49210d0e71cc 100644
+--- a/drivers/input/sensors/psensor/Makefile
++++ b/drivers/input/sensors/psensor/Makefile
+@@ -5,3 +5,4 @@ obj-$(CONFIG_PS_AL3006) 		+= ps_al3006.o
+ obj-$(CONFIG_PS_STK3171) 		+= ps_stk3171.o
+ obj-$(CONFIG_PS_AP321XX) 		+= ps_ap321xx.o
+ obj-$(CONFIG_PS_STK3410) 		+= ps_stk3410.o
++obj-$(CONFIG_PS_EM3071X)		+= ps_em3071x.o
+diff --git a/drivers/input/sensors/psensor/ps_em3071x.c b/drivers/input/sensors/psensor/ps_em3071x.c
+new file mode 100644
+index 000000000000..5f387348881b
+--- /dev/null
++++ b/drivers/input/sensors/psensor/ps_em3071x.c
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel/drivers/input/sensors/psensor/ps_em3071x.c
++ *
++ * Copyright (C) 2020 Rockchip Co.,Ltd.
++ * Author: Wang Jie <dave.wang@rock-chips.com>
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++#define EM3071X_CONFIG_REG		0x01
++#define EM3071X_INT_REG			0x02
++#define EM3071X_PS_L_REG		0x03
++#define EM3071X_PS_H_REG		0x04
++#define EM3071X_PS_REG			0x08
++#define EM3071X_INT_PMASK		0x80
++#define EM3071X_PS_OFFSET		0x0F
++
++#define EM3071X_PS_CONFIG		0xB0
++/* #define ps_threshold_low		0x30 */
++/* #define ps_threshold_high		0x40 */
++#define EM3071X_INT_CLEAR		0x00
++
++static int ps_threshold_low;
++static int ps_threshold_high;
++
++static int em3071x_get_object(struct i2c_client *client)
++{
++	int index = 0;
++	int val;
++
++	val = sensor_read_reg(client, EM3071X_PS_REG);
++
++	if (val >= ps_threshold_high) {
++		index = 0;
++		val = 0;
++	} else if (val <= ps_threshold_low) {
++		index = 1;
++		val = 1;
++	} else {
++		index = val;
++	}
++
++	dev_dbg(&client->dev,
++		 "%s: val = 0x%x, index = %d\n", __func__, val, index);
++
++	return index;
++}
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	int status = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	if (enable) {
++		status = EM3071X_PS_CONFIG;
++		sensor->ops->ctrl_data |= status;
++	} else {
++		status = ~EM3071X_PS_CONFIG;
++		sensor->ops->ctrl_data &= status;
++	}
++
++	result = sensor_write_reg(client, sensor->ops->ctrl_reg,
++						sensor->ops->ctrl_data);
++	if (result)
++		dev_err(&client->dev, "%s: fail to active sensor\n", __func__);
++
++	return result;
++
++}
++
++static int em3071x_set_threshold(struct i2c_client *client,
++				 int threshold_high, int threshold_low)
++{
++	int result = 0;
++
++	result = sensor_write_reg(client, EM3071X_PS_L_REG, threshold_low);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to write EM3071X_PS_L_REG(%d)\n",
++			__func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, EM3071X_PS_H_REG, threshold_high);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to write EM3071X_PS_H_REG(%d)\n",
++			__func__, result);
++		return result;
++	}
++
++	dev_dbg(&client->dev,
++		"%s: set threshold_high = %d, set threshold_low = %d\n",
++		__func__, threshold_high, threshold_low);
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	struct device_node *np = client->dev.of_node;
++	int ps_val = 0;
++	int ret = 0;
++	int result = 0;
++
++	result = sensor->ops->active(client, 0, 0);
++	if (result) {
++		dev_err(&client->dev, "%s: line = %d, result = %d.\n",
++			__func__, __LINE__, result);
++		return result;
++	}
++	sensor->status_cur = SENSOR_OFF;
++
++	/* initialize the EM3071X chip */
++	result = sensor_write_reg(client, EM3071X_CONFIG_REG, 0X00);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: write EM3071X_CONFIG_REG reg fail(%d)\n",
++			__func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, EM3071X_INT_REG, EM3071X_INT_CLEAR);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: write EM3071X_INT_REG reg fail(%d)\n",
++			__func__, result);
++		return result;
++	}
++
++	result = sensor_write_reg(client, EM3071X_PS_OFFSET, 0X00);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: write EM3071X_PS_OFFSET reg fail(%d)\n",
++			__func__, result);
++		return result;
++	}
++
++	ret = of_property_read_u32(np, "ps_threshold_low", &ps_val);
++	if (ret)
++		dev_warn(&client->dev,
++			"%s: Unable to get ps_threshold_low\n", __func__);
++
++	ps_threshold_low = ps_val;
++
++	ret = of_property_read_u32(np, "ps_threshold_high", &ps_val);
++	if (ret)
++		dev_warn(&client->dev,
++			"%s: Unable to get ps_threshold_high\n", __func__);
++
++	ps_threshold_high = ps_val;
++
++	ret = em3071x_set_threshold(client,
++				    ps_threshold_high, ps_threshold_low);
++	if (ret)
++		dev_err(&client->dev,
++			"%s: em3071x set threshold failed\n", __func__);
++
++	return result;
++}
++
++static int em3071x_get_status(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	int val;
++
++	val = sensor_read_reg(client, sensor->ops->int_status_reg);
++	val &= 0x80;
++
++	return val;
++}
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	char value = 0;
++	u8 status;
++
++	status = em3071x_get_status(client);
++	dev_dbg(&client->dev, "em3071x_get_status: status = 0x%x\n", status);
++
++	if (sensor->pdata->irq_enable) {
++		if (status & EM3071X_INT_PMASK) {
++			result = sensor_write_reg(client, EM3071X_INT_REG, 0x00);
++			if (result) {
++				dev_err(&client->dev,
++					"%s: write EM3071X_INT_REG reg fail(%d)\n", __func__, result);
++				return result;
++			}
++
++			value = em3071x_get_object(client);
++			input_report_abs(sensor->input_dev, ABS_DISTANCE, value);
++			input_sync(sensor->input_dev);
++		}
++	} else {
++		value = em3071x_get_object(client);
++		input_report_abs(sensor->input_dev, ABS_DISTANCE, value);
++		input_sync(sensor->input_dev);
++	}
++
++	return result;
++}
++
++struct sensor_operate psensor_em3071x_ops = {
++	.name		= "ps_em3071x",
++	.type		= SENSOR_TYPE_PROXIMITY,
++	.id_i2c		= PROXIMITY_ID_EM3071X,
++	.read_reg	= SENSOR_UNKNOW_DATA,
++	.read_len	= 1,
++	.id_reg		= 0,
++	.id_data	= 0x31,
++	.precision	= 8,
++	.ctrl_reg	= 0x01,
++	.int_status_reg = 0x02,
++	.range		= {0, 10},
++	.brightness	= {10, 255},
++	.trig		= IRQF_TRIGGER_LOW | IRQF_ONESHOT | IRQF_SHARED,
++	.active		= sensor_active,
++	.init		= sensor_init,
++	.report		= sensor_report_value,
++};
++
++static int proximity_em3071x_probe(struct i2c_client *client,
++				   const struct i2c_device_id *devid)
++{
++	return sensor_register_device(client, NULL, devid, &psensor_em3071x_ops);
++}
++
++static int proximity_em3071x_remove(struct i2c_client *client)
++{
++	return sensor_unregister_device(client, NULL, &psensor_em3071x_ops);
++}
++
++static const struct i2c_device_id proximity_em3071x_id[] = {
++	{"ps_em3071x", PROXIMITY_ID_EM3071X},
++	{}
++};
++
++static struct i2c_driver proximity_em3071x_driver = {
++	.probe = proximity_em3071x_probe,
++	.remove = proximity_em3071x_remove,
++	.shutdown = sensor_shutdown,
++	.id_table = proximity_em3071x_id,
++	.driver = {
++		.name = "proximity_em3071x",
++#ifdef CONFIG_PM
++		.pm = &sensor_pm_ops,
++#endif
++	},
++};
++
++module_i2c_driver(proximity_em3071x_driver);
++
++MODULE_AUTHOR("Wang Jie <dave.wang@rock-chips.com>");
++MODULE_DESCRIPTION("em3071x proximity driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/sensor-dev.h b/include/linux/sensor-dev.h
+index 36c86d6050b7..79fe90f33df8 100644
+--- a/include/linux/sensor-dev.h
++++ b/include/linux/sensor-dev.h
+@@ -103,12 +103,14 @@ enum sensor_id {
+ 	LIGHT_ID_PHOTORESISTOR,
+ 	LIGHT_ID_US5152,
+ 	LIGHT_ID_STK3410,
++	LIGHT_ID_EM3071X,
+ 
+ 	PROXIMITY_ID_ALL,
+ 	PROXIMITY_ID_AL3006,
+ 	PROXIMITY_ID_STK3171,
+ 	PROXIMITY_ID_AP321XX,
+ 	PROXIMITY_ID_STK3410,
++	PROXIMITY_ID_EM3071X,
+ 
+ 	TEMPERATURE_ID_ALL,
+ 	TEMPERATURE_ID_MS5607,
+-- 
+2.35.3
+

@@ -1,0 +1,601 @@
+From 6bcf52d724d87e72aee68bccd2065310a47cc931 Mon Sep 17 00:00:00 2001
+From: xxx <xxx@rock-chips.com>
+Date: Mon, 13 Aug 2012 21:13:29 -0700
+Subject: [PATCH] add video_state function which can reduce reset ddr rate when
+ playing video
+
+---
+ arch/arm/mach-rk30/Makefile           |   2 +-
+ arch/arm/mach-rk30/clock_data.c       |  15 ++-
+ arch/arm/mach-rk30/cpufreq.c          |  17 ++-
+ arch/arm/mach-rk30/ddr.c              |   2 +-
+ arch/arm/mach-rk30/ddr_freq.c         | 130 ++++++++++++++-------
+ arch/arm/mach-rk30/dvfs.c             |  29 ++++-
+ arch/arm/mach-rk30/include/mach/ddr.h |   2 +
+ arch/arm/mach-rk30/video_state.c      | 161 ++++++++++++++++++++++++++
+ 8 files changed, 311 insertions(+), 47 deletions(-)
+ mode change 100755 => 100644 arch/arm/mach-rk30/Makefile
+ mode change 100755 => 100644 arch/arm/mach-rk30/cpufreq.c
+ mode change 100755 => 100644 arch/arm/mach-rk30/ddr.c
+ mode change 100755 => 100644 arch/arm/mach-rk30/ddr_freq.c
+ create mode 100755 arch/arm/mach-rk30/video_state.c
+
+diff --git a/arch/arm/mach-rk30/Makefile b/arch/arm/mach-rk30/Makefile
+old mode 100755
+new mode 100644
+index 2167eef284c7..3777e6549650
+--- a/arch/arm/mach-rk30/Makefile
++++ b/arch/arm/mach-rk30/Makefile
+@@ -16,7 +16,7 @@ obj-$(CONFIG_HOTPLUG_CPU) += hotplug.o
+ obj-$(CONFIG_LOCAL_TIMERS) += localtimer.o
+ obj-$(CONFIG_PM) += pm.o
+ obj-$(CONFIG_CPU_IDLE) += cpuidle.o
+-obj-$(CONFIG_CPU_FREQ) += cpufreq.o
++obj-$(CONFIG_CPU_FREQ) += cpufreq.o video_state.o
+ obj-$(CONFIG_DVFS) += dvfs.o
+ obj-$(CONFIG_DDR_FREQ) += ddr_freq.o
+ obj-$(CONFIG_RK30_I2C_INSRAM) += i2c_sram.o
+diff --git a/arch/arm/mach-rk30/clock_data.c b/arch/arm/mach-rk30/clock_data.c
+index e28a2df3f528..340b86028f3f 100644
+--- a/arch/arm/mach-rk30/clock_data.c
++++ b/arch/arm/mach-rk30/clock_data.c
+@@ -26,6 +26,7 @@
+ #include "clock.h"
+ #include <mach/pmu.h>
+ #include <mach/dvfs.h>
++#include <mach/ddr.h>
+ 
+ #define MHZ			(1000*1000)
+ #define KHZ			(1000)
+@@ -1115,12 +1116,24 @@ static int ddr_clk_set_rate(struct clk *c, unsigned long rate)
+ 	return 0;
+ }
+ 
++static long ddr_clk_round_rate(struct clk *clk, unsigned long rate)
++{
++	return ddr_set_pll(rate/MHZ,0)*MHZ;
++}
++static unsigned long ddr_clk_recalc_rate(struct clk *clk)
++{
++	u32 shift = get_cru_bits(clk->clksel_con,clk->div_mask,clk->div_shift);
++	unsigned long rate = clk->parent->recalc(clk->parent)>> shift;
++	pr_debug("%s new clock rate is %lu (shift %u)\n", clk->name, rate, shift);
++	return rate;
++}
+ static struct clk *clk_ddr_parents[2] = {&ddr_pll_clk, &general_pll_clk};
+ static struct clk clk_ddr = {
+ 	.name		= "ddr",	
+ 	.parent		= &ddr_pll_clk,
+-	.recalc		= clksel_recalc_shift,
++	.recalc		= ddr_clk_recalc_rate,
+ 	.set_rate	= ddr_clk_set_rate,
++	.round_rate	= ddr_clk_round_rate,
+ 	.clksel_con	= CRU_CLKSELS_CON(26),
+ 	//CRU_DIV_SET(0x3,0,4),
+ 	//CRU_SRC_SET(1,8),
+diff --git a/arch/arm/mach-rk30/cpufreq.c b/arch/arm/mach-rk30/cpufreq.c
+old mode 100755
+new mode 100644
+index 31b0f0f829c8..f4e51ba215d2
+--- a/arch/arm/mach-rk30/cpufreq.c
++++ b/arch/arm/mach-rk30/cpufreq.c
+@@ -31,6 +31,8 @@
+ #include <linux/earlysuspend.h>
+ #include <asm/unistd.h>
+ #include <asm/uaccess.h>
++#include <mach/ddr.h>
++#include <linux/cpu.h>
+ #ifdef DEBUG
+ #define FREQ_PRINTK_DBG(fmt, args...) pr_debug(fmt, ## args)
+ #define FREQ_PRINTK_LOG(fmt, args...) pr_debug(fmt, ## args)
+@@ -68,6 +70,7 @@ static struct clk *cpu_gpll;
+ static DEFINE_MUTEX(cpufreq_mutex);
+ 
+ static struct clk *gpu_clk;
++static struct clk *ddr_clk;
+ #define GPU_MAX_RATE 350*1000*1000
+ 
+ static int cpufreq_scale_rate_for_dvfs(struct clk *clk, unsigned long rate, dvfs_set_rate_callback set_rate);
+@@ -220,11 +223,20 @@ static int rk30_verify_speed(struct cpufreq_policy *policy)
+ 	return cpufreq_frequency_table_verify(policy, freq_table);
+ }
+ 
++uint32_t ddr_set_rate(uint32_t nMHz);
++
++int ddr_scale_rate_for_dvfs(struct clk *clk, unsigned long rate, dvfs_set_rate_callback set_rate)
++{
++	#if defined (CONFIG_DDR_FREQ)
++	ddr_set_rate(rate/(1000*1000));
++	#endif
++	return 0;
++}
++
+ static int rk30_cpu_init(struct cpufreq_policy *policy)
+ {
+ 	if (policy->cpu == 0) {
+ 		int i;
+-		struct clk *ddr_clk;
+ 		
+ 		gpu_clk = clk_get(NULL, "gpu");
+ 		if (!IS_ERR(gpu_clk))
+@@ -233,8 +245,9 @@ static int rk30_cpu_init(struct cpufreq_policy *policy)
+ 		ddr_clk = clk_get(NULL, "ddr");
+ 		if (!IS_ERR(ddr_clk))
+ 		{
++			dvfs_clk_register_set_rate_callback(ddr_clk, ddr_scale_rate_for_dvfs);
+ 			clk_enable_dvfs(ddr_clk);
+-			clk_set_rate(ddr_clk,clk_get_rate(ddr_clk)-1);
++			//clk_set_rate(ddr_clk,clk_get_rate(ddr_clk)-1);
+ 		}
+ 		
+ 		cpu_clk = clk_get(NULL, "cpu");
+diff --git a/arch/arm/mach-rk30/ddr.c b/arch/arm/mach-rk30/ddr.c
+old mode 100755
+new mode 100644
+index 970cbec38934..ad62e0dcc981
+--- a/arch/arm/mach-rk30/ddr.c
++++ b/arch/arm/mach-rk30/ddr.c
+@@ -2978,7 +2978,6 @@ uint32_t __sramfunc ddr_change_freq(uint32_t nMHz)
+     DDR_RESTORE_SP(save_sp);
+     local_fiq_enable();
+     local_irq_restore(flags);
+-    clk_set_rate(clk_get(NULL, "ddr_pll"), 0);
+     return ret;
+ }
+ 
+@@ -3221,6 +3220,7 @@ int ddr_init(uint32_t dram_speed_bin, uint32_t freq)
+     ddr_adjust_config(mem_type);
+ 
+     value=ddr_change_freq(freq);
++    clk_set_rate(clk_get(NULL, "ddr_pll"), 0);
+     ddr_print("init success!!! freq=%dMHz\n", value);
+ 
+     for(value=0;value<4;value++)
+diff --git a/arch/arm/mach-rk30/ddr_freq.c b/arch/arm/mach-rk30/ddr_freq.c
+old mode 100755
+new mode 100644
+index c0a40c12790c..c81af12621eb
+--- a/arch/arm/mach-rk30/ddr_freq.c
++++ b/arch/arm/mach-rk30/ddr_freq.c
+@@ -4,82 +4,132 @@
+ #include <linux/slab.h>
+ #include <linux/cpu.h>
+ #include <linux/delay.h>
++#include <linux/clk.h>
+ 
+ #define ddr_print(x...) printk( "DDR DEBUG: " x )
+ 
+-struct ddr{
+-    int suspend;
+-    struct early_suspend	early_suspend;
++struct ddr {
++	int suspend;
++	struct early_suspend early_suspend;
++	struct clk *ddr_pll;
+ };
+-struct ddr *ddr = NULL;
++
++static void ddr_early_suspend(struct early_suspend *h);
++static void ddr_late_resume(struct early_suspend *h);
++
++static struct ddr ddr = {
++	.early_suspend = {
++		.suspend = ddr_early_suspend,
++		.resume = ddr_late_resume,
++		.level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 50,
++	},
++};
++
++static volatile bool __sramdata cpu1_pause;
++static inline bool is_cpu1_paused(void) { smp_rmb(); return cpu1_pause; }
++static inline void set_cpu1_pause(bool pause) { cpu1_pause = pause; smp_wmb(); }
++#define MAX_TIMEOUT (16000000UL << 6) //>0.64s
++
++static void __ddr_change_freq(void *info)
++{
++	uint32_t *value = info;
++	u32 timeout = MAX_TIMEOUT;
++
++	while (!is_cpu1_paused() && --timeout);
++	if (timeout == 0)
++		return;
++
++	*value = ddr_change_freq(*value);
++
++	set_cpu1_pause(false);
++}
++
++/* Do not use stack, safe on SMP */
++static void __sramfunc pause_cpu1(void *info)
++{
++	u32 timeout = MAX_TIMEOUT;
++	unsigned long flags;
++	local_irq_save(flags);
++
++	set_cpu1_pause(true);
++	while (is_cpu1_paused() && --timeout);
++
++	local_irq_restore(flags);
++}
++
++static uint32_t _ddr_change_freq(uint32_t nMHz)
++{
++	int this_cpu = get_cpu();
++
++	set_cpu1_pause(false);
++	if (this_cpu == 0) {
++		if (smp_call_function_single(1, (smp_call_func_t)pause_cpu1, NULL, 0) == 0) {
++			u32 timeout = MAX_TIMEOUT;
++			while (!is_cpu1_paused() && --timeout);
++			if (timeout == 0)
++				goto out;
++		}
++
++		nMHz = ddr_change_freq(nMHz);
++
++		set_cpu1_pause(false);
++	} else {
++		smp_call_function_single(0, __ddr_change_freq, &nMHz, 0);
++
++		pause_cpu1(NULL);
++	}
++
++	clk_set_rate(ddr.ddr_pll, 0);
++out:
++	put_cpu();
++
++	return nMHz;
++}
++
++uint32_t ddr_set_rate(uint32_t nMHz)
++{
++	_ddr_change_freq(nMHz);
++	return 0;
++}
++
+ 
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ static void ddr_early_suspend(struct early_suspend *h)
+ {
+-
+     uint32_t value;
+-    bool cpu1_online;
+ 
+     //Enable auto self refresh  0x01*32 DDR clk cycle
+     ddr_set_auto_self_refresh(true);
+-    
+-    cpu1_online = cpu_online(1);
+-    if(cpu1_online)
+-        cpu_down(1);
+ 
+-    value=ddr_change_freq(100);
++    value = _ddr_change_freq(100);
+ 
+-    if(cpu1_online)
+-        cpu_up(1);
+     ddr_print("init success!!! freq=%dMHz\n", value);
+ 
+     return;
+ }
+ 
+-static void ddr_early_resume(struct early_suspend *h)
++static void ddr_late_resume(struct early_suspend *h)
+ {
+-
+     uint32_t value;
+-    bool cpu1_online;
+ 
+     //Disable auto self refresh
+     ddr_set_auto_self_refresh(false);
+ 
+-    cpu1_online = cpu_online(1);
+-    if(cpu1_online)
+-        cpu_down(1);
++    value = _ddr_change_freq(DDR_FREQ);
+ 
+-    value=ddr_change_freq(DDR_FREQ);
+-
+-    if(cpu1_online)
+-        cpu_up(1);
+     ddr_print("init success!!! freq=%dMHz\n", value);
+ 
+     return;
+ }
+-#endif
+-
+ 
+ static int rk30_ddr_late_init (void)
+ {
+-
+-    ddr = kmalloc(sizeof(struct ddr), GFP_KERNEL);
+-    if(!ddr)
+-    {
+-        ddr_print("%s: kmalloc fail!\n",__FUNCTION__);
+-        return -ENOMEM;
+-    }
+-    memset(ddr, 0, sizeof(struct ddr));
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-    ddr->early_suspend.suspend = ddr_early_suspend;
+-    ddr->early_suspend.resume = ddr_early_resume;
+-    ddr->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB + 50;
+-    register_early_suspend(&ddr->early_suspend);
+-#endif	
++    ddr.ddr_pll = clk_get(NULL, "ddr_pll");
++    register_early_suspend(&ddr.early_suspend);
+     return 0;
+ }
+ late_initcall(rk30_ddr_late_init);
+-
++#endif
+ 
+ #ifdef CONFIG_DDR_TEST
+ #include <linux/slab.h>
+diff --git a/arch/arm/mach-rk30/dvfs.c b/arch/arm/mach-rk30/dvfs.c
+index d9c9fa9267df..f1fc2eafe714 100644
+--- a/arch/arm/mach-rk30/dvfs.c
++++ b/arch/arm/mach-rk30/dvfs.c
+@@ -33,6 +33,10 @@
+ #else
+ #define DVFS_DBG(fmt, args...) printk(KERN_DEBUG "DVFS DBG:\t"fmt, ##args)
+ #endif
++
++#define DVFS_SET_VOLT_FAILURE 	1
++#define DVFS_SET_VOLT_SUCCESS	0
++
+ #define DVFS_ERR(fmt, args...) printk(KERN_ERR "DVFS ERR:\t"fmt, ##args)
+ #define DVFS_LOG(fmt, args...) printk(KERN_DEBUG "DVFS LOG:\t"fmt, ##args)
+ 
+@@ -394,6 +398,21 @@ int clk_enable_dvfs(struct clk *clk)
+ 		}
+ #endif
+ 		dvfs_vd_get_newvolt_byclk(dvfs_clk);
++		if(dvfs_clk->vd->cur_volt<dvfs_clk->set_volt)
++		{
++			int ret;
++			mutex_lock(&rk_dvfs_mutex);
++			ret = dvfs_regulator_set_voltage_readback(dvfs_clk->vd->regulator, dvfs_clk->set_volt, dvfs_clk->set_volt);
++			if (ret < 0) {
++				dvfs_clk->vd->volt_set_flag = DVFS_SET_VOLT_FAILURE;
++				dvfs_clk->enable_dvfs = 0;
++				DVFS_ERR("dvfs enable clk %s,set volt error \n", dvfs_clk->name);
++				mutex_unlock(&rk_dvfs_mutex);
++				return -1;
++			}
++			dvfs_clk->vd->volt_set_flag = DVFS_SET_VOLT_SUCCESS;
++			mutex_unlock(&rk_dvfs_mutex);
++		}
+ 		dvfs_clk->enable_dvfs++;
+ 	} else {
+ 		DVFS_ERR("dvfs already enable clk enable = %d!\n", dvfs_clk->enable_dvfs);
+@@ -694,8 +713,7 @@ static int dvfs_set_depend_post(struct clk_node *dvfs_clk, unsigned long rate_ol
+ 	return 0;
+ }
+ #endif
+-#define DVFS_SET_VOLT_FAILURE	1
+-#define DVFS_SET_VOLT_SUCCESS	0
++
+ #define ARM_HIGHER_LOGIC	(150 * 1000)
+ #define LOGIC_HIGHER_ARM	(100 * 1000)
+ 
+@@ -1019,6 +1037,8 @@ int dvfs_target_cpu(struct clk *clk, unsigned long rate_hz)
+ 	/* need round rate */
+ 	rate_old = clk_get_rate(clk);
+ 	rate_new = clk_round_rate_nolock(clk, rate_hz);
++	if(rate_new==rate_old)
++		return 0;
+ 	DVFS_DBG("dvfs(%s) round rate (%lu)(rount %lu) old (%lu)\n", 
+ 			dvfs_clk->name, rate_hz, rate_new, rate_old);
+ 
+@@ -1145,6 +1165,8 @@ int dvfs_target_core(struct clk *clk, unsigned long rate_hz)
+ 	/* need round rate */
+ 	rate_old = clk_get_rate(clk);
+ 	rate_new = clk_round_rate_nolock(clk, rate_hz);
++	if(rate_new==rate_old)
++		return 0;
+ 	DVFS_DBG("dvfs(%s) round rate (%lu)(rount %lu) old (%lu)\n", 
+ 			dvfs_clk->name, rate_hz, rate_new, rate_old);
+ 
+@@ -1270,18 +1292,21 @@ static struct cpufreq_frequency_table dep_cpu2core_table[] = {
+ static struct vd_node vd_cpu = {
+ 	.name 		= "vd_cpu",
+ 	.regulator_name	= "vdd_cpu",
++	.volt_set_flag		=DVFS_SET_VOLT_FAILURE,
+ 	.vd_dvfs_target	= dvfs_target_cpu,
+ };
+ 
+ static struct vd_node vd_core = {
+ 	.name 		= "vd_core",
+ 	.regulator_name = "vdd_core",
++	.volt_set_flag		=DVFS_SET_VOLT_FAILURE,
+ 	.vd_dvfs_target	= dvfs_target_core,
+ };
+ 
+ static struct vd_node vd_rtc = {
+ 	.name 		= "vd_rtc",
+ 	.regulator_name	= "vdd_rtc",
++	.volt_set_flag		=DVFS_SET_VOLT_FAILURE,
+ 	.vd_dvfs_target	= NULL,
+ };
+ 
+diff --git a/arch/arm/mach-rk30/include/mach/ddr.h b/arch/arm/mach-rk30/include/mach/ddr.h
+index b4c8aef5873b..fd733fc54952 100755
+--- a/arch/arm/mach-rk30/include/mach/ddr.h
++++ b/arch/arm/mach-rk30/include/mach/ddr.h
+@@ -149,5 +149,7 @@ void __sramfunc ddr_resume(void);
+ uint32_t __sramfunc ddr_change_freq(uint32_t nMHz);
+ int ddr_init(uint32_t dram_type, uint32_t freq);
+ void ddr_set_auto_self_refresh(bool en);
++uint32_t __sramlocalfunc ddr_set_pll(uint32_t nMHz, uint32_t set);
++
+ 
+ #endif
+diff --git a/arch/arm/mach-rk30/video_state.c b/arch/arm/mach-rk30/video_state.c
+new file mode 100755
+index 000000000000..9e0589bcc73d
+--- /dev/null
++++ b/arch/arm/mach-rk30/video_state.c
+@@ -0,0 +1,161 @@
++/* arch/arm/mach-rk30/video_state.c
++ *
++ * Copyright (C) 2012 ROCKCHIP, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/poll.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/sched.h>
++#include <mach/ddr.h>
++#include <linux/cpu.h>
++#include <linux/clk.h>
++
++
++#ifdef CONFIG_DDR_SDRAM_FREQ
++#define DDR_FREQ          (CONFIG_DDR_SDRAM_FREQ)
++#else
++#define DDR_FREQ 400
++#endif
++
++
++int rk_video_state=0;
++static struct clk * ddr_clk;
++
++
++#define VIDEO_STATE_NAME		"video_state"
++#define BUFFER_SIZE			16
++
++MODULE_AUTHOR("Mike Lockwood <lockwood@android.com>");
++MODULE_DESCRIPTION("Key chord input driver");
++MODULE_SUPPORTED_DEVICE("video_state");
++MODULE_LICENSE("GPL");
++
++/*
++ * video_state_read is used to read video_state events from the driver
++ */
++static ssize_t video_state_read(struct file *file, char __user *buffer,
++		size_t count, loff_t *ppos)
++{
++	return count;
++}
++
++/*
++ * video_state_write is used to configure the driver
++ */
++static ssize_t video_state_write(struct file *file, const char __user *buffer,
++		size_t count, loff_t *ppos)
++{
++	char *parameters= 0;
++	int vedeo_state;
++	int set_rate=0;
++	int set_rate_old=0;
++
++	if(DDR_FREQ<=333)	
++		return count;
++	//if (count < sizeof(struct input_keychord))
++	//	return -EINVAL;
++	parameters = kzalloc(count, GFP_KERNEL);
++	if (!parameters)
++		return -ENOMEM;
++
++	/* read list of keychords from userspace */
++	if (copy_from_user(parameters, buffer, count)) {
++		kfree(parameters);
++		return -EFAULT;
++	}
++	sscanf(parameters, "%d", &vedeo_state);
++
++	//printk("video_state %d\n",vedeo_state);
++	switch(vedeo_state)
++	{
++		case 0:
++			rk_video_state=0;
++			set_rate=DDR_FREQ;
++		break;
++		case 1:
++			rk_video_state=1;
++			set_rate=300;
++		break;
++		default:
++			rk_video_state=0;
++			return -EFAULT;	
++	}
++	set_rate_old=clk_get_rate(ddr_clk);
++	set_rate=clk_round_rate(ddr_clk,set_rate*1000*1000);
++	if(set_rate_old!=set_rate)
++	{
++		clk_set_rate(ddr_clk,set_rate);
++		//printk("ddr rate=%d\n",set_rate/(1000*1000));
++	}	
++	kfree(parameters);
++	return count;
++}
++
++static unsigned int video_state_poll(struct file *file, poll_table *wait)
++{
++	return 0;
++}
++
++static int video_state_open(struct inode *inode, struct file *file)
++{
++
++
++	return 0;
++}
++
++static int video_state_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static const struct file_operations video_state_fops = {
++	.owner		= THIS_MODULE,
++	.open		= video_state_open,
++	.release	= video_state_release,
++	.read		= video_state_read,
++	.write		= video_state_write,
++	.poll		= video_state_poll,
++};
++
++static struct miscdevice video_state = {
++	.fops		= &video_state_fops,
++	.name		= VIDEO_STATE_NAME,
++	.minor		= MISC_DYNAMIC_MINOR,
++};
++
++
++static int __init video_state_init(void)
++{
++	ddr_clk=clk_get(NULL,"ddr");
++	if(IS_ERR(ddr_clk))
++		return -1;
++
++	
++	return misc_register(&video_state);
++}
++
++static void __exit video_state_exit(void)
++{
++	misc_deregister(&video_state);
++}
++
++module_init(video_state_init);
++module_exit(video_state_exit);
++
++
++
+-- 
+2.35.3
+

@@ -1,0 +1,176 @@
+From 29c90bf3e9ee8f8bbdbae84979095a10a7c14ffd Mon Sep 17 00:00:00 2001
+From: Tao Huang <huangtao@rock-chips.com>
+Date: Wed, 17 Feb 2021 19:09:28 +0800
+Subject: [PATCH] PM / devfreq: rockchip_dmc: Introduce
+ rockchip_dmcfreq_lock_nested()
+
+After commit c95036feef04 ("PM / devfreq: rockchip_dmc: Fix deadlock between dmcfreq and vop on/off"),
+rockchip_dmcfreq_sem support down read recursive.
+Try to avoid lockdep warning:
+
+======================================================
+WARNING: possible circular locking dependency detected
+4.19.172 #9 Not tainted
+------------------------------------------------------
+composer@2.1-se/221 is trying to acquire lock:
+00000000a1c9588b (&genpd->mlock){+.+.}, at: genpd_lock_mtx+0x14/0x1c
+
+but task is already holding lock:
+00000000cc938c9c (rockchip_dmcfreq_sem){++++}, at: rockchip_dmcfreq_lock+0x14/0x1c
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #2 (rockchip_dmcfreq_sem){++++}:
+       down_read+0x50/0x94
+       rockchip_dmcfreq_lock+0x14/0x1c
+       rockchip_pd_power+0x3c/0x200
+       rockchip_pd_power_off+0x24/0x2c
+       genpd_power_off+0x168/0x27c
+       genpd_power_off_work_fn+0x34/0x50
+       process_one_work+0x300/0x66c
+       worker_thread+0x238/0x4c0
+       kthread+0x148/0x158
+       ret_from_fork+0x10/0x18
+
+-> #1 (&pmu->mutex){+.+.}:
+       __mutex_lock_common+0xc8/0x1014
+       mutex_lock_nested+0x28/0x30
+       rockchip_pd_power+0x38/0x200
+       rockchip_pd_power_off+0x24/0x2c
+       genpd_power_off+0x168/0x27c
+       genpd_power_off_work_fn+0x34/0x50
+       process_one_work+0x300/0x66c
+       worker_thread+0x238/0x4c0
+       kthread+0x148/0x158
+       ret_from_fork+0x10/0x18
+
+-> #0 (&genpd->mlock){+.+.}:
+       lock_acquire+0x124/0x1ec
+       __mutex_lock_common+0xc8/0x1014
+       mutex_lock_nested+0x28/0x30
+       genpd_lock_mtx+0x14/0x1c
+       genpd_runtime_suspend+0x1d8/0x21c
+       __rpm_callback+0x150/0x24c
+       rpm_suspend+0x278/0x7b0
+       rpm_idle+0x6c/0x444
+       __pm_runtime_idle+0x78/0x9c
+       vop2_crtc_atomic_disable+0x5ac/0x6b4
+       drm_atomic_helper_commit_modeset_disables+0x234/0x440
+       rockchip_atomic_commit_complete+0x140/0x378
+       rockchip_drm_atomic_commit+0x1c4/0x224
+       drm_atomic_connector_commit_dpms+0x110/0x128
+       drm_mode_obj_set_property_ioctl+0x144/0x2b4
+       drm_connector_property_set_ioctl+0x3c/0x60
+       drm_ioctl+0x2c0/0x454
+       do_vfs_ioctl+0x4dc/0x794
+       __arm64_sys_ioctl+0x70/0x98
+       el0_svc_common+0x9c/0x16c
+       el0_svc_handler+0x28/0x60
+       el0_svc+0x8/0xc
+
+other info that might help us debug this:
+
+Chain exists of:
+  &genpd->mlock --> &pmu->mutex --> rockchip_dmcfreq_sem
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(rockchip_dmcfreq_sem);
+                               lock(&pmu->mutex);
+                               lock(rockchip_dmcfreq_sem);
+  lock(&genpd->mlock);
+
+ *** DEADLOCK ***
+
+4 locks held by composer@2.1-se/221:
+ #0: 0000000079852c0e (crtc_ww_class_acquire){+.+.}, at: drm_mode_obj_set_property_ioctl+0xe4/0x2b4
+ #1: 00000000a8d2d1f1 (crtc_ww_class_mutex){+.+.}, at: drm_modeset_backoff+0x118/0x230
+ #2: 000000008d649114 (&vop2->vop2_lock){+.+.}, at: vop2_crtc_atomic_disable+0x3c/0x6b4
+ #3: 00000000cc938c9c (rockchip_dmcfreq_sem){++++}, at: rockchip_dmcfreq_lock+0x14/0x1c
+
+stack backtrace:
+CPU: 0 PID: 221 Comm: composer@2.1-se Not tainted 4.19.172 #9
+Hardware name: Rockchip RK3566 EVB2 LP4X V10 Board (DT)
+Call trace:
+ dump_backtrace+0x0/0x160
+ show_stack+0x14/0x1c
+ dump_stack+0xd8/0x128
+ print_circular_bug+0x580/0x588
+ __lock_acquire+0x1bc4/0x1bd0
+ lock_acquire+0x124/0x1ec
+ __mutex_lock_common+0xc8/0x1014
+ mutex_lock_nested+0x28/0x30
+ genpd_lock_mtx+0x14/0x1c
+ genpd_runtime_suspend+0x1d8/0x21c
+ __rpm_callback+0x150/0x24c
+ rpm_suspend+0x278/0x7b0
+ rpm_idle+0x6c/0x444
+ __pm_runtime_idle+0x78/0x9c
+ vop2_crtc_atomic_disable+0x5ac/0x6b4
+ drm_atomic_helper_commit_modeset_disables+0x234/0x440
+ rockchip_atomic_commit_complete+0x140/0x378
+ rockchip_drm_atomic_commit+0x1c4/0x224
+ drm_atomic_connector_commit_dpms+0x110/0x128
+ drm_mode_obj_set_property_ioctl+0x144/0x2b4
+ drm_connector_property_set_ioctl+0x3c/0x60
+ drm_ioctl+0x2c0/0x454
+ do_vfs_ioctl+0x4dc/0x794
+ __arm64_sys_ioctl+0x70/0x98
+ el0_svc_common+0x9c/0x16c
+ el0_svc_handler+0x28/0x60
+ el0_svc+0x8/0xc
+
+Signed-off-by: Tao Huang <huangtao@rock-chips.com>
+Change-Id: Ic743189e335b0e9ae7fed9c3d542bf1d57f5d33a
+---
+ drivers/devfreq/rockchip_dmc.c      | 6 ++++++
+ include/soc/rockchip/rockchip_dmc.h | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/devfreq/rockchip_dmc.c b/drivers/devfreq/rockchip_dmc.c
+index abce67b26bfe..f6990f1df586 100644
+--- a/drivers/devfreq/rockchip_dmc.c
++++ b/drivers/devfreq/rockchip_dmc.c
+@@ -186,6 +186,12 @@ void rockchip_dmcfreq_lock(void)
+ }
+ EXPORT_SYMBOL(rockchip_dmcfreq_lock);
+ 
++void rockchip_dmcfreq_lock_nested(void)
++{
++	down_read_nested(&rockchip_dmcfreq_sem, SINGLE_DEPTH_NESTING);
++}
++EXPORT_SYMBOL(rockchip_dmcfreq_lock_nested);
++
+ void rockchip_dmcfreq_unlock(void)
+ {
+ 	up_read(&rockchip_dmcfreq_sem);
+diff --git a/include/soc/rockchip/rockchip_dmc.h b/include/soc/rockchip/rockchip_dmc.h
+index a73d30240172..b2a74003bd3c 100644
+--- a/include/soc/rockchip/rockchip_dmc.h
++++ b/include/soc/rockchip/rockchip_dmc.h
+@@ -33,6 +33,7 @@
+ 
+ #ifdef CONFIG_ARM_ROCKCHIP_DMC_DEVFREQ
+ void rockchip_dmcfreq_lock(void);
++void rockchip_dmcfreq_lock_nested(void);
+ void rockchip_dmcfreq_unlock(void);
+ int rockchip_dmcfreq_wait_complete(void);
+ int rockchip_dmcfreq_vop_bandwidth_request(struct devfreq *devfreq,
+@@ -46,6 +47,10 @@ static inline void rockchip_dmcfreq_lock(void)
+ {
+ }
+ 
++static inline void rockchip_dmcfreq_lock_nested(void)
++{
++}
++
+ static inline void rockchip_dmcfreq_unlock(void)
+ {
+ }
+-- 
+2.35.3
+

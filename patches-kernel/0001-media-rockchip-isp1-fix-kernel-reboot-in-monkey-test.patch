@@ -1,0 +1,196 @@
+From a44dd078a27d6d32f503aef6d99761cb01fa9ab0 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Mon, 27 May 2019 10:07:16 +0800
+Subject: [PATCH] media: rockchip: isp1: fix kernel reboot in monkey test
+
+1. use the same mutex to serialize the calls from user application.
+2. keep iommu attached state when last video is closed,
+because the user application may still access the buffer allocated
+ by v4l2 driver.
+
+Change-Id: I667a42a07672e5d30cc4383e9f54388fe1b91f1c
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp1/capture.c    | 8 ++++----
+ drivers/media/platform/rockchip/isp1/common.h     | 2 --
+ drivers/media/platform/rockchip/isp1/dev.c        | 1 +
+ drivers/media/platform/rockchip/isp1/dev.h        | 1 +
+ drivers/media/platform/rockchip/isp1/dmarx.c      | 5 ++---
+ drivers/media/platform/rockchip/isp1/isp_params.c | 5 ++---
+ drivers/media/platform/rockchip/isp1/isp_stats.c  | 5 ++---
+ 7 files changed, 12 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index 95b2354f1669..72cd55783af5 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -943,6 +943,7 @@ static int raw_config_mi(struct rkisp1_stream *stream)
+ 
+ 		in_size = raw->out_fmt.plane_fmt[0].sizeimage;
+ 	}
++
+ 	dmatx0_set_pic_size(base, in_frm->width, in_frm->height);
+ 	dmatx0_set_pic_off(base, 0);
+ 	dmatx0_ctrl(base,
+@@ -1591,7 +1592,7 @@ static int rkisp_init_vb2_queue(struct vb2_queue *q,
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->min_buffers_needed = CIF_ISP_REQ_BUFS_MIN;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &node->vlock;
++	q->lock = &stream->ispdev->apilock;
+ 	q->dev = stream->ispdev->dev;
+ 
+ 	return vb2_queue_init(q);
+@@ -1726,7 +1727,7 @@ int rkisp1_fop_release(struct file *file)
+ 	int ret;
+ 
+ 	ret = v4l2_pipeline_pm_use(&stream->vnode.vdev.entity, 0);
+-	ret = vb2_fop_release(file);
++	ret |= vb2_fop_release(file);
+ 	atomic_dec(&dev->open_cnt);
+ 
+ 	return ret;
+@@ -2037,14 +2038,13 @@ static int rkisp1_register_stream_vdev(struct rkisp1_stream *stream)
+ 	}
+ 	strlcpy(vdev->name, vdev_name, sizeof(vdev->name));
+ 	node = vdev_to_node(vdev);
+-	mutex_init(&node->vlock);
+ 
+ 	vdev->ioctl_ops = &rkisp1_v4l2_ioctl_ops;
+ 	vdev->release = video_device_release_empty;
+ 	vdev->fops = &rkisp1_fops;
+ 	vdev->minor = -1;
+ 	vdev->v4l2_dev = v4l2_dev;
+-	vdev->lock = &node->vlock;
++	vdev->lock = &dev->apilock;
+ 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE |
+ 				V4L2_CAP_STREAMING;
+ 	video_set_drvdata(vdev, stream);
+diff --git a/drivers/media/platform/rockchip/isp1/common.h b/drivers/media/platform/rockchip/isp1/common.h
+index 6b002d70e1c0..f20a0829c96c 100644
+--- a/drivers/media/platform/rockchip/isp1/common.h
++++ b/drivers/media/platform/rockchip/isp1/common.h
+@@ -71,8 +71,6 @@ enum rkisp1_sd_type {
+ /* One structure per video node */
+ struct rkisp1_vdev_node {
+ 	struct vb2_queue buf_queue;
+-	/* vfd lock */
+-	struct mutex vlock;
+ 	struct video_device vdev;
+ 	struct media_pad pad;
+ };
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 77dbb1ffef5e..76f0df7294ee 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -1054,6 +1054,7 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 	isp_dev->clk_rate_tbl = match_data->clk_rate_tbl;
+ 	isp_dev->num_clk_rate_tbl = match_data->num_clk_rate_tbl;
+ 
++	mutex_init(&isp_dev->apilock);
+ 	atomic_set(&isp_dev->pipe.power_cnt, 0);
+ 	atomic_set(&isp_dev->pipe.stream_cnt, 0);
+ 	atomic_set(&isp_dev->open_cnt, 0);
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index d6c8d68f2060..66e585f1d7af 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -164,6 +164,7 @@ struct rkisp1_device {
+ 	enum rkisp1_isp_state isp_state;
+ 	unsigned int isp_err_cnt;
+ 	enum rkisp1_isp_inp isp_inp;
++	struct mutex apilock; /* mutex to serialize the calls from user */
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/dmarx.c b/drivers/media/platform/rockchip/isp1/dmarx.c
+index 09121883c5c8..07e27954e36e 100644
+--- a/drivers/media/platform/rockchip/isp1/dmarx.c
++++ b/drivers/media/platform/rockchip/isp1/dmarx.c
+@@ -395,7 +395,7 @@ static int rkisp_init_vb2_queue(struct vb2_queue *q,
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->min_buffers_needed = CIF_ISP_REQ_BUFS_MIN;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &node->vlock;
++	q->lock = &stream->ispdev->apilock;
+ 
+ 	return vb2_queue_init(q);
+ }
+@@ -586,13 +586,12 @@ static int rkisp1_register_dmarx_video(struct rkisp1_stream *stream)
+ 	int ret = 0;
+ 
+ 	node = vdev_to_node(vdev);
+-	mutex_init(&node->vlock);
+ 
+ 	vdev->release = video_device_release_empty;
+ 	vdev->fops = &rkisp1_fops;
+ 	vdev->minor = -1;
+ 	vdev->v4l2_dev = v4l2_dev;
+-	vdev->lock = &node->vlock;
++	vdev->lock = &dev->apilock;
+ 	video_set_drvdata(vdev, stream);
+ 
+ 	vdev->ioctl_ops = &rkisp1_dmarx_ioctl;
+diff --git a/drivers/media/platform/rockchip/isp1/isp_params.c b/drivers/media/platform/rockchip/isp1/isp_params.c
+index 3e74938894fa..3052302741d4 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_params.c
++++ b/drivers/media/platform/rockchip/isp1/isp_params.c
+@@ -2556,7 +2556,7 @@ rkisp1_params_init_vb2_queue(struct vb2_queue *q,
+ 	q->mem_ops = &vb2_vmalloc_memops;
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &node->vlock;
++	q->lock = &params_vdev->dev->apilock;
+ 	q->dev = params_vdev->dev->dev;
+ 
+ 	return vb2_queue_init(q);
+@@ -2588,7 +2588,6 @@ int rkisp1_register_params_vdev(struct rkisp1_isp_params_vdev *params_vdev,
+ 	struct video_device *vdev = &node->vdev;
+ 
+ 	params_vdev->dev = dev;
+-	mutex_init(&node->vlock);
+ 	spin_lock_init(&params_vdev->config_lock);
+ 
+ 	strlcpy(vdev->name, "rkisp1-input-params", sizeof(vdev->name));
+@@ -2601,7 +2600,7 @@ int rkisp1_register_params_vdev(struct rkisp1_isp_params_vdev *params_vdev,
+ 	 * Provide a mutex to v4l2 core. It will be used
+ 	 * to protect all fops and v4l2 ioctls.
+ 	 */
+-	vdev->lock = &node->vlock;
++	vdev->lock = &dev->apilock;
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	vdev->queue = &node->buf_queue;
+ 	vdev->device_caps = V4L2_CAP_STREAMING | V4L2_CAP_META_OUTPUT;
+diff --git a/drivers/media/platform/rockchip/isp1/isp_stats.c b/drivers/media/platform/rockchip/isp1/isp_stats.c
+index b7d17f8a792a..bbc4d99a400c 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_stats.c
++++ b/drivers/media/platform/rockchip/isp1/isp_stats.c
+@@ -211,7 +211,7 @@ static int rkisp1_stats_init_vb2_queue(struct vb2_queue *q,
+ 	q->mem_ops = &vb2_vmalloc_memops;
+ 	q->buf_struct_size = sizeof(struct rkisp1_buffer);
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->lock = &node->vlock;
++	q->lock = &stats_vdev->dev->apilock;
+ 	q->dev = stats_vdev->dev->dev;
+ 
+ 	return vb2_queue_init(q);
+@@ -620,7 +620,6 @@ int rkisp1_register_stats_vdev(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	struct video_device *vdev = &node->vdev;
+ 
+ 	stats_vdev->dev = dev;
+-	mutex_init(&node->vlock);
+ 	INIT_LIST_HEAD(&stats_vdev->stat);
+ 	spin_lock_init(&stats_vdev->irq_lock);
+ 	spin_lock_init(&stats_vdev->rd_lock);
+@@ -631,7 +630,7 @@ int rkisp1_register_stats_vdev(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	vdev->ioctl_ops = &rkisp1_stats_ioctl;
+ 	vdev->fops = &rkisp1_stats_fops;
+ 	vdev->release = video_device_release_empty;
+-	vdev->lock = &node->vlock;
++	vdev->lock = &dev->apilock;
+ 	vdev->v4l2_dev = v4l2_dev;
+ 	vdev->queue = &node->buf_queue;
+ 	vdev->device_caps = V4L2_CAP_META_CAPTURE | V4L2_CAP_STREAMING;
+-- 
+2.35.3
+

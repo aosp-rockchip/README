@@ -1,0 +1,82 @@
+From b618612b8852284f4c5b8a8be1c0c9afbf63c3b6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Fri, 24 Aug 2012 17:19:18 +0800
+Subject: [PATCH] rga: fix deadlock issue between rga_power_on and
+ rga_power_off_work
+
+Fix this deadlock by call mutex_trylock on rga_power_off_work:
+
+SurfaceFlinger  D c086ec20     0   247      1 0x00000001
+[<c086ec20>] (__schedule+0x6d0/0x79c) from [<c086f110>] (schedule_timeout+0x1c/0x208)
+[<c086f110>] (schedule_timeout+0x1c/0x208) from [<c086e36c>] (wait_for_common+0xdc/0x178)
+[<c086e36c>] (wait_for_common+0xdc/0x178) from [<c04773b8>] (wait_on_work+0xf0/0x158)
+[<c04773b8>] (wait_on_work+0xf0/0x158) from [<c0477d30>] (__cancel_work_timer+0xb8/0x104)
+[<c0477d30>] (__cancel_work_timer+0xb8/0x104) from [<c05ca548>] (rga_try_set_reg+0x38/0x270)
+[<c05ca548>] (rga_try_set_reg+0x38/0x270) from [<c05cafc4>] (rga_blit+0x3b4/0x3fc)
+[<c05cafc4>] (rga_blit+0x3b4/0x3fc) from [<c05cb29c>] (rga_ioctl+0x154/0x374)
+[<c05cb29c>] (rga_ioctl+0x154/0x374) from [<c04e3480>] (do_vfs_ioctl+0x500/0x57c)
+[<c04e3480>] (do_vfs_ioctl+0x500/0x57c) from [<c04e3530>] (sys_ioctl+0x34/0x54)
+[<c04e3530>] (sys_ioctl+0x34/0x54) from [<c0435c80>] (ret_fast_syscall+0x0/0x30)
+kworker/1:1     D c086ec20     0  7718      2 0x00000000
+[<c086ec20>] (__schedule+0x6d0/0x79c) from [<c086f784>] (__mutex_lock_slowpath+0x158/0x1d8)
+[<c086f784>] (__mutex_lock_slowpath+0x158/0x1d8) from [<c086f824>] (mutex_lock+0x20/0x38)
+[<c086f824>] (mutex_lock+0x20/0x38) from [<c05ca920>] (rga_power_off_work+0x10/0x24)
+[<c05ca920>] (rga_power_off_work+0x10/0x24) from [<c0475d74>] (process_one_work+0x250/0x3ac)
+[<c0475d74>] (process_one_work+0x250/0x3ac) from [<c04762b4>] (worker_thread+0x228/0x3e8)
+[<c04762b4>] (worker_thread+0x228/0x3e8) from [<c047bc18>] (kthread+0x80/0x88)
+[<c047bc18>] (kthread+0x80/0x88) from [<c0436678>] (kernel_thread_exit+0x0/0x8)
+
+Also do not call cancel_delayed_work_sync every time.
+---
+ drivers/video/rockchip/rga/rga_drv.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/video/rockchip/rga/rga_drv.c b/drivers/video/rockchip/rga/rga_drv.c
+index 6bf2399a59b8..555647126dff 100755
+--- a/drivers/video/rockchip/rga/rga_drv.c
++++ b/drivers/video/rockchip/rga/rga_drv.c
+@@ -210,11 +210,22 @@ static void rga_dump(void)
+ 	}
+ }
+ 
++static inline void rga_queue_power_off_work(void)
++{
++	queue_delayed_work(system_nrt_wq, &drvdata->power_off_work, RGA_POWER_OFF_DELAY);
++}
++
+ /* Caller must hold rga_service.lock */
+ static void rga_power_on(void)
+ {
+-	cancel_delayed_work_sync(&drvdata->power_off_work);
+-	queue_delayed_work(system_nrt_wq, &drvdata->power_off_work, RGA_POWER_OFF_DELAY);
++	static ktime_t last;
++	ktime_t now = ktime_get();
++
++	if (ktime_to_ns(ktime_sub(now, last)) > NSEC_PER_SEC) {
++		cancel_delayed_work_sync(&drvdata->power_off_work);
++		rga_queue_power_off_work();
++		last = now;
++	}
+ 	if (rga_service.enable)
+ 		return;
+ 
+@@ -251,9 +262,13 @@ static void rga_power_off(void)
+ 
+ static void rga_power_off_work(struct work_struct *work)
+ {
+-	mutex_lock(&rga_service.lock);
+-	rga_power_off();
+-	mutex_unlock(&rga_service.lock);
++	if (mutex_trylock(&rga_service.lock)) {
++		rga_power_off();
++		mutex_unlock(&rga_service.lock);
++	} else {
++		/* Come back later if the device is busy... */
++		rga_queue_power_off_work();
++	}
+ }
+ 
+ static int rga_flush(rga_session *session, unsigned long arg)
+-- 
+2.35.3
+

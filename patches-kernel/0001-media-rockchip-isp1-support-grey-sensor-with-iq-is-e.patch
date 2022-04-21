@@ -1,0 +1,192 @@
+From 72e4ba0ccf477a6d90f40a2fb5e3bc9e5025093b Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Thu, 27 Sep 2018 09:54:05 +0800
+Subject: [PATCH] media: rockchip: isp1: support grey sensor with iq is enabled
+
+The data path of grey sensor in ISP is as follows,
+grey sensor(input format: Y8/Y10/Y12)
+ ->
+rockchip-sy-mipi-dphy(output format: RAW8/RAW10/RAW12)
+ ->
+rkisp1-isp-subdev(output format: YUV422,
+		  in RGB Bayer Mode with demosaicing disable)
+ ->
+video0(MP)/video1(SP) (output format: all support format)
+
+Change-Id: I33cc9760739f9430ff51288597d1300fa3f51a25
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 31 ++++++++++---------
+ .../media/platform/rockchip/isp1/isp_params.c | 14 +++++++++
+ .../media/platform/rockchip/isp1/isp_params.h |  1 +
+ drivers/media/platform/rockchip/isp1/rkisp1.c | 29 +++++++++++++++--
+ 4 files changed, 59 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index db69956037d4..b998c17e637a 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -138,9 +138,10 @@ static int mbus_code_xysubs(u32 code, u32 *xsubs, u32 *ysubs)
+ 	return 0;
+ }
+ 
+-static int mbus_code_sp_in_fmt(u32 code, u32 *format)
++static int mbus_code_sp_in_fmt(u32 in_mbus_code, u32 out_fourcc,
++			       u32 *format)
+ {
+-	switch (code) {
++	switch (in_mbus_code) {
+ 	case MEDIA_BUS_FMT_YUYV8_2X8:
+ 		*format = MI_CTRL_SP_INPUT_YUV422;
+ 		break;
+@@ -148,6 +149,16 @@ static int mbus_code_sp_in_fmt(u32 code, u32 *format)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Only SP can support output format of YCbCr4:0:0,
++	 * and the input format of SP must be YCbCr4:0:0
++	 * when outputting YCbCr4:0:0.
++	 * The output format of isp is YCbCr4:2:2,
++	 * so the CbCr data is discarded here.
++	 */
++	if (out_fourcc == V4L2_PIX_FMT_GREY)
++		*format = MI_CTRL_SP_INPUT_YUV400;
++
+ 	return 0;
+ }
+ 
+@@ -270,16 +281,6 @@ static const struct capture_fmt mp_fmts[] = {
+ 		.uv_swap = 0,
+ 		.write_format = MI_CTRL_MP_WRITE_YUV_PLA_OR_RAW8,
+ 	},
+-	/* yuv400 */
+-	{
+-		.fourcc = V4L2_PIX_FMT_GREY,
+-		.fmt_type = FMT_YUV,
+-		.bpp = { 8 },
+-		.cplanes = 1,
+-		.mplanes = 1,
+-		.uv_swap = 0,
+-		.write_format = MI_CTRL_MP_WRITE_YUVINT,
+-	},
+ 	/* raw */
+ 	{
+ 		.fourcc = V4L2_PIX_FMT_SRGGB8,
+@@ -497,7 +498,7 @@ static const struct capture_fmt sp_fmts[] = {
+ 		.cplanes = 1,
+ 		.mplanes = 1,
+ 		.uv_swap = 0,
+-		.write_format = MI_CTRL_SP_WRITE_INT,
++		.write_format = MI_CTRL_SP_WRITE_PLA,
+ 		.output_format = MI_CTRL_SP_OUTPUT_YUV400,
+ 	},
+ 	/* rgb */
+@@ -835,10 +836,12 @@ static int sp_config_mi(struct rkisp1_stream *stream)
+ 			rkisp1_get_ispsd_out_fmt(&dev->isp_sdev);
+ 	u32 sp_in_fmt;
+ 
+-	if (mbus_code_sp_in_fmt(input_isp_fmt->mbus_code, &sp_in_fmt)) {
++	if (mbus_code_sp_in_fmt(input_isp_fmt->mbus_code,
++				output_isp_fmt->fourcc, &sp_in_fmt)) {
+ 		v4l2_err(&dev->v4l2_dev, "Can't find the input format\n");
+ 		return -EINVAL;
+ 	}
++
+        /*
+ 	* NOTE: plane_fmt[0].sizeimage is total size of all planes for single
+ 	* memory plane formats, so calculate the size explicitly.
+diff --git a/drivers/media/platform/rockchip/isp1/isp_params.c b/drivers/media/platform/rockchip/isp1/isp_params.c
+index 66cb4e1ba48c..c1bdda7caf0c 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_params.c
++++ b/drivers/media/platform/rockchip/isp1/isp_params.c
+@@ -1705,6 +1705,19 @@ void rkisp1_params_config_parameter(struct rkisp1_isp_params_vdev *params_vdev)
+ 	else
+ 		ops->csm_config(params_vdev, false);
+ 
++	/* disable color related config for grey sensor */
++	if (params_vdev->in_mbus_code == MEDIA_BUS_FMT_Y8_1X8 ||
++	    params_vdev->in_mbus_code == MEDIA_BUS_FMT_Y10_1X10 ||
++	    params_vdev->in_mbus_code == MEDIA_BUS_FMT_Y12_1X12) {
++		ops->ctk_enable(params_vdev, false);
++		isp_param_clear_bits(params_vdev,
++				     CIF_ISP_CTRL,
++				     CIF_ISP_CTRL_ISP_AWB_ENA);
++		isp_param_clear_bits(params_vdev,
++				     CIF_ISP_LSC_CTRL,
++				     CIF_ISP_LSC_CTRL_ENA);
++	}
++
+ 	/* override the default things */
+ 	__isp_isr_other_config(params_vdev, &params_vdev->cur_params);
+ 	__isp_isr_meas_config(params_vdev, &params_vdev->cur_params);
+@@ -1719,6 +1732,7 @@ void rkisp1_params_configure_isp(struct rkisp1_isp_params_vdev *params_vdev,
+ {
+ 	params_vdev->quantization = quantization;
+ 	params_vdev->raw_type = in_fmt->bayer_pat;
++	params_vdev->in_mbus_code = in_fmt->mbus_code;
+ 	rkisp1_params_config_parameter(params_vdev);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/isp_params.h b/drivers/media/platform/rockchip/isp1/isp_params.h
+index efea6567bded..ca0f1fd544c9 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_params.h
++++ b/drivers/media/platform/rockchip/isp1/isp_params.h
+@@ -113,6 +113,7 @@ struct rkisp1_isp_params_vdev {
+ 
+ 	enum v4l2_quantization quantization;
+ 	enum rkisp1_fmt_raw_pat_type raw_type;
++	u32 in_mbus_code;
+ 
+ 	struct rkisp1_isp_params_ops *ops;
+ 	struct rkisp1_isp_params_config *config;
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index 77b3aef2bc1d..cd7e4aef2ce3 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -174,8 +174,15 @@ static int rkisp1_config_isp(struct rkisp1_device *dev)
+ 				isp_ctrl =
+ 					CIF_ISP_CTRL_ISP_MODE_RAW_PICT;
+ 		} else {
+-			writel(CIF_ISP_DEMOSAIC_TH(0xc),
+-			       base + CIF_ISP_DEMOSAIC);
++			/* demosaicing bypass for grey sensor */
++			if (in_fmt->mbus_code == MEDIA_BUS_FMT_Y8_1X8 ||
++			    in_fmt->mbus_code == MEDIA_BUS_FMT_Y10_1X10 ||
++			    in_fmt->mbus_code == MEDIA_BUS_FMT_Y12_1X12)
++				writel(CIF_ISP_DEMOSAIC_TH(0x40c),
++				       base + CIF_ISP_DEMOSAIC);
++			else
++				writel(CIF_ISP_DEMOSAIC_TH(0xc),
++				       base + CIF_ISP_DEMOSAIC);
+ 
+ 			if (sensor->mbus.type == V4L2_MBUS_BT656)
+ 				isp_ctrl = CIF_ISP_CTRL_ISP_MODE_BAYER_ITU656;
+@@ -656,6 +663,24 @@ static const struct ispsd_in_fmt rkisp1_isp_input_formats[] = {
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CRYCBY,
+ 		.bus_width	= 12,
++	}, {
++		.mbus_code	= MEDIA_BUS_FMT_Y8_1X8,
++		.fmt_type	= FMT_BAYER,
++		.mipi_dt	= CIF_CSI2_DT_RAW8,
++		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
++		.bus_width	= 8,
++	}, {
++		.mbus_code	= MEDIA_BUS_FMT_Y10_1X10,
++		.fmt_type	= FMT_BAYER,
++		.mipi_dt	= CIF_CSI2_DT_RAW10,
++		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
++		.bus_width	= 10,
++	}, {
++		.mbus_code	= MEDIA_BUS_FMT_Y12_1X12,
++		.fmt_type	= FMT_BAYER,
++		.mipi_dt	= CIF_CSI2_DT_RAW12,
++		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
++		.bus_width	= 12,
+ 	}
+ };
+ 
+-- 
+2.35.3
+

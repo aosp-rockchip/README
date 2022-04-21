@@ -1,0 +1,543 @@
+From 4e985204d062871a6e30fe54722f886e4f22baf3 Mon Sep 17 00:00:00 2001
+From: Grey Li <grey.li@rock-chips.com>
+Date: Thu, 5 Dec 2019 09:26:13 +0800
+Subject: [PATCH] video: rockchip: mpp: add reset group for shared reset clk
+
+1. Put the same reset clk in same group to make sure these clk can only
+   use devm_reset_control_get get once. Otherwise, devm_reset_control_get
+   will be fail.
+
+2. Add rw_semaphore to avoid shared clk reset when other running.
+
+Change-Id: Ifd0f1137ac82fdfef9e99bc3501c8dc8c1e1b7dd
+Signed-off-by: Grey Li <grey.li@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c  | 164 +++++++++++++++++++----
+ drivers/video/rockchip/mpp/mpp_common.h  |  26 +++-
+ drivers/video/rockchip/mpp/mpp_rkvdec.c  |  12 +-
+ drivers/video/rockchip/mpp/mpp_service.c |  33 ++++-
+ drivers/video/rockchip/mpp/mpp_vdpu1.c   |   4 +-
+ drivers/video/rockchip/mpp/mpp_vdpu2.c   |   4 +-
+ drivers/video/rockchip/mpp/mpp_vepu1.c   |   4 +-
+ drivers/video/rockchip/mpp/mpp_vepu2.c   |   4 +-
+ 8 files changed, 199 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index ce2bc906dbc4..63e14f52032a 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -286,6 +286,85 @@ static int mpp_refresh_pm_runtime(struct device *dev)
+ 	return 0;
+ }
+ 
++struct reset_control *
++mpp_reset_control_get(struct mpp_dev *mpp, const char *name)
++{
++	struct mpp_reset_clk *rst_clk = NULL, *n;
++	struct reset_control *clk = NULL;
++	struct device *dev = mpp->dev;
++	char shared_name[30] = "shared_";
++	int index = 0;
++	int clk_cnt = 0, i = 0;
++	static const char * const clk_list[] = {
++		"video_a", "video_h",
++		"niu_a", "niu_h",
++		"video_cabac", "video_core",
++	};
++
++	if (!name) {
++		mpp_err("error: reset clk name is null\n");
++		return NULL;
++	}
++
++	clk_cnt = ARRAY_SIZE(clk_list);
++	for (i = 0; i < clk_cnt; i++) {
++		if (!strcmp(clk_list[i], name))
++			break;
++	}
++	if (i == clk_cnt) {
++		mpp_err("error: reset clk name is error\n");
++		return NULL;
++	}
++
++	if (!dev) {
++		mpp_err("error: dev is null\n");
++		return NULL;
++	}
++
++	/* not shared reset clk */
++	index = of_property_match_string(dev->of_node, "reset-names", name);
++	if (index >= 0) {
++		clk = devm_reset_control_get(dev, name);
++		return clk;
++	}
++
++	/* shared reset clk */
++	strncat(shared_name, name,
++		sizeof(shared_name) - strlen(shared_name) - 1);
++	index = of_property_match_string(dev->of_node, "reset-names",
++					 shared_name);
++	if (index >= 0) {
++		down_write(&mpp->reset_group->rw_sem);
++		list_for_each_entry_safe(rst_clk, n,
++					 &mpp->reset_group->clk, link) {
++			if (!strcmp(rst_clk->name, name)) {
++				clk = rst_clk->clk;
++				break;
++			}
++		}
++		if (!clk) {
++			rst_clk = devm_kzalloc(dev, sizeof(*rst_clk),
++						GFP_KERNEL);
++			strncpy(rst_clk->name, name, sizeof(rst_clk->name));
++			rst_clk->clk = devm_reset_control_get(dev,
++							      shared_name);
++			if (IS_ERR_OR_NULL(rst_clk->clk))
++				goto fail;
++
++			INIT_LIST_HEAD(&rst_clk->link);
++			list_add_tail(&rst_clk->link, &mpp->reset_group->clk);
++			clk = rst_clk->clk;
++		}
++		up_write(&mpp->reset_group->rw_sem);
++	}
++
++	return clk;
++fail:
++	devm_kfree(dev, rst_clk);
++	up_write(&mpp->reset_group->rw_sem);
++	return NULL;
++}
++
+ static int mpp_dev_reset(struct mpp_dev *mpp)
+ {
+ 	dev_info(mpp->dev, "resetting...\n");
+@@ -300,6 +379,7 @@ static int mpp_dev_reset(struct mpp_dev *mpp)
+ 		mpp->hw_ops->reduce_freq(mpp);
+ 	/* FIXME lock resource lock of the other devices in combo */
+ 	down_write(&mpp->rw_sem);
++	down_write(&mpp->reset_group->rw_sem);
+ 	atomic_set(&mpp->reset_request, 0);
+ 	mpp_iommu_detach(mpp->iommu_info);
+ 
+@@ -315,6 +395,7 @@ static int mpp_dev_reset(struct mpp_dev *mpp)
+ 	mpp_refresh_pm_runtime(mpp->dev);
+ 
+ 	mpp_iommu_attach(mpp->iommu_info);
++	up_write(&mpp->reset_group->rw_sem);
+ 	up_write(&mpp->rw_sem);
+ 
+ 	dev_info(mpp->dev, "reset done\n");
+@@ -328,6 +409,8 @@ static int mpp_dev_abort(struct mpp_dev *mpp)
+ 
+ 	mpp_debug_enter();
+ 
++	up_read(&mpp->reset_group->rw_sem);
++
+ 	mpp_dev_reset(mpp);
+ 	/* destroy the current task after hardware reset */
+ 	ret = mpp_taskqueue_is_running(mpp->queue);
+@@ -383,6 +466,9 @@ static int mpp_task_run(struct mpp_dev *mpp,
+ 	 * TODO: Lock the reader locker of the device resource lock here,
+ 	 * release at the finish operation
+ 	 */
++
++	down_read(&mpp->reset_group->rw_sem);
++
+ 	if (mpp->dev_ops->run)
+ 		mpp->dev_ops->run(mpp, task);
+ 
+@@ -491,9 +577,7 @@ static int mpp_wait_result(struct mpp_session *session,
+ 		mpp_err("error: pid %d wait %d task done timeout\n",
+ 			session->pid, atomic_read(&session->task_running));
+ 		ret = -ETIMEDOUT;
+-		mutex_lock(&mpp->reset_lock);
+ 		mpp_dev_abort(mpp);
+-		mutex_unlock(&mpp->reset_lock);
+ 	}
+ 	atomic_dec(&mpp->total_running);
+ 	mpp_power_off(mpp);
+@@ -503,17 +587,11 @@ static int mpp_wait_result(struct mpp_session *session,
+ 
+ static int mpp_attach_service(struct mpp_dev *mpp, struct device *dev)
+ {
+-	u32 node = 0;
++	u32 taskqueue_node = 0;
++	u32 reset_group_node = 0;
+ 	struct device_node *np = NULL;
+ 	struct platform_device *pdev = NULL;
+-
+-	of_property_read_u32(dev->of_node,
+-			     "rockchip,taskqueue-node", &node);
+-	if (node >= MPP_DEVICE_BUTT) {
+-		dev_err(dev, "rockchip,taskqueue-node %d must less than %d\n",
+-			node, MPP_DEVICE_BUTT);
+-		return -ENODEV;
+-	}
++	int ret = 0;
+ 
+ 	np = of_parse_phandle(dev->of_node, "rockchip,srv", 0);
+ 	if (!np || !of_device_is_available(np)) {
+@@ -523,29 +601,50 @@ static int mpp_attach_service(struct mpp_dev *mpp, struct device *dev)
+ 
+ 	pdev = of_find_device_by_node(np);
+ 	if (!pdev) {
+-		of_node_put(np);
+ 		dev_err(dev, "failed to get mpp service from node\n");
+-		return -ENODEV;
++		ret = -ENODEV;
++		goto fail;
+ 	}
+ 
+-	device_lock(&pdev->dev);
+ 	mpp->srv = platform_get_drvdata(pdev);
+-	if (mpp->srv) {
+-		/* register current device to mpp service */
+-		mpp->srv->sub_devices[mpp->var->device_type] = mpp;
+-		/* set taskqueue which set in dtsi */
+-		mpp->queue = mpp->srv->task_queues[node];
+-		mpp->srv->hw_support |= BIT(mpp->var->device_type);
+-	} else {
++	if (!mpp->srv) {
+ 		dev_err(&pdev->dev, "failed attach service\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto fail;
++	}
++
++	of_property_read_u32(dev->of_node,
++			     "rockchip,taskqueue-node", &taskqueue_node);
++	if (taskqueue_node >= mpp->srv->taskqueue_cnt) {
++		dev_err(dev, "rockchip,taskqueue-node %d must less than %d\n",
++			taskqueue_node, mpp->srv->taskqueue_cnt);
++		ret = -ENODEV;
++		goto fail;
++	}
++
++	of_property_read_u32(dev->of_node,
++			     "rockchip,resetgroup-node", &reset_group_node);
++	if (reset_group_node >= mpp->srv->reset_group_cnt) {
++		dev_err(dev, "rockchip,resetgroup-node %d must less than %d\n",
++			reset_group_node, mpp->srv->reset_group_cnt);
++		ret = -ENODEV;
++		goto fail;
+ 	}
+-	device_unlock(&pdev->dev);
+ 
++	device_lock(&pdev->dev);
++	/* register current device to mpp service */
++	mpp->srv->sub_devices[mpp->var->device_type] = mpp;
++	/* set taskqueue which set in dtsi */
++	mpp->queue = mpp->srv->task_queues[taskqueue_node];
++	/* set resetgroup which set in dtsi */
++	mpp->reset_group = mpp->srv->reset_groups[reset_group_node];
++	mpp->srv->hw_support |= BIT(mpp->var->device_type);
++	device_unlock(&pdev->dev);
+ 	put_device(&pdev->dev);
+-	of_node_put(np);
+ 
+-	return 0;
++fail:
++	of_node_put(np);
++	return ret;
+ }
+ 
+ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+@@ -563,6 +662,15 @@ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+ 	return 0;
+ }
+ 
++int mpp_reset_group_init(struct mpp_reset_group *group,
++		       struct mpp_service *srv)
++{
++	init_rwsem(&group->rw_sem);
++	INIT_LIST_HEAD(&group->clk);
++
++	return 0;
++}
++
+ static int mpp_check_cmd_v1(__u32 cmd)
+ {
+ 	int ret;
+@@ -968,11 +1076,10 @@ int mpp_task_finish(struct mpp_session *session,
+ 		mpp->dev_ops->finish(mpp, task);
+ 	atomic_dec(&task->session->task_running);
+ 
+-	/* FIXME lock resource lock of combo device */
+-	mutex_lock(&mpp->reset_lock);
++	up_read(&mpp->reset_group->rw_sem);
++
+ 	if (atomic_read(&mpp->reset_request) > 0)
+ 		mpp_dev_reset(mpp);
+-	mutex_unlock(&mpp->reset_lock);
+ 
+ 	mpp_taskqueue_done(mpp->queue, task);
+ 	/* Wake up the GET thread */
+@@ -1035,7 +1142,6 @@ int mpp_dev_probe(struct mpp_dev *mpp,
+ 	mpp->dev_ops = mpp->var->dev_ops;
+ 
+ 	init_rwsem(&mpp->rw_sem);
+-	mutex_init(&mpp->reset_lock);
+ 	atomic_set(&mpp->reset_request, 0);
+ 	atomic_set(&mpp->total_running, 0);
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index 50b713bb3b3d..e1e379f3655f 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -187,16 +187,16 @@ struct mpp_dev {
+ 	struct mpp_iommu_info *iommu_info;
+ 
+ 	struct rw_semaphore rw_sem;
+-	/* lock for reset */
+-	struct mutex reset_lock;
++
+ 	atomic_t reset_request;
+ 	atomic_t total_running;
+ 	/* task for work queue */
+ 	struct workqueue_struct *workq;
+ 	/* set session max buffers */
+ 	u32 session_max_buffers;
+-	/* point to MPP Service */
+ 	struct mpp_taskqueue *queue;
++	struct mpp_reset_group *reset_group;
++	/* point to MPP Service */
+ 	struct mpp_service *srv;
+ };
+ 
+@@ -250,6 +250,17 @@ struct mpp_taskqueue {
+ 	struct mpp_service *srv;
+ };
+ 
++struct mpp_reset_clk {
++	struct list_head link;
++	struct reset_control *clk;
++	char name[20];
++};
++
++struct mpp_reset_group {
++	struct rw_semaphore rw_sem;
++	struct list_head clk;
++};
++
+ struct mpp_service {
+ 	struct class *cls;
+ 	struct device *dev;
+@@ -266,7 +277,10 @@ struct mpp_service {
+ 	struct platform_driver *sub_drivers[MPP_DRIVER_BUTT];
+ 	/* follows for attach service */
+ 	struct mpp_dev *sub_devices[MPP_DEVICE_BUTT];
++	u32 taskqueue_cnt;
+ 	struct mpp_taskqueue *task_queues[MPP_DEVICE_BUTT];
++	u32 reset_group_cnt;
++	struct mpp_reset_group *reset_groups[MPP_DEVICE_BUTT];
+ };
+ 
+ /*
+@@ -328,6 +342,9 @@ struct mpp_dev_ops {
+ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+ 		       struct mpp_service *srv);
+ 
++int mpp_reset_group_init(struct mpp_reset_group *group,
++			 struct mpp_service *srv);
++
+ struct mpp_mem_region *
+ mpp_task_attach_fd(struct mpp_task *task, int fd);
+ int mpp_translate_reg_address(struct mpp_dev *data,
+@@ -351,6 +368,9 @@ int mpp_dev_remove(struct mpp_dev *mpp);
+ irqreturn_t mpp_dev_irq(int irq, void *param);
+ irqreturn_t mpp_dev_isr_sched(int irq, void *param);
+ 
++struct reset_control *
++mpp_reset_control_get(struct mpp_dev *mpp, const char *name);
++
+ int mpp_safe_reset(struct reset_control *rst);
+ int mpp_safe_unreset(struct reset_control *rst);
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index 7d763e87d508..c692e9a57ebd 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -1019,32 +1019,32 @@ static int rkvdec_init(struct mpp_dev *mpp)
+ 		dec->clk_core = NULL;
+ 	}
+ 
+-	dec->rst_a = devm_reset_control_get(mpp->dev, "video_a");
++	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+ 		dec->rst_a = NULL;
+ 	}
+-	dec->rst_h = devm_reset_control_get(mpp->dev, "video_h");
++	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+ 	if (IS_ERR_OR_NULL(dec->rst_h)) {
+ 		mpp_err("No hclk reset resource define\n");
+ 		dec->rst_h = NULL;
+ 	}
+-	dec->rst_niu_a = devm_reset_control_get(mpp->dev, "niu_a");
++	dec->rst_niu_a = mpp_reset_control_get(mpp, "niu_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_niu_a)) {
+ 		mpp_err("No niu aclk reset resource define\n");
+ 		dec->rst_niu_a = NULL;
+ 	}
+-	dec->rst_niu_h = devm_reset_control_get(mpp->dev, "niu_h");
++	dec->rst_niu_h = mpp_reset_control_get(mpp, "niu_h");
+ 	if (IS_ERR_OR_NULL(dec->rst_niu_h)) {
+ 		mpp_err("No niu hclk reset resource define\n");
+ 		dec->rst_niu_h = NULL;
+ 	}
+-	dec->rst_cabac = devm_reset_control_get(mpp->dev, "video_cabac");
++	dec->rst_cabac = mpp_reset_control_get(mpp, "video_cabac");
+ 	if (IS_ERR_OR_NULL(dec->rst_cabac)) {
+ 		mpp_err("No cabac reset resource define\n");
+ 		dec->rst_cabac = NULL;
+ 	}
+-	dec->rst_core = devm_reset_control_get(mpp->dev, "video_core");
++	dec->rst_core = mpp_reset_control_get(mpp, "video_core");
+ 	if (IS_ERR_OR_NULL(dec->rst_core)) {
+ 		mpp_err("No core reset resource define\n");
+ 		dec->rst_core = NULL;
+diff --git a/drivers/video/rockchip/mpp/mpp_service.c b/drivers/video/rockchip/mpp/mpp_service.c
+index ca6f387915a4..80ee66bd137c 100644
+--- a/drivers/video/rockchip/mpp/mpp_service.c
++++ b/drivers/video/rockchip/mpp/mpp_service.c
+@@ -139,7 +139,6 @@ static int mpp_debugfs_init(struct mpp_service *srv)
+ static int mpp_service_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+-	u32 taskqueue_cnt;
+ 	struct mpp_service *srv = NULL;
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *np = dev->of_node;
+@@ -158,18 +157,18 @@ static int mpp_service_probe(struct platform_device *pdev)
+ 		return PTR_ERR(srv->cls);
+ 
+ 	of_property_read_u32(np, "rockchip,taskqueue-count",
+-			     &taskqueue_cnt);
+-	if (taskqueue_cnt > MPP_DEVICE_BUTT) {
++			     &srv->taskqueue_cnt);
++	if (srv->taskqueue_cnt > MPP_DEVICE_BUTT) {
+ 		dev_err(dev, "rockchip,taskqueue-count %d must less than %d\n",
+-			taskqueue_cnt, MPP_DEVICE_BUTT);
++			srv->taskqueue_cnt, MPP_DEVICE_BUTT);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (taskqueue_cnt) {
++	if (srv->taskqueue_cnt) {
+ 		u32 i = 0;
+ 		struct mpp_taskqueue *queue;
+ 
+-		for (i = 0; i < taskqueue_cnt; i++) {
++		for (i = 0; i < srv->taskqueue_cnt; i++) {
+ 			queue = devm_kzalloc(dev, sizeof(*queue), GFP_KERNEL);
+ 			if (!queue)
+ 				continue;
+@@ -178,6 +177,28 @@ static int mpp_service_probe(struct platform_device *pdev)
+ 			srv->task_queues[i] = queue;
+ 		}
+ 	}
++
++	of_property_read_u32(np, "rockchip,resetgroup-count",
++			     &srv->reset_group_cnt);
++	if (srv->reset_group_cnt > MPP_DEVICE_BUTT) {
++		dev_err(dev, "rockchip,resetgroup-count %d must less than %d\n",
++			srv->reset_group_cnt, MPP_DEVICE_BUTT);
++		return -EINVAL;
++	}
++
++	if (srv->reset_group_cnt) {
++		u32 i = 0;
++		struct mpp_reset_group *group;
++
++		for (i = 0; i < srv->reset_group_cnt; i++) {
++			group = devm_kzalloc(dev, sizeof(*group), GFP_KERNEL);
++			if (!group)
++				continue;
++
++			mpp_reset_group_init(group, srv);
++			srv->reset_groups[i] = group;
++		}
++	}
+ 	MPP_REGISTER_GRF(np, RKVDEC, "grf_rkvdec");
+ 	MPP_REGISTER_GRF(np, RKVENC, "grf_rkvenc");
+ 	MPP_REGISTER_GRF(np, VEPU1, "grf_vepu1");
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu1.c b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+index 4fca6f0b40d8..d50d7b6d8c1d 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+@@ -478,12 +478,12 @@ static int vdpu_init(struct mpp_dev *mpp)
+ 		dec->hclk = NULL;
+ 	}
+ 
+-	dec->rst_a = devm_reset_control_get(mpp->dev, "video_a");
++	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+ 		dec->rst_a = NULL;
+ 	}
+-	dec->rst_h = devm_reset_control_get(mpp->dev, "video_h");
++	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+ 	if (IS_ERR_OR_NULL(dec->rst_h)) {
+ 		mpp_err("No hclk reset resource define\n");
+ 		dec->rst_h = NULL;
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu2.c b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+index b614591de0a1..1c6ba2e5d95b 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+@@ -442,12 +442,12 @@ static int vdpu_init(struct mpp_dev *mpp)
+ 		dec->hclk = NULL;
+ 	}
+ 
+-	dec->rst_a = devm_reset_control_get(mpp->dev, "video_a");
++	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+ 		dec->rst_a = NULL;
+ 	}
+-	dec->rst_h = devm_reset_control_get(mpp->dev, "video_h");
++	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+ 	if (IS_ERR_OR_NULL(dec->rst_h)) {
+ 		mpp_err("No hclk reset resource define\n");
+ 		dec->rst_h = NULL;
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu1.c b/drivers/video/rockchip/mpp/mpp_vepu1.c
+index fb675e270604..6f5e237aeff4 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu1.c
+@@ -398,12 +398,12 @@ static int vepu_init(struct mpp_dev *mpp)
+ 		enc->hclk = NULL;
+ 	}
+ 
+-	enc->rst_a = devm_reset_control_get(mpp->dev, "video_a");
++	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(enc->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+ 		enc->rst_a = NULL;
+ 	}
+-	enc->rst_h = devm_reset_control_get(mpp->dev, "video_h");
++	enc->rst_h = mpp_reset_control_get(mpp, "video_h");
+ 	if (IS_ERR_OR_NULL(enc->rst_h)) {
+ 		mpp_err("No hclk reset resource define\n");
+ 		enc->rst_h = NULL;
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index 4080bac518ed..24785ab12b1a 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -405,12 +405,12 @@ static int vepu_init(struct mpp_dev *mpp)
+ 		enc->hclk = NULL;
+ 	}
+ 
+-	enc->rst_a = devm_reset_control_get(mpp->dev, "video_a");
++	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(enc->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+ 		enc->rst_a = NULL;
+ 	}
+-	enc->rst_h = devm_reset_control_get(mpp->dev, "video_h");
++	enc->rst_h = mpp_reset_control_get(mpp, "video_h");
+ 	if (IS_ERR_OR_NULL(enc->rst_h)) {
+ 		mpp_err("No hclk reset resource define\n");
+ 		enc->rst_h = NULL;
+-- 
+2.35.3
+

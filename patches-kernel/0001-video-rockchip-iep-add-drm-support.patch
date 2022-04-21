@@ -1,0 +1,1993 @@
+From adf61468905b4c4c63ecbc57e3d1a8990b391a5b Mon Sep 17 00:00:00 2001
+From: Jung Zhao <jung.zhao@rock-chips.com>
+Date: Fri, 25 Nov 2016 15:41:33 +0800
+Subject: [PATCH] video: rockchip: iep: add drm support
+
+iep drm support is similar with vcodec drm support. change the allocator
+part from ion to drm.
+
+Change-Id: I67c7ac795b768c85e80817262a947a20e9804ec8
+Signed-off-by: Jung Zhao <jung.zhao@rock-chips.com>
+---
+ drivers/video/rockchip/iep/Makefile           |   2 +-
+ .../video/rockchip/iep/hw_iep_config_addr.h   |  14 -
+ drivers/video/rockchip/iep/hw_iep_reg.c       |  93 +---
+ drivers/video/rockchip/iep/hw_iep_reg.h       | 153 ------
+ drivers/video/rockchip/iep/iep_drv.c          | 143 ++---
+ drivers/video/rockchip/iep/iep_drv.h          |  30 +-
+ drivers/video/rockchip/iep/iep_iommu_drm.c    | 491 ++++++++++++++++++
+ drivers/video/rockchip/iep/iep_iommu_ion.c    | 259 +++++++++
+ drivers/video/rockchip/iep/iep_iommu_ops.c    | 248 +++++++++
+ drivers/video/rockchip/iep/iep_iommu_ops.h    | 124 +++++
+ 10 files changed, 1185 insertions(+), 372 deletions(-)
+ create mode 100644 drivers/video/rockchip/iep/iep_iommu_drm.c
+ create mode 100644 drivers/video/rockchip/iep/iep_iommu_ion.c
+ create mode 100644 drivers/video/rockchip/iep/iep_iommu_ops.c
+ create mode 100644 drivers/video/rockchip/iep/iep_iommu_ops.h
+
+diff --git a/drivers/video/rockchip/iep/Makefile b/drivers/video/rockchip/iep/Makefile
+index 0d058cac079f..781907395012 100755
+--- a/drivers/video/rockchip/iep/Makefile
++++ b/drivers/video/rockchip/iep/Makefile
+@@ -1 +1 @@
+-obj-$(CONFIG_IEP) += hw_iep_reg.o iep_drv.o 
++obj-$(CONFIG_IEP) += hw_iep_reg.o iep_drv.o iep_iommu_drm.o iep_iommu_ion.o iep_iommu_ops.o
+diff --git a/drivers/video/rockchip/iep/hw_iep_config_addr.h b/drivers/video/rockchip/iep/hw_iep_config_addr.h
+index 7b90d6aa56dc..41b2eaea8ce9 100644
+--- a/drivers/video/rockchip/iep/hw_iep_config_addr.h
++++ b/drivers/video/rockchip/iep/hw_iep_config_addr.h
+@@ -90,20 +90,6 @@
+ #define      RAW_IEP_ENH_YUV_CNFG_2        0x0078
+ #define      RAW_IEP_ENH_RGB_CNFG          0x007C
+ 
+-#if defined(CONFIG_IEP_MMU)
+-#define      IEP_MMU_BASE                  0x0800
+-#define      IEP_MMU_DTE_ADDR              (IEP_MMU_BASE+0x00)
+-#define      IEP_MMU_STATUS                (IEP_MMU_BASE+0x04)
+-#define      IEP_MMU_CMD                   (IEP_MMU_BASE+0x08)
+-#define      IEP_MMU_PAGE_FAULT_ADDR       (IEP_MMU_BASE+0x0c)
+-#define      IEP_MMU_ZAP_ONE_LINE          (IEP_MMU_BASE+0x10)
+-#define      IEP_MMU_INT_RAWSTAT           (IEP_MMU_BASE+0x14)
+-#define      IEP_MMU_INT_CLEAR             (IEP_MMU_BASE+0x18)
+-#define      IEP_MMU_INT_MASK              (IEP_MMU_BASE+0x1c)
+-#define      IEP_MMU_INT_STATUS            (IEP_MMU_BASE+0x20)
+-#define      IEP_MMU_AUTO_GATING           (IEP_MMU_BASE+0x24)
+-#endif
+-
+ #define ReadReg32(base, raddr)	        (__raw_readl(base + raddr))
+ #define WriteReg32(base, waddr, value)	(__raw_writel(value, base + waddr))
+ #define ConfRegBits32(base, raddr, waddr, position, value)           WriteReg32(base, waddr, (ReadReg32(base, waddr)&~(position))|(value))
+diff --git a/drivers/video/rockchip/iep/hw_iep_reg.c b/drivers/video/rockchip/iep/hw_iep_reg.c
+index d44d0c890151..0683ae644a2b 100644
+--- a/drivers/video/rockchip/iep/hw_iep_reg.c
++++ b/drivers/video/rockchip/iep/hw_iep_reg.c
+@@ -9,11 +9,12 @@
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+- * 
++ *
+  */
+ 
+ #include <linux/delay.h>
+ #include <linux/slab.h>
++#include "iep_iommu_ops.h"
+ #include "hw_iep_reg.h"
+ #include "iep.h"
+ #include "hw_iep_config_addr.h"
+@@ -1280,48 +1281,6 @@ void iep_config_frame_end_int_en(void *base)
+ 	IEP_REGB_FRAME_END_INT_EN(base, 1);
+ }
+ 
+-#if defined(CONFIG_IEP_MMU)
+-struct iep_mmu_int_status iep_probe_mmu_int_status(void *base)
+-{
+-	uint32_t mmu_int_sts = IEP_REGB_MMU_INT_STATUS(base);
+-	struct iep_mmu_int_status sts;
+-
+-	memcpy(&sts, &mmu_int_sts, 4);
+-
+-	return sts;
+-}
+-
+-void iep_config_mmu_page_fault_int_en(void *base, bool en)
+-{
+-	IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN(base, en);
+-}
+-
+-void iep_config_mmu_page_fault_int_clr(void *base)
+-{
+-	IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR(base, 1);
+-}
+-
+-void iep_config_mmu_read_bus_error_int_clr(void *base)
+-{
+-	IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR(base, 1);
+-}
+-
+-uint32_t iep_probe_mmu_page_fault_addr(void *base)
+-{
+-	return IEP_REGB_MMU_PAGE_FAULT_ADDR(base);
+-}
+-
+-void iep_config_mmu_cmd(void *base, enum iep_mmu_cmd cmd)
+-{
+-	IEP_REGB_MMU_CMD(base, cmd);
+-}
+-
+-void iep_config_mmu_dte_addr(void *base, uint32_t addr)
+-{
+-	IEP_REGB_MMU_DTE_ADDR(base, addr);
+-}
+-#endif
+-
+ void iep_config_misc(struct IEP_MSG *iep_msg)
+ {
+ //	IEP_REGB_V_REVERSE_DISP();
+@@ -1414,7 +1373,6 @@ void iep_switch_input_address(void *base)
+ 	IEP_REGB_SRC_ADDR_CR1(base, src_addr_cr);
+ }
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ static int iep_bufid_to_iova(iep_service_info *pservice, u8 *tbl,
+ 	int size, struct iep_reg *reg)
+ {
+@@ -1431,18 +1389,12 @@ static int iep_bufid_to_iova(iep_service_info *pservice, u8 *tbl,
+ 		usr_fd = reg->reg[tbl[i]] & 0x3FF;
+ 		offset = reg->reg[tbl[i]] >> 10;
+ 		if (usr_fd != 0) {
+-			struct ion_handle *hdl;
++			int hdl;
+ 			int ret;
+ 			struct iep_mem_region *mem_region;
+ 
+-			hdl = ion_import_dma_buf(pservice->ion_client, usr_fd);
+-			if (IS_ERR(hdl)) {
+-				dev_err(pservice->iommu_dev,
+-					"import dma-buf from fd %d"
+-					" failed, reg[%d]\n",
+-					usr_fd, tbl[i]);
+-				return PTR_ERR(hdl);
+-			}
++			hdl = iep_iommu_import(pservice->iommu_info,
++					       reg->session, usr_fd);
+ 
+ 			mem_region = kzalloc(sizeof(struct iep_mem_region),
+ 				GFP_KERNEL);
+@@ -1451,20 +1403,22 @@ static int iep_bufid_to_iova(iep_service_info *pservice, u8 *tbl,
+ 				dev_err(pservice->iommu_dev,
+ 					"allocate memory for"
+ 					" iommu memory region failed\n");
+-				ion_free(pservice->ion_client, hdl);
+-				return -1;
++				iep_iommu_free(pservice->iommu_info,
++					       reg->session, hdl);
++				return -ENOMEM;
+ 			}
+ 
+ 			mem_region->hdl = hdl;
+ 
+-			ret = ion_map_iommu(pservice->iommu_dev,
+-				pservice->ion_client, mem_region->hdl,
++			ret = iep_iommu_map_iommu(pservice->iommu_info,
++				reg->session, mem_region->hdl,
+ 				&mem_region->iova, &mem_region->len);
+ 			if (ret < 0) {
+ 				dev_err(pservice->iommu_dev,
+ 					"ion map iommu failed\n");
+ 				kfree(mem_region);
+-				ion_free(pservice->ion_client, hdl);
++				iep_iommu_free(pservice->iommu_info,
++					       reg->session, hdl);
+ 				return ret;
+ 			}
+ 
+@@ -1486,17 +1440,19 @@ static int iep_reg_address_translate(iep_service_info *pservice, struct iep_reg
+ {
+ 	return iep_bufid_to_iova(pservice, addr_tbl_iep, sizeof(addr_tbl_iep), reg);
+ }
+-#endif
+ 
+ /**
+  * generating a series of registers copy from iep message
+  */
+ void iep_config(iep_session *session, struct IEP_MSG *iep_msg)
+ {
+-	struct iep_reg *reg = kzalloc(sizeof(struct iep_reg), GFP_KERNEL);
++	struct iep_reg *reg = NULL;
+ 	int w;
+ 	int h;
+ 
++	reg = kzalloc(sizeof(*reg), GFP_KERNEL);
++	if (!reg)
++		return;
+ 	reg->session = session;
+ 	iep_msg->base = reg->reg;
+ 	atomic_set(&reg->session->done, 0);
+@@ -1504,9 +1460,7 @@ void iep_config(iep_session *session, struct IEP_MSG *iep_msg)
+ 	INIT_LIST_HEAD(&reg->session_link);
+ 	INIT_LIST_HEAD(&reg->status_link);
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ 	INIT_LIST_HEAD(&reg->mem_region_list);
+-#endif
+ 
+ 	//write config
+ 	iep_config_src_size(iep_msg);
+@@ -1548,19 +1502,6 @@ void iep_config(iep_session *session, struct IEP_MSG *iep_msg)
+ 		reg->dpi_en     = false;
+ 	}
+ 
+-#if defined(CONFIG_IEP_MMU)
+-	if (iep_msg->vir_addr_enable) {
+-		iep_config_mmu_cmd(iep_msg->base, MMU_ENABLE_PAGING);
+-		iep_config_mmu_page_fault_int_en(iep_msg->base, 1);
+-	} else {
+-		iep_config_mmu_cmd(iep_msg->base, MMU_DISABLE_PAGING);
+-		iep_config_mmu_page_fault_int_en(iep_msg->base, 0);
+-	}
+-	iep_config_mmu_dte_addr(iep_msg->base,
+-		(uint32_t)virt_to_phys((uint32_t *)session->dte_table));
+-#endif
+-
+-#if defined(CONFIG_IEP_IOMMU)
+ 	if (iep_service.iommu_dev) {
+ 		if (0 > iep_reg_address_translate(&iep_service, reg)) {
+ 			IEP_ERR("error: translate reg address failed\n");
+@@ -1568,7 +1509,7 @@ void iep_config(iep_session *session, struct IEP_MSG *iep_msg)
+ 			return;
+ 		}
+ 	}
+-#endif
++
+ 	/* workaround for iommu enable case when 4k video input */
+ 	w = (iep_msg->src.act_w + 15) & (0xfffffff0);
+ 	h = (iep_msg->src.act_h + 15) & (0xfffffff0);
+diff --git a/drivers/video/rockchip/iep/hw_iep_reg.h b/drivers/video/rockchip/iep/hw_iep_reg.h
+index f2385ecfdc9d..9c8706434731 100644
+--- a/drivers/video/rockchip/iep/hw_iep_reg.h
++++ b/drivers/video/rockchip/iep/hw_iep_reg.h
+@@ -16,33 +16,6 @@ struct iep_status {
+ 	uint32_t voi_sts     : 1;
+ };
+ 
+-#if defined(CONFIG_IEP_MMU)
+-struct iep_mmu_status {
+-	uint32_t paging_enabled         : 1;
+-	uint32_t page_fault_active      : 1;
+-	uint32_t stall_active           : 1;
+-	uint32_t idle                   : 1;
+-	uint32_t replay_buffer_empty    : 1;
+-	uint32_t page_fault_is_write    : 1;
+-	uint32_t page_fault_bus_id      : 5;
+-};
+-
+-struct iep_mmu_int_status {
+-	uint32_t page_fault     : 1;
+-	uint32_t read_bus_error : 1;
+-};
+-
+-enum iep_mmu_cmd {
+-	MMU_ENABLE_PAGING,
+-	MMU_DISABLE_PAGING,
+-	MMU_ENABLE_STALL,
+-	MMU_DISABLE_STALL,
+-	MMU_ZAP_CACHE,
+-	MMU_PAGE_FAULT_DONE,
+-	MMU_FORCE_RESET
+-};
+-#endif
+-
+ #define      rIEP_CONFIG0      		         (IEP_BASE+IEP_CONFIG0)
+ #define      rIEP_CONFIG1      		         (IEP_BASE+IEP_CONFIG1)
+ 
+@@ -129,20 +102,6 @@ enum iep_mmu_cmd {
+ 
+ #define      rIEP_CG_TAB_ADDR                 (IEP_BASE+0x0100)
+ 
+-#if defined(CONFIG_IEP_MMU)
+-#define      rIEP_MMU_BASE                    0x0800
+-#define      rIEP_MMU_DTE_ADDR                (IEP_MMU_BASE+0x00)
+-#define      rIEP_MMU_STATUS                  (IEP_MMU_BASE+0x04)
+-#define      rIEP_MMU_CMD                     (IEP_MMU_BASE+0x08)
+-#define      rIEP_MMU_PAGE_FAULT_ADDR         (IEP_MMU_BASE+0x0c)
+-#define      rIEP_MMU_ZAP_ONE_LINE            (IEP_MMU_BASE+0x10)
+-#define      rIEP_MMU_INT_RAWSTAT             (IEP_MMU_BASE+0x14)
+-#define      rIEP_MMU_INT_CLEAR               (IEP_MMU_BASE+0x18)
+-#define      rIEP_MMU_INT_MASK                (IEP_MMU_BASE+0x1c)
+-#define      rIEP_MMU_INT_STATUS              (IEP_MMU_BASE+0x20)
+-#define      rIEP_MMU_AUTO_GATING             (IEP_MMU_BASE+0x24)
+-#endif
+-
+ /*-----------------------------------------------------------------
+ //reg bit operation definition
+ -----------------------------------------------------------------*/
+@@ -278,35 +237,6 @@ enum iep_mmu_cmd {
+ #define     IEP_REGB_DIL_MTN_TAB7_2_Z(x)      (((x)&0x7f ) <<  16 )
+ #define     IEP_REGB_DIL_MTN_TAB7_3_Z(x)      (((x)&0x7f ) <<  24 )
+ 
+-#if defined(CONFIG_IEP_MMU)
+-/*mmu*/
+-#define     IEP_REGB_MMU_STATUS_PAGING_ENABLE_Z(x)              (((x)&0x01) << 0)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_ACTIVE_Z(x)          (((x)&0x01) << 1)
+-#define     IEP_REGB_MMU_STATUS_STALL_ACTIVE_Z(x)               (((x)&0x01) << 2)
+-#define     IEP_REGB_MMU_STATUS_IDLE_Z(x)                       (((x)&0x01) << 3)
+-#define     IEP_REGB_MMU_STATUS_REPLAY_BUFFER_EMPTY_Z(x)        (((x)&0x01) << 4)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_IS_WRITE_Z(x)        (((x)&0x01) << 5)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_BUS_ID_Z(x)          (((x)&0x1F) << 6)
+-
+-#define     IEP_REGB_MMU_CMD_Z(x)                               (((x)&0x07) << 0)
+-
+-#define     IEP_REGB_MMU_ZAP_ONE_LINE_Z(x)                      (((x)&0x01) << 0)
+-
+-#define     IEP_REGB_MMU_INT_RAWSTAT_PAGE_FAULT_Z(x)            (((x)&0x01) << 0)
+-#define     IEP_REGB_MMU_INT_RAWSTAT_READ_BUS_ERROR_Z(x)        (((x)&0x01) << 1)
+-
+-#define     IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR_Z(x)        (((x)&0x01) << 0)
+-#define     IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR_Z(x)    (((x)&0x01) << 1)
+-
+-#define     IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN_Z(x)        (((x)&0x01) << 0)
+-#define     IEP_REGB_MMU_INT_MASK_READ_BUS_ERROR_INT_EN_Z(x)    (((x)&0x01) << 1)
+-
+-#define     IEP_REGB_MMU_INT_STATUS_PAGE_FAULT_Z(x)             (((x)&0x01) << 0)
+-#define     IEP_REGB_MMU_INT_STATUS_READ_BUS_ERROR_Z(x)         (((x)&0x01) << 1)
+-
+-#define     IEP_REGB_MMU_AUTO_GATING_Z(x)                       (((x)&0x01) << 0)
+-#endif
+-
+ /*iep_config0*/
+ #define     IEP_REGB_V_REVERSE_DISP_Y      (0x1  << 31 )
+ #define     IEP_REGB_H_REVERSE_DISP_Y      (0x1  << 30 )
+@@ -439,44 +369,6 @@ enum iep_mmu_cmd {
+ #define     IEP_REGB_DIL_MTN_TAB7_2_Y      (0x7f  <<  16 )
+ #define     IEP_REGB_DIL_MTN_TAB7_3_Y      (0x7f  <<  24 )
+ 
+-#if defined(CONFIG_IEP_MMU)
+-/*mmu*/
+-#define     IEP_REGB_MMU_STATUS_PAGING_ENABLE_Y              (0x01 << 0)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_ACTIVE_Y          (0x01 << 1)
+-#define     IEP_REGB_MMU_STATUS_STALL_ACTIVE_Y               (0x01 << 2)
+-#define     IEP_REGB_MMU_STATUS_IDLE_Y                       (0x01 << 3)
+-#define     IEP_REGB_MMU_STATUS_REPLAY_BUFFER_EMPTY_Y        (0x01 << 4)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_IS_WRITE_Y        (0x01 << 5)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_BUS_ID_Y          (0x1F << 6)
+-
+-#define     IEP_REGB_MMU_CMD_Y                               (0x07 << 0)
+-
+-#define     IEP_REGB_MMU_ZAP_ONE_LINE_Y                      (0x01 << 0)
+-
+-#define     IEP_REGB_MMU_INT_RAWSTAT_PAGE_FAULT_Y            (0x01 << 0)
+-#define     IEP_REGB_MMU_INT_RAWSTAT_READ_BUS_ERROR_Y        (0x01 << 1)
+-
+-#define     IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR_Y        (0x01 << 0)
+-#define     IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR_Y    (0x01 << 1)
+-
+-#define     IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN_Y        (0x01 << 0)
+-#define     IEP_REGB_MMU_INT_MASK_READ_BUS_ERROR_INT_EN_Y    (0x01 << 1)
+-
+-#define     IEP_REGB_MMU_INT_STATUS_PAGE_FAULT_Y             (0x01 << 0)
+-#define     IEP_REGB_MMU_INT_STATUS_READ_BUS_ERROR_Y         (0x01 << 1)
+-
+-#define     IEP_REGB_MMU_AUTO_GATING_Y                       (0x01 << 0)
+-
+-/*offset*/
+-#define     IEP_REGB_MMU_STATUS_PAGING_ENABLE_F              (0)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_ACTIVE_F          (1)
+-#define     IEP_REGB_MMU_STATUS_STALL_ACTIVE_F               (2)
+-#define     IEP_REGB_MMU_STATUS_IDLE_F                       (3)
+-#define     IEP_REGB_MMU_STATUS_REPLAY_BUFFER_EMPTY_F        (4)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_IS_WRITE_F        (5)
+-#define     IEP_REGB_MMU_STATUS_PAGE_FAULT_BUS_ID_F          (6)
+-#endif
+-
+ /*-----------------------------------------------------------------
+ MaskRegBits32(addr, y, z),Register configure
+ -----------------------------------------------------------------*/
+@@ -610,42 +502,6 @@ MaskRegBits32(addr, y, z),Register configure
+ 
+ #define     IEP_REGB_STATUS(base)               ReadReg32(base, rIEP_STATUS)
+ 
+-#if defined(CONFIG_IEP_MMU)
+-/*mmu*/
+-#define     IEP_REGB_MMU_DTE_ADDR(base, x)                          WriteReg32(base, rIEP_MMU_DTE_ADDR, x)
+-#define     IEP_REGB_MMU_STATUS(base)                               ReadReg32(base, rIEP_MMU_STATUS)
+-
+-#define     IEP_REGB_MMU_CMD(base, x)                               MaskRegBits32(base, rIEP_MMU_CMD, IEP_REGB_MMU_CMD_Y, IEP_REGB_MMU_CMD_Z(x))
+-
+-#define     IEP_REGB_MMU_PAGE_FAULT_ADDR(base)                      ReadReg32(base, rIEP_MMU_PAGE_FAULT_ADDR)
+-
+-#define     IEP_REGB_MMU_ZAP_ONE_LINE(base, x)                      MaskRegBits32(base, rIEP_MMU_ZAP_ONE_LINE, \
+-                                                                    IEP_REGB_MMU_ZAP_ONE_LINE_Y, \
+-                                                                    IEP_REGB_MMU_ZAP_ONE_LINE_Z(x))
+-
+-#define     IEP_REGB_MMU_INT_RAWSTAT(base)                          ReadReg32(base, rIEP_MMU_INT_RAWSTAT)
+-
+-#define     IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR(base, x)        MaskRegBits32(base, rIEP_MMU_INT_CLEAR, \
+-                                                                    IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR_Y, \
+-                                                                    IEP_REGB_MMU_INT_CLEAR_PAGE_FAULT_CLEAR_Z(x))
+-#define     IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR(base, x)    MaskRegBits32(base, rIEP_MMU_INT_CLEAR, \
+-                                                                    IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR_Y, \
+-                                                                    IEP_REGB_MMU_INT_CLEAR_READ_BUS_ERROR_CLEAR_Z(x))
+-
+-#define     IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN(base, x)        MaskRegBits32(base, rIEP_MMU_INT_MASK, \
+-                                                                    IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN_Y, \
+-                                                                    IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN_Z(x))
+-#define     IEP_REGB_MMU_INT_MASK_READ_BUS_ERROR_INT_EN(base, x)    MaskRegBits32(base, rIEP_MMU_INT_MASK, \
+-                                                                    IEP_REGB_MMU_INT_MASK_READ_BUS_ERROR_INT_EN_Y, \
+-                                                                    IEP_REGB_MMU_INT_MASK_PAGE_FAULT_INT_EN_Z(x))
+-
+-#define     IEP_REGB_MMU_INT_STATUS(base)                           ReadReg32(base, rIEP_MMU_INT_STATUS)
+-
+-#define     IEP_REGB_MMU_AUTO_GATING(base, x)                       MaskRegBits32(base, rIEP_MMU_AUTO_GATING, \
+-                                                                    IEP_REGB_MMU_AUTO_GATING_Y, \
+-                                                                    IEP_REGB_MMU_AUTO_GATING_Z(x))
+-#endif
+-
+ void iep_config_lcdc_path(struct IEP_MSG *iep_msg);
+ 
+ /* system control, directly operating the device registers.*/
+@@ -657,15 +513,6 @@ int iep_probe_int(void *base);
+ void iep_config_frame_end_int_clr(void *base);
+ void iep_config_frame_end_int_en(void *base);
+ struct iep_status iep_get_status(void *base);
+-#if defined(CONFIG_IEP_MMU)
+-struct iep_mmu_int_status iep_probe_mmu_int_status(void *base);
+-void iep_config_mmu_page_fault_int_en(void *base, bool en);
+-void iep_config_mmu_page_fault_int_clr(void *base);
+-void iep_config_mmu_read_bus_error_int_clr(void *base);
+-uint32_t iep_probe_mmu_page_fault_addr(void *base);
+-void iep_config_mmu_cmd(void *base, enum iep_mmu_cmd cmd);
+-void iep_config_mmu_dte_addr(void *base, uint32_t addr);
+-#endif
+ int iep_get_deinterlace_mode(void *base);
+ void iep_set_deinterlace_mode(int mode, void *base);
+ void iep_switch_input_address(void *base);
+diff --git a/drivers/video/rockchip/iep/iep_drv.c b/drivers/video/rockchip/iep/iep_drv.c
+index c8bf9d22b7b2..2d9900b8baa9 100644
+--- a/drivers/video/rockchip/iep/iep_drv.c
++++ b/drivers/video/rockchip/iep/iep_drv.c
+@@ -35,10 +35,8 @@
+ #include <linux/rockchip/cru.h>
+ #include <asm/cacheflush.h>
+ #include "iep_drv.h"
+-#if defined(CONFIG_IEP_MMU)
+-#include "iep_mmu.h"
+-#endif
+ #include "hw_iep_reg.h"
++#include "iep_iommu_ops.h"
+ 
+ #define IEP_MAJOR		255
+ #define IEP_CLK_ENABLE
+@@ -88,18 +86,20 @@ iep_service_info iep_service;
+ 
+ static void iep_reg_deinit(struct iep_reg *reg)
+ {
+-#if defined(CONFIG_IEP_IOMMU)
+ 	struct iep_mem_region *mem_region = NULL, *n;
+ 	/* release memory region attach to this registers table.*/
+ 	if (iep_service.iommu_dev) {
+-		list_for_each_entry_safe(mem_region, n, &reg->mem_region_list, reg_lnk) {
+-			/*ion_unmap_iommu(iep_service.iommu_dev, iep_service.ion_client, mem_region->hdl);*/
+-			ion_free(iep_service.ion_client, mem_region->hdl);
++		list_for_each_entry_safe(mem_region, n, &reg->mem_region_list,
++					 reg_lnk) {
++			iep_iommu_unmap_iommu(iep_service.iommu_info,
++					      reg->session, mem_region->hdl);
++			iep_iommu_free(iep_service.iommu_info,
++				       reg->session, mem_region->hdl);
+ 			list_del_init(&mem_region->reg_lnk);
+ 			kfree(mem_region);
+ 		}
+ 	}
+-#endif
++
+ 	list_del_init(&reg->session_link);
+ 	list_del_init(&reg->status_link);
+ 	kfree(reg);
+@@ -132,7 +132,8 @@ static void iep_del_running_list(void)
+ 
+ 	while (!list_empty(&iep_service.running)) {
+ 		BUG_ON(cnt != 0);
+-		reg = list_entry(iep_service.running.next, struct iep_reg, status_link);
++		reg = list_entry(iep_service.running.next,
++				 struct iep_reg, status_link);
+ 
+ 		atomic_dec(&reg->session->task_running);
+ 		atomic_dec(&iep_service.total_running);
+@@ -234,11 +235,7 @@ static void iep_power_on(void)
+ 
+ 	wake_lock(&iep_drvdata1->wake_lock);
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+-	if (iep_service.iommu_dev) {
+-		rockchip_iovmm_activate(iep_service.iommu_dev);
+-	}
+-#endif
++	iep_iommu_attach(iep_service.iommu_info);
+ 
+ 	iep_service.enable = true;
+ }
+@@ -261,11 +258,9 @@ static void iep_power_off(void)
+ 		iep_dump();
+ 	}
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ 	if (iep_service.iommu_dev) {
+-		rockchip_iovmm_deactivate(iep_service.iommu_dev);
++		iep_iommu_detach(iep_service.iommu_info);
+ 	}
+-#endif
+ 
+ #ifdef IEP_CLK_ENABLE
+ 	clk_disable_unprepare(iep_drvdata1->aclk_iep);
+@@ -281,9 +276,11 @@ static void iep_power_off(void)
+ 
+ static void iep_power_off_work(struct work_struct *work)
+ {
+-	if (mutex_trylock(&iep_service.lock) && !iep_drvdata1->dpi_mode) {
+-		IEP_INFO("iep dpi mode inactivity\n");
+-		iep_power_off();
++	if (mutex_trylock(&iep_service.lock)) {
++		if (!iep_drvdata1->dpi_mode) {
++			IEP_INFO("iep dpi mode inactivity\n");
++			iep_power_off();
++		}
+ 		mutex_unlock(&iep_service.lock);
+ 	} else {
+ 		/* Come back later if the device is busy... */
+@@ -435,12 +432,6 @@ static void iep_reg_copy_to_hw(struct iep_reg *reg)
+ 	for (i = 0; i < IEP_ADD_REG_LEN; i++)
+ 		pbase[IEP_ADD_REG_BASE + i] = reg->reg[IEP_ADD_REG_BASE + i];
+ 
+-#if defined(CONFIG_IEP_MMU)
+-	/* mmu registers */
+-	for (i = 0; i < IEP_MMU_REG_LEN; i++)
+-		pbase[IEP_MMU_REG_BASE + i] = reg->reg[IEP_MMU_REG_BASE + i];
+-#endif
+-
+ 	/* dmac_flush_range(&pbase[0], &pbase[IEP_REG_LEN]); */
+ 	/* outer_flush_range(virt_to_phys(&pbase[0]),virt_to_phys(&pbase[IEP_REG_LEN])); */
+ 
+@@ -551,33 +542,6 @@ static irqreturn_t iep_isr(int irq, void *dev_id)
+ 		atomic_dec(&iep_drvdata1->iep_int);
+ 	}
+ 
+-#if defined(CONFIG_IEP_MMU)
+-	if (atomic_read(&iep_drvdata1->mmu_page_fault) > 0) {
+-
+-		if (!list_empty(&iep_service.running)) {
+-			uint32_t va = iep_probe_mmu_page_fault_addr(iep_drvdata1->iep_base);
+-			struct iep_reg *reg = list_entry(iep_service.running.next, struct iep_reg, status_link);
+-			if (0 > rk_mmu_generate_pte_from_va(reg->session, va)) {
+-				IEP_ERR("Generate PTE from Virtual Address 0x%08x failed\n", va);
+-			} else {
+-				iep_config_mmu_cmd(iep_drvdata1->iep_base, MMU_ZAP_CACHE);
+-				iep_config_mmu_cmd(iep_drvdata1->iep_base, MMU_PAGE_FAULT_DONE);
+-			}
+-		} else {
+-			IEP_ERR("Page Fault occur when IEP IDLE\n");
+-		}
+-
+-		atomic_dec(&iep_drvdata1->mmu_page_fault);
+-	}
+-
+-	if (atomic_read(&iep_drvdata1->mmu_bus_error) > 0) {
+-		/* reset iep mmu module */
+-		IEP_ERR("Bus Error!!!\n");
+-		iep_config_mmu_cmd(iep_drvdata1->iep_base, MMU_FORCE_RESET);
+-		atomic_dec(&iep_drvdata1->mmu_bus_error);
+-	}
+-#endif
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -586,21 +550,6 @@ static irqreturn_t iep_irq(int irq,  void *dev_id)
+ 	/*clear INT */
+ 	void *pbase = (void *)iep_drvdata1->iep_base;
+ 
+-#if defined(CONFIG_IEP_MMU)
+-	struct iep_mmu_int_status mmu_int_status;
+-
+-	mmu_int_status = iep_probe_mmu_int_status(pbase);
+-	if (mmu_int_status.page_fault) {
+-		iep_config_mmu_page_fault_int_clr(pbase);
+-		atomic_inc(&iep_drvdata1->mmu_page_fault);
+-	}
+-
+-	if (mmu_int_status.read_bus_error) {
+-		iep_config_mmu_read_bus_error_int_clr(pbase);
+-		atomic_inc(&iep_drvdata1->mmu_bus_error);
+-	}
+-#endif
+-
+ 	if (iep_probe_int(pbase)) {
+ 		iep_config_frame_end_int_clr(pbase);
+ 		atomic_inc(&iep_drvdata1->iep_int);
+@@ -650,11 +599,6 @@ static int iep_open(struct inode *inode, struct file *filp)
+ 	atomic_set(&session->task_running, 0);
+ 	atomic_set(&session->num_done, 0);
+ 
+-#if defined(CONFIG_IEP_MMU)
+-	rk_mmu_init_dte_table(session);
+-	INIT_LIST_HEAD(&session->pte_list);
+-#endif
+-
+ 	filp->private_data = (void *)session;
+ 
+ 	return nonseekable_open(inode, filp);
+@@ -679,9 +623,11 @@ static int iep_release(struct inode *inode, struct file *filp)
+ 	}
+ 
+ 	wake_up(&session->wait);
++	iep_power_on();
+ 	mutex_lock(&iep_service.lock);
+ 	list_del(&session->list_session);
+ 	iep_service_session_clear(session);
++	iep_iommu_clear(iep_service.iommu_info, session);
+ 	kfree(session);
+ 	mutex_unlock(&iep_service.lock);
+ 
+@@ -761,9 +707,7 @@ static long iep_ioctl(struct file *filp, uint32_t cmd, unsigned long arg)
+ 
+ 			if (ret == 0) {
+ 				if (atomic_read(&iep_service.waitcnt) < 10) {
+-#if defined(CONFIG_IEP_IOMMU)
+ 					iep_power_on();
+-#endif
+ 					iep_config(session, msg);
+ 					atomic_inc(&iep_service.waitcnt);
+ 				} else {
+@@ -796,9 +740,8 @@ static long iep_ioctl(struct file *filp, uint32_t cmd, unsigned long arg)
+ 		{
+ 			int iommu_enable = 0;
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ 			iommu_enable = iep_service.iommu_dev ? 1 : 0;
+-#endif
++
+ 			if (copy_to_user((void __user *)arg, &iommu_enable,
+ 				sizeof(int))) {
+ 				IEP_ERR("error: copy_to_user failed\n");
+@@ -855,9 +798,7 @@ static long compat_iep_ioctl(struct file *filp, uint32_t cmd,
+ 
+ 			if (ret == 0) {
+ 				if (atomic_read(&iep_service.waitcnt) < 10) {
+-#if defined(CONFIG_IEP_IOMMU)
+ 					iep_power_on();
+-#endif
+ 					iep_config(session, msg);
+ 					atomic_inc(&iep_service.waitcnt);
+ 				} else {
+@@ -889,9 +830,8 @@ static long compat_iep_ioctl(struct file *filp, uint32_t cmd,
+ 		{
+ 			int iommu_enable = 0;
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ 			iommu_enable = iep_service.iommu_dev ? 1 : 0;
+-#endif
++
+ 			if (copy_to_user((void __user *)arg, &iommu_enable,
+ 				sizeof(int))) {
+ 				IEP_ERR("error: copy_to_user failed\n");
+@@ -933,7 +873,6 @@ static struct miscdevice iep_dev = {
+ 	.fops  = &iep_fops,
+ };
+ 
+-#ifdef CONFIG_IEP_IOMMU
+ static struct device* rockchip_get_sysmmu_device_by_compatible(
+ 	const char *compt)
+ {
+@@ -997,11 +936,7 @@ static int iep_sysmmu_fault_handler(struct device *dev,
+ 
+ 	return 0;
+ }
+-#endif
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+-extern struct ion_client* rockchip_ion_client_create(const char *name);
+-#endif
+ static int iep_drv_probe(struct platform_device *pdev)
+ {
+ 	struct iep_drvdata *data;
+@@ -1009,11 +944,11 @@ static int iep_drv_probe(struct platform_device *pdev)
+ 	struct resource *res = NULL;
+ 	u32 version;
+ 	struct device_node *np = pdev->dev.of_node;
+-#if defined(CONFIG_IEP_IOMMU)
++	struct platform_device *sub_dev = NULL;
++	struct device_node *sub_np = NULL;
+ 	u32 iommu_en = 0;
+ 	struct device *mmu_dev = NULL;
+ 	of_property_read_u32(np, "iommu_enabled", &iommu_en);
+-#endif
+ 
+ 	data = (struct iep_drvdata *)devm_kzalloc(&pdev->dev,
+ 		sizeof(struct iep_drvdata), GFP_KERNEL);
+@@ -1144,33 +1079,32 @@ static int iep_drv_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(data->dev);
+ #endif
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ 	iep_service.iommu_dev = NULL;
+-	if (iommu_en) {
+-		iep_power_on();
+-		iep_service.ion_client = rockchip_ion_client_create("iep");
+-		if (IS_ERR(iep_service.ion_client)) {
+-			IEP_ERR("failed to create ion client for vcodec");
+-			return PTR_ERR(iep_service.ion_client);
+-		} else {
+-			IEP_INFO("iep ion client create success!\n");
+-		}
++	sub_np = of_parse_phandle(np, "iommus", 0);
++	if (sub_np) {
++		sub_dev = of_find_device_by_node(sub_np);
++		iep_service.iommu_dev = &sub_dev->dev;
++	}
+ 
++	if (!iep_service.iommu_dev) {
+ 		mmu_dev = rockchip_get_sysmmu_device_by_compatible(
+ 			IEP_IOMMU_COMPATIBLE_NAME);
+ 
+ 		if (mmu_dev) {
+ 			platform_set_sysmmu(mmu_dev, &pdev->dev);
+-			rockchip_iovmm_activate(&pdev->dev);
+ 		}
+ 
+ 		rockchip_iovmm_set_fault_handler(&pdev->dev,
+-			iep_sysmmu_fault_handler);
++						 iep_sysmmu_fault_handler);
+ 
+-		iep_service.iommu_dev = &pdev->dev;
+-		iep_power_off();
++		iep_service.iommu_dev = mmu_dev;
+ 	}
+-#endif
++	of_property_read_u32(np, "allocator", (u32 *)&iep_service.alloc_type);
++	iep_power_on();
++	iep_service.iommu_info = iep_iommu_info_create(data->dev,
++						       iep_service.iommu_dev,
++						       iep_service.alloc_type);
++	iep_power_off();
+ 
+ 	IEP_INFO("IEP Driver loaded succesfully\n");
+ 
+@@ -1198,6 +1132,9 @@ static int iep_drv_remove(struct platform_device *pdev)
+ 	struct iep_drvdata *data = platform_get_drvdata(pdev);
+ 	struct resource *res;
+ 
++	iep_iommu_info_destroy(iep_service.iommu_info);
++	iep_service.iommu_info = NULL;
++
+ 	wake_lock_destroy(&data->wake_lock);
+ 
+ 	misc_deregister(&(data->miscdev));
+diff --git a/drivers/video/rockchip/iep/iep_drv.h b/drivers/video/rockchip/iep/iep_drv.h
+index f0787342fd74..a2feb9791238 100644
+--- a/drivers/video/rockchip/iep/iep_drv.h
++++ b/drivers/video/rockchip/iep/iep_drv.h
+@@ -5,12 +5,7 @@
+ #include <linux/miscdevice.h>
+ #include <linux/mutex.h>
+ 
+-#if defined(CONFIG_RK_IOMMU) && defined(CONFIG_ION_ROCKCHIP)
+-#define CONFIG_IEP_IOMMU
+-#endif
+-
+-#ifdef CONFIG_IEP_IOMMU
+-#include <linux/rockchip_ion.h>
++#if defined(CONFIG_RK_IOMMU)
+ #include <linux/rockchip-iovmm.h>
+ #include <linux/dma-buf.h>
+ #endif
+@@ -29,11 +24,6 @@
+ #define IEP_ADD_REG_BASE    0x20
+ #define IEP_RAW_REG_BASE    0x16
+ 
+-#if defined(CONFIG_IEP_MMU)
+-#define IEP_MMU_REG_BASE    0x200
+-#define IEP_MMU_REG_LEN     0xA
+-#endif
+-
+ struct iep_parameter_req {
+ 	struct iep_img src;
+ 	struct iep_img dst;
+@@ -118,12 +108,6 @@ typedef struct iep_session {
+ 	pid_t               pid;
+ 	atomic_t            task_running;
+ 	atomic_t            num_done;
+-
+-#if defined(CONFIG_IEP_MMU)
+-	uint32_t *dte_table;
+-	struct list_head    pte_list;
+-	struct task_struct *tsk;
+-#endif
+ } iep_session;
+ 
+ typedef struct iep_service_info {
+@@ -142,10 +126,10 @@ typedef struct iep_service_info {
+ 
+ 	struct mutex	    mutex;  // mutex
+ 
+-#ifdef CONFIG_IEP_IOMMU
+-	struct ion_client *ion_client;
+-#endif
++	struct iep_iommu_info *iommu_info;
++
+ 	struct device *iommu_dev;
++	u32 alloc_type;
+ } iep_service_info;
+ 
+ struct iep_reg {
+@@ -162,21 +146,17 @@ struct iep_reg {
+ 	int                 vir_height;
+ 	int                 layer;
+ 	unsigned int        format;
+-#if defined(CONFIG_IEP_IOMMU)
+ 	struct list_head    mem_region_list;
+-#endif
+ };
+ 
+-#if defined(CONFIG_IEP_IOMMU)
+ struct iep_mem_region {
+ 	struct list_head srv_lnk;
+ 	struct list_head reg_lnk;
+ 	struct list_head session_lnk;
+ 	unsigned long iova;              /* virtual address for iommu */
+ 	unsigned long len;
+-	struct ion_handle *hdl;
++	int hdl;
+ };
+-#endif
+ 
+ #endif
+ 
+diff --git a/drivers/video/rockchip/iep/iep_iommu_drm.c b/drivers/video/rockchip/iep/iep_iommu_drm.c
+new file mode 100644
+index 000000000000..e3c30f8a3423
+--- /dev/null
++++ b/drivers/video/rockchip/iep/iep_iommu_drm.c
+@@ -0,0 +1,491 @@
++/*
++ * Copyright (C) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ * author: Jung Zhao jung.zhao@rock-chips.com
++ *         Randy Li, randy.li@rock-chips.com
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <drm/drmP.h>
++#include <linux/dma-iommu.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-mapping.h>
++#include <linux/kref.h>
++
++#include "iep_iommu_ops.h"
++
++struct iep_drm_buffer {
++	struct list_head list;
++	struct dma_buf *dma_buf;
++	union {
++		unsigned long iova;
++		unsigned long phys;
++	};
++	unsigned long size;
++	int index;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	struct page **pages;
++	struct kref ref;
++	struct iep_iommu_session_info *session_info;
++};
++
++struct iep_iommu_drm_info {
++	struct iommu_domain *domain;
++	bool attached;
++};
++
++static struct iep_drm_buffer *
++iep_drm_get_buffer_no_lock(struct iep_iommu_session_info *session_info,
++			   int idx)
++{
++	struct iep_drm_buffer *drm_buffer = NULL, *n;
++
++	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
++				 list) {
++		if (drm_buffer->index == idx)
++			return drm_buffer;
++	}
++
++	return NULL;
++}
++
++static struct iep_drm_buffer *
++iep_drm_get_buffer_fd_no_lock(struct iep_iommu_session_info *session_info,
++			      int fd)
++{
++	struct iep_drm_buffer *drm_buffer = NULL, *n;
++	struct dma_buf *dma_buf = NULL;
++
++	dma_buf = dma_buf_get(fd);
++
++	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
++				 list) {
++		if (drm_buffer->dma_buf == dma_buf) {
++			dma_buf_put(dma_buf);
++			return drm_buffer;
++		}
++	}
++
++	dma_buf_put(dma_buf);
++
++	return NULL;
++}
++
++static void iep_drm_detach(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++	struct device *dev = iommu_info->dev;
++	struct iommu_domain *domain = drm_info->domain;
++
++	mutex_lock(&iommu_info->iommu_mutex);
++
++	if (!drm_info->attached) {
++		mutex_unlock(&iommu_info->iommu_mutex);
++		return;
++	}
++
++	iommu_detach_device(domain, dev);
++	drm_info->attached = false;
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++}
++
++static int iep_drm_attach_unlock(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++	struct device *dev = iommu_info->dev;
++	struct iommu_domain *domain = drm_info->domain;
++	int ret = 0;
++
++	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
++	ret = iommu_attach_device(domain, dev);
++	if (ret) {
++		dev_err(dev, "Failed to attach iommu device\n");
++		return ret;
++	}
++
++	if (!common_iommu_setup_dma_ops(dev, 0x10000000, SZ_2G, domain->ops)) {
++		dev_err(dev, "Failed to set dma_ops\n");
++		iommu_detach_device(domain, dev);
++		ret = -ENODEV;
++	}
++
++	return ret;
++}
++
++static int iep_drm_attach(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++	int ret;
++
++	mutex_lock(&iommu_info->iommu_mutex);
++
++	if (drm_info->attached) {
++		mutex_unlock(&iommu_info->iommu_mutex);
++		return 0;
++	}
++
++	ret = iep_drm_attach_unlock(iommu_info);
++	if (ret) {
++		mutex_unlock(&iommu_info->iommu_mutex);
++		return ret;
++	}
++
++	drm_info->attached = true;
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++
++	return ret;
++}
++
++static void iep_drm_clear_map(struct kref *ref)
++{
++	struct iep_drm_buffer *drm_buffer =
++		container_of(ref, struct iep_drm_buffer, ref);
++	struct iep_iommu_session_info *session_info =
++		drm_buffer->session_info;
++	struct iep_iommu_info *iommu_info = session_info->iommu_info;
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++	struct device *dev = session_info->dev;
++	struct iommu_domain *domain = drm_info->domain;
++
++	mutex_lock(&iommu_info->iommu_mutex);
++	drm_info = session_info->iommu_info->private;
++	if (!drm_info->attached) {
++		if (iep_drm_attach_unlock(session_info->iommu_info))
++			dev_err(dev, "can't clea map, attach iommu failed.\n");
++	}
++
++	if (drm_buffer->attach) {
++		dma_buf_unmap_attachment(drm_buffer->attach, drm_buffer->sgt,
++					 DMA_BIDIRECTIONAL);
++		dma_buf_detach(drm_buffer->dma_buf, drm_buffer->attach);
++		dma_buf_put(drm_buffer->dma_buf);
++		drm_buffer->attach = NULL;
++	}
++
++	if (!drm_info->attached)
++		iommu_detach_device(domain, dev);
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++}
++
++static void vcdoec_drm_dump_info(struct iep_iommu_session_info *session_info)
++{
++	struct iep_drm_buffer *drm_buffer = NULL, *n;
++
++	vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_OPS_DUMP,
++			"still there are below buffers stored in list\n");
++	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
++				 list) {
++		vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_OPS_DUMP,
++				"index %d drm_buffer dma_buf %p\n",
++				drm_buffer->index,
++				drm_buffer->dma_buf);
++	}
++}
++
++static int iep_drm_free(struct iep_iommu_session_info *session_info,
++			int idx)
++{
++	struct device *dev = session_info->dev;
++	/* please double-check all maps have been release */
++	struct iep_drm_buffer *drm_buffer;
++
++	mutex_lock(&session_info->list_mutex);
++	drm_buffer = iep_drm_get_buffer_no_lock(session_info, idx);
++
++	if (!drm_buffer) {
++		dev_err(dev, "can not find %d buffer in list\n", idx);
++		mutex_unlock(&session_info->list_mutex);
++
++		return -EINVAL;
++	}
++
++	if (atomic_read(&drm_buffer->ref.refcount) == 0) {
++		dma_buf_put(drm_buffer->dma_buf);
++		list_del_init(&drm_buffer->list);
++		kfree(drm_buffer);
++		session_info->buffer_nums--;
++		vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_NORMAL,
++			"buffer nums %d\n", session_info->buffer_nums);
++	}
++	mutex_unlock(&session_info->list_mutex);
++
++	return 0;
++}
++
++static int
++iep_drm_unmap_iommu(struct iep_iommu_session_info *session_info,
++		    int idx)
++{
++	struct device *dev = session_info->dev;
++	struct iep_drm_buffer *drm_buffer;
++
++	/* Force to flush iommu table */
++	if (of_machine_is_compatible("rockchip,rk3288"))
++		rockchip_iovmm_invalidate_tlb(session_info->mmu_dev);
++
++	mutex_lock(&session_info->list_mutex);
++	drm_buffer = iep_drm_get_buffer_no_lock(session_info, idx);
++	mutex_unlock(&session_info->list_mutex);
++
++	if (!drm_buffer) {
++		dev_err(dev, "can not find %d buffer in list\n", idx);
++		return -EINVAL;
++	}
++
++	kref_put(&drm_buffer->ref, iep_drm_clear_map);
++
++	return 0;
++}
++
++static int iep_drm_map_iommu(struct iep_iommu_session_info *session_info,
++			     int idx,
++			     unsigned long *iova,
++			     unsigned long *size)
++{
++	struct device *dev = session_info->dev;
++	struct iep_drm_buffer *drm_buffer;
++
++	/* Force to flush iommu table */
++	if (of_machine_is_compatible("rockchip,rk3288"))
++		rockchip_iovmm_invalidate_tlb(session_info->mmu_dev);
++
++	mutex_lock(&session_info->list_mutex);
++	drm_buffer = iep_drm_get_buffer_no_lock(session_info, idx);
++	mutex_unlock(&session_info->list_mutex);
++
++	if (!drm_buffer) {
++		dev_err(dev, "can not find %d buffer in list\n", idx);
++		return -EINVAL;
++	}
++
++	kref_get(&drm_buffer->ref);
++	if (iova)
++		*iova = drm_buffer->iova;
++	if (size)
++		*size = drm_buffer->size;
++	return 0;
++}
++
++static int
++iep_drm_free_fd(struct iep_iommu_session_info *session_info, int fd)
++{
++	/* please double-check all maps have been release */
++	struct iep_drm_buffer *drm_buffer = NULL;
++
++	mutex_lock(&session_info->list_mutex);
++	drm_buffer = iep_drm_get_buffer_fd_no_lock(session_info, fd);
++
++	if (!drm_buffer) {
++		vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_NORMAL,
++				"can not find %d buffer in list\n", fd);
++		mutex_unlock(&session_info->list_mutex);
++
++		return -EINVAL;
++	}
++	mutex_unlock(&session_info->list_mutex);
++
++	iep_drm_unmap_iommu(session_info, drm_buffer->index);
++
++	mutex_lock(&session_info->list_mutex);
++	if (atomic_read(&drm_buffer->ref.refcount) == 0) {
++		dma_buf_put(drm_buffer->dma_buf);
++		list_del_init(&drm_buffer->list);
++		kfree(drm_buffer);
++		session_info->buffer_nums--;
++		vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_NORMAL,
++				"buffer nums %d\n", session_info->buffer_nums);
++	}
++	mutex_unlock(&session_info->list_mutex);
++
++	return 0;
++}
++
++static void
++iep_drm_clear_session(struct iep_iommu_session_info *session_info)
++{
++	struct iep_drm_buffer *drm_buffer = NULL, *n;
++
++	list_for_each_entry_safe(drm_buffer, n, &session_info->buffer_list,
++				 list) {
++		kref_put(&drm_buffer->ref, iep_drm_clear_map);
++		iep_drm_free(session_info, drm_buffer->index);
++	}
++}
++
++static int iep_drm_import(struct iep_iommu_session_info *session_info,
++			  int fd)
++{
++	struct iep_drm_buffer *drm_buffer = NULL, *n;
++	struct iep_iommu_info *iommu_info = session_info->iommu_info;
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++	struct iommu_domain *domain = drm_info->domain;
++	struct device *dev = session_info->dev;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	struct dma_buf *dma_buf;
++	int ret = 0;
++
++	dma_buf = dma_buf_get(fd);
++	if (IS_ERR(dma_buf)) {
++		ret = PTR_ERR(dma_buf);
++		return ret;
++	}
++
++	list_for_each_entry_safe(drm_buffer, n,
++				 &session_info->buffer_list, list) {
++		if (drm_buffer->dma_buf == dma_buf) {
++			dma_buf_put(dma_buf);
++			return drm_buffer->index;
++		}
++	}
++
++	drm_buffer = kzalloc(sizeof(*drm_buffer), GFP_KERNEL);
++	if (!drm_buffer) {
++		ret = -ENOMEM;
++		return ret;
++	}
++
++	drm_buffer->dma_buf = dma_buf;
++	drm_buffer->session_info = session_info;
++
++	kref_init(&drm_buffer->ref);
++
++	mutex_lock(&iommu_info->iommu_mutex);
++	drm_info = session_info->iommu_info->private;
++	if (!drm_info->attached) {
++		ret = iep_drm_attach_unlock(session_info->iommu_info);
++		if (ret)
++			goto fail_out;
++	}
++
++	attach = dma_buf_attach(drm_buffer->dma_buf, dev);
++	if (IS_ERR(attach)) {
++		ret = PTR_ERR(attach);
++		goto fail_out;
++	}
++
++	get_dma_buf(drm_buffer->dma_buf);
++
++	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto fail_detach;
++	}
++
++	drm_buffer->iova = sg_dma_address(sgt->sgl);
++	drm_buffer->size = drm_buffer->dma_buf->size;
++
++	drm_buffer->attach = attach;
++	drm_buffer->sgt = sgt;
++
++	if (!drm_info->attached)
++		iommu_detach_device(domain, dev);
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++
++	INIT_LIST_HEAD(&drm_buffer->list);
++	mutex_lock(&session_info->list_mutex);
++	session_info->buffer_nums++;
++	vpu_iommu_debug(session_info->debug_level, DEBUG_IOMMU_NORMAL,
++			"buffer nums %d\n", session_info->buffer_nums);
++	drm_buffer->index = session_info->max_idx;
++	list_add_tail(&drm_buffer->list, &session_info->buffer_list);
++	session_info->max_idx++;
++	if ((session_info->max_idx & 0xfffffff) == 0)
++		session_info->max_idx = 0;
++	mutex_unlock(&session_info->list_mutex);
++
++	return drm_buffer->index;
++
++fail_detach:
++	dev_err(dev, "dmabuf map attach failed\n");
++	dma_buf_detach(drm_buffer->dma_buf, attach);
++	dma_buf_put(drm_buffer->dma_buf);
++fail_out:
++	kfree(drm_buffer);
++	mutex_unlock(&iommu_info->iommu_mutex);
++
++	return ret;
++}
++
++static int iep_drm_create(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_drm_info *drm_info;
++	int ret;
++
++	iommu_info->private = kzalloc(sizeof(*drm_info),
++				      GFP_KERNEL);
++	drm_info = iommu_info->private;
++	if (!drm_info)
++		return -ENOMEM;
++
++	drm_info->domain = iommu_domain_alloc(&platform_bus_type);
++	drm_info->attached = false;
++	if (!drm_info->domain) {
++		kfree(iommu_info->private);
++		return -ENOMEM;
++	}
++
++	ret = iommu_get_dma_cookie(drm_info->domain);
++	if (ret)
++		goto err_free_domain;
++
++	iep_drm_attach(iommu_info);
++
++	return 0;
++
++err_free_domain:
++	iommu_domain_free(drm_info->domain);
++
++	return ret;
++}
++
++static int iep_drm_destroy(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_drm_info *drm_info = iommu_info->private;
++
++	iep_drm_detach(iommu_info);
++	iommu_put_dma_cookie(drm_info->domain);
++	iommu_domain_free(drm_info->domain);
++
++	kfree(drm_info);
++	iommu_info->private = NULL;
++
++	return 0;
++}
++
++static struct iep_iommu_ops drm_ops = {
++	.create = iep_drm_create,
++	.import = iep_drm_import,
++	.free = iep_drm_free,
++	.free_fd = iep_drm_free_fd,
++	.map_iommu = iep_drm_map_iommu,
++	.unmap_iommu = iep_drm_unmap_iommu,
++	.destroy = iep_drm_destroy,
++	.dump = vcdoec_drm_dump_info,
++	.attach = iep_drm_attach,
++	.detach = iep_drm_detach,
++	.clear = iep_drm_clear_session,
++};
++
++void iep_iommu_drm_set_ops(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info)
++		return;
++	iommu_info->ops = &drm_ops;
++}
+diff --git a/drivers/video/rockchip/iep/iep_iommu_ion.c b/drivers/video/rockchip/iep/iep_iommu_ion.c
+new file mode 100644
+index 000000000000..b6a91d685d0f
+--- /dev/null
++++ b/drivers/video/rockchip/iep/iep_iommu_ion.c
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (C) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ * author: Jung Zhao jung.zhao@rock-chips.com
++ *         Randy Li, randy.li@rock-chips.com
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/rockchip_ion.h>
++#include <linux/rockchip-iovmm.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/memblock.h>
++#include <linux/module.h>
++#include <linux/of_address.h>
++#include <linux/of_graph.h>
++#include <linux/component.h>
++#include <linux/fence.h>
++#include <linux/console.h>
++#include <linux/kref.h>
++#include <linux/fdtable.h>
++
++#include "iep_iommu_ops.h"
++
++struct iep_ion_buffer {
++	struct list_head list;
++	struct ion_handle *handle;
++	int index;
++};
++
++struct iep_iommu_ion_info {
++	struct ion_client *ion_client;
++	bool attached;
++};
++
++static struct iep_ion_buffer *
++iep_ion_get_buffer_no_lock(struct iep_iommu_session_info *session_info,
++			   int idx)
++{
++	struct iep_ion_buffer *ion_buffer = NULL, *n;
++
++	list_for_each_entry_safe(ion_buffer, n,
++				 &session_info->buffer_list, list) {
++		if (ion_buffer->index == idx)
++			return ion_buffer;
++	}
++
++	return NULL;
++}
++
++static void
++iep_ion_clear_session(struct iep_iommu_session_info *session_info)
++{
++	/* do nothing */
++}
++
++static int iep_ion_attach(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++	int ret;
++
++	mutex_lock(&iommu_info->iommu_mutex);
++
++	if (ion_info->attached) {
++		mutex_unlock(&iommu_info->iommu_mutex);
++		return 0;
++	}
++
++	rockchip_iovmm_activate(iommu_info->dev);
++
++	ion_info->attached = true;
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++
++	return ret;
++}
++
++static void iep_ion_detach(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++
++	mutex_lock(&iommu_info->iommu_mutex);
++
++	if (!ion_info->attached) {
++		mutex_unlock(&iommu_info->iommu_mutex);
++		return;
++	}
++
++	rockchip_iovmm_deactivate(iommu_info->dev);
++	ion_info->attached = false;
++
++	mutex_unlock(&iommu_info->iommu_mutex);
++}
++
++static int iep_ion_destroy(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++
++	iep_ion_detach(iommu_info);
++	kfree(ion_info);
++	iommu_info->private = NULL;
++
++	return 0;
++}
++
++static int
++iep_ion_free(struct iep_iommu_session_info *session_info, int idx)
++{
++	struct iep_ion_buffer *ion_buffer;
++
++	mutex_lock(&session_info->list_mutex);
++	ion_buffer = iep_ion_get_buffer_no_lock(session_info, idx);
++
++	if (!ion_buffer) {
++		mutex_unlock(&session_info->list_mutex);
++		pr_err("%s can not find %d buffer in list\n", __func__, idx);
++
++		return -EINVAL;
++	}
++
++	list_del_init(&ion_buffer->list);
++	mutex_unlock(&session_info->list_mutex);
++	kfree(ion_buffer);
++
++	return 0;
++}
++
++static int
++iep_ion_unmap_iommu(struct iep_iommu_session_info *session_info, int idx)
++{
++	struct iep_ion_buffer *ion_buffer;
++	struct iep_iommu_info *iommu_info = session_info->iommu_info;
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++
++	mutex_lock(&session_info->list_mutex);
++	ion_buffer = iep_ion_get_buffer_no_lock(session_info, idx);
++	mutex_unlock(&session_info->list_mutex);
++
++	if (!ion_buffer) {
++		pr_err("%s can not find %d buffer in list\n", __func__, idx);
++
++		return -EINVAL;
++	}
++
++	ion_free(ion_info->ion_client, ion_buffer->handle);
++
++	return 0;
++}
++
++static int
++iep_ion_map_iommu(struct iep_iommu_session_info *session_info, int idx,
++		  unsigned long *iova, unsigned long *size)
++{
++	struct iep_ion_buffer *ion_buffer;
++	struct device *dev = session_info->dev;
++	struct iep_iommu_info *iommu_info = session_info->iommu_info;
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++	int ret = 0;
++
++	/* Force to flush iommu table */
++	rockchip_iovmm_invalidate_tlb(session_info->dev);
++
++	mutex_lock(&session_info->list_mutex);
++	ion_buffer = iep_ion_get_buffer_no_lock(session_info, idx);
++	mutex_unlock(&session_info->list_mutex);
++
++	if (!ion_buffer) {
++		pr_err("%s can not find %d buffer in list\n", __func__, idx);
++
++		return -EINVAL;
++	}
++
++	if (session_info->mmu_dev)
++		ret = ion_map_iommu(dev, ion_info->ion_client,
++				    ion_buffer->handle, iova, size);
++	else
++		ret = ion_phys(ion_info->ion_client, ion_buffer->handle,
++			       iova, (size_t *)size);
++
++	return ret;
++}
++
++static int
++iep_ion_import(struct iep_iommu_session_info *session_info, int fd)
++{
++	struct iep_ion_buffer *ion_buffer = NULL;
++	struct iep_iommu_info *iommu_info = session_info->iommu_info;
++	struct iep_iommu_ion_info *ion_info = iommu_info->private;
++
++	ion_buffer = kzalloc(sizeof(*ion_buffer), GFP_KERNEL);
++	if (!ion_buffer)
++		return -ENOMEM;
++
++	ion_buffer->handle = ion_import_dma_buf(ion_info->ion_client, fd);
++
++	INIT_LIST_HEAD(&ion_buffer->list);
++	mutex_lock(&session_info->list_mutex);
++	ion_buffer->index = session_info->max_idx;
++	list_add_tail(&ion_buffer->list, &session_info->buffer_list);
++	session_info->max_idx++;
++	if ((session_info->max_idx & 0xfffffff) == 0)
++		session_info->max_idx = 0;
++	mutex_unlock(&session_info->list_mutex);
++
++	return ion_buffer->index;
++}
++
++static int iep_ion_create(struct iep_iommu_info *iommu_info)
++{
++	struct iep_iommu_ion_info *ion_info;
++
++	iommu_info->private = kmalloc(sizeof(*ion_info), GFP_KERNEL);
++
++	ion_info = iommu_info->private;
++	if (!ion_info)
++		return -ENOMEM;
++
++	ion_info->ion_client = rockchip_ion_client_create("vpu");
++	ion_info->attached = false;
++
++	iep_ion_attach(iommu_info);
++
++	return IS_ERR(ion_info->ion_client) ? -1 : 0;
++}
++
++static struct iep_iommu_ops ion_ops = {
++	.create = iep_ion_create,
++	.destroy = iep_ion_destroy,
++	.import = iep_ion_import,
++	.free = iep_ion_free,
++	.free_fd = NULL,
++	.map_iommu = iep_ion_map_iommu,
++	.unmap_iommu = iep_ion_unmap_iommu,
++	.dump = NULL,
++	.attach = iep_ion_attach,
++	.detach = iep_ion_detach,
++	.clear = iep_ion_clear_session,
++};
++
++/*
++ * we do not manage the ref number ourselves,
++ * since ion will help us to do that. what we
++ * need to do is just map/unmap and import/free
++ * every time
++ */
++void iep_iommu_ion_set_ops(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info)
++		return;
++	iommu_info->ops = &ion_ops;
++}
+diff --git a/drivers/video/rockchip/iep/iep_iommu_ops.c b/drivers/video/rockchip/iep/iep_iommu_ops.c
+new file mode 100644
+index 000000000000..36c4815f1660
+--- /dev/null
++++ b/drivers/video/rockchip/iep/iep_iommu_ops.c
+@@ -0,0 +1,248 @@
++/**
++ * Copyright (C) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ * author: Jung Zhao jung.zhao@rock-chips.com
++ *         Randy Li, randy.li@rock-chips.com
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/slab.h>
++
++#include "iep_iommu_ops.h"
++
++static
++struct iep_iommu_session_info *iep_iommu_get_session_info
++	(struct iep_iommu_info *iommu_info, struct iep_session *session)
++{
++	struct iep_iommu_session_info *session_info = NULL, *n;
++
++	list_for_each_entry_safe(session_info, n, &iommu_info->session_list,
++				 head) {
++		if (session_info->session == session)
++			return session_info;
++	}
++
++	return NULL;
++}
++
++int iep_iommu_create(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info || !iommu_info->ops->create)
++		return -EINVAL;
++
++	return iommu_info->ops->create(iommu_info);
++}
++
++int iep_iommu_import(struct iep_iommu_info *iommu_info,
++		     struct iep_session *session, int fd)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info || !iommu_info->ops->import || !session)
++		return -EINVAL;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++	if (!session_info) {
++		session_info = kzalloc(sizeof(*session_info), GFP_KERNEL);
++		if (!session_info)
++			return -ENOMEM;
++
++		INIT_LIST_HEAD(&session_info->head);
++		INIT_LIST_HEAD(&session_info->buffer_list);
++		mutex_init(&session_info->list_mutex);
++		session_info->max_idx = 0;
++		session_info->session = session;
++		session_info->mmu_dev = iommu_info->mmu_dev;
++		session_info->dev = iommu_info->dev;
++		session_info->iommu_info = iommu_info;
++		session_info->buffer_nums = 0;
++		mutex_lock(&iommu_info->list_mutex);
++		list_add_tail(&session_info->head, &iommu_info->session_list);
++		mutex_unlock(&iommu_info->list_mutex);
++	}
++
++	session_info->debug_level = iommu_info->debug_level;
++
++	return iommu_info->ops->import(session_info, fd);
++}
++
++int iep_iommu_free(struct iep_iommu_info *iommu_info,
++		   struct iep_session *session, int idx)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return -EINVAL;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->free || !session_info)
++		return -EINVAL;
++
++	return iommu_info->ops->free(session_info, idx);
++}
++
++int iep_iommu_free_fd(struct iep_iommu_info *iommu_info,
++		      struct iep_session *session, int fd)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return -EINVAL;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->free_fd || !session_info)
++		return -EINVAL;
++
++	return iommu_info->ops->free_fd(session_info, fd);
++}
++
++int iep_iommu_map_iommu(struct iep_iommu_info *iommu_info,
++			struct iep_session *session,
++			int idx, unsigned long *iova,
++			unsigned long *size)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return -EINVAL;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->map_iommu || !session_info)
++		return -EINVAL;
++
++	return iommu_info->ops->map_iommu(session_info, idx, iova, size);
++}
++
++int iep_iommu_unmap_iommu(struct iep_iommu_info *iommu_info,
++			  struct iep_session *session, int idx)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return -EINVAL;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->unmap_iommu || !session_info)
++		return -EINVAL;
++
++	return iommu_info->ops->unmap_iommu(session_info, idx);
++}
++
++int iep_iommu_destroy(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info || !iommu_info->ops->destroy)
++		return -EINVAL;
++
++	return iommu_info->ops->destroy(iommu_info);
++}
++
++void iep_iommu_dump(struct iep_iommu_info *iommu_info,
++		    struct iep_session *session)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->dump || !session_info)
++		return;
++
++	iommu_info->ops->dump(session_info);
++}
++
++void iep_iommu_clear(struct iep_iommu_info *iommu_info,
++		     struct iep_session *session)
++{
++	struct iep_iommu_session_info *session_info = NULL;
++
++	if (!iommu_info)
++		return;
++
++	session_info = iep_iommu_get_session_info(iommu_info, session);
++
++	if (!iommu_info->ops->clear || !session_info)
++		return;
++
++	iommu_info->ops->clear(session_info);
++
++	mutex_lock(&iommu_info->list_mutex);
++	list_del_init(&session_info->head);
++	kfree(session_info);
++	mutex_unlock(&iommu_info->list_mutex);
++}
++
++int iep_iommu_attach(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info || !iommu_info->ops->attach)
++		return 0;
++
++	return iommu_info->ops->attach(iommu_info);
++}
++
++void iep_iommu_detach(struct iep_iommu_info *iommu_info)
++{
++	if (!iommu_info || !iommu_info->ops->detach)
++		return;
++
++	return iommu_info->ops->detach(iommu_info);
++}
++
++struct iep_iommu_info *
++iep_iommu_info_create(struct device *dev,
++		      struct device *mmu_dev,
++		      int alloc_type)
++{
++	struct iep_iommu_info *iommu_info = NULL;
++
++	iommu_info = kzalloc(sizeof(*iommu_info), GFP_KERNEL);
++	if (!iommu_info)
++		return NULL;
++
++	iommu_info->dev = dev;
++	INIT_LIST_HEAD(&iommu_info->session_list);
++	mutex_init(&iommu_info->list_mutex);
++	mutex_init(&iommu_info->iommu_mutex);
++	switch (alloc_type) {
++#ifdef CONFIG_DRM
++	case ALLOCATOR_USE_DRM:
++		iep_iommu_drm_set_ops(iommu_info);
++		break;
++#endif
++#ifdef CONFIG_ION
++	case ALLOCATOR_USE_ION:
++		iep_iommu_ion_set_ops(iommu_info);
++		break;
++#endif
++	default:
++		iommu_info->ops = NULL;
++		break;
++	}
++
++	iommu_info->mmu_dev = mmu_dev;
++
++	iep_iommu_create(iommu_info);
++
++	return iommu_info;
++}
++
++int iep_iommu_info_destroy(struct iep_iommu_info *iommu_info)
++{
++	iep_iommu_destroy(iommu_info);
++	kfree(iommu_info);
++
++	return 0;
++}
+diff --git a/drivers/video/rockchip/iep/iep_iommu_ops.h b/drivers/video/rockchip/iep/iep_iommu_ops.h
+new file mode 100644
+index 000000000000..b1c5ff88fcce
+--- /dev/null
++++ b/drivers/video/rockchip/iep/iep_iommu_ops.h
+@@ -0,0 +1,124 @@
++/**
++ * Copyright (C) 2016 Fuzhou Rockchip Electronics Co., Ltd
++ * author: Jung Zhao jung.zhao@rock-chips.com
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __IEP_IOMMU_OPS_H__
++#define __IEP_IOMMU_OPS_H__
++
++#include <linux/platform_device.h>
++#include "iep_drv.h"
++
++#define BUFFER_LIST_MAX_NUMS	30
++
++#define ALLOCATOR_USE_ION		0x00000000
++#define ALLOCATOR_USE_DRM		0x00000001
++
++#define DEBUG_IOMMU_OPS_DUMP	0x00020000
++#define DEBUG_IOMMU_NORMAL	0x00040000
++
++#define vpu_iommu_debug_func(debug_level, type, fmt, args...)	\
++	do {							\
++		if (unlikely(debug_level & type)) {		\
++			pr_info("%s:%d: " fmt,			\
++				 __func__, __LINE__, ##args);	\
++		}						\
++	} while (0)
++#define vpu_iommu_debug(debug_level, type, fmt, args...)	\
++	do {							\
++		if (unlikely(debug_level & type)) {		\
++			pr_info(fmt, ##args);			\
++		}						\
++	} while (0)
++
++struct iep_iommu_info;
++struct iep_iommu_session_info;
++
++struct iep_iommu_ops {
++	int (*create)(struct iep_iommu_info *iommu_info);
++	int (*import)(struct iep_iommu_session_info *session_info, int fd);
++	int (*free)(struct iep_iommu_session_info *session_info, int idx);
++	int (*free_fd)(struct iep_iommu_session_info *session_info, int fd);
++	int (*map_iommu)(struct iep_iommu_session_info *session_info,
++			 int idx,
++			 unsigned long *iova, unsigned long *size);
++	int (*unmap_iommu)(struct iep_iommu_session_info *session_info,
++			   int idx);
++	int (*destroy)(struct iep_iommu_info *iommu_info);
++	void (*dump)(struct iep_iommu_session_info *session_info);
++	int (*attach)(struct iep_iommu_info *iommu_info);
++	void (*detach)(struct iep_iommu_info *iommu_info);
++	void (*clear)(struct iep_iommu_session_info *session_info);
++};
++
++struct iep_iommu_session_info {
++	struct list_head head;
++	struct iep_session *session;
++	int buffer_nums;
++	struct list_head buffer_list;
++	struct mutex list_mutex;
++	int max_idx;
++	struct device *dev;
++	struct device *mmu_dev;
++	struct iep_iommu_info *iommu_info;
++	int debug_level;
++};
++
++struct iep_iommu_info {
++	struct list_head session_list;
++	struct mutex list_mutex;
++	struct mutex iommu_mutex;
++	struct device *dev;
++	struct device *mmu_dev;
++	struct iep_iommu_ops *ops;
++	int debug_level;
++	void *private;
++};
++
++#ifdef CONFIG_DRM
++void iep_iommu_drm_set_ops(struct iep_iommu_info *iommu_info);
++#endif
++#ifdef CONFIG_ION
++void iep_iommu_ion_set_ops(struct iep_iommu_info *iommu_info);
++#endif
++
++struct iep_iommu_info *iep_iommu_info_create(struct device *dev,
++					     struct device *mmu_dev,
++					     int alloc_type);
++int iep_iommu_info_destroy(struct iep_iommu_info *iommu_info);
++
++int iep_iommu_create(struct iep_iommu_info *iommu_info);
++int iep_iommu_import(struct iep_iommu_info *iommu_info,
++		     struct iep_session *session, int fd);
++int iep_iommu_free(struct iep_iommu_info *iommu_info,
++		   struct iep_session *session, int idx);
++int iep_iommu_free_fd(struct iep_iommu_info *iommu_info,
++		      struct iep_session *session, int fd);
++int iep_iommu_map_iommu(struct iep_iommu_info *iommu_info,
++			struct iep_session *session,
++			int idx,
++			unsigned long *iova,
++			unsigned long *size);
++int iep_iommu_unmap_iommu(struct iep_iommu_info *iommu_info,
++			  struct iep_session *session,
++			  int idx);
++int iep_iommu_destroy(struct iep_iommu_info *iommu_info);
++void iep_iommu_dump(struct iep_iommu_info *iommu_info,
++		    struct iep_session *session);
++void iep_iommu_clear(struct iep_iommu_info *iommu_info,
++		     struct iep_session *session);
++
++int iep_iommu_attach(struct iep_iommu_info *iommu_info);
++void iep_iommu_detach(struct iep_iommu_info *iommu_info);
++
++#endif
+-- 
+2.35.3
+

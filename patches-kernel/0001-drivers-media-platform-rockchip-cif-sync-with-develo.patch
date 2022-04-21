@@ -1,0 +1,219 @@
+From 02bc53d50b87f8279e8766aef6ecfa57114120bf Mon Sep 17 00:00:00 2001
+From: Allon Huang <allon.huang@rock-chips.com>
+Date: Wed, 25 Mar 2020 21:09:54 +0800
+Subject: [PATCH] drivers: media: platform: rockchip: cif: sync with
+ develop-4.4
+
+sync with develop-4.4 at commit point:2b8ec827b22abc4a47
+
+Signed-off-by: Allon Huang <allon.huang@rock-chips.com>
+Change-Id: I1d16e1a176ca8af36d5c8f0d55d747718db5aca0
+---
+ drivers/media/platform/rockchip/cif/capture.c | 46 ++++++++-----
+ drivers/media/platform/rockchip/cif/dev.c     | 64 ++++++++++++++++++-
+ 2 files changed, 92 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+index a59e9966fda2..93151c27a493 100644
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -33,6 +33,12 @@
+ #define STREAM_PAD_SINK				0
+ #define STREAM_PAD_SOURCE			1
+ 
++/*
++ * Round up height when allocate memory so that Rockchip encoder can
++ * use DMA buffer directly, though this may waste a bit of memory.
++ */
++#define MEMORY_ALIGN_ROUND_UP_HEIGHT		16
++
+ /* Get xsubs and ysubs for fourcc formats
+  *
+  * @xsubs: horizontal color samples in a 4*4 matrix, for yuv
+@@ -879,27 +885,37 @@ static void rkcif_stream_stop(struct rkcif_stream *stream)
+ }
+ 
+ static int rkcif_queue_setup(struct vb2_queue *queue,
++			     const void *parg,
+ 			     unsigned int *num_buffers,
+ 			     unsigned int *num_planes,
+ 			     unsigned int sizes[],
+-			     struct device *alloc_ctxs[])
++			     void *alloc_ctxs[])
+ {
+ 	struct rkcif_stream *stream = queue->drv_priv;
+ 	struct rkcif_device *dev = stream->cifdev;
++	const struct v4l2_format *pfmt = parg;
+ 	const struct v4l2_pix_format_mplane *pixm;
+ 	const struct cif_output_fmt *cif_fmt;
+ 	u32 i;
+ 
++	if (pfmt) {
++		pixm = &pfmt->fmt.pix_mp;
++		cif_fmt = find_output_fmt(stream, pixm->pixelformat);
++	} else {
++		pixm = &stream->pixm;
++		cif_fmt = stream->cif_fmt_out;
++	}
+ 
+-	pixm = &stream->pixm;
+-	cif_fmt = stream->cif_fmt_out;
+ 	*num_planes = cif_fmt->mplanes;
+ 
+ 	for (i = 0; i < cif_fmt->mplanes; i++) {
+ 		const struct v4l2_plane_pix_format *plane_fmt;
++		int h = round_up(pixm->height, MEMORY_ALIGN_ROUND_UP_HEIGHT);
+ 
+ 		plane_fmt = &pixm->plane_fmt[i];
+-		sizes[i] = plane_fmt->sizeimage;
++		sizes[i] = plane_fmt->sizeimage / pixm->height * h;
++
++		alloc_ctxs[i] = dev->alloc_ctx;
+ 	}
+ 
+ 	v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev, "%s count %d, size %d\n",
+@@ -1588,19 +1604,18 @@ static int rkcif_fh_open(struct file *filp)
+ 	 * Because CRU would reset iommu too, so there's not chance
+ 	 * to reset cif once we hold buffers after buf queued
+ 	 */
+-	if (cifdev->chip_id == CHIP_RK1808_CIF)
++	if (cifdev->chip_id == CHIP_RK1808_CIF) {
++		mutex_lock(&cifdev->stream_lock);
++		v4l2_info(&cifdev->v4l2_dev, "fh_cnt: %d\n",
++					atomic_read(&cifdev->fh_cnt));
++		if (!atomic_read(&cifdev->fh_cnt))
++			rkcif_soft_reset(cifdev, true);
+ 		atomic_inc(&cifdev->fh_cnt);
+-	else
++		mutex_unlock(&cifdev->stream_lock);
++	} else {
+ 		rkcif_soft_reset(cifdev, true);
+-
+-	ret = vb2_fop_release(file);
+-	if (!ret) {
+-		ret = v4l2_pipeline_pm_use(&stream->vdev.entity, 0);
+-		if (ret < 0)
+-			v4l2_err(&cifdev->v4l2_dev,
+-				"set pipeline power failed %d\n", ret);
+ 	}
+-	return ret;
++	return v4l2_fh_open(filp);
+ }
+ 
+ static int rkcif_fh_release(struct file *filp)
+@@ -1896,7 +1911,6 @@ static int rkcif_register_stream_vdev(struct rkcif_stream *stream,
+ 	}
+ 
+ 	ret = media_entity_init(&vdev->entity, 1, &node->pad, 0);
+-
+ 	if (ret < 0)
+ 		goto unreg;
+ 
+@@ -1954,7 +1968,7 @@ static void rkcif_vb_done_oneframe(struct rkcif_stream *stream,
+ 		vb2_set_plane_payload(&vb_done->vb2_buf, i,
+ 				      stream->pixm.plane_fmt[i].sizeimage);
+ 	}
+-	vb_done->vb2_buf.timestamp = ktime_get_ns();
++	vb_done->timestamp = ns_to_timeval(ktime_get_ns());
+ 	vb2_buffer_done(&vb_done->vb2_buf, VB2_BUF_STATE_DONE);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/cif/dev.c b/drivers/media/platform/rockchip/cif/dev.c
+index 7fab521d4b56..571d9f4e1fb8 100644
+--- a/drivers/media/platform/rockchip/cif/dev.c
++++ b/drivers/media/platform/rockchip/cif/dev.c
+@@ -585,6 +585,63 @@ static int rkcif_enable_sys_clk(struct rkcif_device *cif_dev)
+ 	return ret;
+ }
+ 
++static int rkcif_iommu_init(struct rkcif_device *cif_dev)
++{
++	struct iommu_group *group;
++	int ret;
++
++	cif_dev->domain = iommu_domain_alloc(&platform_bus_type);
++	if (!cif_dev->domain)
++		return -ENOMEM;
++
++	ret = iommu_get_dma_cookie(cif_dev->domain);
++	if (ret)
++		goto err_free_domain;
++
++	group = iommu_group_get(cif_dev->dev);
++	if (!group) {
++		group = iommu_group_alloc();
++		if (IS_ERR(group)) {
++			ret = PTR_ERR(group);
++			goto err_put_cookie;
++		}
++		ret = iommu_group_add_device(group, cif_dev->dev);
++		iommu_group_put(group);
++		if (ret)
++			goto err_put_cookie;
++	}
++	iommu_group_put(group);
++
++	ret = iommu_attach_device(cif_dev->domain, cif_dev->dev);
++	if (ret)
++		goto err_put_cookie;
++	if (!common_iommu_setup_dma_ops(cif_dev->dev, 0x10000000, SZ_2G,
++					cif_dev->domain->ops)) {
++		ret = -ENODEV;
++		goto err_detach;
++	}
++
++	return 0;
++
++err_detach:
++	iommu_detach_device(cif_dev->domain, cif_dev->dev);
++err_put_cookie:
++	iommu_put_dma_cookie(cif_dev->domain);
++err_free_domain:
++	iommu_domain_free(cif_dev->domain);
++
++	dev_err(cif_dev->dev, "Failed to setup IOMMU, ret(%d)\n", ret);
++
++	return ret;
++}
++
++static void rkcif_iommu_cleanup(struct rkcif_device *cif_dev)
++{
++	iommu_detach_device(cif_dev->domain, cif_dev->dev);
++	iommu_put_dma_cookie(cif_dev->domain);
++	iommu_domain_free(cif_dev->domain);
++}
++
+ static inline bool is_iommu_enable(struct device *dev)
+ {
+ 	struct device_node *iommu;
+@@ -746,7 +803,6 @@ static int rkcif_plat_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	media_device_init(&cif_dev->media_dev);
+ 	ret = media_device_register(&cif_dev->media_dev);
+ 	if (ret < 0) {
+ 		v4l2_err(v4l2_dev, "Failed to register media device: %d\n",
+@@ -760,7 +816,9 @@ static int rkcif_plat_probe(struct platform_device *pdev)
+ 		goto err_unreg_media_dev;
+ 
+ 	cif_dev->iommu_en = is_iommu_enable(dev);
+-	if (!(cif_dev->iommu_en)) {
++	if (cif_dev->iommu_en) {
++		rkcif_iommu_init(cif_dev);
++	} else {
+ 		ret = of_reserved_mem_device_init(dev);
+ 		if (ret)
+ 			v4l2_warn(v4l2_dev,
+@@ -790,6 +848,8 @@ static int rkcif_plat_remove(struct platform_device *pdev)
+ 	struct rkcif_device *cif_dev = platform_get_drvdata(pdev);
+ 
+ 	pm_runtime_disable(&pdev->dev);
++	if (cif_dev->iommu_en)
++		rkcif_iommu_cleanup(cif_dev);
+ 
+ 	media_device_unregister(&cif_dev->media_dev);
+ 	v4l2_device_unregister(&cif_dev->v4l2_dev);
+-- 
+2.35.3
+

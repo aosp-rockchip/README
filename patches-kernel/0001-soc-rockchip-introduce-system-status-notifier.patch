@@ -1,0 +1,235 @@
+From 7e1f848e15a8a5b9fb395a775176a057df38ad52 Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Mon, 22 May 2017 20:59:20 +0800
+Subject: [PATCH] soc: rockchip: introduce system status notifier
+
+This makes dmc driver possible to register a system status notifier and
+other drivers possible to call the notifier call-back easily, so that
+the dmc driver can change frequency according to different system status.
+
+Change-Id: I1a4fb4649366d75310d2e29f87775bb2d9ca3d67
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/soc/rockchip/Makefile                 |   1 +
+ drivers/soc/rockchip/rockchip-system-status.c | 102 ++++++++++++++++++
+ .../dt-bindings/soc/rockchip-system-status.h  |  43 ++++++++
+ include/linux/rockchip/common.h               |   5 -
+ include/soc/rockchip/rockchip-system-status.h |  22 ++++
+ 5 files changed, 168 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/soc/rockchip/rockchip-system-status.c
+ create mode 100644 include/dt-bindings/soc/rockchip-system-status.h
+ create mode 100644 include/soc/rockchip/rockchip-system-status.h
+
+diff --git a/drivers/soc/rockchip/Makefile b/drivers/soc/rockchip/Makefile
+index 16861bd11da9..22e54844968a 100644
+--- a/drivers/soc/rockchip/Makefile
++++ b/drivers/soc/rockchip/Makefile
+@@ -11,3 +11,4 @@ obj-$(CONFIG_ROCKCHIP_PVTM)	+= rockchip_pvtm.o
+ obj-$(CONFIG_ROCKCHIP_SUSPEND_MODE) += rockchip_pm_config.o
+ 
+ obj-y += rk_vendor_storage.o
++obj-y += rockchip-system-status.o
+diff --git a/drivers/soc/rockchip/rockchip-system-status.c b/drivers/soc/rockchip/rockchip-system-status.c
+new file mode 100644
+index 000000000000..56d5ae3be08c
+--- /dev/null
++++ b/drivers/soc/rockchip/rockchip-system-status.c
+@@ -0,0 +1,102 @@
++/*
++ * Copyright (C) 2017 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed "as is" WITHOUT ANY WARRANTY of any
++ * kind, whether express or implied; without even the implied warranty
++ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/mutex.h>
++#include <linux/notifier.h>
++
++static unsigned long system_status;
++static unsigned long ref_count[32] = {0};
++
++static DEFINE_MUTEX(system_status_mutex);
++
++static BLOCKING_NOTIFIER_HEAD(system_status_notifier_list);
++
++int rockchip_register_system_status_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&system_status_notifier_list,
++						nb);
++}
++EXPORT_SYMBOL_GPL(rockchip_register_system_status_notifier);
++
++int rockchip_unregister_system_status_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&system_status_notifier_list,
++						  nb);
++}
++EXPORT_SYMBOL_GPL(rockchip_unregister_system_status_notifier);
++
++static int rockchip_system_status_notifier_call_chain(unsigned long val)
++{
++	int ret = blocking_notifier_call_chain(&system_status_notifier_list,
++					       val, NULL);
++
++	return notifier_to_errno(ret);
++}
++
++void rockchip_set_system_status(unsigned long status)
++{
++	unsigned long old_system_status;
++	unsigned int single_status_offset;
++
++	mutex_lock(&system_status_mutex);
++
++	old_system_status = system_status;
++
++	while (status) {
++		single_status_offset = fls(status) - 1;
++		status &= ~(1 << single_status_offset);
++		if (ref_count[single_status_offset] == 0)
++			system_status |= 1 << single_status_offset;
++		ref_count[single_status_offset]++;
++	}
++
++	if (old_system_status != system_status)
++		rockchip_system_status_notifier_call_chain(system_status);
++
++	mutex_unlock(&system_status_mutex);
++}
++EXPORT_SYMBOL_GPL(rockchip_set_system_status);
++
++void rockchip_clear_system_status(unsigned long status)
++{
++	unsigned long old_system_status;
++	unsigned int single_status_offset;
++
++	mutex_lock(&system_status_mutex);
++
++	old_system_status = system_status;
++
++	while (status) {
++		single_status_offset = fls(status) - 1;
++		status &= ~(1 << single_status_offset);
++		if (ref_count[single_status_offset] == 0) {
++			continue;
++		} else {
++			if (ref_count[single_status_offset] == 1)
++				system_status &= ~(1 << single_status_offset);
++			ref_count[single_status_offset]--;
++		}
++	}
++
++	if (old_system_status != system_status)
++		rockchip_system_status_notifier_call_chain(system_status);
++
++	mutex_unlock(&system_status_mutex);
++}
++EXPORT_SYMBOL_GPL(rockchip_clear_system_status);
++
++unsigned long rockchip_get_system_status(void)
++{
++	return system_status;
++}
++EXPORT_SYMBOL_GPL(rockchip_get_system_status);
+diff --git a/include/dt-bindings/soc/rockchip-system-status.h b/include/dt-bindings/soc/rockchip-system-status.h
+new file mode 100644
+index 000000000000..fe103a55f222
+--- /dev/null
++++ b/include/dt-bindings/soc/rockchip-system-status.h
+@@ -0,0 +1,43 @@
++/*
++ *
++ * Copyright (C) 2017 ROCKCHIP, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _DT_BINDINGS_SOC_ROCKCHIP_SYSTEM_STATUS_H
++#define _DT_BINDINGS_SOC_ROCKCHIP_SYSTEM_STATUS_H
++
++#define SYS_STATUS_NORMAL	(1 << 0)
++#define SYS_STATUS_SUSPEND	(1 << 1)
++#define SYS_STATUS_IDLE		(1 << 2)
++#define SYS_STATUS_REBOOT	(1 << 3)
++#define SYS_STATUS_VIDEO_4K	(1 << 4)
++#define SYS_STATUS_VIDEO_1080P	(1 << 5)
++#define SYS_STATUS_GPU		(1 << 6)
++#define SYS_STATUS_RGA		(1 << 7)
++#define SYS_STATUS_CIF0		(1 << 8)
++#define SYS_STATUS_CIF1		(1 << 9)
++#define SYS_STATUS_LCDC0	(1 << 10)
++#define SYS_STATUS_LCDC1	(1 << 11)
++#define SYS_STATUS_BOOST	(1 << 12)
++#define SYS_STATUS_PERFORMANCE	(1 << 13)
++#define SYS_STATUS_ISP		(1 << 14)
++#define SYS_STATUS_HDMI		(1 << 15)
++#define SYS_STATUS_VIDEO_4K_10B	(1 << 16)
++#define SYS_STATUS_LOW_POWER	(1 << 17)
++
++#define SYS_STATUS_VIDEO	(SYS_STATUS_VIDEO_4K | \
++				 SYS_STATUS_VIDEO_1080P | \
++				 SYS_STATUS_VIDEO_4K_10B)
++#define SYS_STATUS_DUALVIEW	(SYS_STATUS_LCDC0 | SYS_STATUS_LCDC1)
++
++#endif
+diff --git a/include/linux/rockchip/common.h b/include/linux/rockchip/common.h
+index 006d52d8df04..f467d37f0757 100644
+--- a/include/linux/rockchip/common.h
++++ b/include/linux/rockchip/common.h
+@@ -73,11 +73,6 @@ int rockchip_pm_set_policy(enum rockchip_pm_policy policy);
+ int rockchip_pm_policy_register_notifier(struct notifier_block *nb);
+ int rockchip_pm_policy_unregister_notifier(struct notifier_block *nb);
+ 
+-int rockchip_register_system_status_notifier(struct notifier_block *nb);
+-int rockchip_unregister_system_status_notifier(struct notifier_block *nb);
+-int rockchip_set_system_status(unsigned long status);
+-int rockchip_clear_system_status(unsigned long status);
+-unsigned long rockchip_get_system_status(void);
+ u32 pvtm_get_value(u32 ch, u32 time_us);
+ 
+ #define INVALID_TEMP INT_MAX
+diff --git a/include/soc/rockchip/rockchip-system-status.h b/include/soc/rockchip/rockchip-system-status.h
+new file mode 100644
+index 000000000000..ebcc65d040cf
+--- /dev/null
++++ b/include/soc/rockchip/rockchip-system-status.h
+@@ -0,0 +1,22 @@
++/*
++ * Copyright (c) 2016, Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++#ifndef __SOC_ROCKCHIP_SYSTEM_STATUS_H
++#define __SOC_ROCKCHIP_SYSTEM_STATUS_H
++
++int rockchip_register_system_status_notifier(struct notifier_block *nb);
++int rockchip_unregister_system_status_notifier(struct notifier_block *nb);
++void rockchip_set_system_status(unsigned long status);
++void rockchip_clear_system_status(unsigned long status);
++unsigned long rockchip_get_system_status(void);
++
++#endif
+-- 
+2.35.3
+

@@ -1,0 +1,527 @@
+From 54e1a2cf73ddabe63d19ef7ff630c4b53002b564 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Sat, 3 Oct 2020 11:11:19 +0800
+Subject: [PATCH] media: rockchip: ispp: use fec share buffer to reduce buffer
+ size
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: Ie59ce6dbedbbc1a60d5eb3e8a4216b2f4869140d
+---
+ drivers/media/platform/rockchip/ispp/common.c |  13 +-
+ drivers/media/platform/rockchip/ispp/common.h |   2 +
+ drivers/media/platform/rockchip/ispp/ispp.c   |  62 ++++++++
+ drivers/media/platform/rockchip/ispp/params.c | 140 ++++++++++++++++--
+ drivers/media/platform/rockchip/ispp/params.h |   7 +
+ drivers/media/platform/rockchip/ispp/stream.c |  46 ------
+ drivers/media/platform/rockchip/ispp/stream.h |   1 -
+ include/uapi/linux/rkispp-config.h            |  39 ++++-
+ 8 files changed, 240 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index 2e83fe2af127..d567609c930f 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -87,8 +87,18 @@ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 	buf->dma_addr = *((dma_addr_t *)g_ops->cookie(mem_priv));
+ 	if (!attrs)
+ 		buf->vaddr = g_ops->vaddr(mem_priv);
+-	if (buf->is_need_dbuf)
++	if (buf->is_need_dbuf) {
+ 		buf->dbuf = g_ops->get_dmabuf(mem_priv, O_RDWR);
++		if (buf->is_need_dmafd) {
++			buf->dma_fd = dma_buf_fd(buf->dbuf, O_CLOEXEC);
++			if (buf->dma_fd < 0) {
++				dma_buf_put(buf->dbuf);
++				ret = buf->dma_fd;
++				goto err;
++			}
++			get_dma_buf(buf->dbuf);
++		}
++	}
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "%s buf:0x%x~0x%x size:%d\n", __func__,
+ 		 (u32)buf->dma_addr, (u32)buf->dma_addr + buf->size, buf->size);
+@@ -114,6 +124,7 @@ void rkispp_free_buffer(struct rkispp_device *dev,
+ 		buf->mem_priv = NULL;
+ 		buf->is_need_dbuf = false;
+ 		buf->is_need_vaddr = false;
++		buf->is_need_dmafd = false;
+ 	}
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index 1da00ee14a3b..f395efa7fd54 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -68,8 +68,10 @@ struct rkispp_dummy_buffer {
+ 	u64 timestamp;
+ 	u32 size;
+ 	u32 id;
++	int dma_fd;
+ 	bool is_need_vaddr;
+ 	bool is_need_dbuf;
++	bool is_need_dmafd;
+ };
+ 
+ static inline struct rkispp_vdev_node *vdev_to_node(struct video_device *vdev)
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index 0f60545728c8..229edeef1ba9 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -361,6 +361,64 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 	return ret;
+ }
+ 
++static long rkispp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
++{
++	struct rkispp_subdev *ispp_sdev = v4l2_get_subdevdata(sd);
++	struct rkispp_device *ispp_dev = ispp_sdev->dev;
++	struct rkispp_fecbuf_info *fecbuf;
++	struct rkispp_fecbuf_size *fecsize;
++	long ret = 0;
++
++	if (!arg)
++		return -EINVAL;
++
++	switch (cmd) {
++	case RKISPP_CMD_GET_FECBUF_INFO:
++		fecbuf = (struct rkispp_fecbuf_info *)arg;
++		rkispp_params_get_fecbuf_inf(&ispp_dev->params_vdev, fecbuf);
++		break;
++	case RKISPP_CMD_SET_FECBUF_SIZE:
++		fecsize = (struct rkispp_fecbuf_size *)arg;
++		rkispp_params_set_fecbuf_size(&ispp_dev->params_vdev, fecsize);
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++	}
++
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++static long rkispp_compat_ioctl32(struct v4l2_subdev *sd,
++				  unsigned int cmd, unsigned long arg)
++{
++	void __user *up = compat_ptr(arg);
++	struct rkispp_fecbuf_info fecbuf;
++	struct rkispp_fecbuf_size fecsize;
++	long ret = 0;
++
++	if (!up)
++		return -EINVAL;
++
++	switch (cmd) {
++	case RKISPP_CMD_GET_FECBUF_INFO:
++		ret = rkispp_ioctl(sd, cmd, &fecbuf);
++		if (!ret)
++			ret = copy_to_user(up, &fecbuf, sizeof(fecbuf));
++		break;
++	case RKISPP_CMD_SET_FECBUF_SIZE:
++		ret = copy_from_user(&fecsize, up, sizeof(fecsize));
++		if (!ret)
++			ret = rkisp_ioctl(sd, cmd, &fecsize);
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++	}
++
++	return ret;
++}
++#endif
++
+ static const struct media_entity_operations rkispp_sd_media_ops = {
+ 	.link_setup = rkispp_subdev_link_setup,
+ 	.link_validate = v4l2_subdev_link_validate,
+@@ -380,6 +438,10 @@ static const struct v4l2_subdev_video_ops rkispp_sd_video_ops = {
+ 
+ static const struct v4l2_subdev_core_ops rkispp_sd_core_ops = {
+ 	.s_power = rkispp_sd_s_power,
++	.ioctl = rkispp_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl32 = rkispp_compat_ioctl32,
++#endif
+ };
+ 
+ static struct v4l2_subdev_ops rkispp_sd_ops = {
+diff --git a/drivers/media/platform/rockchip/ispp/params.c b/drivers/media/platform/rockchip/ispp/params.c
+index afda1093b3b7..8c9fc8b3cdbd 100644
+--- a/drivers/media/platform/rockchip/ispp/params.c
++++ b/drivers/media/platform/rockchip/ispp/params.c
+@@ -529,17 +529,54 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_fec_config *arg)
+ {
+ 	struct rkispp_device *dev = params_vdev->dev;
+-	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+-	struct rkispp_dummy_buffer *buf;
+-	u32 val;
+-
+-	if (arg->mesh_size > vdev->fec_buf.mesh_xint.size) {
++	struct rkispp_fec_head *fec_data;
++	u32 width, height, mesh_size;
++	dma_addr_t dma_addr;
++	u32 val, i, buf_idx;
++
++	width = dev->ispp_sdev.out_fmt.width;
++	height = dev->ispp_sdev.out_fmt.height;
++	mesh_size = cal_fec_mesh(width, height, 0);
++	if (arg->mesh_size > mesh_size) {
+ 		v4l2_err(&dev->v4l2_dev,
+ 			 "Input mesh size too large. mesh size 0x%x, 0x%x\n",
+-			 arg->mesh_size, vdev->fec_buf.mesh_xint.size);
++			 arg->mesh_size, mesh_size);
+ 		return;
+ 	}
+ 
++	for (i = 0; i < FEC_MESH_BUF_NUM; i++) {
++		if (arg->buf_fd == params_vdev->buf_fec[i].dma_fd)
++			break;
++	}
++	if (i == FEC_MESH_BUF_NUM) {
++		dev_err(dev->dev, "cannot find fec buf fd(%d)\n", arg->buf_fd);
++		return;
++	}
++
++	if (!params_vdev->buf_fec[i].vaddr) {
++		dev_err(dev->dev, "no fec buffer allocated\n");
++		return;
++	}
++
++	buf_idx = params_vdev->buf_fec_idx;
++	fec_data = (struct rkispp_fec_head *)params_vdev->buf_fec[buf_idx].vaddr;
++	fec_data->stat = FEC_BUF_INIT;
++
++	buf_idx = i;
++	fec_data = (struct rkispp_fec_head *)params_vdev->buf_fec[buf_idx].vaddr;
++	fec_data->stat = FEC_BUF_CHIPINUSE;
++	params_vdev->buf_fec_idx = buf_idx;
++
++	dma_addr = params_vdev->buf_fec[buf_idx].dma_addr;
++	val = dma_addr + fec_data->meshxf_oft;
++	rkispp_write(params_vdev->dev, RKISPP_FEC_MESH_XFRA_BASE, val);
++	val = dma_addr + fec_data->meshyf_oft;
++	rkispp_write(params_vdev->dev, RKISPP_FEC_MESH_YFRA_BASE, val);
++	val = dma_addr + fec_data->meshxi_oft;
++	rkispp_write(params_vdev->dev, RKISPP_FEC_MESH_XINT_BASE, val);
++	val = dma_addr + fec_data->meshyi_oft;
++	rkispp_write(params_vdev->dev, RKISPP_FEC_MESH_YINT_BASE, val);
++
+ 	val = 0;
+ 	if (arg->mesh_density)
+ 		val = SW_MESH_DENSITY;
+@@ -550,20 +587,19 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 	val = (arg->crop_height & 0x1FFFF) << 14 |
+ 	      (arg->crop_width & 0x1FFFF) << 1 | (arg->crop_en & 0x01);
+ 	rkispp_write(params_vdev->dev, RKISPP_FEC_CROP, val);
+-
+-	buf = &vdev->fec_buf.mesh_xint;
+-	memcpy(buf->vaddr, &arg->meshxi[0], arg->mesh_size * sizeof(u16));
+-	buf = &vdev->fec_buf.mesh_yint;
+-	memcpy(buf->vaddr, &arg->meshyi[0], arg->mesh_size * sizeof(u16));
+-	buf = &vdev->fec_buf.mesh_xfra;
+-	memcpy(buf->vaddr, &arg->meshxf[0], arg->mesh_size * sizeof(u8));
+-	buf = &vdev->fec_buf.mesh_yfra;
+-	memcpy(buf->vaddr, &arg->meshyf[0], arg->mesh_size * sizeof(u8));
+ }
+ 
+ static void fec_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ {
++	struct rkispp_device *dev = params_vdev->dev;
++	u32 buf_idx;
++
+ 	if (en) {
++		buf_idx = params_vdev->buf_fec_idx;
++		if (!params_vdev->buf_fec[buf_idx].vaddr) {
++			dev_err(dev->dev, "no fec buffer allocated\n");
++			return;
++		}
+ 		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL0_CTRL, SW_SCL_FIRST_MODE);
+ 		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL1_CTRL, SW_SCL_FIRST_MODE);
+ 		rkispp_clear_bits(params_vdev->dev, RKISPP_SCL2_CTRL, SW_SCL_FIRST_MODE);
+@@ -683,6 +719,54 @@ static const struct v4l2_ioctl_ops rkispp_params_ioctl = {
+ 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe
+ };
+ 
++static int
++rkispp_param_init_fecbuf(struct rkispp_params_vdev *params,
++			 struct rkispp_fecbuf_size *fecsize)
++{
++	struct rkispp_device *pp_dev = params->dev;
++	struct rkispp_fec_head *fec_data;
++	u32 width, height, mesh_size, buf_size;
++	int i, ret;
++
++	width = fecsize->meas_width;
++	height = fecsize->meas_height;
++	mesh_size = cal_fec_mesh(width, height, fecsize->meas_mode);
++	buf_size = ALIGN(sizeof(struct rkispp_fec_head), 16);
++	buf_size += 2 * (ALIGN(mesh_size * 2, 16) + ALIGN(mesh_size, 16));
++
++	params->buf_fec_idx = 0;
++	for (i = 0; i < FEC_MESH_BUF_NUM; i++) {
++		params->buf_fec[i].is_need_vaddr = true;
++		params->buf_fec[i].is_need_dbuf = true;
++		params->buf_fec[i].is_need_dmafd = true;
++		params->buf_fec[i].size = PAGE_ALIGN(buf_size);
++		ret = rkispp_allow_buffer(params->dev, &params->buf_fec[i]);
++		if (ret) {
++			dev_err(pp_dev->dev, "can not alloc fec buffer\n");
++			return ret;
++		}
++
++		fec_data = (struct rkispp_fec_head *)params->buf_fec[i].vaddr;
++		fec_data->stat = FEC_BUF_INIT;
++		fec_data->meshxf_oft = ALIGN(sizeof(struct rkispp_fec_head), 16);
++		fec_data->meshyf_oft = fec_data->meshxf_oft + ALIGN(mesh_size, 16);
++		fec_data->meshxi_oft = fec_data->meshyf_oft + ALIGN(mesh_size, 16);
++		fec_data->meshyi_oft = fec_data->meshxi_oft + ALIGN(mesh_size * 2, 16);
++	}
++
++	return 0;
++}
++
++static void
++rkispp_param_deinit_fecbuf(struct rkispp_params_vdev *params)
++{
++	int i;
++
++	params->buf_fec_idx = 0;
++	for (i = 0; i < FEC_MESH_BUF_NUM; i++)
++		rkispp_free_buffer(params->dev, &params->buf_fec[i]);
++}
++
+ static int rkispp_params_vb2_queue_setup(struct vb2_queue *vq,
+ 					 unsigned int *num_buffers,
+ 					 unsigned int *num_planes,
+@@ -803,9 +887,14 @@ rkispp_param_fh_open(struct file *filp)
+ 		if (ret < 0) {
+ 			v4l2_err(&isppdev->v4l2_dev,
+ 				 "pipeline power on failed %d\n", ret);
+-			vb2_fop_release(filp);
++			goto ERR;
+ 		}
+ 	}
++
++	return 0;
++
++ERR:
++	vb2_fop_release(filp);
+ 	return ret;
+ }
+ 
+@@ -823,6 +912,7 @@ rkispp_param_fh_release(struct file *filp)
+ 			v4l2_err(&isppdev->v4l2_dev,
+ 				 "pipeline power off failed %d\n", ret);
+ 	}
++	rkispp_param_deinit_fecbuf(params);
+ 	return ret;
+ }
+ 
+@@ -1060,6 +1150,24 @@ void rkispp_params_configure(struct rkispp_params_vdev *params_vdev)
+ 			   !!(module_ens & ISPP_MODULE_ORB));
+ }
+ 
++void rkispp_params_get_fecbuf_inf(struct rkispp_params_vdev *params_vdev,
++				  struct rkispp_fecbuf_info *fecbuf)
++{
++	int i;
++
++	for (i = 0; i < FEC_MESH_BUF_NUM; i++) {
++		fecbuf->buf_fd[i] = params_vdev->buf_fec[i].dma_fd;
++		fecbuf->buf_size[i] = params_vdev->buf_fec[i].size;
++	}
++}
++
++void rkispp_params_set_fecbuf_size(struct rkispp_params_vdev *params_vdev,
++				   struct rkispp_fecbuf_size *fecsize)
++{
++	rkispp_param_deinit_fecbuf(params_vdev);
++	rkispp_param_init_fecbuf(params_vdev, fecsize);
++}
++
+ int rkispp_register_params_vdev(struct rkispp_device *dev)
+ {
+ 	struct rkispp_params_vdev *params_vdev = &dev->params_vdev;
+diff --git a/drivers/media/platform/rockchip/ispp/params.h b/drivers/media/platform/rockchip/ispp/params.h
+index 8e037788d497..30c391b98065 100644
+--- a/drivers/media/platform/rockchip/ispp/params.h
++++ b/drivers/media/platform/rockchip/ispp/params.h
+@@ -26,10 +26,17 @@ struct rkispp_params_vdev {
+ 	struct v4l2_format vdev_fmt;
+ 	bool streamon;
+ 	bool first_params;
++
++	struct rkispp_dummy_buffer buf_fec[FEC_MESH_BUF_NUM];
++	u32 buf_fec_idx;
+ };
+ 
+ int rkispp_register_params_vdev(struct rkispp_device *dev);
+ void rkispp_unregister_params_vdev(struct rkispp_device *dev);
+ void rkispp_params_configure(struct rkispp_params_vdev *params_vdev);
+ void rkispp_params_isr(struct rkispp_params_vdev *params_vdev, u32 mis);
++void rkispp_params_get_fecbuf_inf(struct rkispp_params_vdev *params_vdev,
++				  struct rkispp_fecbuf_info *fecbuf);
++void rkispp_params_set_fecbuf_size(struct rkispp_params_vdev *params_vdev,
++				   struct rkispp_fecbuf_size *fecsize);
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 2863bd0f84ee..266977c72369 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -824,26 +824,18 @@ static void fec_free_buf(struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct list_head *list = &vdev->fec.list_rd;
+-	int i;
+ 
+ 	if (vdev->fec.cur_rd)
+ 		vdev->fec.cur_rd = NULL;
+ 	while (!list_empty(list))
+ 		get_list_buf(list, false);
+-
+-	for (i = 0; i < sizeof(vdev->fec_buf) /
+-	     sizeof(struct rkispp_dummy_buffer); i++)
+-		rkispp_free_buffer(dev, &vdev->fec_buf.mesh_xint + i);
+ }
+ 
+ static int config_fec(struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+-	struct rkispp_dummy_buffer *buf;
+ 	u32 width, height, fmt, mult = 1;
+-	u32 mesh_size;
+-	int ret;
+ 
+ 	vdev = &dev->stream_vdev;
+ 	vdev->fec.is_end = true;
+@@ -876,39 +868,6 @@ static int config_fec(struct rkispp_device *dev)
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_FEC_RD_UV_BASE_SHD;
+ 	}
+ 
+-	mesh_size = cal_fec_mesh(width, height, 0);
+-	buf = &vdev->fec_buf.mesh_xint;
+-	buf->is_need_vaddr = true;
+-	buf->size = ALIGN(mesh_size * 2, 8);
+-	ret = rkispp_allow_buffer(dev, buf);
+-	if (ret < 0)
+-		goto err;
+-	rkispp_write(dev, RKISPP_FEC_MESH_XINT_BASE, buf->dma_addr);
+-
+-	buf = &vdev->fec_buf.mesh_yint;
+-	buf->is_need_vaddr = true;
+-	buf->size = ALIGN(mesh_size * 2, 8);
+-	ret = rkispp_allow_buffer(dev, buf);
+-	if (ret < 0)
+-		goto err;
+-	rkispp_write(dev, RKISPP_FEC_MESH_YINT_BASE, buf->dma_addr);
+-
+-	buf = &vdev->fec_buf.mesh_xfra;
+-	buf->is_need_vaddr = true;
+-	buf->size = ALIGN(mesh_size, 8);
+-	ret = rkispp_allow_buffer(dev, buf);
+-	if (ret < 0)
+-		goto err;
+-	rkispp_write(dev, RKISPP_FEC_MESH_XFRA_BASE, buf->dma_addr);
+-
+-	buf = &vdev->fec_buf.mesh_yfra;
+-	buf->is_need_vaddr = true;
+-	buf->size = ALIGN(mesh_size, 8);
+-	ret = rkispp_allow_buffer(dev, buf);
+-	if (ret < 0)
+-		goto err;
+-	rkispp_write(dev, RKISPP_FEC_MESH_YFRA_BASE, buf->dma_addr);
+-
+ 	rkispp_set_bits(dev, RKISPP_FEC_CTRL, FMT_RD_MASK, fmt);
+ 	rkispp_write(dev, RKISPP_FEC_RD_VIR_STRIDE, ALIGN(width * mult, 16) >> 2);
+ 	rkispp_write(dev, RKISPP_FEC_PIC_SIZE, height << 16 | width);
+@@ -919,11 +878,6 @@ static int config_fec(struct rkispp_device *dev)
+ 		 rkispp_read(dev, RKISPP_FEC_CTRL),
+ 		 rkispp_read(dev, RKISPP_FEC_CORE_CTRL));
+ 	return 0;
+-err:
+-	fec_free_buf(dev);
+-	v4l2_err(&dev->v4l2_dev,
+-		 "%s Failed to allocate buffer\n", __func__);
+-	return ret;
+ }
+ 
+ static void rkispp_start_3a_run(struct rkispp_device *dev)
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 21a9018a8ab6..12063dcfff4b 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -207,7 +207,6 @@ struct rkispp_stream_vdev {
+ 	struct tnr_module tnr;
+ 	struct nr_module nr;
+ 	struct fec_module fec;
+-	struct in_fec_buf fec_buf;
+ 	struct frame_debug_info dbg;
+ 	struct rkispp_monitor monitor;
+ 	atomic_t refcnt;
+diff --git a/include/uapi/linux/rkispp-config.h b/include/uapi/linux/rkispp-config.h
+index 52740115a26e..b7de28d1db72 100644
+--- a/include/uapi/linux/rkispp-config.h
++++ b/include/uapi/linux/rkispp-config.h
+@@ -72,6 +72,13 @@
+ 
+ #define FEC_MESH_XY_POINT_SIZE		6
+ #define FEC_MESH_XY_NUM			131072
++#define FEC_MESH_BUF_NUM		2
++
++#define RKISPP_CMD_GET_FECBUF_INFO	\
++	_IOR('V', BASE_VIDIOC_PRIVATE + 0, struct rkispp_fecbuf_info)
++
++#define RKISPP_CMD_SET_FECBUF_SIZE	\
++	_IOW('V', BASE_VIDIOC_PRIVATE + 1, struct rkispp_fecbuf_size)
+ 
+ struct rkispp_tnr_config {
+ 	u8 opty_en;
+@@ -215,18 +222,38 @@ struct rkispp_sharp_config {
+ 	u16 rfh_ratio;
+ } __attribute__ ((packed));
+ 
++enum rkispp_fecbuf_stat {
++	FEC_BUF_INIT = 0,
++	FEC_BUF_WAIT2CHIP,
++	FEC_BUF_CHIPINUSE,
++};
++
++struct rkispp_fecbuf_info {
++	s32 buf_fd[FEC_MESH_BUF_NUM];
++	u32 buf_size[FEC_MESH_BUF_NUM];
++} __attribute__ ((packed));
++
++struct rkispp_fecbuf_size {
++	u32 meas_width;
++	u32 meas_height;
++	u32 meas_mode;
++} __attribute__ ((packed));
++
++struct rkispp_fec_head {
++	enum rkispp_fecbuf_stat stat;
++	u32 meshxf_oft;
++	u32 meshyf_oft;
++	u32 meshxi_oft;
++	u32 meshyi_oft;
++} __attribute__ ((packed));
++
+ struct rkispp_fec_config {
+ 	u8 mesh_density;
+ 	u8 crop_en;
+-	u8 meshxf[FEC_MESH_XY_NUM];
+-	u8 meshyf[FEC_MESH_XY_NUM];
+-
+ 	u16 crop_width __attribute__((aligned(2)));
+ 	u16 crop_height;
+-	u16 meshxi[FEC_MESH_XY_NUM];
+-	u16 meshyi[FEC_MESH_XY_NUM];
+-
+ 	u32 mesh_size __attribute__((aligned(4)));
++	s32 buf_fd;
+ } __attribute__ ((packed));
+ 
+ struct rkispp_orb_config {
+-- 
+2.35.3
+

@@ -1,0 +1,275 @@
+From eccfced0817470eb11e7682e315f06f100d875a1 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Wed, 25 Nov 2015 09:11:27 +0800
+Subject: [PATCH] mmc: porting legacy tactices into develop-4.4
+
+We currently port some materials with concern to card
+probling and gendisk recognization, etc. In attempt to
+keep best bisecompatibe with upstream, the less legacy works
+the better.
+
+Change-Id: Ieb0e609f5cad4e889be6194f8fd8a54057a1174b
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/card/block.c  | 15 +++++++++++
+ drivers/mmc/core/core.c   | 20 +++++++++++++++
+ drivers/mmc/core/host.c   | 53 +++++++++++++++++++++++++++++++++++++++
+ drivers/mmc/host/Makefile |  1 +
+ drivers/mmc/host/dw_mmc.c | 23 +++++++++++++++++
+ include/linux/genhd.h     |  1 +
+ include/linux/mmc/host.h  |  6 +++++
+ 7 files changed, 119 insertions(+)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index d8486168415a..f284de46d500 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -2546,6 +2546,7 @@ static const struct mmc_fixup blk_fixups[] =
+ 	END_FIXUP
+ };
+ 
++extern struct mmc_card *this_card;
+ static int mmc_blk_probe(struct mmc_card *card)
+ {
+ 	struct mmc_blk_data *md, *part_md;
+@@ -2574,6 +2575,15 @@ static int mmc_blk_probe(struct mmc_card *card)
+ 
+ 	dev_set_drvdata(&card->dev, md);
+ 
++	#if defined(CONFIG_MMC_DW_ROCKCHIP)
++	if (card->host->restrict_caps & RESTRICT_CARD_TYPE_EMMC) {
++		this_card = card;
++		md->disk->emmc_disk = 1;
++	} else {
++		md->disk->emmc_disk = 0;
++	}
++	#endif
++
+ 	if (mmc_add_disk(md))
+ 		goto out;
+ 
+@@ -2606,6 +2616,11 @@ static void mmc_blk_remove(struct mmc_card *card)
+ {
+ 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
+ 
++	#if defined(CONFIG_MMC_DW_ROCKCHIP)
++	if (card->host->restrict_caps & RESTRICT_CARD_TYPE_EMMC)
++		this_card = NULL;
++	#endif
++
+ 	mmc_blk_remove_parts(card, md);
+ 	pm_runtime_get_sync(&card->dev);
+ 	mmc_claim_host(card->host);
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 5ae89e48fd85..0962e4316fcf 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -2477,6 +2477,7 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 	 * if the card is being re-initialized, just send it.  CMD52
+ 	 * should be ignored by SD/eMMC cards.
+ 	 */
++#ifdef MMC_STANDARD_PROBE
+ 	sdio_reset(host);
+ 	mmc_go_idle(host);
+ 
+@@ -2489,7 +2490,26 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 		return 0;
+ 	if (!mmc_attach_mmc(host))
+ 		return 0;
++#else
++	if (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
++		sdio_reset(host);
+ 
++	mmc_go_idle(host);
++
++	if (host->restrict_caps &
++	    (RESTRICT_CARD_TYPE_SDIO | RESTRICT_CARD_TYPE_SD))
++		mmc_send_if_cond(host, host->ocr_avail);
++	/* Order's important: probe SDIO, then SD, then MMC */
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_SDIO) &&
++	    !mmc_attach_sdio(host))
++		return 0;
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_SD) &&
++	     !mmc_attach_sd(host))
++		return 0;
++	if ((host->restrict_caps & RESTRICT_CARD_TYPE_EMMC) &&
++	     !mmc_attach_mmc(host))
++		return 0;
++#endif
+ 	mmc_power_off(host);
+ 	return -EIO;
+ }
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index da950c44204d..9ced8125fbdf 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -290,6 +290,13 @@ int mmc_of_parse(struct mmc_host *host)
+ 	if (of_property_read_bool(np, "mmc-hs400-1_2v"))
+ 		host->caps2 |= MMC_CAP2_HS400_1_2V | MMC_CAP2_HS200_1_2V_SDR;
+ 
++	if (of_property_read_bool(np, "supports-sd"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_SD;
++	if (of_property_read_bool(np, "supports-sdio"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_SDIO;
++	if (of_property_read_bool(np, "supports-emmc"))
++		host->restrict_caps |= RESTRICT_CARD_TYPE_EMMC;
++
+ 	host->dsr_req = !of_property_read_u32(np, "dsr", &host->dsr);
+ 	if (host->dsr_req && (host->dsr & ~0xffff)) {
+ 		dev_err(host->parent,
+@@ -377,6 +384,7 @@ EXPORT_SYMBOL(mmc_alloc_host);
+  *	prepared to start servicing requests before this function
+  *	completes.
+  */
++static struct mmc_host *primary_sdio_host;
+ int mmc_add_host(struct mmc_host *host)
+ {
+ 	int err;
+@@ -397,6 +405,9 @@ int mmc_add_host(struct mmc_host *host)
+ 	mmc_start_host(host);
+ 	register_pm_notifier(&host->pm_notify);
+ 
++	if (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
++		primary_sdio_host = host;
++
+ 	return 0;
+ }
+ 
+@@ -439,3 +450,45 @@ void mmc_free_host(struct mmc_host *host)
+ }
+ 
+ EXPORT_SYMBOL(mmc_free_host);
++
++/**
++ * mmc_host_rescan - triger software rescan flow
++ * @host: mmc host
++ *
++ * rescan slot attach in the assigned host.
++ * If @host is NULL, default rescan primary_sdio_host
++ * saved by mmc_add_host().
++ * OR, rescan host from argument.
++ *
++ */
++int mmc_host_rescan(struct mmc_host *host, int val, int is_cap_sdio_irq)
++{
++	if (NULL != primary_sdio_host) {
++		if (!host)
++			  host = primary_sdio_host;
++		else
++			pr_info("%s: mmc_host_rescan pass in host from argument!\n",
++				mmc_hostname(host));
++	} else {
++		pr_err("sdio: host isn't  initialization successfully.\n");
++		return -ENOMEDIUM;
++	}
++
++	pr_info("%s:mmc host rescan start!\n", mmc_hostname(host));
++
++	/*  0: oob  1:cap-sdio-irq */
++	if (is_cap_sdio_irq == 1) {
++		host->caps |= MMC_CAP_SDIO_IRQ;
++	} else if (is_cap_sdio_irq == 0) {
++		host->caps &= ~MMC_CAP_SDIO_IRQ;
++	} else {
++		dev_err(&host->class_dev, "sdio: host doesn't identify oob or sdio_irq mode!\n");
++		return -ENOMEDIUM;
++	}
++
++	if (!(host->caps & MMC_CAP_NONREMOVABLE) && host->ops->set_sdio_status)
++		host->ops->set_sdio_status(host, val);
++
++	return 0;
++}
++EXPORT_SYMBOL(mmc_host_rescan);
+diff --git a/drivers/mmc/host/Makefile b/drivers/mmc/host/Makefile
+index 3595f83e89dd..b663b2ccfb89 100644
+--- a/drivers/mmc/host/Makefile
++++ b/drivers/mmc/host/Makefile
+@@ -48,6 +48,7 @@ obj-$(CONFIG_MMC_DW_EXYNOS)	+= dw_mmc-exynos.o
+ obj-$(CONFIG_MMC_DW_K3)		+= dw_mmc-k3.o
+ obj-$(CONFIG_MMC_DW_PCI)	+= dw_mmc-pci.o
+ obj-$(CONFIG_MMC_DW_ROCKCHIP)	+= dw_mmc-rockchip.o
++obj-$(CONFIG_MMC_DW_ROCKCHIP)	+= rk_sdmmc_ops.o
+ obj-$(CONFIG_MMC_SH_MMCIF)	+= sh_mmcif.o
+ obj-$(CONFIG_MMC_JZ4740)	+= jz4740_mmc.o
+ obj-$(CONFIG_MMC_VUB300)	+= vub300.o
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 7a6cedbe48a8..c299df2b4548 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -1446,6 +1446,28 @@ static int dw_mci_get_ro(struct mmc_host *mmc)
+ 	return read_only;
+ }
+ 
++static int dw_mci_set_sdio_status(struct mmc_host *mmc, int val)
++{
++	struct dw_mci_slot *slot = mmc_priv(mmc);
++	struct dw_mci *host = slot->host;
++
++	if (!(mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO))
++		return 0;
++
++	spin_lock_bh(&host->lock);
++
++	if (val)
++		set_bit(DW_MMC_CARD_PRESENT, &slot->flags);
++	else
++		clear_bit(DW_MMC_CARD_PRESENT, &slot->flags);
++
++	spin_unlock_bh(&host->lock);
++
++	mmc_detect_change(slot->mmc, 20);
++
++	return 0;
++}
++
+ static int dw_mci_get_cd(struct mmc_host *mmc)
+ {
+ 	int present;
+@@ -1561,6 +1583,7 @@ static const struct mmc_host_ops dw_mci_ops = {
+ 	.pre_req		= dw_mci_pre_req,
+ 	.post_req		= dw_mci_post_req,
+ 	.set_ios		= dw_mci_set_ios,
++	.set_sdio_status	= dw_mci_set_sdio_status,
+ 	.get_ro			= dw_mci_get_ro,
+ 	.get_cd			= dw_mci_get_cd,
+ 	.enable_sdio_irq	= dw_mci_enable_sdio_irq,
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 847cc1d91634..740bf0be0725 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -202,6 +202,7 @@ struct gendisk {
+ 	struct request_queue *queue;
+ 	void *private_data;
+ 
++	int emmc_disk;			/* Flag for emmc devive */
+ 	int flags;
+ 	struct device *driverfs_dev;  // FIXME: remove
+ 	struct kobject *slave_dir;
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 8673ffe3d86e..409d93ad5efc 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -126,6 +126,7 @@ struct mmc_host_ops {
+ 
+ 	/* Check if the card is pulling dat[0:3] low */
+ 	int	(*card_busy)(struct mmc_host *host);
++	int     (*set_sdio_status)(struct mmc_host *host, int val);
+ 
+ 	/* The tuning command opcode value is different for SD and eMMC cards */
+ 	int	(*execute_tuning)(struct mmc_host *host, u32 opcode);
+@@ -292,6 +293,11 @@ struct mmc_host {
+ 
+ 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
+ 
++	u32			restrict_caps;  /* Indicate slot specific card type */
++#define RESTRICT_CARD_TYPE_SD   (1 << 0)        /* Can support Secure-Digital Card */
++#define RESTRICT_CARD_TYPE_SDIO (1 << 1)        /* Can support Secure-Digital I/O Card or Combo-Mem */
++#define RESTRICT_CARD_TYPE_EMMC (1 << 2)        /* Can support embedded Multi-Media Card */
++
+ 	/* host specific block data */
+ 	unsigned int		max_seg_size;	/* see blk_queue_max_segment_size */
+ 	unsigned short		max_segs;	/* see blk_queue_max_segments */
+-- 
+2.35.3
+

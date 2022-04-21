@@ -1,0 +1,1236 @@
+From 4a88bb10e711d6d76ce476302c418f11e7eb3071 Mon Sep 17 00:00:00 2001
+From: "dalon.zhang" <dalon.zhang@rock-chips.com>
+Date: Sat, 28 Feb 2015 19:16:21 +0800
+Subject: [PATCH] camsys_drv: v0.0x1c.0
+
+---
+ drivers/media/video/rk_camsys/Makefile        |   2 +-
+ drivers/media/video/rk_camsys/camsys_drv.c    | 218 +++++++++++++-
+ drivers/media/video/rk_camsys/camsys_gpio.h   |   5 +-
+ .../media/video/rk_camsys/camsys_internal.h   |  17 +-
+ drivers/media/video/rk_camsys/camsys_marvin.c |  84 ++++--
+ drivers/media/video/rk_camsys/camsys_marvin.h |   2 +
+ .../video/rk_camsys/camsys_mipicsi_phy.c      |  57 +++-
+ .../video/rk_camsys/camsys_mipicsi_phy.h      |   1 -
+ .../media/video/rk_camsys/camsys_soc_priv.c   |  82 +----
+ .../media/video/rk_camsys/camsys_soc_priv.h   |   6 +
+ .../media/video/rk_camsys/camsys_soc_rk3288.c |  55 ++++
+ .../media/video/rk_camsys/camsys_soc_rk3288.h |   8 +-
+ .../media/video/rk_camsys/camsys_soc_rk3368.c | 283 ++++++++++++++++++
+ .../media/video/rk_camsys/camsys_soc_rk3368.h | 111 +++++++
+ 14 files changed, 818 insertions(+), 113 deletions(-)
+ create mode 100644 drivers/media/video/rk_camsys/camsys_soc_rk3368.c
+ create mode 100644 drivers/media/video/rk_camsys/camsys_soc_rk3368.h
+
+diff --git a/drivers/media/video/rk_camsys/Makefile b/drivers/media/video/rk_camsys/Makefile
+index 5704148ecc43..e522ca1e2891 100755
+--- a/drivers/media/video/rk_camsys/Makefile
++++ b/drivers/media/video/rk_camsys/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for rockchip camsys driver
+ #
+ obj-$(CONFIG_CAMSYS_DRV) += camsys_drv.o 
+-obj-$(CONFIG_CAMSYS_MRV) += camsys_marvin.o camsys_mipicsi_phy.o camsys_soc_priv.o 
++obj-$(CONFIG_CAMSYS_MRV) += camsys_marvin.o camsys_mipicsi_phy.o camsys_soc_priv.o camsys_soc_rk3288.o camsys_soc_rk3368.o
+ obj-$(CONFIG_CAMSYS_CIF) += camsys_cif.o
+ obj-y					 += ext_flashled_drv/
+ 
+diff --git a/drivers/media/video/rk_camsys/camsys_drv.c b/drivers/media/video/rk_camsys/camsys_drv.c
+index d9e0e35b3a65..33be480983c3 100755
+--- a/drivers/media/video/rk_camsys/camsys_drv.c
++++ b/drivers/media/video/rk_camsys/camsys_drv.c
+@@ -769,6 +769,211 @@ static int camsys_release(struct inode *inode, struct file *file)
+ * The ioctl() implementation
+ */
+ 
++typedef struct camsys_querymem_s_32 {
++    camsys_mmap_type_t      mem_type;
++    unsigned int           mem_offset;
++
++    unsigned int            mem_size;
++} camsys_querymem_32_t;
++
++#define CAMSYS_QUREYMEM_32          _IOR(CAMSYS_IOC_MAGIC,  11, camsys_querymem_32_t)
++
++static long camsys_ioctl_compat(struct file *filp,unsigned int cmd, unsigned long arg)
++{
++	long err = 0;
++    camsys_dev_t *camsys_dev = (camsys_dev_t*)filp->private_data; 
++    
++	if (_IOC_TYPE(cmd) != CAMSYS_IOC_MAGIC) { 
++        camsys_err("ioctl type(%c!=%c) is invalidate\n",_IOC_TYPE(cmd),CAMSYS_IOC_MAGIC);
++        err = -ENOTTY;
++        goto end;
++	}
++	if (_IOC_NR(cmd) > CAMSYS_IOC_MAXNR) {
++        camsys_err("ioctl index(%d>%d) is invalidate\n",_IOC_NR(cmd),CAMSYS_IOC_MAXNR);
++        err = -ENOTTY;
++        goto end;
++	}
++
++    if (_IOC_DIR(cmd) & _IOC_READ)
++        err = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));	
++    else if (_IOC_DIR(cmd) & _IOC_WRITE)
++        err = !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
++
++    if (err) {
++        camsys_err("ioctl(0x%x) operation not permitted for %s",cmd,dev_name(camsys_dev->miscdev.this_device));
++        err = -EFAULT;
++        goto end;
++    }
++
++	switch (cmd) {
++
++	    case CAMSYS_VERCHK:
++	    {
++	        camsys_version_t camsys_ver;
++	        
++            camsys_ver.drv_ver = CAMSYS_DRIVER_VERSION;
++            camsys_ver.head_ver = CAMSYS_HEAD_VERSION;
++            if (copy_to_user((void __user *)arg,(void*)&camsys_ver, sizeof(camsys_version_t)))
++                return -EFAULT;
++            break;
++	    }
++	    case CAMSYS_QUREYIOMMU:
++	    {
++            int iommu_enabled = 0;
++            #ifdef CONFIG_ROCKCHIP_IOMMU
++				struct device_node * vpu_node =NULL;
++				int vpu_iommu_enabled = 0;
++                vpu_node = of_find_node_by_name(NULL, "vpu_service");
++				if(vpu_node){
++					of_property_read_u32(vpu_node, "iommu_enabled", &vpu_iommu_enabled);
++					of_property_read_u32(camsys_dev->pdev->dev.of_node, "rockchip,isp,iommu_enable", &iommu_enabled);
++					of_node_put(vpu_node);
++					if(iommu_enabled != vpu_iommu_enabled){
++						camsys_err("iommu status not consistent,check the dts file ! isp:%d,vpu:%d",iommu_enabled,vpu_iommu_enabled);
++						return -EFAULT;
++					}
++				}
++			#endif
++            if (copy_to_user((void __user *)arg,(void*)&iommu_enabled, sizeof(iommu_enabled)))
++                return -EFAULT;
++            break;
++	    }
++	    case CAMSYS_I2CRD:
++	    {
++	        camsys_i2c_info_t i2cinfo;
++	        
++            if (copy_from_user((void*)&i2cinfo,(void __user *)arg, sizeof(camsys_i2c_info_t))) 
++                return -EFAULT;
++
++            err = camsys_i2c_read(&i2cinfo,camsys_dev);
++            if (err==0) {
++                if (copy_to_user((void __user *)arg,(void*)&i2cinfo, sizeof(camsys_i2c_info_t)))
++                    return -EFAULT;
++            }
++            break;
++	    }
++
++	    case CAMSYS_I2CWR:
++	    {
++            camsys_i2c_info_t i2cinfo;
++	        
++            if (copy_from_user((void*)&i2cinfo,(void __user *)arg, sizeof(camsys_i2c_info_t))) 
++                return -EFAULT;
++
++            err = camsys_i2c_write(&i2cinfo,camsys_dev);
++            break;
++	    }
++
++        case CAMSYS_SYSCTRL:
++        {
++            camsys_sysctrl_t devctl;
++
++            if (copy_from_user((void*)&devctl,(void __user *)arg, sizeof(camsys_sysctrl_t))) 
++                return -EFAULT;
++
++            err = camsys_sysctl(&devctl, camsys_dev);
++            if ((err==0) && (devctl.ops == CamSys_IOMMU)){
++                if (copy_to_user((void __user *)arg,(void*)&devctl, sizeof(camsys_sysctrl_t))) 
++                    return -EFAULT;
++            }
++            break;
++        }
++
++        case CAMSYS_REGRD:
++        {
++
++            break;
++        }
++
++        case CAMSYS_REGWR:
++        {
++
++            break;
++        }
++
++        case CAMSYS_REGISTER_DEVIO:
++        {
++            camsys_devio_name_t devio;
++
++            if (copy_from_user((void*)&devio,(void __user *)arg, sizeof(camsys_devio_name_t))) 
++                return -EFAULT;
++
++            err = camsys_extdev_register(&devio,camsys_dev);
++            break;
++        }
++
++        case CAMSYS_DEREGISTER_DEVIO:
++        {
++            unsigned int dev_id;
++
++            if (copy_from_user((void*)&dev_id,(void __user *)arg, sizeof(unsigned int)))
++                return -EFAULT;
++
++            err = camsys_extdev_deregister(dev_id, camsys_dev, false);
++            break;
++        }
++
++        case CAMSYS_IRQCONNECT:
++        {
++            camsys_irqcnnt_t irqcnnt;
++
++            if (copy_from_user((void*)&irqcnnt,(void __user *)arg, sizeof(camsys_irqcnnt_t))) 
++                return -EFAULT;
++            
++            err = camsys_irq_connect(&irqcnnt, camsys_dev);
++            
++            break;
++        }
++
++        case CAMSYS_IRQWAIT:
++        {
++            camsys_irqsta_t irqsta;
++
++            err = camsys_irq_wait(&irqsta, camsys_dev);
++            if (err==0) {
++                if (copy_to_user((void __user *)arg,(void*)&irqsta, sizeof(camsys_irqsta_t))) 
++                    return -EFAULT;
++            }
++            break;
++        }
++
++        case CAMSYS_IRQDISCONNECT:
++        {
++            camsys_irqcnnt_t irqcnnt;
++
++            if (copy_from_user((void*)&irqcnnt,(void __user *)arg, sizeof(camsys_irqcnnt_t))) 
++                return -EFAULT;
++            err = camsys_irq_disconnect(&irqcnnt,camsys_dev,false);
++			break;
++        }
++
++		case CAMSYS_QUREYMEM_32:
++       	{
++            camsys_querymem_t qmem;
++			camsys_querymem_32_t qmem32;
++
++            if (copy_from_user((void*)&qmem32,(void __user *)arg, sizeof(camsys_querymem_32_t))) 
++                return -EFAULT;
++
++			qmem.mem_type = qmem32.mem_type;
++            err = camsys_querymem(camsys_dev,&qmem);
++            if (err == 0) {
++				qmem32.mem_offset = (unsigned int)qmem.mem_offset;
++				qmem32.mem_size = qmem.mem_size;
++                if (copy_to_user((void __user *)arg,(void*)&qmem32, sizeof(camsys_querymem_32_t))) 
++                    return -EFAULT;
++            }
++            break;
++		}
++        default :
++            break;
++	}
++
++end:	
++	return err;
++
++}
++
+ static long camsys_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
+ {
+ 	long err = 0;
+@@ -953,7 +1158,7 @@ static long camsys_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
+             }
+             break;
+         }
+-       
++		
+         default :
+             break;
+ 	}
+@@ -962,6 +1167,8 @@ static long camsys_ioctl(struct file *filp,unsigned int cmd, unsigned long arg)
+ 	return err;
+ 
+ }
++
++
+ /*
+  * VMA operations.
+  */
+@@ -1050,6 +1257,7 @@ struct file_operations camsys_fops = {
+     .release =          camsys_release,
+ 	.unlocked_ioctl =   camsys_ioctl,
+ 	.mmap =             camsys_mmap,
++	.compat_ioctl = camsys_ioctl_compat,
+ };
+ 
+ static int camsys_platform_probe(struct platform_device *pdev){
+@@ -1112,13 +1320,13 @@ static int camsys_platform_probe(struct platform_device *pdev){
+         goto request_mem_fail;
+     }
+ 
+-    meminfo->vir_base = (unsigned int)devm_ioremap_resource(dev, &register_res);
++    meminfo->vir_base = (unsigned long)devm_ioremap_resource(dev, &register_res);
+     if (!meminfo->vir_base){
+         camsys_err("%s ioremap %s failed",dev_name(&pdev->dev), CAMSYS_REGISTER_MEM_NAME);
+         err = -ENXIO;
+         goto request_mem_fail;
+     }
+-
++	rk_isp_base = meminfo->vir_base;
+     strlcpy(meminfo->name, CAMSYS_REGISTER_MEM_NAME,sizeof(meminfo->name));
+     meminfo->phy_base = register_res.start;
+     meminfo->size = register_res.end - register_res.start + 1;  
+@@ -1187,12 +1395,12 @@ static int camsys_platform_probe(struct platform_device *pdev){
+     list_for_each_entry(meminfo, &camsys_dev->devmems.memslist, list) {
+         if (strcmp(meminfo->name,CAMSYS_I2C_MEM_NAME) == 0) {
+             camsys_dev->devmems.i2cmem = meminfo;
+-            camsys_trace(1,"    I2c memory (phy: 0x%x vir: 0x%x size: 0x%x)",
++            camsys_trace(1,"    I2c memory (phy: 0x%lx vir: 0x%lx size: 0x%x)",
+                         meminfo->phy_base,meminfo->vir_base,meminfo->size);
+         }
+         if (strcmp(meminfo->name,CAMSYS_REGISTER_MEM_NAME) == 0) {
+             camsys_dev->devmems.registermem = meminfo;
+-            camsys_trace(1,"    Register memory (phy: 0x%x vir: 0x%x size: 0x%x)",
++            camsys_trace(1,"    Register memory (phy: 0x%lx vir: 0x%lx size: 0x%x)",
+                         meminfo->phy_base,meminfo->vir_base,meminfo->size);
+         }
+     }
+diff --git a/drivers/media/video/rk_camsys/camsys_gpio.h b/drivers/media/video/rk_camsys/camsys_gpio.h
+index e75fac61b526..d3c74994cf5d 100755
+--- a/drivers/media/video/rk_camsys/camsys_gpio.h
++++ b/drivers/media/video/rk_camsys/camsys_gpio.h
+@@ -1,8 +1,9 @@
+ #ifndef __RKCAMSYS_GPIO_H__
+ #define __RKCAMSYS_GPIO_H__
+ 
+-//#include <mach/gpio.h>
+-#include <asm/gpio.h>
++
++//#include <asm/gpio.h>
++
+ #if defined(CONFIG_ARCH_ROCKCHIP)
+ #define RK30_PIN0_PA0 (0)
+ #define NUM_GROUP 	(32)
+diff --git a/drivers/media/video/rk_camsys/camsys_internal.h b/drivers/media/video/rk_camsys/camsys_internal.h
+index 6311637d99c2..c70464e45a72 100755
+--- a/drivers/media/video/rk_camsys/camsys_internal.h
++++ b/drivers/media/video/rk_camsys/camsys_internal.h
+@@ -35,9 +35,8 @@
+ #include <linux/rockchip/cpu.h>
+ #include <linux/rockchip/iomap.h>
+ #include <linux/rockchip/grf.h>
+-
+-#include <asm/gpio.h>
+-#include <asm/system.h>	
++//#include <asm/gpio.h>
++//#include <asm/system.h>	
+ #include <asm/uaccess.h>
+ 
+ #include <linux/of.h>
+@@ -111,9 +110,11 @@
+ *v0.0x1a.0:
+ 		 1) vpu_node changed from "vpu_service" to "rockchip,vpu_sub"
+ *v0.0x1b.0:
+-		 1) use of_find_node_by_name to get vpu node instead of of_find_compatible_node 
++		 1) use of_find_node_by_name to get vpu node instead of of_find_compatible_node
++*v0.0x1c.0:
++         1) support rk3368. 
+ */
+-#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0,0x1b,0)
++#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0,0x1c,0)
+ 
+ 
+ #define CAMSYS_PLATFORM_DRV_NAME                "RockChip-CamSys"
+@@ -179,8 +180,8 @@ typedef struct camsys_irq_s {
+ 
+ typedef struct camsys_meminfo_s {
+     unsigned char name[32];
+-    unsigned int phy_base;
+-    unsigned int vir_base;
++    unsigned long phy_base;
++    unsigned long vir_base;
+     unsigned int size;
+     unsigned int vmas;
+ 
+@@ -270,6 +271,8 @@ typedef struct camsys_dev_s {
+ 
+     void                  *soc;
+ 
++	camsys_meminfo_t     *csiphy_reg;
++
+     int (*clkin_cb)(void *ptr, unsigned int on);
+     int (*clkout_cb)(void *ptr,unsigned int on,unsigned int clk);
+     int (*reset_cb)(void *ptr, unsigned int on);
+diff --git a/drivers/media/video/rk_camsys/camsys_marvin.c b/drivers/media/video/rk_camsys/camsys_marvin.c
+index a7544ca3080c..588cea3bc4af 100755
+--- a/drivers/media/video/rk_camsys/camsys_marvin.c
++++ b/drivers/media/video/rk_camsys/camsys_marvin.c
+@@ -334,11 +334,15 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+         clk_prepare_enable(clk->aclk_isp);
+         clk_prepare_enable(clk->hclk_isp);
+         clk_prepare_enable(clk->isp);
+-        clk_prepare_enable(clk->isp_jpe);
+-        clk_prepare_enable(clk->clk_mipi_24m); 
++        clk_prepare_enable(clk->isp_jpe);        
+         clk_prepare_enable(clk->pclkin_isp); 
+-		clk_prepare_enable(clk->pd_isp);
+-
++		if(CHIP_TYPE == 3368){
++			clk_prepare_enable(clk->cif_clk_out);
++			clk_prepare_enable(clk->pclk_dphyrx);
++		}else{
++			clk_prepare_enable(clk->pd_isp);
++			clk_prepare_enable(clk->clk_mipi_24m);		
++		}
+         clk->in_on = true;
+ 
+         camsys_trace(1, "%s clock(f: %ld Hz) in turn on",dev_name(camsys_dev->miscdev.this_device),isp_clk);
+@@ -352,10 +356,14 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+         clk_disable_unprepare(clk->hclk_isp);
+         clk_disable_unprepare(clk->isp);
+         clk_disable_unprepare(clk->isp_jpe);
+-        clk_disable_unprepare(clk->clk_mipi_24m); 
+         clk_disable_unprepare(clk->pclkin_isp); 
+-		clk_disable_unprepare(clk->pd_isp);
+-
++		if(CHIP_TYPE == 3368){
++	        clk_disable_unprepare(clk->cif_clk_out);
++			clk_disable_unprepare(clk->pclk_dphyrx);
++		}else{
++	        clk_disable_unprepare(clk->clk_mipi_24m); 
++			clk_disable_unprepare(clk->pd_isp);
++		}
+ 		rockchip_clear_system_status(SYS_STATUS_ISP);
+         clk->in_on = false;
+         camsys_trace(1, "%s clock in turn off",dev_name(camsys_dev->miscdev.this_device));
+@@ -546,25 +554,44 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+         err = -EINVAL;
+         goto clk_failed;
+     }
+-     
+-    mrv_clk->pd_isp = devm_clk_get(&pdev->dev, "pd_isp");
+-    mrv_clk->aclk_isp = devm_clk_get(&pdev->dev, "aclk_isp");
+-    mrv_clk->hclk_isp = devm_clk_get(&pdev->dev, "hclk_isp");
+-    mrv_clk->isp = devm_clk_get(&pdev->dev, "clk_isp");
+-    mrv_clk->isp_jpe = devm_clk_get(&pdev->dev, "clk_isp_jpe");
+-    mrv_clk->pclkin_isp = devm_clk_get(&pdev->dev, "pclkin_isp");
+-    mrv_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_cif_out");
+-    mrv_clk->cif_clk_pll = devm_clk_get(&pdev->dev, "clk_cif_pll");
+-    mrv_clk->clk_mipi_24m = devm_clk_get(&pdev->dev,"clk_mipi_24m"); 
+-    
+-	if (IS_ERR_OR_NULL(mrv_clk->pd_isp) || IS_ERR_OR_NULL(mrv_clk->aclk_isp) || IS_ERR_OR_NULL(mrv_clk->hclk_isp) ||
+-        IS_ERR_OR_NULL(mrv_clk->isp) || IS_ERR_OR_NULL(mrv_clk->isp_jpe) || IS_ERR_OR_NULL(mrv_clk->pclkin_isp) || 
+-        IS_ERR_OR_NULL(mrv_clk->cif_clk_out) || IS_ERR_OR_NULL(mrv_clk->clk_mipi_24m)) {
+-        camsys_err("Get %s clock resouce failed!\n",miscdev_name);
+-        err = -EINVAL;
+-        goto clk_failed;
+-    }
+-    
++    if(CHIP_TYPE == 3368){
++	    mrv_clk->pd_isp = NULL;
++	    mrv_clk->aclk_isp = devm_clk_get(&pdev->dev, "aclk_isp");
++	    mrv_clk->hclk_isp = devm_clk_get(&pdev->dev, "hclk_isp");
++	    mrv_clk->isp = devm_clk_get(&pdev->dev, "clk_isp");
++	    mrv_clk->isp_jpe = devm_clk_get(&pdev->dev, "clk_isp_jpe");
++	    mrv_clk->pclkin_isp = devm_clk_get(&pdev->dev, "pclkin_isp");
++	    mrv_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_cif_out");
++	    mrv_clk->cif_clk_pll = devm_clk_get(&pdev->dev, "clk_cif_pll");
++	    mrv_clk->pclk_dphyrx = devm_clk_get(&pdev->dev, "pclk_dphyrx");    
++	    
++	    
++		if (IS_ERR_OR_NULL(mrv_clk->aclk_isp) || IS_ERR_OR_NULL(mrv_clk->hclk_isp) ||
++	        IS_ERR_OR_NULL(mrv_clk->isp) || IS_ERR_OR_NULL(mrv_clk->isp_jpe) || IS_ERR_OR_NULL(mrv_clk->pclkin_isp) || 
++	        IS_ERR_OR_NULL(mrv_clk->cif_clk_out) || IS_ERR_OR_NULL(mrv_clk->pclk_dphyrx)) {
++	        camsys_err("Get %s clock resouce failed!\n",miscdev_name);
++	        err = -EINVAL;
++	        goto clk_failed;
++	    }
++    }else{
++	    mrv_clk->pd_isp = devm_clk_get(&pdev->dev, "pd_isp");
++	    mrv_clk->aclk_isp = devm_clk_get(&pdev->dev, "aclk_isp");
++	    mrv_clk->hclk_isp = devm_clk_get(&pdev->dev, "hclk_isp");
++	    mrv_clk->isp = devm_clk_get(&pdev->dev, "clk_isp");
++	    mrv_clk->isp_jpe = devm_clk_get(&pdev->dev, "clk_isp_jpe");
++	    mrv_clk->pclkin_isp = devm_clk_get(&pdev->dev, "pclkin_isp");
++	    mrv_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_cif_out");
++	    mrv_clk->cif_clk_pll = devm_clk_get(&pdev->dev, "clk_cif_pll");
++	    mrv_clk->clk_mipi_24m = devm_clk_get(&pdev->dev,"clk_mipi_24m"); 
++	    
++		if (IS_ERR_OR_NULL(mrv_clk->pd_isp) || IS_ERR_OR_NULL(mrv_clk->aclk_isp) || IS_ERR_OR_NULL(mrv_clk->hclk_isp) ||
++	        IS_ERR_OR_NULL(mrv_clk->isp) || IS_ERR_OR_NULL(mrv_clk->isp_jpe) || IS_ERR_OR_NULL(mrv_clk->pclkin_isp) || 
++	        IS_ERR_OR_NULL(mrv_clk->cif_clk_out) || IS_ERR_OR_NULL(mrv_clk->clk_mipi_24m)) {
++	        camsys_err("Get %s clock resouce failed!\n",miscdev_name);
++	        err = -EINVAL;
++	        goto clk_failed;
++	    }
++	}
+     clk_set_rate(mrv_clk->isp,210000000);
+     clk_set_rate(mrv_clk->isp_jpe, 210000000);
+     
+@@ -626,6 +653,11 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+         if (!IS_ERR_OR_NULL(mrv_clk->cif_clk_out)) {
+             clk_put(mrv_clk->cif_clk_out);
+         }
++		if(CHIP_TYPE == 3368){
++	        if (!IS_ERR_OR_NULL(mrv_clk->pclk_dphyrx)) {
++	            clk_put(mrv_clk->pclk_dphyrx);
++	        }
++		}
+ 
+         kfree(mrv_clk);
+         mrv_clk = NULL;
+diff --git a/drivers/media/video/rk_camsys/camsys_marvin.h b/drivers/media/video/rk_camsys/camsys_marvin.h
+index 6c4343964c1f..1c70febf8666 100755
+--- a/drivers/media/video/rk_camsys/camsys_marvin.h
++++ b/drivers/media/video/rk_camsys/camsys_marvin.h
+@@ -55,6 +55,8 @@ typedef struct camsys_mrv_clk_s {
+ 
+     struct clk      *cif_clk_out;
+     struct clk      *cif_clk_pll;
++	struct clk		*pclk_dphyrx;
++	
+     unsigned int     out_on;
+ 
+     struct mutex     lock;
+diff --git a/drivers/media/video/rk_camsys/camsys_mipicsi_phy.c b/drivers/media/video/rk_camsys/camsys_mipicsi_phy.c
+index a124be8c7b85..8094b7e654be 100755
+--- a/drivers/media/video/rk_camsys/camsys_mipicsi_phy.c
++++ b/drivers/media/video/rk_camsys/camsys_mipicsi_phy.c
+@@ -1,6 +1,11 @@
+ #include "camsys_soc_priv.h"
+ #include "camsys_mipicsi_phy.h"
+ 
++unsigned int CHIP_TYPE;
++unsigned long rk_grf_base;
++unsigned long rk_cru_base;
++unsigned long rk_isp_base;
++
+ static int camsys_mipiphy_clkin_cb(void *ptr, unsigned int on)
+ {
+     camsys_mipiphy_clk_t *clk;
+@@ -81,8 +86,13 @@ static int camsys_mipiphy_remove_cb(struct platform_device *pdev)
+             }
+         }
+     }
++	if(CHIP_TYPE == 3368){
++		if(camsys_dev->csiphy_reg != NULL){
++			kfree(camsys_dev->csiphy_reg);
++			camsys_dev->csiphy_reg = NULL;
++		}
++	}
+ 
+-    
+     return 0;
+ }
+ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+@@ -95,7 +105,20 @@ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_d
+     struct clk* clk;
+     camsys_mipiphy_clk_t *phyclk;
+     int err,i;
++	struct device_node *node;
++	const char *compatible = NULL;
+ 
++	err = of_property_read_string(dev->of_node->parent,"compatible",&compatible);	
++    if (err < 0) {
++        camsys_err("get compatible failed!");
++    } else {
++        camsys_trace(1, "compatible is %s\n",compatible);
++    }
++	if(strstr(compatible, "rk3368"))
++		CHIP_TYPE = 3368;
++	else if(strstr(compatible, "rk3288"))
++		CHIP_TYPE = 3288;
++	
+     err = of_property_read_u32(dev->of_node,"rockchip,isp,mipiphy",&mipiphy_cnt);
+     if (err < 0) {
+         camsys_err("get property(rockchip,isp,mipiphy) failed!");
+@@ -122,7 +145,7 @@ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_d
+             if (meminfo == NULL) {                
+                 camsys_err("malloc camsys_meminfo_t for mipiphy%d failed!",i);                
+             } else {
+-                meminfo->vir_base = (unsigned int)ioremap(phyreg[0],phyreg[1]);
++                meminfo->vir_base = (unsigned long)ioremap(phyreg[0],phyreg[1]);
+                 if (!meminfo->vir_base){
+                     camsys_err("%s ioremap %s failed",dev_name(&pdev->dev), str);                    
+                 } else {
+@@ -156,7 +179,7 @@ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_d
+         camsys_dev->mipiphy[i].remove = camsys_mipiphy_remove_cb;
+ 
+         if (meminfo != NULL) {
+-            camsys_trace(1,"%s mipi phy%d probe success(reg_phy: 0x%x  reg_vir: 0x%x  size: 0x%x)",
++            camsys_trace(1,"%s mipi phy%d probe success(reg_phy: 0x%lx  reg_vir: 0x%lx  size: 0x%x)",
+                 dev_name(&pdev->dev), i,meminfo->phy_base,meminfo->vir_base, meminfo->size);
+         } else {
+             camsys_trace(1,"%s mipi phy%d probe success(reg_phy: 0x%x  reg_vir: 0x%x  size: 0x%x)",
+@@ -164,7 +187,33 @@ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_d
+         }
+ 
+     }   
+-    
++
++	if(CHIP_TYPE == 3368){
++		camsys_dev->csiphy_reg = kzalloc(sizeof(camsys_meminfo_t),GFP_KERNEL);
++	    if (camsys_dev->csiphy_reg == NULL) {                
++		    camsys_err("malloc camsys_meminfo_t for csiphy_reg failed!"); 
++		}
++		if (of_property_read_u32_array(dev->of_node,"rockchip,isp,csiphy,reg",phyreg,2) == 0) {
++			camsys_dev->csiphy_reg->vir_base = (unsigned long)ioremap(phyreg[0],phyreg[1]);
++	        if (!camsys_dev->csiphy_reg->vir_base){
++		        camsys_err("%s ioremap %s failed",dev_name(&pdev->dev), "rockchip,isp,csiphy,reg");                    
++	        } else {
++	        camsys_trace(1,"csiphy vir addr=0x%lx",camsys_dev->csiphy_reg->vir_base);
++		        strlcpy(camsys_dev->csiphy_reg->name, "Csi-DPHY",sizeof(camsys_dev->csiphy_reg->name));
++		        camsys_dev->csiphy_reg->phy_base = phyreg[0];
++		        camsys_dev->csiphy_reg->size = phyreg[1];
++	    	}
++		}
++		//get cru base
++	    node = of_parse_phandle(dev->of_node, "rockchip,cru", 0);
++	    rk_cru_base = (unsigned long)of_iomap(node, 0);
++		camsys_trace(1,"rk_cru_base=0x%lx",rk_cru_base);
++		//get grf base
++	    node = of_parse_phandle(dev->of_node, "rockchip,grf", 0);
++	    rk_grf_base = (unsigned long)of_iomap(node, 0);
++		camsys_trace(1,"rk_grf_base=0x%lx",rk_grf_base);
++	}
++	
+     return 0;
+ 
+ fail:
+diff --git a/drivers/media/video/rk_camsys/camsys_mipicsi_phy.h b/drivers/media/video/rk_camsys/camsys_mipicsi_phy.h
+index 68547717890d..08f1bc520186 100755
+--- a/drivers/media/video/rk_camsys/camsys_mipicsi_phy.h
++++ b/drivers/media/video/rk_camsys/camsys_mipicsi_phy.h
+@@ -10,5 +10,4 @@ typedef struct camsys_mipiphy_clk_s {
+ } camsys_mipiphy_clk_t;
+ 
+ int camsys_mipiphy_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev);
+-
+ #endif
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_priv.c b/drivers/media/video/rk_camsys/camsys_soc_priv.c
+index 7d62386ee2ea..8c609b706c05 100755
+--- a/drivers/media/video/rk_camsys/camsys_soc_priv.c
++++ b/drivers/media/video/rk_camsys/camsys_soc_priv.c
+@@ -2,66 +2,10 @@
+ #include "camsys_soc_priv.h"
+ 
+ 
+-
+ static camsys_soc_priv_t* camsys_soc_p;
+ 
+-#include "camsys_soc_rk3288.c"
+-
+-static int camsys_rk3288_cfg (camsys_soc_cfg_t cfg_cmd, void* cfg_para)
+-{
+-    unsigned int *para_int;
+-    
+-    switch (cfg_cmd)
+-    {
+-        case Clk_DriverStrength_Cfg:
+-        {
+-            para_int = (unsigned int*)cfg_para;
+-            __raw_writel((((*para_int)&0x03)<<3)|(0x03<<3), RK_GRF_VIRT+0x01d4);
+-            break;
+-        }
+-
+-        case Cif_IoDomain_Cfg:
+-        {
+-            para_int = (unsigned int*)cfg_para;
+-            if (*para_int < 28000000) {
+-                __raw_writel(((1<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);    // 1.8v IO
+-            } else {
+-                __raw_writel(((0<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);    // 3.3v IO
+-            }
+-            break;
+-        }
+-
+-        case Mipi_Phy_Cfg:
+-        {
+-            camsys_rk3288_mipihpy_cfg((camsys_mipiphy_soc_para_t*)cfg_para);
+-            break;
+-        }
+-
+-        case Isp_SoftRst:         /* ddl@rock-chips.com: v0.d.0 */
+-        {
+-            unsigned int reset;
+-            reset = (unsigned int)cfg_para;
+-
+-            if (reset == 1)
+-                cru_writel(0x40004000,0x1d0);
+-            else 
+-                cru_writel(0x40000000,0x1d0);
+-            camsys_trace(1, "Isp_SoftRst: %d",reset);
+-            break;
+-        }
+-
+-        default:
+-        {
+-            camsys_warn("cfg_cmd: 0x%x isn't support for %s",cfg_cmd,camsys_soc_p->name);
+-            break;
+-        }
+-
+-    }
+-
+-    return 0;
+-
+-
+-}
++extern int camsys_rk3288_cfg (camsys_soc_cfg_t cfg_cmd, void* cfg_para);
++extern int camsys_rk3368_cfg (camsys_soc_cfg_t cfg_cmd, void* cfg_para);
+ 
+ camsys_soc_priv_t* camsys_soc_get(void)
+ {
+@@ -80,14 +24,20 @@ int camsys_soc_init(void)
+         goto fail;
+     }
+ 
+-    if (soc_is_rk3288()) {
+-        strlcpy(camsys_soc_p->name,"camsys_rk3288",31);
+-        camsys_soc_p->soc_cfg = camsys_rk3288_cfg;
+-    } else {
+-        camsys_err("camsys isn't support soc: 0x%lx!",rockchip_soc_id);
+-        goto fail;
+-    }
+-    
++#ifdef CONFIG_ARM64
++	strlcpy(camsys_soc_p->name,"camsys_rk3368",31);
++	camsys_soc_p->soc_cfg = camsys_rk3368_cfg;
++	camsys_err("camsys_soc_init exit!");
++#else
++	if (soc_is_rk3288()) {
++	        strlcpy(camsys_soc_p->name,"camsys_rk3288",31);
++        camsys_soc_p->soc_cfg = camsys_rk3288_cfg;	
++	} else {
++		camsys_err("camsys isn't support soc: 0x%lx!",rockchip_soc_id);
++		goto fail;
++	}
++#endif
++
+     return 0;
+ fail:
+     if (camsys_soc_p != NULL) {
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_priv.h b/drivers/media/video/rk_camsys/camsys_soc_priv.h
+index 6e58115a3512..707d2e6d0616 100755
+--- a/drivers/media/video/rk_camsys/camsys_soc_priv.h
++++ b/drivers/media/video/rk_camsys/camsys_soc_priv.h
+@@ -26,5 +26,11 @@ typedef struct camsys_soc_priv_s {
+ extern camsys_soc_priv_t* camsys_soc_get(void);
+ extern int camsys_soc_init(void);
+ extern int camsys_soc_deinit(void);
++
++extern unsigned long rk_grf_base;
++extern unsigned long rk_cru_base;
++extern unsigned long rk_isp_base;
++extern unsigned int CHIP_TYPE;
++
+ #endif
+ 
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_rk3288.c b/drivers/media/video/rk_camsys/camsys_soc_rk3288.c
+index a1d008f2b4af..a95172d883c7 100755
+--- a/drivers/media/video/rk_camsys/camsys_soc_rk3288.c
++++ b/drivers/media/video/rk_camsys/camsys_soc_rk3288.c
+@@ -224,4 +224,59 @@ static int camsys_rk3288_mipihpy_cfg (camsys_mipiphy_soc_para_t *para)
+     return -1;
+ }
+ 
++int camsys_rk3288_cfg (camsys_soc_cfg_t cfg_cmd, void* cfg_para)
++{
++    unsigned int *para_int;
++    
++    switch (cfg_cmd)
++    {
++        case Clk_DriverStrength_Cfg:
++        {
++            para_int = (unsigned int*)cfg_para;
++            __raw_writel((((*para_int)&0x03)<<3)|(0x03<<3), RK_GRF_VIRT+0x01d4);
++            break;
++        }
++
++        case Cif_IoDomain_Cfg:
++        {
++            para_int = (unsigned int*)cfg_para;
++            if (*para_int < 28000000) {
++                __raw_writel(((1<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);    // 1.8v IO
++            } else {
++                __raw_writel(((0<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);    // 3.3v IO
++            }
++            break;
++        }
++
++        case Mipi_Phy_Cfg:
++        {
++            camsys_rk3288_mipihpy_cfg((camsys_mipiphy_soc_para_t*)cfg_para);
++            break;
++        }
++
++        case Isp_SoftRst:         /* ddl@rock-chips.com: v0.d.0 */
++        {
++            unsigned int reset;
++            reset = (unsigned int)cfg_para;
++
++            if (reset == 1)
++                cru_writel(0x40004000,0x1d0);
++            else 
++                cru_writel(0x40000000,0x1d0);
++            camsys_trace(1, "Isp_SoftRst: %d",reset);
++            break;
++        }
++
++        default:
++        {
++            camsys_warn("cfg_cmd: 0x%x isn't support",cfg_cmd);
++            break;
++        }
++
++    }
++
++    return 0;
++
++
++}
+ 
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_rk3288.h b/drivers/media/video/rk_camsys/camsys_soc_rk3288.h
+index 5de3daa33d89..6899cca5bbd5 100755
+--- a/drivers/media/video/rk_camsys/camsys_soc_rk3288.h
++++ b/drivers/media/video/rk_camsys/camsys_soc_rk3288.h
+@@ -96,11 +96,17 @@
+ #define write_grf_reg(addr, val)           __raw_writel(val, addr+RK_GRF_VIRT)
+ #define read_grf_reg(addr)                 __raw_readl(addr+RK_GRF_VIRT)
+ #define mask_grf_reg(addr, msk, val)       write_grf_reg(addr,(val)|((~(msk))&read_grf_reg(addr)))
++#ifdef CONFIG_ARM64
++#define cru_writel(v, o)	do {writel(v, RK_CRU_VIRT + (o));} \
++				while (0)
+ 
++#define write_csihost_reg(addr, val)       __raw_writel(val, addr+(void __force __iomem *)(phy_virt))
++#define read_csihost_reg(addr)             __raw_readl(addr+(void __force __iomem *)(phy_virt))
++#else
+ #define cru_writel(v, o)	do {writel(v, RK_CRU_VIRT + (o)); dsb();} \
+ 				while (0)
+ 
+ #define write_csihost_reg(addr, val)       __raw_writel(val, addr+IOMEM(phy_virt))
+ #define read_csihost_reg(addr)             __raw_readl(addr+IOMEM(phy_virt))
+-
++#endif
+ #endif
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_rk3368.c b/drivers/media/video/rk_camsys/camsys_soc_rk3368.c
+new file mode 100644
+index 000000000000..ce664d95476e
+--- /dev/null
++++ b/drivers/media/video/rk_camsys/camsys_soc_rk3368.c
+@@ -0,0 +1,283 @@
++#include "camsys_soc_priv.h"
++#include "camsys_soc_rk3368.h"
++
++
++struct mipiphy_hsfreqrange_s {
++    unsigned int range_l;
++    unsigned int range_h;
++    unsigned char cfg_bit;
++};
++
++static struct mipiphy_hsfreqrange_s mipiphy_hsfreqrange[] = {
++    {80,110,0x00},
++    {110,150,0x01},
++    {150,200,0x02},
++    {200,250,0x03},
++    {250,300,0x04},
++    {300,400,0x05},
++    {400,500,0x06},
++    {500,600,0x07},
++    {600,700,0x08},
++    {700,800,0x09},
++    {800,1000,0x10},
++    {1000,1200,0x11},
++    {1200,1400,0x12},
++    {1400,1600,0x13},
++    {1600,1800,0x14}
++    
++};
++
++#if 0
++static int camsys_rk3368_mipiphy_wr_reg(unsigned long phy_virt, unsigned char addr, unsigned char data)
++{
++	/*TESTEN =1,TESTDIN=addr */
++	write_csihost_reg(CSIHOST_PHY_TEST_CTRL1, (0x00010000 | addr));
++	/*TESTCLK=0 */
++	write_csihost_reg(CSIHOST_PHY_TEST_CTRL0, 0x00000000);
++	udelay(10);
++	/*TESTEN =0,TESTDIN=data */
++	write_csihost_reg(CSIHOST_PHY_TEST_CTRL1, (0x00000000 | data));
++	/*TESTCLK=1 */
++	write_csihost_reg(CSIHOST_PHY_TEST_CTRL0, 0x00000002);
++	udelay(10);
++
++	return 0;
++}
++
++static int camsys_rk3368_mipiphy_rd_reg(unsigned long phy_virt,unsigned char addr)
++{
++    return (read_csihost_reg(((CSIHOST_PHY_TEST_CTRL1)&0xff00))>>8);
++}
++
++static int camsys_rk3368_csiphy_wr_reg(unsigned long csiphy_virt, unsigned char addr, unsigned char data)
++{
++	write_csiphy_reg(addr,data);
++	return 0;
++}
++
++static int camsys_rk3368_csiphy_rd_reg(unsigned long csiphy_virt,unsigned char addr)
++{
++	return read_csiphy_reg(addr);
++}
++#endif
++static int camsys_rk3368_mipihpy_cfg (camsys_mipiphy_soc_para_t *para)
++{ 
++    unsigned char hsfreqrange=0xff,i;
++    struct mipiphy_hsfreqrange_s *hsfreqrange_p;
++    unsigned long phy_virt, phy_index;
++    unsigned long base;
++	unsigned long csiphy_virt;
++
++    phy_index = para->phy->phy_index;
++    if (para->camsys_dev->mipiphy[phy_index].reg!=NULL) {
++        phy_virt  = para->camsys_dev->mipiphy[phy_index].reg->vir_base;
++    } else {
++        phy_virt = 0x00;
++    }
++    if(para->camsys_dev->csiphy_reg!=NULL){
++		csiphy_virt = (unsigned long)para->camsys_dev->csiphy_reg->vir_base;
++	}else {
++		csiphy_virt = 0x00;
++	}
++    if ((para->phy->bit_rate == 0) || (para->phy->data_en_bit == 0)) {
++        if (para->phy->phy_index == 0) {
++			camsys_trace(1, ">>>>>>>>>>>>>>>>para->phy->phy_index==0");	
++            base = (unsigned long)para->camsys_dev->devmems.registermem->vir_base;
++            *((unsigned int*)(base + (MRV_MIPI_BASE+MRV_MIPI_CTRL))) &= ~(0x0f<<8);
++            camsys_trace(1, "mipi phy 0 standby!");		
++        } else if (para->phy->phy_index == 1) {
++			/*TODO*/
++        }
++
++        return 0;
++    }
++    
++    hsfreqrange_p = mipiphy_hsfreqrange;
++    for (i=0; i<(sizeof(mipiphy_hsfreqrange)/sizeof(struct mipiphy_hsfreqrange_s)); i++) {
++
++        if ((para->phy->bit_rate > hsfreqrange_p->range_l) && (para->phy->bit_rate <= hsfreqrange_p->range_h)) {
++            hsfreqrange = hsfreqrange_p->cfg_bit;
++            break;
++        }
++        hsfreqrange_p++;
++    }
++
++    if (hsfreqrange == 0xff) {
++        camsys_err("mipi phy config bitrate %d Mbps isn't supported!",para->phy->bit_rate);
++        hsfreqrange = 0x00;
++    }
++	/* hsfreqrange <<= 1; */
++
++    if (para->phy->phy_index == 0) {
++
++		/*isp select */
++        write_grf_reg(GRF_SOC_CON6_OFFSET, ISP_MIPI_CSI_HOST_SEL_OFFSET_MASK | (1<<ISP_MIPI_CSI_HOST_SEL_OFFSET_BIT)); 
++
++		/*phy start */
++        {
++			/*set clock lane */
++			/*write_csiphy_reg(0x34,0x00); */
++			
++            write_csiphy_reg((MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x100),hsfreqrange|(read_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x100)&(~0xf)));
++
++			if(para->phy->data_en_bit > 0x00){
++				write_csiphy_reg((MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x180),hsfreqrange|(read_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x180)&(~0xf)));//lane0			
++			}
++			if(para->phy->data_en_bit > 0x02){
++				write_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x200,hsfreqrange|(read_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x200)&(~0xf)));//lane1			
++			}
++			if(para->phy->data_en_bit > 0x04){
++				write_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x280,hsfreqrange|(read_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x280)&(~0xf)));//lane2			
++				write_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x300,hsfreqrange|(read_csiphy_reg(MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x300)&(~0xf)));	//lane3				
++			}
++
++			/*set data lane num and enable clock lane */
++			write_csiphy_reg( 0x00, ((para->phy->data_en_bit << 2)|(0x1<<6)|0x1));
++			//base = (unsigned long)para->camsys_dev->devmems.registermem->vir_base;
++			//*((unsigned int*)(base + (MRV_MIPI_BASE+MRV_MIPI_CTRL))) =( 0x1|((/*para->phy->data_en_bit*/0x0)<<12)|0x1<<18);
++
++        }
++		camsys_trace(1,"vir_base=0x%lx",(unsigned long)para->camsys_dev->devmems.registermem->vir_base);		
++
++        base = (unsigned long)para->camsys_dev->devmems.registermem->vir_base;
++        *((unsigned int*)(base + (MRV_MIPI_BASE+MRV_MIPI_CTRL))) &= ~(0x0f<<8);
++        camsys_trace(1,"val:0x%x",*((unsigned int*)(base + (MRV_MIPI_BASE+MRV_MIPI_CTRL))));
++    }
++#if 0	
++	else if (para->phy->phy_index == 1){
++		
++		//csihost select
++        write_grf_reg(GRF_SOC_CON6_OFFSET, ISP_MIPI_CSI_HOST_SEL_OFFSET_MASK | (0<<ISP_MIPI_CSI_HOST_SEL_OFFSET_BIT)); 
++		  
++		write_csihost_reg(CSIHOST_PHY_TEST_CTRL0,0x00000002); 		 //TESTCLK=1
++		write_csihost_reg(CSIHOST_PHY_TEST_CTRL0,0x00000003); 		 //TESTCLR=1 TESTCLK=1	
++		udelay(100);
++		write_csihost_reg(CSIHOST_PHY_TEST_CTRL0,0x00000002); 		 //TESTCLR=0 TESTCLK=1
++		udelay(100);
++
++		//set lane num, csi phy
++		camsys_rk3368_mipiphy_wr_reg(phy_virt, MIPI_CSI_DPHY_CTRL_LANE_ENABLE_OFFSET<<2, para->phy->data_en_bit << MIPI_CSI_DPHY_CTRL_LANE_ENABLE_OFFSET_BIT);
++
++		//set clock lane
++		camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x100)<<2,0x00);
++		//MSB enable
++		//camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET+0x100)<<2,0x40); 		
++		if(para->phy->data_en_bit > 0x00){
++			camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x180)<<2,hsfreqrange);//lane0
++			//MSB enable
++			//camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET+0x180)<<2,0x40);
++		}
++		if(para->phy->data_en_bit > 0x02){
++			camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x200)<<2,hsfreqrange);//lane1
++			//MSB enable
++			//camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET+0x200)<<2,0x40);
++		}
++		if(para->phy->data_en_bit > 0x04){
++			camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x280)<<2,hsfreqrange);//lane2
++			//MSB enable
++			//camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET+0x280)<<2,0x40);
++			camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET+0x300)<<2,hsfreqrange); //lane3 
++			//MSB enable
++			//camsys_rk3368_mipiphy_wr_reg(phy_virt, (MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET+0x300)<<2,0x40);
++		}
++
++		
++		//set active lane num, csi host
++		if(para->phy->data_en_bit > 0x00){
++			write_csihost_reg(CSIHOST_N_LANES_OFFSET, 0x00);//one lane active
++		}else if(para->phy->data_en_bit > 0x01){
++			write_csihost_reg(CSIHOST_N_LANES_OFFSET, 0x01);//two lane active
++		}else if(para->phy->data_en_bit > 0x04){
++			write_csihost_reg(CSIHOST_N_LANES_OFFSET, 0x02);// three lane active
++		}else if(para->phy->data_en_bit > 0x08){
++			write_csihost_reg(CSIHOST_N_LANES_OFFSET, 0x03);//foure lane active
++		}
++		camsys_rk3368_mipiphy_rd_reg(phy_virt,0x0);
++		write_csihost_reg(CSIHOST_PHY_TEST_CTRL0,0x00000002);  //TESTCLK=1			
++		write_csihost_reg(CSIHOST_PHY_TEST_CTRL1,0x00000000); //TESTCLR=0	
++        write_csihost_reg(CSIHOST_PHY_SHUTDOWNZ,0x00000001);  //SHUTDOWNZ=1
++        write_csihost_reg(CSIHOST_DPHY_RSTZ,0x00000001);  //RSTZ=1	
++        write_csihost_reg(CSIHOST_CSI2_RESETN,0x00000001);  //RESETN=1	       
++    }
++#endif
++    else {
++        camsys_err("mipi phy index %d is invalidate!",para->phy->phy_index);
++        goto fail;
++    }
++
++    camsys_trace(1, "mipi phy(%d) turn on(lane: 0x%x  bit_rate: %dMbps)",para->phy->phy_index,para->phy->data_en_bit, para->phy->bit_rate);
++
++    return 0;
++
++fail:
++    return -1;
++}
++
++#define MRV_AFM_BASE		0x0000
++#define VI_IRCL				0x0014
++int camsys_rk3368_cfg (camsys_soc_cfg_t cfg_cmd, void* cfg_para)
++{
++    unsigned int *para_int;
++    
++    switch (cfg_cmd)
++    {
++        case Clk_DriverStrength_Cfg:
++        {
++            para_int = (unsigned int*)cfg_para;
++			__raw_writel((((*para_int)&0x03)<<3)|(0x03<<3), (void*)(rk_grf_base+0x204));
++            //__raw_writel(0xffffffff, rk_grf_base+0x204);
++            break;
++        }
++
++        case Cif_IoDomain_Cfg:
++        {
++            para_int = (unsigned int*)cfg_para;
++            if (*para_int < 28000000) {
++                __raw_writel(((1<<1)|(1<<(1+16))),(void*)(rk_grf_base+0x0900));    // 1.8v IO
++            } else {
++                __raw_writel(((0<<1)|(1<<(1+16))),(void*)(rk_grf_base+0x0900));    // 3.3v IO
++            }
++            break;
++        }
++
++        case Mipi_Phy_Cfg:
++        {
++            camsys_rk3368_mipihpy_cfg((camsys_mipiphy_soc_para_t*)cfg_para);
++            break;
++        }
++
++        case Isp_SoftRst:         /* ddl@rock-chips.com: v0.d.0 */
++        {
++            unsigned int reset;
++            reset = (unsigned int)cfg_para;
++			#if 0
++            if (reset == 1)
++                write_cru_reg(0x318,0x40004000);
++            else 
++                write_cru_reg(0x318,0x40000000);
++            camsys_trace(1, "Isp_SoftRst: %d",reset);
++			#endif
++			if (reset == 1)
++				__raw_writel(0x80,
++					     (void*)(rk_isp_base + MRV_AFM_BASE +
++					     VI_IRCL));
++			else
++				__raw_writel(0x00,
++					     (void*)(rk_isp_base + MRV_AFM_BASE +
++					     VI_IRCL));
++			camsys_trace(1, "Isp self soft rst: %d", reset);
++            break;
++        }
++
++        default:
++        {
++            camsys_warn("cfg_cmd: 0x%x isn't support",cfg_cmd);
++            break;
++        }
++
++    }
++
++    return 0;
++}
++
++
+diff --git a/drivers/media/video/rk_camsys/camsys_soc_rk3368.h b/drivers/media/video/rk_camsys/camsys_soc_rk3368.h
+new file mode 100644
+index 000000000000..47efb19d2fcf
+--- /dev/null
++++ b/drivers/media/video/rk_camsys/camsys_soc_rk3368.h
+@@ -0,0 +1,111 @@
++#ifndef __RKCAMSYS_SOC_RK3368_H__
++#define __RKCAMSYS_SOC_RK3368_H__
++
++#include "camsys_internal.h"
++
++/*MARVIN REGISTER*/
++#define MRV_MIPI_BASE                           0x1C00
++#define MRV_MIPI_CTRL                           0x00
++
++/*
++#define CSIHOST_PHY_TEST_CTRL0_OFFSET 0x0030
++#define DPHY_TX1RX1_TESTCLR    (1<<0)
++#define DPHY_TX1RX1_TESTCLK    (1<<1)
++
++#define CSIHOST_PHY_TEST_CTRL1_OFFSET 0x0034
++#define DPHY_TX1RX1_TESTDIN_OFFSET_BITS    (0)
++#define DPHY_TX1RX1_TESTDOUT_OFFSET_BITS    (8)
++#define DPHY_TX1RX1_TESTEN    (16)
++*/
++
++#define GRF_SOC_STATUS21                  (0x2D4)
++
++#define CSIHOST_PHY_TEST_CTRL0            (0x30)
++#define CSIHOST_PHY_TEST_CTRL1            (0x34)
++#define CSIHOST_N_LANES                   (0x04)
++#define CSIHOST_PHY_SHUTDOWNZ             (0x08)
++#define CSIHOST_CSI2_RESETN               (0x10)
++#define CSIHOST_DPHY_RSTZ                 (0x0c)
++#define CSIHOST_PHY_STATE                 (0x14)
++#define CSIHOST_DATA_IDS1                 (0x18)
++#define CSIHOST_DATA_IDS2                 (0x1C)
++#define CSIHOST_ERR1                      (0x20)
++#define CSIHOST_ERR2                      (0x24)
++
++/*
++*GRF_SOC_CON6
++*dphy_rx_forcerxmode 11:8
++*isp_mipi_csi_host_sel:1
++*disable_isp:0
++*bit 0 grf_con_disable_isp
++*bit 1 isp_mipi_csi_host_sel  1'b0: mipi csi host
++*/
++#define GRF_SOC_CON6_OFFSET    (0x0418)
++/*bit 0*/
++#define MIPI_PHY_DISABLE_ISP_MASK       (0x1<<16)
++#define MIPI_PHY_DISABLE_ISP            (0x0<<0)
++/*bit 1*/
++#define ISP_MIPI_CSI_HOST_SEL_OFFSET_MASK       (0x1<<17)
++#define ISP_MIPI_CSI_HOST_SEL_OFFSET_BIT       (0x1)
++/*bit 6*/
++#define DPHY_RX_CLK_INV_SEL_MASK  (0x1<<22)
++#define DPHY_RX_CLK_INV_SEL   (0x1<<6)
++/*bit 11:8*/
++#define DPHY_RX_FORCERXMODE_OFFSET_MASK     (0xF<<24)
++#define DPHY_RX_FORCERXMODE_OFFSET_BITS   (8)
++
++/*GRF_SOC_CON7*/
++/*dphy_tx0_forcerxmode*/
++#define GRF_SOC_CON7_OFFSET  (0x041c)
++/*bit 10:7*/
++#define FORCETXSTOPMODE_OFFSET_BITS   (7)
++#define FORCETXSTOPMODE_MASK   (0xF<<23)
++
++#define DPHY_TX0_FORCERXMODE   (6)
++#define DPHY_TX0_FORCERXMODE_MASK   (0x01<<22)
++/*bit 5*/
++#define LANE0_TURNDISABLE_BITS  (5)
++#define LANE0_TURNDISABLE_MASK  (0x01<<21)
++
++#define GRF_SOC_STATUS13  (0x04b4)
++/*dphy_rx_rxclkactivehs*/
++/*dphy_rx_direction*/
++/*dphy_rx_ulpsactivenot_0...3*/
++
++/*LOW POWER MODE SET*/
++/*base*/
++#define MIPI_CSI_DPHY_CTRL_LANE_ENABLE_OFFSET  (0x00)
++#define MIPI_CSI_DPHY_CTRL_LANE_ENABLE_OFFSET_BIT  (2)
++
++#define MIPI_CSI_DPHY_CTRL_PWRCTL_OFFSET  (0x04)
++#define MIPI_CSI_DPHY_CTRL_DIG_RST_OFFSET  (0x80)
++#define MIPI_CSI_DPHY_CTRL_SIG_INV_OFFSET   (0x84)
++
++/*Configure the count time of the THS-SETTLE by protocol.*/
++#define MIPI_CSI_DPHY_LANEX_THS_SETTLE_OFFSET  (0x00)
++/*MSB enable for pin_rxdatahs_
++*1: enable
++*0: disable
++*/
++#define MIPI_CSI_DPHY_LANEX_MSB_EN_OFFSET  (0x38)
++
++#define CSIHOST_N_LANES_OFFSET 0x04
++#define CSIHOST_N_LANES_OFFSET_BIT (0)
++
++#define write_grf_reg(addr, val)           __raw_writel(val, (void*)(addr+rk_grf_base)) //__raw_writel(val, addr+RK_GRF_VIRT)
++#define read_grf_reg(addr)                 __raw_readl((void*)(addr+rk_grf_base)) //__raw_readl(addr+RK_GRF_VIRT)
++#define mask_grf_reg(addr, msk, val)       write_grf_reg(addr,(val)|((~(msk))&read_grf_reg(addr)))
++
++#define write_cru_reg(addr, val)           __raw_writel(val, (void*)(addr+rk_cru_base))
++
++/*#define cru_writel(v, o)	do {writel(v, RK_CRU_VIRT + (o)); dsb();} \
++				while (0)
++*/
++
++#define write_csihost_reg(addr, val)       __raw_writel(val, (void*)(addr+phy_virt))//__raw_writel(val, addr+IOMEM(phy_virt))
++#define read_csihost_reg(addr)             __raw_readl((void*)(addr+phy_virt))//__raw_readl(addr+IOMEM(phy_virt))
++/*csi phy*/
++#define write_csiphy_reg(addr, val)       __raw_writel(val, (void*)(addr+csiphy_virt))//__raw_writel(val, addr+IOMEM(csiphy_virt))
++#define read_csiphy_reg(addr)             __raw_readl((void*)(addr+csiphy_virt))//__raw_readl(addr+IOMEM(csiphy_virt))
++
++#endif
+-- 
+2.35.3
+

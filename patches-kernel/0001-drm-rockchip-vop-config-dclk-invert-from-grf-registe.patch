@@ -1,0 +1,223 @@
+From c2b587fa35bc361c7e451b26fc5c81507e6b33a1 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 18 Apr 2018 16:53:11 +0800
+Subject: [PATCH] drm/rockchip: vop: config dclk invert from grf register
+
+Some platform like rk3288,rk3368,px30, we need to config grf
+register to invert dclk polarity when connector is rgb or lvds.
+
+Change-Id: I9ef9ce09f050ee42c0543d415a9baac1f50a0848
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 28 +++++++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h |  5 ++++
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.c | 21 ++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.h |  3 +++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 3e7e4ef6032e..a4a00ebbce12 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -34,6 +34,8 @@
+ #include <linux/of_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/component.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
+ 
+ #include <linux/reset.h>
+ #include <linux/delay.h>
+@@ -134,6 +136,12 @@
+ 
+ #define VOP_WIN_GET_YRGBADDR(vop, win) \
+ 		vop_readl(vop, win->offset + VOP_WIN_NAME(win, yrgb_mst).offset)
++#define VOP_GRF_SET(vop, reg, v) \
++	do { \
++		if (vop->data->grf_ctrl) { \
++			vop_grf_writel(vop, vop->data->grf_ctrl->reg, v); \
++		} \
++	} while (0)
+ 
+ #define to_vop(x) container_of(x, struct vop, crtc)
+ #define to_vop_win(x) container_of(x, struct vop_win, base)
+@@ -229,6 +237,7 @@ struct vop {
+ 
+ 	uint32_t *regsbak;
+ 	void __iomem *regs;
++	struct regmap *grf;
+ 
+ 	/* physical map length of vop register */
+ 	uint32_t len;
+@@ -271,6 +280,18 @@ struct vop {
+ static struct vop *dmc_vop[MAX_VOPS];
+ static struct devfreq *devfreq_vop;
+ static DEFINE_MUTEX(register_devfreq_lock);
++static inline void vop_grf_writel(struct vop *vop, struct vop_reg reg, u32 v)
++{
++	u32 val = 0;
++
++	if (IS_ERR_OR_NULL(vop->grf))
++		return;
++
++	if (VOP_REG_SUPPORT(vop, reg)) {
++		val = (v << reg.shift) | (reg.mask << (reg.shift + 16));
++		regmap_write(vop->grf, reg.offset, val);
++	}
++}
+ 
+ static inline void vop_writel(struct vop *vop, uint32_t offset, uint32_t v)
+ {
+@@ -2516,6 +2537,8 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 		VOP_CTRL_SET(vop, lvds_en, 1);
+ 		VOP_CTRL_SET(vop, lvds_pin_pol, val);
+ 		VOP_CTRL_SET(vop, lvds_dclk_pol, dclk_inv);
++
++		VOP_GRF_SET(vop, grf_dclk_inv, !dclk_inv);
+ 		break;
+ 	case DRM_MODE_CONNECTOR_eDP:
+ 		VOP_CTRL_SET(vop, edp_en, 1);
+@@ -4247,6 +4270,11 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
+ 		}
+ 	}
+ 
++	vop->grf = syscon_regmap_lookup_by_phandle(dev->of_node,
++						   "rockchip,grf");
++	if (IS_ERR(vop->grf))
++		dev_err(dev, "missing rockchip,grf property\n");
++
+ 	vop->hclk = devm_clk_get(vop->dev, "hclk_vop");
+ 	if (IS_ERR(vop->hclk)) {
+ 		dev_err(vop->dev, "failed to get hclk source\n");
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index e2205caa7fbd..3f909c5d220f 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -427,6 +427,10 @@ struct vop_win_data {
+ 	u64 feature;
+ };
+ 
++struct vop_grf_ctrl {
++	struct vop_reg grf_dclk_inv;
++};
++
+ #define VOP_FEATURE_OUTPUT_10BIT	BIT(0)
+ #define VOP_FEATURE_AFBDC		BIT(1)
+ #define VOP_FEATURE_ALPHA_SCALE		BIT(2)
+@@ -449,6 +453,7 @@ struct vop_data {
+ 	const struct vop_win_data *win;
+ 	const struct vop_csc_table *csc_table;
+ 	const struct vop_hdr_table *hdr_table;
++	const struct vop_grf_ctrl *grf_ctrl;
+ 	unsigned int win_size;
+ 	uint32_t version;
+ 	struct vop_rect max_input;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+index 850a53c0f2b1..e24c9527bbe3 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+@@ -322,12 +322,21 @@ static const struct vop_intr rk3288_vop_intr = {
+ 	.clear = VOP_REG(RK3288_INTR_CTRL0, 0xf, 8),
+ };
+ 
++static const struct vop_grf_ctrl rk3288_vop_big_grf_ctrl = {
++	.grf_dclk_inv = VOP_REG(RK3288_GRF_SOC_CON15, 0x1, 12),
++};
++
++static const struct vop_grf_ctrl rk3288_vop_lit_grf_ctrl = {
++	.grf_dclk_inv = VOP_REG(RK3288_GRF_SOC_CON15, 0x1, 14),
++};
++
+ static const struct vop_data rk3288_vop_big = {
+ 	.version = VOP_VERSION(3, 0),
+ 	.feature = VOP_FEATURE_OUTPUT_10BIT | VOP_FEATURE_ALPHA_SCALE,
+ 	.max_input = {4096, 8192},
+ 	.max_output = {3840, 2160},
+ 	.intr = &rk3288_vop_intr,
++	.grf_ctrl = &rk3288_vop_big_grf_ctrl,
+ 	.ctrl = &rk3288_ctrl_data,
+ 	.win = rk3288_vop_win_data,
+ 	.win_size = ARRAY_SIZE(rk3288_vop_win_data),
+@@ -339,6 +348,7 @@ static const struct vop_data rk3288_vop_lit = {
+ 	.max_input = {4096, 8192},
+ 	.max_output = {2560, 1600},
+ 	.intr = &rk3288_vop_intr,
++	.grf_ctrl = &rk3288_vop_lit_grf_ctrl,
+ 	.ctrl = &rk3288_ctrl_data,
+ 	.win = rk3288_vop_win_data,
+ 	.win_size = ARRAY_SIZE(rk3288_vop_win_data),
+@@ -460,12 +470,17 @@ static const struct vop_intr rk3366_vop_intr = {
+ 	.clear = VOP_REG_MASK(RK3366_INTR_CLEAR0, 0xffff, 0),
+ };
+ 
++static const struct vop_grf_ctrl rk3368_vop_grf_ctrl = {
++	.grf_dclk_inv = VOP_REG(RK3368_GRF_SOC_CON6, 0x1, 5),
++};
++
+ static const struct vop_data rk3366_vop = {
+ 	.version = VOP_VERSION(3, 4),
+ 	.feature = VOP_FEATURE_ALPHA_SCALE,
+ 	.max_input = {4096, 8192},
+ 	.max_output = {4096, 2160},
+ 	.intr = &rk3366_vop_intr,
++	.grf_ctrl = &rk3368_vop_grf_ctrl,
+ 	.ctrl = &rk3288_ctrl_data,
+ 	.win = rk3368_vop_win_data,
+ 	.win_size = ARRAY_SIZE(rk3368_vop_win_data),
+@@ -1550,12 +1565,17 @@ static const struct vop_win_data px30_vop_lit_win_data[] = {
+ 	{ .phy = NULL },
+ };
+ 
++static const struct vop_grf_ctrl px30_grf_ctrl = {
++	.grf_dclk_inv = VOP_REG(PX30_GRF_PD_VO_CON1, 0x1, 4),
++};
++
+ static const struct vop_data px30_vop_lit = {
+ 	.version = VOP_VERSION(2, 5),
+ 	.max_input = {1920, 8192},
+ 	.max_output = {1920, 1080},
+ 	.ctrl = &px30_ctrl_data,
+ 	.intr = &rk3366_lit_intr,
++	.grf_ctrl = &px30_grf_ctrl,
+ 	.win = px30_vop_lit_win_data,
+ 	.win_size = ARRAY_SIZE(px30_vop_lit_win_data),
+ };
+@@ -1567,6 +1587,7 @@ static const struct vop_data px30_vop_big = {
+ 	.max_output = {1920, 1080},
+ 	.ctrl = &px30_ctrl_data,
+ 	.intr = &rk3366_lit_intr,
++	.grf_ctrl = &px30_grf_ctrl,
+ 	.win = px30_vop_big_win_data,
+ 	.win_size = ARRAY_SIZE(px30_vop_big_win_data),
+ };
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+index e3641847f586..fc172a058f4d 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+@@ -125,6 +125,7 @@
+ #define RK3288_BCSH_COLOR_BAR			0x01b0
+ #define RK3288_BCSH_BCS				0x01b4
+ #define RK3288_BCSH_H				0x01b8
++#define RK3288_GRF_SOC_CON15			0x03a4
+ /* register definition end */
+ 
+ /* rk3368 register definition */
+@@ -312,6 +313,7 @@
+ #define RK3368_CABC_GAMMA_LUT_ADDR		0x1800
+ #define RK3368_MCU_BYPASS_WPORT			0x2200
+ #define RK3368_MCU_BYPASS_RPORT			0x2300
++#define RK3368_GRF_SOC_CON6			0x0418
+ /* rk3368 register definition end */
+ 
+ #define RK3366_REG_CFG_DONE			0x0000
+@@ -1037,6 +1039,7 @@
+ #define PX30_AFBCD0_PIC_SIZE			0x00248
+ #define PX30_AFBCD0_PIC_OFFSET			0x0024c
+ #define PX30_AFBCD0_AXI_CTRL			0x00250
++#define PX30_GRF_PD_VO_CON1			0x00438
+ /* px30 register definition end */
+ 
+ #endif /* _ROCKCHIP_VOP_REG_H */
+-- 
+2.35.3
+

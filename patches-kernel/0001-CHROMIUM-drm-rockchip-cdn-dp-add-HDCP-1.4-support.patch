@@ -1,0 +1,513 @@
+From 6f4dea14e177662aded01899e6ad505097afadd5 Mon Sep 17 00:00:00 2001
+From: Ziyuan Xu <xzy.xu@rock-chips.com>
+Date: Thu, 27 Oct 2016 20:23:35 +0800
+Subject: [PATCH] CHROMIUM: drm/rockchip: cdn-dp: add HDCP 1.4 support
+
+Implement HDCP 1.4 authentication function for DP driver.
+
+First, userspace write HDCP cipher to driver via "hdcp_key" sysfs node,
+it contains ksv and device private key. DP connector object has a
+"Content Proection" property which it's 'Undesired' default. Userspace
+set it to 'Desired' as a HDCP authentication request, and it will be set
+to 'Enabled' once HDCP authenticated.
+
+BUG=chrome-os-partner:56883
+TEST=WITH HDCP KEY SITUATION:
+	1.flash encrypt key to vpd area, and reboot chromebook.
+	$ vpd -O; vpd -s hdcp_key_v1_4=something...;dump_vpd_log
+	--force;
+	2.write key to DP driver.
+	$ grep hdcp_key /var/cache/vpd/full-v2.txt | cut -s -d \" -f 4 |
+	tr -d "\n" > /sys/devices/platform/fec00000.dp/hdcp_key
+	3.set "Content Protection" property to 'Desired'
+	$ proptest 36 connector 23 1
+	4.if the HDCP 1.4 authenticated, the 'Content Proection' will be
+	changed to 'Enabled'
+
+Signed-off-by: Ziyuan Xu <xzy.xu@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/403975
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+
+Change-Id: I58f11535dd68d9517a3c7b0b9a61ed9fa6d9a1c0
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/cdn-dp-core.c | 198 +++++++++++++++++++++++++
+ drivers/gpu/drm/rockchip/cdn-dp-core.h |   1 +
+ drivers/gpu/drm/rockchip/cdn-dp-reg.c  | 112 ++++++++++++++
+ drivers/gpu/drm/rockchip/cdn-dp-reg.h  |  35 +++++
+ 4 files changed, 346 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.c b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+index 8295722fc1e3..a15d311fadda 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+@@ -26,6 +26,7 @@
+ #include <linux/extcon.h>
+ #include <linux/firmware.h>
+ #include <linux/hdmi-notifier.h>
++#include <linux/iopoll.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+ #include <linux/mfd/syscon.h>
+@@ -39,10 +40,15 @@
+ #include "cdn-dp-reg.h"
+ #include "rockchip_drm_vop.h"
+ 
++#define HDCP_RETRY_INTERVAL_MS		100
++#define HDCP_EVENT_TIMEOUT_MS		500
++#define HDCP_AUTHENTICATE_DELAY_MS	100
++
+ #define HDCP_KEY_DATA_START_TRANSFER	0
+ #define HDCP_KEY_DATA_START_DECRYPT	1
+ 
+ #define RK_SIP_HDCP_CONTROL		0x82000009
++#define RK_SIP_HDCP_KEY_DATA64		0xC200000A
+ 
+ #define connector_to_dp(c) \
+ 		container_of(c, struct cdn_dp_device, connector)
+@@ -194,6 +200,50 @@ static int cdn_dp_get_sink_count(struct cdn_dp_device *dp, u8 *sink_count)
+ 	return 0;
+ }
+ 
++static int cdn_dp_start_hdcp1x_auth(struct cdn_dp_device *dp)
++{
++	int ret;
++	struct arm_smccc_res res;
++	uint64_t *buf;
++
++	mutex_lock(&dp->lock);
++	if (!dp->active) {
++		dev_err(dp->dev, "firmware is not active\n");
++		goto out;
++	}
++
++	arm_smccc_smc(RK_SIP_HDCP_CONTROL, HDCP_KEY_DATA_START_TRANSFER,
++		      0, 0, 0, 0, 0, 0, &res);
++
++	buf = (uint64_t *)&dp->key;
++
++	for (; !res.a0 && (u8 *)buf - (u8 *)&dp->key < sizeof(dp->key);
++	     buf += 6)
++		arm_smccc_smc(RK_SIP_HDCP_KEY_DATA64, buf[0], buf[1],
++			      buf[2], buf[3], buf[4], buf[5], 0, &res);
++
++	if (res.a0) {
++		dev_err(dp->dev, "send hdcp keys failed: %ld\n", res.a0);
++		ret = -EIO;
++		goto out;
++	}
++	arm_smccc_smc(RK_SIP_HDCP_CONTROL, HDCP_KEY_DATA_START_DECRYPT,
++		      0, 0, 0, 0, 0, 0, &res);
++
++	ret = cdn_dp_hdcp_tx_configuration(dp, HDCP_TX_1, true);
++	if (ret) {
++		dev_err(dp->dev, "start hdcp authentication failed: %d\n", ret);
++		goto out;
++	}
++
++	schedule_delayed_work(&dp->hdcp_event_work,
++			      msecs_to_jiffies(HDCP_AUTHENTICATE_DELAY_MS));
++
++out:
++	mutex_unlock(&dp->lock);
++	return ret;
++}
++
+ static struct cdn_dp_port *cdn_dp_connected_port(struct cdn_dp_device *dp)
+ {
+ 	struct cdn_dp_port *port;
+@@ -261,12 +311,71 @@ static void cdn_dp_connector_destroy(struct drm_connector *connector)
+ 	drm_connector_cleanup(connector);
+ }
+ 
++static int cdn_dp_set_content_protection(struct cdn_dp_device *dp,
++					 struct drm_mode_object *obj,
++					 struct drm_property *property,
++					 uint64_t val)
++{
++	int ret;
++
++	switch (val) {
++	case DRM_MODE_CONTENT_PROTECTION_UNDESIRED:
++		ret = cdn_dp_hdcp_tx_configuration(dp, HDCP_TX_1, false);
++		break;
++
++	case DRM_MODE_CONTENT_PROTECTION_DESIRED:
++		ret = cdn_dp_start_hdcp1x_auth(dp);
++		break;
++
++	case DRM_MODE_CONTENT_PROTECTION_ENABLED:
++		ret = -EINVAL;
++	}
++	return ret;
++}
++
++static int cdn_dp_connector_set_property(struct drm_connector *connector,
++						struct drm_property *property,
++						uint64_t val)
++{
++	struct cdn_dp_device *dp = connector_to_dp(connector);
++	int ret = 0;
++
++	if (strcmp(property->name, "Content Protection") == 0)
++		ret = cdn_dp_set_content_protection(dp, &connector->base,
++						    property, val);
++
++	return ret;
++}
++
++static int cdn_dp_connector_atomic_get_property(
++					struct drm_connector *connector,
++					const struct drm_connector_state *state,
++					struct drm_property *property,
++					uint64_t *val)
++{
++	struct drm_mode_config *mc = &connector->dev->mode_config;
++	int i;
++
++	if (property == mc->content_protection_property) {
++		for (i = 0; i < connector->properties.count; i++) {
++			if (connector->properties.properties[i] == property) {
++				*val = connector->properties.values[i];
++				return 0;
++			}
++		}
++	}
++
++	return -EINVAL;
++}
++
+ static const struct drm_connector_funcs cdn_dp_atomic_connector_funcs = {
+ 	.dpms = drm_atomic_helper_connector_dpms,
+ 	.detect = cdn_dp_connector_detect,
+ 	.destroy = cdn_dp_connector_destroy,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.reset = drm_atomic_helper_connector_reset,
++	.set_property = cdn_dp_connector_set_property,
++	.atomic_get_property = cdn_dp_connector_atomic_get_property,
+ 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+ };
+@@ -1089,6 +1198,88 @@ static int cdn_dp_pd_event(struct notifier_block *nb,
+ 	return NOTIFY_DONE;
+ }
+ 
++static int cdn_dp_set_hdcp_drm_property(struct cdn_dp_device *dp, uint64_t val)
++{
++	struct drm_connector *connector = &dp->connector;
++	struct drm_mode_config *mc = &connector->dev->mode_config;
++
++	return drm_object_property_set_value(&connector->base,
++					     mc->content_protection_property,
++					     val);
++}
++
++static bool cdn_dp_hdcp_authorize(struct cdn_dp_device *dp)
++{
++	bool auth_done = false;
++	u16 tx_status;
++	u32 sw_event;
++	int ret;
++
++	mutex_lock(&dp->lock);
++
++	/*
++	 * HDCP authentication might cause the disconnect hpd event, just
++	 * stop the hdcp event SM.
++	 */
++	if (!dp->connected) {
++		auth_done = true;
++		goto out;
++	}
++
++	sw_event = cdn_dp_get_event(dp);
++
++	if (sw_event & HDCP_TX_STATUS_EVENT) {
++		auth_done = true;
++
++		ret = cdn_dp_hdcp_tx_status_req(dp, &tx_status);
++		if (ret)
++			goto out;
++		if (HDCP_TX_STATUS_ERROR(tx_status)) {
++			dev_err(dp->dev, "hdcp status error: %x\n",
++				HDCP_TX_STATUS_ERROR(tx_status));
++			goto out;
++		} else if (tx_status & HDCP_TX_STATUS_AUTHENTICATED) {
++			cdn_dp_set_hdcp_drm_property(dp,
++				DRM_MODE_CONTENT_PROTECTION_ENABLED);
++			goto out;
++		} else {
++			auth_done = false;
++		}
++	}
++
++	if (sw_event & HDCP_TX_IS_RECEIVER_ID_VALID_EVENT) {
++		ret = cdn_dp_hdcp_tx_is_receiver_id_valid_req(dp);
++		if (ret) {
++			auth_done = true;
++			goto out;
++		}
++		ret = cdn_dp_hdcp_tx_respond_id_valid(dp, true);
++		if (ret)
++			auth_done = true;
++	}
++
++out:
++	mutex_unlock(&dp->lock);
++
++	return auth_done;
++}
++
++static void cdn_dp_hdcp_event_work(struct work_struct *work)
++{
++	struct cdn_dp_device *dp = container_of(work, struct cdn_dp_device,
++						hdcp_event_work.work);
++	unsigned long timeout = jiffies +
++				msecs_to_jiffies(HDCP_EVENT_TIMEOUT_MS);
++
++	while (time_before(jiffies, timeout)) {
++		if (cdn_dp_hdcp_authorize(dp))
++			return;
++		msleep(HDCP_RETRY_INTERVAL_MS);
++	}
++
++	dev_err(dp->dev, "Failed to authorize hdcp\n");
++}
++
+ static int cdn_dp_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct cdn_dp_device *dp = dev_get_drvdata(dev);
+@@ -1096,6 +1287,7 @@ static int cdn_dp_bind(struct device *dev, struct device *master, void *data)
+ 	struct drm_connector *connector;
+ 	struct cdn_dp_port *port;
+ 	struct drm_device *drm_dev = data;
++	struct drm_mode_config *mode_config;
+ 	int ret, i;
+ 
+ 	ret = cdn_dp_parse_dt(dp);
+@@ -1109,6 +1301,7 @@ static int cdn_dp_bind(struct device *dev, struct device *master, void *data)
+ 	dp->fw_loaded = false;
+ 
+ 	INIT_WORK(&dp->event_work, cdn_dp_pd_event_work);
++	INIT_DELAYED_WORK(&dp->hdcp_event_work, cdn_dp_hdcp_event_work);
+ 
+ 	encoder = &dp->encoder;
+ 
+@@ -1170,6 +1363,11 @@ static int cdn_dp_bind(struct device *dev, struct device *master, void *data)
+ 
+ 	schedule_work(&dp->event_work);
+ 
++	mode_config = &connector->dev->mode_config;
++	drm_object_attach_property(&connector->base,
++				   mode_config->content_protection_property,
++				   DRM_MODE_CONTENT_PROTECTION_UNDESIRED);
++
+ 	return 0;
+ 
+ err_free_connector:
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.h b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+index c5efdea174df..8b5d283c66c6 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+@@ -132,5 +132,6 @@ struct cdn_dp_device {
+ 	struct switch_dev switchdev;
+ #endif
+ 	struct cdn_dp_hdcp_key_1x key;
++	struct delayed_work hdcp_event_work;
+ };
+ #endif  /* _CDN_DP_CORE_H */
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.c b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+index 32c725ca9976..3fcfbfe71e78 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.c
+@@ -12,6 +12,7 @@
+  * GNU General Public License for more details.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/device.h>
+ #include <linux/delay.h>
+@@ -981,3 +982,114 @@ int cdn_dp_audio_config(struct cdn_dp_device *dp, struct audio_info *audio)
+ 		DRM_DEV_ERROR(dp->dev, "audio config failed: %d\n", ret);
+ 	return ret;
+ }
++
++int cdn_dp_hdcp_tx_configuration(struct cdn_dp_device *dp, int tx_mode,
++						 bool active)
++{
++	u8 msg;
++
++	msg = tx_mode;
++	if (active)
++		msg |= HDCP_TX_ACTIVATE;
++
++	return cdn_dp_mailbox_send(dp, MB_MODULE_ID_HDCP_TX,
++				   HDCP_TX_CONFIGURATION, sizeof(msg), &msg);
++}
++
++int cdn_dp_hdcp_tx_status_req(struct cdn_dp_device *dp, uint16_t *tx_status)
++{
++	u8 status[5];
++	int ret;
++
++	ret = cdn_dp_mailbox_send(dp, MB_MODULE_ID_HDCP_TX,
++				  HDCP_TX_STATUS_CHANGE, 0, NULL);
++	if (ret)
++		goto err_hdcp_tx_status_rq;
++
++	ret = cdn_dp_mailbox_validate_receive(dp, MB_MODULE_ID_HDCP_TX,
++					      HDCP_TX_STATUS_CHANGE,
++					      sizeof(status));
++	if (ret)
++		goto err_hdcp_tx_status_rq;
++
++	ret = cdn_dp_mailbox_read_receive(dp, status, sizeof(status));
++	if (ret)
++		goto err_hdcp_tx_status_rq;
++
++	*tx_status = status[0] << 8 | status[1];
++
++err_hdcp_tx_status_rq:
++	if (ret)
++		DRM_DEV_ERROR(dp->dev, "hdcp tx status failed: %d\n", ret);
++	return ret;
++}
++
++int cdn_dp_hdcp_tx_is_receiver_id_valid_req(struct cdn_dp_device *dp)
++{
++	int ret;
++	u32 mbox_size, i;
++	u8 header[4], *resp;
++
++	ret = cdn_dp_mailbox_send(dp, MB_MODULE_ID_HDCP_TX,
++				  HDCP_TX_IS_RECEIVER_ID_VALID,
++				  0, NULL);
++	if (ret)
++		goto err_hdcp_tx_is_receiver_id_valid_req;
++
++	/*
++	 * The size of HDCP_TX_IS_RECEIVER_ID_VALID_RESP is variable, which
++	 * is dependent on HDCP device type. It will response receiver ID
++	 * list if the device is a repeater.
++	 * So we need to distinguish the size.
++	 */
++	for (i = 0; i < 4; i++) {
++		ret = cdn_dp_mailbox_read(dp);
++		if (ret < 0)
++			goto err_hdcp_tx_is_receiver_id_valid_req;
++
++		header[i] = ret;
++	}
++
++	mbox_size = (header[2] << 8) | header[3];
++
++	if (header[0] != HDCP_TX_IS_RECEIVER_ID_VALID ||
++	    header[1] != MB_MODULE_ID_HDCP_TX ||
++	    !IS_HDCP_TX_RECEIVER_ID_VALID_RESP_SIZE_VALID(mbox_size)) {
++		ret = -EINVAL;
++		for (i = 0; i < mbox_size; i++)
++			if (cdn_dp_mailbox_read(dp) < 0)
++				break;
++
++		goto err_hdcp_tx_is_receiver_id_valid_req;
++	}
++
++	resp = kzalloc(mbox_size, GFP_KERNEL);
++	if (IS_ERR(resp) || IS_ERR_OR_NULL(resp)) {
++		ret = -ENOMEM;
++		goto err_hdcp_tx_is_receiver_id_valid_req;
++	}
++
++	ret = cdn_dp_mailbox_read_receive(dp, resp, mbox_size);
++
++	/* TODO judge the all receivers are in revocation list. */
++	kfree(resp);
++
++err_hdcp_tx_is_receiver_id_valid_req:
++	if (ret)
++		DRM_DEV_ERROR(dp->dev,
++			      "hdcp receivers id verification failed: %d\n",
++			      ret);
++	return ret;
++}
++
++int cdn_dp_hdcp_tx_respond_id_valid(struct cdn_dp_device *dp, bool valid)
++{
++	u8 msg = 0;
++
++	if (valid)
++		msg = 0x01;
++	return cdn_dp_mailbox_send(dp, MB_MODULE_ID_HDCP_TX,
++				   HDCP_TX_RESPOND_RECEIVER_ID_VALID,
++				   sizeof(msg), &msg);
++}
++
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-reg.h b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+index 9abdc7416e4c..53fd59764153 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-reg.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-reg.h
+@@ -328,6 +328,22 @@
+ #define GENERAL_BUS_SETTINGS            0x03
+ #define GENERAL_TEST_ACCESS             0x04
+ 
++/* hdcp opcode */
++#define HDCP_TX_CONFIGURATION			0x00
++#define HDCP2_TX_SET_PUBLIC_KEY_PARAMS		0x01
++#define HDCP2_TX_SET_DEBUG_RANDOM_NUMBERS	0x02
++#define HDCP2_TX_RESPOND_KM			0x03
++#define HDCP1_TX_SEND_KEYS			0x04
++#define HDCP1_TX_SEND_RANDOM_AN			0x05
++#define HDCP_TX_STATUS_CHANGE			0x06
++#define HDCP2_TX_IS_KM_STORED			0x07
++#define HDCP2_TX_STORE_KM			0x08
++#define HDCP_TX_IS_RECEIVER_ID_VALID		0x09
++#define HDCP_TX_RESPOND_RECEIVER_ID_VALID	0x0a
++
++#define IS_HDCP_TX_RECEIVER_ID_VALID_RESP_SIZE_VALID(x)	\
++			(((((x) - 2) % 5) == 0) || ((((x) - 4) % 5) == 0))
++
+ #define DPTX_SET_POWER_MNG			0x00
+ #define DPTX_SET_HOST_CAPABILITIES		0x01
+ #define DPTX_GET_EDID				0x02
+@@ -394,6 +410,14 @@
+ #define HDCP2_TX_STORE_KM_EVENT			BIT(6)
+ #define HDCP_TX_IS_RECEIVER_ID_VALID_EVENT	BIT(7)
+ 
++#define HDCP_TX_ACTIVATE			BIT(2)
++
++#define HDCP_TX_STATUS_AUTHENTICATED		BIT(0)
++#define HDCP_TX_STATUS_RECEIVER_IS_REPEATER	BIT(1)
++#define HDCP_TX_STATUS_RX_HDCP1			(0x01 << 2)
++#define HDCP_TX_STATUS_RX_HDCP2			(0x02 << 2)
++#define HDCP_TX_STATUS_ERROR(x)			(((x) >> 5) & 0xf)
++
+ #define TU_SIZE					30
+ #define CDN_DP_MAX_LINK_RATE			DP_LINK_BW_5_4
+ 
+@@ -459,6 +483,12 @@ enum vic_bt_type {
+ 	BT_709 = 0x1,
+ };
+ 
++enum HDCP_TX_SUPPORT {
++	HDCP_TX_2,
++	HDCP_TX_1,
++	HDCP_TX_BOTH,
++};
++
+ void cdn_dp_clock_reset(struct cdn_dp_device *dp);
+ 
+ void cdn_dp_set_fw_clk(struct cdn_dp_device *dp, unsigned long clk);
+@@ -479,4 +509,9 @@ int cdn_dp_config_video(struct cdn_dp_device *dp);
+ int cdn_dp_audio_stop(struct cdn_dp_device *dp, struct audio_info *audio);
+ int cdn_dp_audio_mute(struct cdn_dp_device *dp, bool enable);
+ int cdn_dp_audio_config(struct cdn_dp_device *dp, struct audio_info *audio);
++int cdn_dp_hdcp_tx_configuration(struct cdn_dp_device *dp, int tx_mode,
++						 bool active);
++int cdn_dp_hdcp_tx_status_req(struct cdn_dp_device *dp, uint16_t *tx_status);
++int cdn_dp_hdcp_tx_is_receiver_id_valid_req(struct cdn_dp_device *dp);
++int cdn_dp_hdcp_tx_respond_id_valid(struct cdn_dp_device *dp, bool valid);
+ #endif /* _CDN_DP_REG_H */
+-- 
+2.35.3
+

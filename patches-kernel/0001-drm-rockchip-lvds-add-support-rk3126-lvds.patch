@@ -1,0 +1,297 @@
+From 3f46fa6cdf2aa0e7419643e64111db745af7ed43 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 23 Aug 2017 14:56:36 +0800
+Subject: [PATCH] drm/rockchip: lvds: add support rk3126 lvds
+
+Change-Id: I30a3fe5a084d58c1427e9d5923170739f762a8ad
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ .../display/rockchip/rockchip-lvds.txt        |   1 +
+ drivers/gpu/drm/rockchip/rockchip_lvds.c      | 113 ++++++++++++++++--
+ drivers/gpu/drm/rockchip/rockchip_lvds.h      |  17 +++
+ 3 files changed, 123 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/rockchip/rockchip-lvds.txt b/Documentation/devicetree/bindings/display/rockchip/rockchip-lvds.txt
+index 5be5b5a96d2b..529e77002c44 100644
+--- a/Documentation/devicetree/bindings/display/rockchip/rockchip-lvds.txt
++++ b/Documentation/devicetree/bindings/display/rockchip/rockchip-lvds.txt
+@@ -3,6 +3,7 @@ Rockchip RK3288 LVDS interface
+ 
+ Required properties:
+ - compatible: matching the soc type, one of
++	- "rockchip,rk3126-lvds";
+ 	- "rockchip,rk3288-lvds";
+ 	- "rockchip,rk3366-lvds";
+ 	- "rockchip,rk3368-lvds";
+diff --git a/drivers/gpu/drm/rockchip/rockchip_lvds.c b/drivers/gpu/drm/rockchip/rockchip_lvds.c
+index 63e33b3c73b6..880bba6c19ab 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_lvds.c
++++ b/drivers/gpu/drm/rockchip/rockchip_lvds.c
+@@ -66,6 +66,7 @@ struct rockchip_lvds {
+ 	struct regmap *grf;
+ 	struct clk *pclk;
+ 	struct clk *pclk_ctrl;
++	struct clk *hclk_ctrl;
+ 	const struct rockchip_lvds_soc_data *soc_data;
+ 
+ 	int output;
+@@ -314,6 +315,13 @@ static int rockchip_lvds_poweron(struct rockchip_lvds *lvds)
+ 		}
+ 	}
+ 
++	if (lvds->hclk_ctrl) {
++		ret = clk_enable(lvds->hclk_ctrl);
++		if (ret < 0) {
++			dev_err(lvds->dev, "failed to enable lvds hclk_ctrl %d\n", ret);
++			return ret;
++		}
++	}
+ 	ret = pm_runtime_get_sync(lvds->dev);
+ 	if (ret < 0) {
+ 		dev_err(lvds->dev, "failed to get pm runtime: %d\n", ret);
+@@ -321,7 +329,8 @@ static int rockchip_lvds_poweron(struct rockchip_lvds *lvds)
+ 	}
+ 	if (LVDS_CHIP(lvds) == RK3288_LVDS)
+ 		rk3288_lvds_poweron(lvds);
+-	else if (LVDS_CHIP(lvds) == RK336X_LVDS)
++	else if ((LVDS_CHIP(lvds) == RK336X_LVDS) ||
++		 (LVDS_CHIP(lvds) == RK3126_LVDS))
+ 		rk336x_lvds_poweron(lvds);
+ 
+ 	return 0;
+@@ -345,8 +354,12 @@ static void rockchip_lvds_poweroff(struct rockchip_lvds *lvds)
+ 		pm_runtime_put(lvds->dev);
+ 		if (lvds->pclk)
+ 			clk_disable(lvds->pclk);
+-	} else if (LVDS_CHIP(lvds) == RK336X_LVDS) {
+-		val = v_RK336X_LVDSMODE_EN(0) | v_RK336X_MIPIPHY_TTL_EN(0);
++	} else if ((LVDS_CHIP(lvds) == RK336X_LVDS) ||
++		   (LVDS_CHIP(lvds) == RK3126_LVDS)) {
++		if (LVDS_CHIP(lvds) == RK336X_LVDS)
++			val = v_RK336X_LVDSMODE_EN(0) | v_RK336X_MIPIPHY_TTL_EN(0);
++		else
++			val = v_RK3126_LVDSMODE_EN(0) | v_RK3126_MIPIPHY_TTL_EN(0);
+ 		ret = regmap_write(lvds->grf, lvds->soc_data->grf_soc_con7, val);
+ 		if (ret != 0) {
+ 			dev_err(lvds->dev, "Could not write to GRF: %d\n", ret);
+@@ -371,6 +384,8 @@ static void rockchip_lvds_poweroff(struct rockchip_lvds *lvds)
+ 			clk_disable(lvds->pclk);
+ 		if (lvds->pclk_ctrl)
+ 			clk_disable(lvds->pclk_ctrl);
++		if (lvds->hclk_ctrl)
++			clk_disable(lvds->hclk_ctrl);
+ 	}
+ }
+ 
+@@ -528,7 +543,9 @@ static void rockchip_lvds_grf_config(struct drm_encoder *encoder,
+ 		val |= (0xffff << 16);
+ 		ret = regmap_write(lvds->grf, lvds->soc_data->grf_soc_con7, val);
+ 		if (ret != 0) {
+-			dev_err(lvds->dev, "Could not write to GRF: %d\n", ret);
++			dev_err(lvds->dev,
++				"Could not write to GRF:0x%x: %d\n",
++				lvds->soc_data->grf_soc_con7, ret);
+ 			return;
+ 		}
+ 	} else if (LVDS_CHIP(lvds) == RK336X_LVDS) {
+@@ -542,7 +559,8 @@ static void rockchip_lvds_grf_config(struct drm_encoder *encoder,
+ 					   lvds->soc_data->grf_soc_con7, val);
+ 			if (ret != 0) {
+ 				dev_err(lvds->dev,
+-					"Could not write to GRF: %d\n", ret);
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con7, ret);
+ 				return;
+ 			}
+ 			val = v_RK336X_FORCE_JETAG(0);
+@@ -550,7 +568,8 @@ static void rockchip_lvds_grf_config(struct drm_encoder *encoder,
+ 					   lvds->soc_data->grf_soc_con15, val);
+ 			if (ret != 0) {
+ 				dev_err(lvds->dev,
+-					"Could not write to GRF: %d\n", ret);
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con15, ret);
+ 				return;
+ 			}
+ 		} else if (lvds->output == DISPLAY_OUTPUT_LVDS) {
+@@ -567,7 +586,56 @@ static void rockchip_lvds_grf_config(struct drm_encoder *encoder,
+ 					   lvds->soc_data->grf_soc_con7, val);
+ 			if (ret != 0) {
+ 				dev_err(lvds->dev,
+-					"Could not write to GRF: %d\n", ret);
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con7, ret);
++				return;
++			}
++		}
++	} else if (LVDS_CHIP(lvds) == RK3126_LVDS) {
++		if (lvds->output == DISPLAY_OUTPUT_RGB) {
++			/* enable lvds mode */
++			val = v_RK3126_LVDSMODE_EN(0) |
++				v_RK3126_MIPIPHY_TTL_EN(1) |
++				v_RK3126_MIPIPHY_LANE0_EN(1) |
++				v_RK3126_MIPIDPI_FORCEX_EN(1);
++			ret = regmap_write(lvds->grf,
++					   lvds->soc_data->grf_soc_con7, val);
++			if (ret != 0) {
++				dev_err(lvds->dev,
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con7, ret);
++				return;
++			}
++			val = v_RK3126_MIPITTL_CLK_EN(1) |
++				v_RK3126_MIPITTL_LANE0_EN(1) |
++				v_RK3126_MIPITTL_LANE1_EN(1) |
++				v_RK3126_MIPITTL_LANE2_EN(1) |
++				v_RK3126_MIPITTL_LANE3_EN(1);
++			ret = regmap_write(lvds->grf,
++					   lvds->soc_data->grf_soc_con15, val);
++
++			if (ret != 0) {
++				dev_err(lvds->dev,
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con15, ret);
++				return;
++			}
++		} else if (lvds->output == DISPLAY_OUTPUT_LVDS) {
++			/* enable lvds mode */
++			val = v_RK3126_LVDSMODE_EN(1) |
++			      v_RK3126_MIPIPHY_TTL_EN(0);
++			/* config lvds_format */
++			val |= v_RK3126_LVDS_OUTPUT_FORMAT(lvds->format);
++			/* LSB receive mode */
++			val |= v_RK3126_LVDS_MSBSEL(LVDS_MSB_D7);
++			val |= v_RK3126_MIPIPHY_LANE0_EN(1) |
++			       v_RK3126_MIPIDPI_FORCEX_EN(1);
++			ret = regmap_write(lvds->grf,
++					   lvds->soc_data->grf_soc_con7, val);
++			if (ret != 0) {
++				dev_err(lvds->dev,
++					"Could not write to GRF:0x%x: %d\n",
++					lvds->soc_data->grf_soc_con7, ret);
+ 				return;
+ 			}
+ 		}
+@@ -674,6 +742,13 @@ static const struct drm_encoder_funcs rockchip_lvds_encoder_funcs = {
+ 	.destroy = rockchip_lvds_encoder_destroy,
+ };
+ 
++static struct rockchip_lvds_soc_data rk3126_lvds_data = {
++	.chip_type = RK3126_LVDS,
++	.grf_soc_con7  = RK3126_GRF_LVDS_CON0,
++	.grf_soc_con15 = RK3126_GRF_CON1,
++	.has_vop_sel = false,
++};
++
+ static struct rockchip_lvds_soc_data rk3288_lvds_data = {
+ 	.chip_type = RK3288_LVDS,
+ 	.grf_soc_con6 = 0x025c,
+@@ -696,6 +771,10 @@ static struct rockchip_lvds_soc_data rk3368_lvds_data = {
+ };
+ 
+ static const struct of_device_id rockchip_lvds_dt_ids[] = {
++	{
++		.compatible = "rockchip,rk3126-lvds",
++		.data = &rk3126_lvds_data
++	},
+ 	{
+ 		.compatible = "rockchip,rk3288-lvds",
+ 		.data = &rk3288_lvds_data
+@@ -914,7 +993,8 @@ static int rockchip_lvds_probe(struct platform_device *pdev)
+ 		lvds->regs = devm_ioremap_resource(&pdev->dev, res);
+ 		if (IS_ERR(lvds->regs))
+ 			return PTR_ERR(lvds->regs);
+-	} else if (LVDS_CHIP(lvds) == RK336X_LVDS) {
++	} else if ((LVDS_CHIP(lvds) == RK336X_LVDS) ||
++		   (LVDS_CHIP(lvds) == RK3126_LVDS)) {
+ 		/* lvds regs on MIPIPHY_REG */
+ 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+ 						   "mipi_lvds_phy");
+@@ -938,6 +1018,11 @@ static int rockchip_lvds_probe(struct platform_device *pdev)
+ 			dev_err(dev, "could not get pclk_ctrl\n");
+ 			lvds->pclk_ctrl = NULL;
+ 		}
++		lvds->hclk_ctrl = devm_clk_get(&pdev->dev, "hclk_vio_h2p");
++		if (IS_ERR(lvds->hclk_ctrl)) {
++			dev_err(dev, "could not get hclk_vio_h2p\n");
++			lvds->hclk_ctrl = NULL;
++		}
+ 	}
+ 	lvds->pclk = devm_clk_get(&pdev->dev, "pclk_lvds");
+ 	if (IS_ERR(lvds->pclk)) {
+@@ -989,12 +1074,22 @@ static int rockchip_lvds_probe(struct platform_device *pdev)
+ 			return ret;
+ 		}
+ 	}
++
++	if (lvds->hclk_ctrl) {
++		ret = clk_prepare(lvds->hclk_ctrl);
++		if (ret < 0) {
++			dev_err(dev, "failed to prepare hclk_ctrl lvds\n");
++			return ret;
++		}
++	}
+ 	ret = component_add(&pdev->dev, &rockchip_lvds_component_ops);
+ 	if (ret < 0) {
+ 		if (lvds->pclk)
+ 			clk_unprepare(lvds->pclk);
+ 		if (lvds->pclk_ctrl)
+ 			clk_unprepare(lvds->pclk_ctrl);
++		if (lvds->hclk_ctrl)
++			clk_unprepare(lvds->hclk_ctrl);
+ 	}
+ 
+ 	return ret;
+@@ -1009,6 +1104,8 @@ static int rockchip_lvds_remove(struct platform_device *pdev)
+ 		clk_unprepare(lvds->pclk);
+ 	if (lvds->pclk_ctrl)
+ 		clk_unprepare(lvds->pclk_ctrl);
++	if (lvds->hclk_ctrl)
++		clk_unprepare(lvds->hclk_ctrl);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_lvds.h b/drivers/gpu/drm/rockchip/rockchip_lvds.h
+index 7144946837a2..e9dcfb5763de 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_lvds.h
++++ b/drivers/gpu/drm/rockchip/rockchip_lvds.h
+@@ -99,6 +99,9 @@
+ #define RK3368_GRF_SOC_CON7	0x041c
+ #define RK3368_GRF_SOC_CON15	0x043c
+ 
++#define RK3126_GRF_LVDS_CON0	0x0150
++#define RK3126_GRF_CON1		0x0144
++
+ #define LVDS_FMT_MASK				(0x07 << 16)
+ #define LVDS_MSB				BIT(3)
+ #define LVDS_DUAL				BIT(4)
+@@ -193,12 +196,26 @@
+ #define v_RK336X_MIPIDPI_FORCEX_EN(x)	(BITS_MASK(x, 1, 6) | BITS_EN(1, 6))
+ #define v_RK336X_FORCE_JETAG(x)		(BITS_MASK(x, 1, 13) | BITS_EN(1, 13))
+ 
++#define v_RK3126_LVDS_OUTPUT_FORMAT(x)	(BITS_MASK(x, 3, 1) | BITS_EN(3, 1))
++#define v_RK3126_LVDS_MSBSEL(x)		(BITS_MASK(x, 1, 3) | BITS_EN(1, 3))
++#define v_RK3126_LVDSMODE_EN(x)		(BITS_MASK(x, 1, 6) | BITS_EN(1, 6))
++#define v_RK3126_MIPIPHY_TTL_EN(x)	(BITS_MASK(x, 1, 7) | BITS_EN(1, 7))
++#define v_RK3126_MIPIPHY_LANE0_EN(x)	(BITS_MASK(x, 1, 8) | BITS_EN(1, 8))
++#define v_RK3126_MIPIDPI_FORCEX_EN(x)	(BITS_MASK(x, 1, 9) | BITS_EN(1, 9))
++
++#define v_RK3126_MIPITTL_CLK_EN(x)	(BITS_MASK(x, 1, 7) | BITS_EN(1, 7))
++#define v_RK3126_MIPITTL_LANE0_EN(x)	(BITS_MASK(x, 1, 11) | BITS_EN(1, 11))
++#define v_RK3126_MIPITTL_LANE1_EN(x)	(BITS_MASK(x, 1, 12) | BITS_EN(1, 12))
++#define v_RK3126_MIPITTL_LANE2_EN(x)	(BITS_MASK(x, 1, 13) | BITS_EN(1, 13))
++#define v_RK3126_MIPITTL_LANE3_EN(x)	(BITS_MASK(x, 1, 14) | BITS_EN(1, 14))
++
+ enum {
+ 	LVDS_MSB_D0 = 0,
+ 	LVDS_MSB_D7,
+ };
+ 
+ enum rockchip_lvds_sub_devtype {
++	RK3126_LVDS,
+ 	RK3288_LVDS,
+ 	RK336X_LVDS,
+ };
+-- 
+2.35.3
+

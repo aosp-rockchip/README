@@ -1,0 +1,362 @@
+From 6df92b2b23603a772cb7e586ee1525ed291ee23b Mon Sep 17 00:00:00 2001
+From: Ziyuan Xu <xzy.xu@rock-chips.com>
+Date: Mon, 24 Dec 2018 21:25:26 +0800
+Subject: [PATCH] iio: adc: support GPIO-controlled Multiplexers ADC
+
+The rockchip saradc controller is too scanty for some products that is
+requires at least x10 channels ADC. Generally, we can use a CMOS analog
+switch to extend a multi-channel ADC, eg.sgm3699. It's a quad,
+bidirectional, single-pole/double-throw (SPDT) CMOS analog siwtch.
+
+This patch implements a multiplexer ADC controller using a number of
+gpio pins and parent ADC channel. It's compatible with most of CMOS
+analog switch. And it provides a direct mode to get a raw data of each
+muxadc channel.
+
+/sys/bus/iio/devices/iio:device1/
+|-- in_voltage_adc_brush_raw
+|-- in_voltage_adc_mid_brush_raw
+|-- in_voltage_adc_move_l_raw
+|-- in_voltage_adc_move_r_raw
+|-- in_voltage_qyxs_raw
+|-- in_voltage_qzxs_raw
+|-- in_voltage_yxs_raw
+|-- in_voltage_zxs_raw
+
+Change-Id: If71636d45543430e616299e6a6b91084f4f315e6
+Signed-off-by: Ziyuan Xu <xzy.xu@rock-chips.com>
+---
+ .../bindings/iio/adc/gpio-muxadc.txt          |  24 ++
+ drivers/iio/adc/Kconfig                       |  13 +
+ drivers/iio/adc/Makefile                      |   1 +
+ drivers/iio/adc/gpio_muxadc.c                 | 251 ++++++++++++++++++
+ 4 files changed, 289 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/iio/adc/gpio-muxadc.txt
+ create mode 100644 drivers/iio/adc/gpio_muxadc.c
+
+diff --git a/Documentation/devicetree/bindings/iio/adc/gpio-muxadc.txt b/Documentation/devicetree/bindings/iio/adc/gpio-muxadc.txt
+new file mode 100644
+index 000000000000..f02502f8ab39
+--- /dev/null
++++ b/Documentation/devicetree/bindings/iio/adc/gpio-muxadc.txt
+@@ -0,0 +1,24 @@
++GPIO-controlled Multiplexers (MUX) A/D Converter bindings
++
++Required properties:
++- compatible: should be "gpio-muxadc" or others like below
++   - "sgm3699": for a quad, bidirectional, single-pole/double-throw (SPDT) CMOS analog switch.
++   - "sgm48752": for a dual, bidirectional, double-pole/double-throw (DPDT) CMOS analog switch.
++- io-channels: Channel node of the parent channel that has multiplexed input.
++- switch-gpios: Digital control pins to connect the parent adc channel(saradc) to the input adc channel(muxadc).
++- labels: The string list for each muxadc channel that should be placed in order.
++
++Example:
++        muxadc {
++                compatible = "sgm48752";
++                io-channels = <&saradc 4>, <&saradc 5>;
++                switch-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>,
++                               <&gpio1 RK_PA1 GPIO_ACTIVE_HIGH>;
++                labels = "wheel_vpropi_r_adc", "wheel_vpropi_l_adc",
++                         "fan_opa_adc", "mid_opa_adc",
++                         "pump_opa_adc", "side_opa_adc",
++                         "dc24vdet_adc", "collision_det_adc_lidar";
++                pinctrl-names = "default";
++                pinctrl-0 = <&switch_gpios>;
++                status = "okay";
++        };
+diff --git a/drivers/iio/adc/Kconfig b/drivers/iio/adc/Kconfig
+index bda6bbe4479c..37247c32d384 100644
+--- a/drivers/iio/adc/Kconfig
++++ b/drivers/iio/adc/Kconfig
+@@ -183,6 +183,19 @@ config EXYNOS_ADC
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called exynos_adc.
+ 
++config GPIO_MUXADC
++	tristate "GPIO MUXADC driver"
++	depends on GPIOLIB || COMPILE_TEST
++	help
++	  The driver builds a multiplexer controller using a number of gpio
++	  pins and parent adc channel. This is a CMOS analog switch on hardware
++	  board that can extend a multi-channel ADC.
++
++	  Say yes here to build support for GPIO_MUXADC.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called gpio_muxadc.
++
+ config HI8435
+ 	tristate "Holt Integrated Circuits HI-8435 threshold detector"
+ 	select IIO_TRIGGERED_EVENT
+diff --git a/drivers/iio/adc/Makefile b/drivers/iio/adc/Makefile
+index 99b37a963a1e..c67de3b109c3 100644
+--- a/drivers/iio/adc/Makefile
++++ b/drivers/iio/adc/Makefile
+@@ -19,6 +19,7 @@ obj-$(CONFIG_BERLIN2_ADC) += berlin2-adc.o
+ obj-$(CONFIG_CC10001_ADC) += cc10001_adc.o
+ obj-$(CONFIG_DA9150_GPADC) += da9150-gpadc.o
+ obj-$(CONFIG_EXYNOS_ADC) += exynos_adc.o
++obj-$(CONFIG_GPIO_MUXADC) += gpio_muxadc.o
+ obj-$(CONFIG_HI8435) += hi8435.o
+ obj-$(CONFIG_LP8788_ADC) += lp8788_adc.o
+ obj-$(CONFIG_MAX1027) += max1027.o
+diff --git a/drivers/iio/adc/gpio_muxadc.c b/drivers/iio/adc/gpio_muxadc.c
+new file mode 100644
+index 000000000000..bf5e2d4b504c
+--- /dev/null
++++ b/drivers/iio/adc/gpio_muxadc.c
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2018 Rockchip Electronics Co. Ltd.
++ *
++ * Author: Ziyuan Xu <xzy.xu@rock-chips.com>
++ */
++
++#include <linux/module.h>
++#include <linux/gpio/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/iio/consumer.h>
++#include <linux/iio/iio.h>
++
++/**
++ * id:			the index of analog switch inputs
++ * saradc_chan_id:	the index of analog switch 'x' output
++ * gpio_mask:		set the value of switch-gpios with mask, that
++ *			makes the 'id' connect to 'saradc_chan_id'.
++ */
++struct gpio_muxadc_chan_data {
++	u32 id;
++	u32 saradc_chan_id;
++	u32 gpio_mask;
++};
++
++#define MUXADC_CHANNEL(_index, _id, _mask) {		\
++	.id = _index,					\
++	.saradc_chan_id = _id,				\
++	.gpio_mask = _mask,				\
++}
++
++/**
++ * nr_chans:		the number of analog switch 'x' output
++ * saradc_nr_chans:	the number of analog switch inputs
++ * chans:		pointer to get the muxadc channel information
++ */
++struct gpio_muxadc_data {
++	u32 nr_chans;
++	u32 saradc_nr_chans;
++	const struct gpio_muxadc_chan_data *chans;
++};
++
++/**
++ * gpios:		pointer of digital enable input gpios
++ * adc_chans:		pointer of the 'saraadc' channel
++ * muxchans:		specification of a single analog switch 'x'
++ *			output channel
++ * data:		pointer to get the muxadc channels information
++ * nr_chans:		the number of analog switch 'x' output
++ */
++struct gpio_muxadc {
++	struct gpio_descs *gpios;
++	struct iio_channel *adc_chans;
++	struct iio_chan_spec *muxchans;
++	const struct gpio_muxadc_data *data;
++	u32 nr_chans;
++};
++
++static int gpio_muxadc_chan_read_by_index(struct gpio_muxadc *muxadc,
++					      int index, int *val)
++{
++	struct iio_channel *saradc_chan;
++	const struct gpio_muxadc_chan_data *chan_data;
++	u32 i, saradc_chan_id;
++
++	chan_data = &muxadc->data->chans[index];
++	for (i = 0; i < muxadc->gpios->ndescs; i++) {
++		struct gpio_desc *gpiod = muxadc->gpios->desc[i];
++		int gpio_val = chan_data->gpio_mask & BIT(i) ? 1 : 0;
++
++		gpiod_set_value(gpiod, gpio_val);
++	}
++
++	saradc_chan_id = chan_data->saradc_chan_id;
++	saradc_chan = &muxadc->adc_chans[saradc_chan_id];
++	return iio_read_channel_raw(saradc_chan, val);
++}
++
++static int gpio_muxadc_read_raw(struct iio_dev *indio_dev,
++				    struct iio_chan_spec const *chan,
++				    int *val, int *val2, long mask)
++{
++	struct gpio_muxadc *muxadc = iio_priv(indio_dev);
++	int ret = IIO_VAL_INT;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		ret = gpio_muxadc_chan_read_by_index(muxadc,
++						     chan->channel, val);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static const struct iio_info gpio_muxadc_iio_info = {
++	.read_raw = gpio_muxadc_read_raw,
++};
++
++static const struct gpio_muxadc_chan_data mux_sgm3699_chans_data[] = {
++	MUXADC_CHANNEL(0, 0, 0b00),
++	MUXADC_CHANNEL(1, 1, 0b00),
++	MUXADC_CHANNEL(2, 2, 0b00),
++	MUXADC_CHANNEL(3, 3, 0b00),
++	MUXADC_CHANNEL(4, 0, 0b01),
++	MUXADC_CHANNEL(5, 1, 0b01),
++	MUXADC_CHANNEL(6, 2, 0b11),
++	MUXADC_CHANNEL(7, 3, 0b11),
++};
++
++static const struct gpio_muxadc_data mux_sgm3699_data = {
++	.saradc_nr_chans = 4,
++	.nr_chans = ARRAY_SIZE(mux_sgm3699_chans_data),
++	.chans = mux_sgm3699_chans_data,
++};
++
++static const struct gpio_muxadc_chan_data mux_sgm48752_chans_data[] = {
++	MUXADC_CHANNEL(0, 0, 0b00),
++	MUXADC_CHANNEL(1, 1, 0b00),
++	MUXADC_CHANNEL(2, 0, 0b10),
++	MUXADC_CHANNEL(3, 1, 0b10),
++	MUXADC_CHANNEL(4, 0, 0b01),
++	MUXADC_CHANNEL(5, 1, 0b01),
++	MUXADC_CHANNEL(6, 0, 0b11),
++	MUXADC_CHANNEL(7, 1, 0b11),
++};
++
++static const struct gpio_muxadc_data mux_sgm48752_data = {
++	.saradc_nr_chans = 2,
++	.nr_chans = ARRAY_SIZE(mux_sgm48752_chans_data),
++	.chans = mux_sgm48752_chans_data,
++};
++
++static const struct of_device_id of_gpio_muxadc_match[] = {
++	{
++		.compatible = "sgm3699",
++		.data = &mux_sgm3699_data,
++	},
++	{
++		.compatible = "sgm48752",
++		.data = &mux_sgm48752_data,
++	},
++	{},
++};
++MODULE_DEVICE_TABLE(of, of_gpio_muxadc_match);
++
++static int gpio_muxadc_probe(struct platform_device *pdev)
++{
++	struct gpio_muxadc *muxadc;
++	struct iio_dev *indio_dev;
++	const struct of_device_id *match;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = pdev->dev.of_node;
++	u32 i, nr_adc_chans = 0;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*muxadc));
++	if (!indio_dev)
++		return -ENOMEM;
++
++	muxadc = iio_priv(indio_dev);
++
++	match = of_match_device(of_gpio_muxadc_match, dev);
++	if (!match) {
++		dev_err(dev, "failed to match device\n");
++		return -ENODEV;
++	}
++	muxadc->data = match->data;
++
++	muxadc->gpios = devm_gpiod_get_array(dev, "switch", GPIOD_OUT_LOW);
++	if (IS_ERR(muxadc->gpios)) {
++		dev_err(dev, "property of switch-gpios not specified\n");
++		return PTR_ERR(muxadc->gpios);
++	}
++
++	muxadc->adc_chans = iio_channel_get_all(dev);
++	if (IS_ERR(muxadc->adc_chans))
++		return PTR_ERR(muxadc->adc_chans);
++	/*
++	 * It's necessary to get the number of input ADC, and make a
++	 * comparison with chan_data->saradc_nr_chans. Otherwise it
++	 * might fall in to trap.
++	 */
++	while (muxadc->adc_chans[nr_adc_chans].indio_dev)
++		nr_adc_chans++;
++	if (muxadc->data->saradc_nr_chans != nr_adc_chans) {
++		dev_err(dev, "the number of io-channels is mismatch\n");
++		return -EINVAL;
++	}
++
++	muxadc->nr_chans = of_property_count_strings(np, "labels");
++	if (muxadc->nr_chans != muxadc->data->nr_chans) {
++		dev_err(dev, "should provide %d label\n",
++			muxadc->nr_chans);
++		return -EINVAL;
++	}
++
++	muxadc->muxchans = devm_kcalloc(dev, muxadc->nr_chans,
++					sizeof(struct iio_chan_spec),
++					GFP_KERNEL);
++	if (!muxadc->muxchans)
++		return -ENOMEM;
++
++	for (i = 0; i < muxadc->nr_chans; i++) {
++		/*
++		 * The specification of each muxadc channel will be
++		 * in_voltage_<label> without been indexed.
++		 */
++		muxadc->muxchans[i].type = IIO_VOLTAGE;
++		muxadc->muxchans[i].channel = i;
++		muxadc->muxchans[i].info_mask_separate = BIT(IIO_CHAN_INFO_RAW);
++		of_property_read_string_index(np, "labels", i,
++					      &muxadc->muxchans[i].extend_name);
++	}
++
++	indio_dev->name = dev_name(dev);
++	indio_dev->dev.parent = dev;
++	indio_dev->dev.of_node = dev->of_node;
++	indio_dev->info = &gpio_muxadc_iio_info;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++	indio_dev->channels = muxadc->muxchans;
++	indio_dev->num_channels = muxadc->nr_chans;
++
++	return iio_device_register(indio_dev);
++}
++
++static int gpio_muxadc_remove(struct platform_device *pdev)
++{
++	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++
++	iio_device_unregister(indio_dev);
++	return 0;
++}
++
++static struct platform_driver gpio_muxadc_driver = {
++	.probe		= gpio_muxadc_probe,
++	.remove		= gpio_muxadc_remove,
++	.driver		= {
++		.name	= "gpio-muxadc",
++		.of_match_table = of_gpio_muxadc_match,
++	},
++};
++
++module_platform_driver(gpio_muxadc_driver);
++
++MODULE_AUTHOR("Ziyuan Xu <xzy.xu@rock-chips.com>");
++MODULE_DESCRIPTION("GPIO MUX ADC driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.35.3
+

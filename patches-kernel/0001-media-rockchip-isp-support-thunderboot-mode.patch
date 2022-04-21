@@ -1,0 +1,856 @@
+From b9ab138ec624b9f92e74cb7d13123c3f073ddf74 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Sat, 2 May 2020 16:39:30 +0800
+Subject: [PATCH] media: rockchip: isp: support thunderboot mode
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: I7964c6cab499fd8ea914f37451155261e9f2a4a0
+---
+ drivers/media/platform/rockchip/isp/Kconfig   |   6 +
+ drivers/media/platform/rockchip/isp/Makefile  |   4 +
+ drivers/media/platform/rockchip/isp/capture.c |   1 +
+ drivers/media/platform/rockchip/isp/csi.c     |   3 +-
+ drivers/media/platform/rockchip/isp/dev.c     | 168 ++++++++++++------
+ drivers/media/platform/rockchip/isp/dev.h     |   8 +
+ drivers/media/platform/rockchip/isp/dmarx.c   |   1 +
+ drivers/media/platform/rockchip/isp/rkisp.c   | 141 +++++++++++++--
+ drivers/media/platform/rockchip/isp/rkisp.h   |   6 +
+ .../platform/rockchip/isp/rkisp_tb_helper.c   | 153 ++++++++++++++++
+ .../platform/rockchip/isp/rkisp_tb_helper.h   |  26 +++
+ include/uapi/linux/rkisp2-config.h            |  46 +++++
+ 12 files changed, 494 insertions(+), 69 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
+ create mode 100644 drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
+
+diff --git a/drivers/media/platform/rockchip/isp/Kconfig b/drivers/media/platform/rockchip/isp/Kconfig
+index 3cf1b429a757..c0cfda858f06 100644
+--- a/drivers/media/platform/rockchip/isp/Kconfig
++++ b/drivers/media/platform/rockchip/isp/Kconfig
+@@ -10,3 +10,9 @@ config VIDEO_ROCKCHIP_ISP
+ 	default n
+ 	help
+ 	  Support for ISP on the rockchip SoC.
++
++config VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
++	bool "Rockchip Image Signal Processing Thunderboot helper"
++	depends on ROCKCHIP_THUNDER_BOOT
++	help
++	  Say y if enable thunderboot helper for isp.
+diff --git a/drivers/media/platform/rockchip/isp/Makefile b/drivers/media/platform/rockchip/isp/Makefile
+index 71b352f93318..2bff454b3848 100644
+--- a/drivers/media/platform/rockchip/isp/Makefile
++++ b/drivers/media/platform/rockchip/isp/Makefile
+@@ -15,3 +15,7 @@ video_rkisp-objs += rkisp.o \
+ 			csi.o \
+ 			bridge.o \
+ 			isp_mipi_luma.o
++
++ifdef CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
++video_rkisp-objs += rkisp_tb_helper.o
++endif
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index 18c1b2909ddb..81b4e937acb0 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -2028,6 +2028,7 @@ static int rkisp_queue_setup(struct vb2_queue *queue,
+ 			plane_fmt->sizeimage;
+ 	}
+ 
++	rkisp_chk_tb_over(dev);
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev, "%s count %d, size %d\n",
+ 		 v4l2_type_names[queue->type], *num_buffers, sizes[0]);
+ 
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index c43c526c24be..c6d95b1e243f 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -455,7 +455,8 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
+ 		 "isp readback frame:%d time:%d\n",
+ 		 cur_frame_id, dma2frm + 1);
+-	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
++	writel(SW_DMA_2FRM_MODE(dma2frm) | SW_IBUF_OP_MODE(dev->hdr.op_mode) |
++		   SW_CSI2RX_EN | readl(addr), addr);
+ }
+ 
+ /* handle read back event from user or isp idle isr */
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index 3ca7d8feb0f7..db9f16585718 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -38,6 +38,7 @@
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_gpio.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_platform.h>
+@@ -615,6 +616,9 @@ static irqreturn_t rkisp_isp_irq_hdl(int irq, void *ctx)
+ 	struct rkisp_device *rkisp_dev = dev_get_drvdata(dev);
+ 	unsigned int mis_val, mis_3a = 0;
+ 
++	if (rkisp_dev->is_thunderboot)
++		return IRQ_HANDLED;
++
+ 	mis_val = readl(rkisp_dev->base_addr + CIF_ISP_MIS);
+ 	if (rkisp_dev->isp_ver == ISP_V20)
+ 		mis_3a = readl(rkisp_dev->base_addr + ISP_ISP3A_MIS);
+@@ -630,6 +634,9 @@ static irqreturn_t rkisp_mi_irq_hdl(int irq, void *ctx)
+ 	struct rkisp_device *rkisp_dev = dev_get_drvdata(dev);
+ 	unsigned int mis_val;
+ 
++	if (rkisp_dev->is_thunderboot)
++		return IRQ_HANDLED;
++
+ 	mis_val = readl(rkisp_dev->base_addr + CIF_MI_MIS);
+ 	if (mis_val)
+ 		rkisp_mi_isr(mis_val, rkisp_dev);
+@@ -642,6 +649,9 @@ static irqreturn_t rkisp_mipi_irq_hdl(int irq, void *ctx)
+ 	struct device *dev = ctx;
+ 	struct rkisp_device *rkisp_dev = dev_get_drvdata(dev);
+ 
++	if (rkisp_dev->is_thunderboot)
++		return IRQ_HANDLED;
++
+ 	if (rkisp_dev->isp_ver == ISP_V13 ||
+ 		rkisp_dev->isp_ver == ISP_V12) {
+ 		u32 err1, err2, err3;
+@@ -953,56 +963,42 @@ static const struct media_device_ops rkisp_media_ops = {
+ 	.link_notify = v4l2_pipeline_link_notify,
+ };
+ 
+-static int rkisp_plat_probe(struct platform_device *pdev)
++static int rkisp_get_reserved_mem(struct rkisp_device *isp_dev)
+ {
+-	const struct of_device_id *match;
+-	struct device_node *node = pdev->dev.of_node;
+-	struct device *dev = &pdev->dev;
+-	struct v4l2_device *v4l2_dev;
+-	struct rkisp_device *isp_dev;
+-	const struct isp_match_data *match_data;
+-	struct resource *res;
+-	int i, ret, irq;
+-
+-	sprintf(rkisp_version, "v%02x.%02x.%02x",
+-		RKISP_DRIVER_VERSION >> 16,
+-		(RKISP_DRIVER_VERSION & 0xff00) >> 8,
+-		RKISP_DRIVER_VERSION & 0x00ff);
+-
+-	dev_info(dev, "rkisp driver version: %s\n", rkisp_version);
++	struct device *dev = isp_dev->dev;
++	struct device_node *np;
++	struct resource r;
++	int ret;
+ 
+-	match = of_match_node(rkisp_plat_of_match, node);
+-	isp_dev = devm_kzalloc(dev, sizeof(*isp_dev), GFP_KERNEL);
+-	if (!isp_dev)
+-		return -ENOMEM;
++	/* Get reserved memory region from Device-tree */
++	np = of_parse_phandle(dev->of_node, "memory-region-thunderboot", 0);
++	if (!np) {
++		dev_err(dev, "No %s specified\n", "memory-region-thunderboot");
++		return -1;
++	}
+ 
+-	dev_set_drvdata(dev, isp_dev);
+-	isp_dev->dev = dev;
++	ret = of_address_to_resource(np, 0, &r);
++	if (ret) {
++		dev_err(dev, "No memory address assigned to the region\n");
++		return -1;
++	}
+ 
+-	isp_dev->grf = syscon_regmap_lookup_by_phandle(dev->of_node,
+-		"rockchip,grf");
+-	if (IS_ERR(isp_dev->grf))
+-		dev_warn(dev, "Missing rockchip,grf property\n");
++	isp_dev->resmem_pa = r.start;
++	isp_dev->resmem_size = resource_size(&r);
++	dev_info(dev, "Allocated reserved memory, paddr: 0x%x\n",
++		(u32)isp_dev->resmem_pa);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(dev, "get resource failed\n");
+-		return -EINVAL;
+-	}
+-	isp_dev->base_addr = devm_ioremap_resource(dev, res);
+-	if (PTR_ERR(isp_dev->base_addr) == -EBUSY) {
+-		resource_size_t offset = res->start;
+-		resource_size_t size = resource_size(res);
++	return 0;
++}
+ 
+-		isp_dev->base_addr = devm_ioremap(dev, offset, size);
+-	}
+-	if (IS_ERR(isp_dev->base_addr)) {
+-		dev_err(dev, "ioremap failed\n");
+-		return PTR_ERR(isp_dev->base_addr);
+-	}
++int rkisp_register_irq(struct rkisp_device *isp_dev)
++{
++	const struct isp_match_data *match_data = isp_dev->match_data;
++	struct platform_device *pdev = isp_dev->pdev;
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	int i, ret, irq;
+ 
+-	match_data = match->data;
+-	isp_dev->mipi_irq = -1;
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ,
+ 					   match_data->irqs[0].name);
+ 	if (res) {
+@@ -1055,6 +1051,69 @@ static int rkisp_plat_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	return 0;
++}
++
++static int rkisp_plat_probe(struct platform_device *pdev)
++{
++	const struct of_device_id *match;
++	struct device_node *node = pdev->dev.of_node;
++	struct device *dev = &pdev->dev;
++	struct v4l2_device *v4l2_dev;
++	struct rkisp_device *isp_dev;
++	const struct isp_match_data *match_data;
++	struct resource *res;
++	int i, ret;
++
++	sprintf(rkisp_version, "v%02x.%02x.%02x",
++		RKISP_DRIVER_VERSION >> 16,
++		(RKISP_DRIVER_VERSION & 0xff00) >> 8,
++		RKISP_DRIVER_VERSION & 0x00ff);
++
++	dev_info(dev, "rkisp driver version: %s\n", rkisp_version);
++
++	match = of_match_node(rkisp_plat_of_match, node);
++	isp_dev = devm_kzalloc(dev, sizeof(*isp_dev), GFP_KERNEL);
++	if (!isp_dev)
++		return -ENOMEM;
++
++	dev_set_drvdata(dev, isp_dev);
++	isp_dev->dev = dev;
++	isp_dev->is_thunderboot = IS_ENABLED(CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP);
++	dev_info(dev, "is_thunderboot: %d\n", isp_dev->is_thunderboot);
++
++	isp_dev->grf = syscon_regmap_lookup_by_phandle(dev->of_node,
++		"rockchip,grf");
++	if (IS_ERR(isp_dev->grf))
++		dev_warn(dev, "Missing rockchip,grf property\n");
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "get resource failed\n");
++		return -EINVAL;
++	}
++	isp_dev->base_addr = devm_ioremap_resource(dev, res);
++	if (PTR_ERR(isp_dev->base_addr) == -EBUSY) {
++		resource_size_t offset = res->start;
++		resource_size_t size = resource_size(res);
++
++		isp_dev->base_addr = devm_ioremap(dev, offset, size);
++	}
++	if (IS_ERR(isp_dev->base_addr)) {
++		dev_err(dev, "ioremap failed\n");
++		return PTR_ERR(isp_dev->base_addr);
++	}
++	rkisp_get_reserved_mem(isp_dev);
++
++	match_data = match->data;
++	isp_dev->mipi_irq = -1;
++	isp_dev->isp_ver = match_data->isp_ver;
++
++	isp_dev->pdev = pdev;
++	isp_dev->match_data = match_data;
++	if (!isp_dev->is_thunderboot)
++		rkisp_register_irq(isp_dev);
++
+ 	for (i = 0; i < match_data->num_clks; i++) {
+ 		struct clk *clk = devm_clk_get(dev, match_data->clks[i]);
+ 
+@@ -1063,7 +1122,6 @@ static int rkisp_plat_probe(struct platform_device *pdev)
+ 		isp_dev->clks[i] = clk;
+ 	}
+ 	isp_dev->num_clks = match_data->num_clks;
+-	isp_dev->isp_ver = match_data->isp_ver;
+ 	isp_dev->clk_rate_tbl = match_data->clk_rate_tbl;
+ 	isp_dev->num_clk_rate_tbl = match_data->num_clk_rate_tbl;
+ 
+@@ -1124,6 +1182,8 @@ static int rkisp_plat_probe(struct platform_device *pdev)
+ 		goto err_unreg_media_dev;
+ 
+ 	pm_runtime_enable(&pdev->dev);
++	if (isp_dev->is_thunderboot)
++		pm_runtime_get_sync(&pdev->dev);
+ 
+ 	ret = rkisp_vs_irq_parse(pdev);
+ 	if (ret)
+@@ -1167,13 +1227,19 @@ static int rkisp_plat_remove(struct platform_device *pdev)
+ static int __maybe_unused rkisp_runtime_suspend(struct device *dev)
+ {
+ 	struct rkisp_device *isp_dev = dev_get_drvdata(dev);
++	int ret = 0;
+ 
+ 	if (isp_dev->isp_ver == ISP_V12 || isp_dev->isp_ver == ISP_V13) {
+ 		if (isp_dev->mipi_irq >= 0)
+ 			disable_irq(isp_dev->mipi_irq);
+ 	}
+-	rkisp_disable_sys_clk(isp_dev);
+-	return pinctrl_pm_select_sleep_state(dev);
++
++	if (!isp_dev->is_thunderboot) {
++		rkisp_disable_sys_clk(isp_dev);
++		ret = pinctrl_pm_select_sleep_state(dev);
++	}
++
++	return ret;
+ }
+ 
+ static int __maybe_unused rkisp_runtime_resume(struct device *dev)
+@@ -1181,10 +1247,12 @@ static int __maybe_unused rkisp_runtime_resume(struct device *dev)
+ 	struct rkisp_device *isp_dev = dev_get_drvdata(dev);
+ 	int ret;
+ 
+-	ret = pinctrl_pm_select_default_state(dev);
+-	if (ret < 0)
+-		return ret;
+-	rkisp_enable_sys_clk(isp_dev);
++	if (!isp_dev->is_thunderboot) {
++		ret = pinctrl_pm_select_default_state(dev);
++		if (ret < 0)
++			return ret;
++		rkisp_enable_sys_clk(isp_dev);
++	}
+ 
+ 	if (isp_dev->isp_ver == ISP_V12 || isp_dev->isp_ver == ISP_V13) {
+ 		writel(0, isp_dev->base_addr + CIF_ISP_CSI0_MASK1);
+diff --git a/drivers/media/platform/rockchip/isp/dev.h b/drivers/media/platform/rockchip/isp/dev.h
+index f1572ecb7f65..07c188f88a9a 100644
+--- a/drivers/media/platform/rockchip/isp/dev.h
++++ b/drivers/media/platform/rockchip/isp/dev.h
+@@ -212,6 +212,14 @@ struct rkisp_device {
+ 	struct mutex apilock; /* mutex to serialize the calls of stream */
+ 	struct mutex iqlock; /* mutex to serialize the calls of iq */
+ 	wait_queue_head_t sync_onoff;
++
++	const struct isp_match_data *match_data;
++	struct platform_device *pdev;
++	phys_addr_t resmem_pa;
++	size_t resmem_size;
++	bool is_thunderboot;
+ };
+ 
++int rkisp_register_irq(struct rkisp_device *isp_dev);
++
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 8bfa482aa3a5..1e3a42fa61c4 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -460,6 +460,7 @@ static int rkisp_queue_setup(struct vb2_queue *queue,
+ 		sizes[i] = plane_fmt->sizeimage;
+ 	}
+ 
++	rkisp_chk_tb_over(dev);
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev, "%s count %d, size %d\n",
+ 		 v4l2_type_names[queue->type], *num_buffers, sizes[0]);
+ 
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 3ace47784fa7..9267a661612f 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -49,6 +49,7 @@
+ 
+ #include "common.h"
+ #include "regs.h"
++#include "rkisp_tb_helper.h"
+ 
+ #define ISP_SUBDEV_NAME DRIVER_NAME "-isp-subdev"
+ /*
+@@ -1590,6 +1591,27 @@ static int rkisp_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 	return rkisp_isp_start(isp_dev);
+ }
+ 
++static void rkisp_isp_soft_reset(struct rkisp_device *isp_dev)
++{
++	void __iomem *base = isp_dev->base_addr;
++
++	if (isp_dev->isp_ver == ISP_V20) {
++		struct iommu_domain *domain =
++			iommu_get_domain_for_dev(isp_dev->dev);
++
++		writel(CIF_ISP_CTRL_ISP_MODE_BAYER_ITU601,
++		       base + CIF_ISP_CTRL);
++		writel(0xffff, base + CIF_IRCL);
++		usleep_range(100, 200);
++		if (domain) {
++#ifdef CONFIG_IOMMU_API
++			domain->ops->detach_dev(domain, isp_dev->dev);
++			domain->ops->attach_dev(domain, isp_dev->dev);
++#endif
++		}
++	}
++}
++
+ static int rkisp_isp_sd_s_power(struct v4l2_subdev *sd, int on)
+ {
+ 	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
+@@ -1603,23 +1625,11 @@ static int rkisp_isp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		if (isp_dev->isp_ver == ISP_V20) {
+-			struct iommu_domain *domain =
+-				iommu_get_domain_for_dev(isp_dev->dev);
+-
+-			writel(CIF_ISP_CTRL_ISP_MODE_BAYER_ITU601,
+-			       base + CIF_ISP_CTRL);
+-			writel(0xffff, base + CIF_IRCL);
+-			usleep_range(100, 200);
+-			if (domain) {
+-#ifdef CONFIG_IOMMU_API
+-				domain->ops->detach_dev(domain, isp_dev->dev);
+-				domain->ops->attach_dev(domain, isp_dev->dev);
+-#endif
+-			}
++		if (!isp_dev->is_thunderboot) {
++			rkisp_isp_soft_reset(isp_dev);
++			rkisp_config_clk(isp_dev, on);
+ 		}
+ 
+-		rkisp_config_clk(isp_dev, on);
+ 		if (isp_dev->isp_ver == ISP_V12 ||
+ 		    isp_dev->isp_ver == ISP_V13) {
+ 			/* disable csi_rx interrupt */
+@@ -1629,7 +1639,8 @@ static int rkisp_isp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 			writel(0, base + CIF_ISP_CSI0_MASK3);
+ 		}
+ 	} else {
+-		rkisp_config_clk(isp_dev, on);
++		if (!isp_dev->is_thunderboot)
++			rkisp_config_clk(isp_dev, on);
+ 		ret = pm_runtime_put(isp_dev->dev);
+ 		if (ret < 0)
+ 			return ret;
+@@ -1808,9 +1819,12 @@ static int rkisp_isp_sd_subs_evt(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ {
+ 	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
++	struct rkisp_thunderboot_resmem *resmem;
++	struct rkisp_thunderboot_resmem_head *head;
++	void *resmem_va;
+ 	long ret = 0;
+ 
+-	if (!arg)
++	if (!arg && cmd != RKISP_CMD_FREE_SHARED_BUF)
+ 		return -EINVAL;
+ 
+ 	switch (cmd) {
+@@ -1826,6 +1840,46 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 		else
+ 			isp_dev->csi_dev.memory = 0;
+ 		break;
++	case RKISP_CMD_GET_SHARED_BUF:
++		resmem = (struct rkisp_thunderboot_resmem *)arg;
++		resmem->resmem_padr = isp_dev->resmem_pa;
++		resmem->resmem_size = isp_dev->resmem_size;
++		if (!isp_dev->resmem_pa || !isp_dev->resmem_size) {
++			v4l2_info(sd, "no reserved memory for thunderboot\n");
++			break;
++		}
++
++		rkisp_chk_tb_over(isp_dev);
++		resmem_va = phys_to_virt(isp_dev->resmem_pa);
++		head = (struct rkisp_thunderboot_resmem_head *)resmem_va;
++		if (head->complete != RKISP_TB_OK) {
++			resmem->resmem_size = 0;
++			free_reserved_area(phys_to_virt(isp_dev->resmem_pa),
++					   phys_to_virt(isp_dev->resmem_pa) + isp_dev->resmem_size,
++					   -1, "rkisp_thunderboot");
++
++			isp_dev->resmem_pa = 0;
++			isp_dev->resmem_size = 0;
++		}
++
++		v4l2_info(sd, "thunderboot info: %d, %d, %d, %d, %d, %d, 0x%x\n",
++			  head->enable,
++			  head->complete,
++			  head->frm_total,
++			  head->hdr_mode,
++			  head->width,
++			  head->height,
++			  head->bus_fmt);
++		break;
++	case RKISP_CMD_FREE_SHARED_BUF:
++		if (isp_dev->resmem_pa && isp_dev->resmem_size)
++			free_reserved_area(phys_to_virt(isp_dev->resmem_pa),
++					   phys_to_virt(isp_dev->resmem_pa) + isp_dev->resmem_size,
++					   -1, "rkisp_thunderboot");
++
++		isp_dev->resmem_pa = 0;
++		isp_dev->resmem_size = 0;
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+@@ -1839,10 +1893,11 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ {
+ 	void __user *up = compat_ptr(arg);
+ 	struct isp2x_csi_trigger trigger;
++	struct rkisp_thunderboot_resmem resmem;
+ 	long ret = 0;
+ 	int mode;
+ 
+-	if (!up)
++	if (!up && cmd != RKISP_CMD_FREE_SHARED_BUF)
+ 		return -EINVAL;
+ 
+ 	switch (cmd) {
+@@ -1856,6 +1911,14 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 		if (!ret)
+ 			ret = rkisp_ioctl(sd, cmd, &mode);
+ 		break;
++	case RKISP_CMD_GET_SHARED_BUF:
++		ret = rkisp_ioctl(sd, cmd, &resmem);
++		if (!ret)
++			ret = copy_to_user(up, &resmem, sizeof(resmem));
++		break;
++	case RKISP_CMD_FREE_SHARED_BUF:
++		ret = rkisp_ioctl(sd, cmd, NULL);
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+@@ -1974,6 +2037,48 @@ void rkisp_unregister_isp_subdev(struct rkisp_device *isp_dev)
+ 	media_entity_cleanup(&sd->entity);
+ }
+ 
++#ifdef CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
++void rkisp_chk_tb_over(struct rkisp_device *isp_dev)
++{
++	struct rkisp_thunderboot_resmem_head *head;
++	void *resmem_va;
++	u32 i;
++
++	if (!isp_dev->resmem_pa || !isp_dev->resmem_size) {
++		v4l2_info(&isp_dev->v4l2_dev,
++			  "no reserved memory for thunderboot\n");
++		return;
++	}
++
++	resmem_va = phys_to_virt(isp_dev->resmem_pa);
++	head = (struct rkisp_thunderboot_resmem_head *)resmem_va;
++	if (isp_dev->is_thunderboot) {
++		if ((!head->complete)) {
++			for (i = 0; i < 100; i++) {
++				usleep_range(5000, 6000);
++				if (head->complete)
++					break;
++			}
++
++			if (!head->complete)
++				v4l2_info(&isp_dev->v4l2_dev,
++					  "wait thunderboot over timeout\n");
++		}
++
++		if (head->complete != RKISP_TB_OK)
++			head->frm_total = 0;
++
++		rkisp_tb_set_state((enum rkisp_tb_state)head->complete);
++		rkisp_tb_unprotect_clk();
++		rkisp_register_irq(isp_dev);
++		isp_dev->is_thunderboot = false;
++		rkisp_isp_soft_reset(isp_dev);
++		rkisp_config_clk(isp_dev, 1);
++		pm_runtime_put(isp_dev->dev);
++	}
++}
++#endif
++
+ /****************  Interrupter Handler ****************/
+ 
+ void rkisp_mipi_isr(unsigned int mis, struct rkisp_device *dev)
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.h b/drivers/media/platform/rockchip/isp/rkisp.h
+index 701f82d9b2cd..ac95ee322b04 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.h
++++ b/drivers/media/platform/rockchip/isp/rkisp.h
+@@ -129,6 +129,12 @@ int rkisp_register_isp_subdev(struct rkisp_device *isp_dev,
+ 
+ void rkisp_unregister_isp_subdev(struct rkisp_device *isp_dev);
+ 
++#ifdef CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
++void rkisp_chk_tb_over(struct rkisp_device *isp_dev);
++#else
++static inline void rkisp_chk_tb_over(struct rkisp_device *isp_dev) {}
++#endif
++
+ void rkisp_mipi_isr(unsigned int mipi_mis, struct rkisp_device *dev);
+ 
+ void rkisp_mipi_v13_isr(unsigned int err1, unsigned int err2,
+diff --git a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
+new file mode 100644
+index 000000000000..7696c8bb9edc
+--- /dev/null
++++ b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2020 Rockchip Electronics Co., Ltd. */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/slab.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_gpio.h>
++#include <linux/of_graph.h>
++#include <linux/of_platform.h>
++#include <linux/pm_runtime.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/regmap.h>
++
++#include "rkisp_tb_helper.h"
++
++static const char *const loader_protect_clocks[] = {
++	"aclk_isp",
++	"hclk_isp",
++	"clk_isp",
++	"pclk_csiphy0",
++	"pclk_csiphy1",
++	"clk_mipicsi_out2io",
++	"clk_scr1",
++	"clk_scr1_core",
++	"clk_scr1_rtc",
++	"clk_scr1_jtag"
++};
++
++static struct clk **loader_clocks;
++static int __maybe_unused rkisp_tb_clocks_loader_protect(void)
++{
++	int nclocks = ARRAY_SIZE(loader_protect_clocks);
++	struct clk *clk;
++	int i;
++
++	loader_clocks = kcalloc(nclocks, sizeof(void *), GFP_KERNEL);
++	if (!loader_clocks)
++		return -ENOMEM;
++
++	for (i = 0; i < nclocks; i++) {
++		clk = __clk_lookup(loader_protect_clocks[i]);
++
++		if (clk) {
++			loader_clocks[i] = clk;
++			clk_prepare_enable(clk);
++		}
++	}
++
++	return 0;
++}
++
++static int __maybe_unused rkisp_tb_clocks_loader_unprotect(void)
++{
++	int i;
++
++	if (!loader_clocks)
++		return -ENODEV;
++
++	for (i = 0; i < ARRAY_SIZE(loader_protect_clocks); i++) {
++		struct clk *clk = loader_clocks[i];
++
++		if (clk)
++			clk_disable_unprepare(clk);
++	}
++
++	kfree(loader_clocks);
++	loader_clocks = NULL;
++
++	return 0;
++}
++
++static int __maybe_unused rkisp_tb_runtime_suspend(struct device *dev)
++{
++	rkisp_tb_clocks_loader_unprotect();
++	return 0;
++}
++
++static int __maybe_unused rkisp_tb_runtime_resume(struct device *dev)
++{
++	rkisp_tb_clocks_loader_protect();
++	return 0;
++}
++
++static const struct dev_pm_ops rkisp_tb_plat_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
++	SET_RUNTIME_PM_OPS(rkisp_tb_runtime_suspend,
++			   rkisp_tb_runtime_resume, NULL)
++};
++
++static const struct of_device_id rkisp_tb_plat_of_match[] = {
++	{
++		.compatible = "rockchip,thunder-boot-rkisp",
++	},
++	{},
++};
++
++static int rkisp_tb_plat_probe(struct platform_device *pdev)
++{
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_get_sync(&pdev->dev);
++
++	return 0;
++}
++
++static int rkisp_tb_plat_remove(struct platform_device *pdev)
++{
++	pm_runtime_put_sync(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	return 0;
++}
++
++static struct platform_driver __maybe_unused rkisp_tb_plat_drv = {
++	.driver = {
++		.name = "rkisp_thunderboot",
++		.of_match_table = of_match_ptr(rkisp_tb_plat_of_match),
++		.pm = &rkisp_tb_plat_pm_ops,
++	},
++	.probe = rkisp_tb_plat_probe,
++	.remove = rkisp_tb_plat_remove,
++};
++
++static int __init rkisp_tb_plat_drv_init(void)
++{
++	return platform_driver_register(&rkisp_tb_plat_drv);
++}
++
++arch_initcall_sync(rkisp_tb_plat_drv_init);
++
++void rkisp_tb_unprotect_clk(void)
++{
++	rkisp_tb_clocks_loader_unprotect();
++}
++EXPORT_SYMBOL(rkisp_tb_unprotect_clk);
++
++static enum rkisp_tb_state tb_state;
++
++void rkisp_tb_set_state(enum rkisp_tb_state result)
++{
++	tb_state = result;
++}
++EXPORT_SYMBOL(rkisp_tb_set_state);
++
++enum rkisp_tb_state rkisp_tb_get_state(void)
++{
++	return tb_state;
++}
++EXPORT_SYMBOL(rkisp_tb_get_state);
+diff --git a/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
+new file mode 100644
+index 000000000000..1d94306210ae
+--- /dev/null
++++ b/drivers/media/platform/rockchip/isp/rkisp_tb_helper.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2020 Rockchip Electronics Co., Ltd. */
++
++#ifndef _RKISP_TB_HELPER_H
++#define _RKISP_TB_HELPER_H
++
++enum rkisp_tb_state {
++	RKISP_TB_RUN = 0,
++	RKISP_TB_OK,
++	RKISP_TB_NG
++};
++
++#ifdef CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
++void rkisp_tb_unprotect_clk(void);
++void rkisp_tb_set_state(enum rkisp_tb_state result);
++enum rkisp_tb_state rkisp_tb_get_state(void);
++#else
++static inline void rkisp_tb_unprotect_clk(void) {}
++static inline void rkisp_tb_set_state(enum rkisp_tb_state result) {}
++static inline enum rkisp_tb_state rkisp_tb_get_state(void)
++{
++	return RKISP_TB_OK;
++}
++#endif
++
++#endif
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index 82a705ac9362..e8b4ada18d47 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -16,6 +16,12 @@
+ #define RKISP_CMD_CSI_MEMORY_MODE \
+ 	_IOW('V', BASE_VIDIOC_PRIVATE + 1, int)
+ 
++#define RKISP_CMD_GET_SHARED_BUF \
++	_IOR('V', BASE_VIDIOC_PRIVATE + 2, struct rkisp_thunderboot_resmem)
++
++#define RKISP_CMD_FREE_SHARED_BUF \
++	_IO('V', BASE_VIDIOC_PRIVATE + 3)
++
+ #define ISP2X_MODULE_DPCC		BIT_ULL(0)
+ #define ISP2X_MODULE_BLS		BIT_ULL(1)
+ #define ISP2X_MODULE_SDG		BIT_ULL(2)
+@@ -141,6 +147,8 @@
+ 
+ #define ISP2X_LDCH_MESH_XY_NUM		0x80000
+ 
++#define ISP2X_THUNDERBOOT_VIDEO_BUF_NUM	30
++
+ struct isp2x_csi_trigger {
+ 	/* timestamp in ns */
+ 	u64 frame_timestamp;
+@@ -1553,4 +1561,42 @@ struct rkisp_isp2x_luma_buffer {
+ 	struct rkisp_mipi_luma luma[ISP2X_MIPI_RAW_MAX];
+ } __attribute__ ((packed));
+ 
++/**
++ * struct rkisp_thunderboot_video_buf
++ */
++struct rkisp_thunderboot_video_buf {
++	u32 index;
++	u32 frame_id;
++	u32 timestamp;
++	u32 time_reg;
++	u32 gain_reg;
++	u32 bufaddr;
++	u32 bufsize;
++} __attribute__ ((packed));
++
++/**
++ * struct rkisp_thunderboot_resmem_head
++ */
++struct rkisp_thunderboot_resmem_head {
++	u16 enable;
++	u16 complete;
++	u16 frm_total;
++	u16 hdr_mode;
++	u16 width;
++	u16 height;
++	u32 bus_fmt;
++
++	struct rkisp_thunderboot_video_buf l_buf[ISP2X_THUNDERBOOT_VIDEO_BUF_NUM];
++	struct rkisp_thunderboot_video_buf m_buf[ISP2X_THUNDERBOOT_VIDEO_BUF_NUM];
++	struct rkisp_thunderboot_video_buf s_buf[ISP2X_THUNDERBOOT_VIDEO_BUF_NUM];
++} __attribute__ ((packed));
++
++/**
++ * struct rkisp_thunderboot_resmem - shared buffer for thunderboot with risc-v side
++ */
++struct rkisp_thunderboot_resmem {
++	u32 resmem_padr;
++	u32 resmem_size;
++} __attribute__ ((packed));
++
+ #endif /* _UAPI_RKISP2_CONFIG_H */
+-- 
+2.35.3
+

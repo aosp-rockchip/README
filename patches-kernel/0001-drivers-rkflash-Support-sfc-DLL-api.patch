@@ -1,0 +1,241 @@
+From c7e05eab3661dd2ac679988308a6d571f53173c0 Mon Sep 17 00:00:00 2001
+From: Jon Lin <jon.lin@rock-chips.com>
+Date: Thu, 3 Dec 2020 19:18:58 +0800
+Subject: [PATCH] drivers: rkflash: Support sfc DLL api
+
+Change-Id: Id4aa6d86ee0fe0a6d4d70ce75d9f15f8be749a1c
+Signed-off-by: Jon Lin <jon.lin@rock-chips.com>
+---
+ drivers/rkflash/sfc.c | 50 ++++++++++++++++++++++++++++++++++++++++++-
+ drivers/rkflash/sfc.h |  9 ++++++++
+ 2 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/rkflash/sfc.c b/drivers/rkflash/sfc.c
+index 92b0d1bd0985..9ee5d6a97f13 100644
+--- a/drivers/rkflash/sfc.c
++++ b/drivers/rkflash/sfc.c
+@@ -18,10 +18,12 @@ static void sfc_reset(void)
+ 	int timeout = 10000;
+ 
+ 	writel(SFC_RESET, g_sfc_reg + SFC_RCVR);
++
+ 	while ((readl(g_sfc_reg + SFC_RCVR) == SFC_RESET) && (timeout > 0)) {
+ 		sfc_delay(1);
+ 		timeout--;
+ 	}
++
+ 	writel(0xFFFFFFFF, g_sfc_reg + SFC_ICLR);
+ }
+ 
+@@ -38,10 +40,29 @@ u32 sfc_get_max_iosize(void)
+ 		return SFC_MAX_IOSIZE_VER3;
+ }
+ 
++void sfc_set_delay_lines(u16 cells)
++{
++	u16 cell_max = SCLK_SMP_SEL_MAX_V4;
++
++	if (sfc_get_version() >= SFC_VER_5)
++		cell_max = SCLK_SMP_SEL_MAX_V5;
++
++	if (cells > cell_max)
++		cells = cell_max;
++
++	writel(SCLK_SMP_SEL_EN | cells, g_sfc_reg + SFC_DLL_CTRL0);
++}
++
++void sfc_disable_delay_lines(void)
++{
++	writel(0, g_sfc_reg + SFC_DLL_CTRL0);
++}
++
+ int sfc_init(void __iomem *reg_addr)
+ {
+ 	g_sfc_reg = reg_addr;
+ 	writel(0, g_sfc_reg + SFC_CTRL);
++
+ 	if (sfc_get_version() >= SFC_VER_4)
+ 		writel(1, g_sfc_reg + SFC_LEN_CTRL);
+ 
+@@ -62,23 +83,29 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 	int timeout = 0;
+ 
+ 	reg = readl(g_sfc_reg + SFC_FSR);
++
+ 	if (!(reg & SFC_TXEMPTY) || !(reg & SFC_RXEMPTY) ||
+ 	    (readl(g_sfc_reg + SFC_SR) & SFC_BUSY))
+ 		sfc_reset();
+ 
+ 	cmd.d32 = op->sfcmd.d32;
++
+ 	if (cmd.b.addrbits == SFC_ADDR_XBITS) {
+ 		union SFCCTRL_DATA ctrl;
+ 
+ 		ctrl.d32 = op->sfctrl.d32;
++
+ 		if (!ctrl.b.addrbits)
+ 			return SFC_PARAM_ERR;
++
+ 		/* Controller plus 1 automatically */
+ 		writel(ctrl.b.addrbits - 1, g_sfc_reg + SFC_ABIT);
+ 	}
++
+ 	/* shift in the data at negedge sclk_out */
+ 	op->sfctrl.d32 |= 0x2;
+ 	cmd.b.datasize = size;
++
+ 	if (sfc_get_version() >= SFC_VER_4)
+ 		writel(size, g_sfc_reg + SFC_LEN_EXT);
+ 	else
+@@ -86,8 +113,10 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 
+ 	writel(op->sfctrl.d32, g_sfc_reg + SFC_CTRL);
+ 	writel(cmd.d32, g_sfc_reg + SFC_CMD);
++
+ 	if (cmd.b.addrbits)
+ 		writel(addr, g_sfc_reg + SFC_ADDR);
++
+ 	if (!size)
+ 		goto exit_wait;
+ 	if (op->sfctrl.b.enbledma) {
+@@ -121,21 +150,27 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 
+ 		if (cmd.b.rw == SFC_WRITE) {
+ 			words  = (size + 3) >> 2;
++
+ 			while (words) {
+ 				fifostat.d32 = readl(g_sfc_reg + SFC_FSR);
++
+ 				if (fifostat.b.txlevel > 0) {
+ 					count = words < fifostat.b.txlevel ?
+ 						words : fifostat.b.txlevel;
++
+ 					for (i = 0; i < count; i++) {
+ 						writel(*p_data++,
+ 						       g_sfc_reg + SFC_DATA);
+ 						words--;
+ 					}
++
+ 					if (words == 0)
+ 						break;
++
+ 					timeout = 0;
+ 				} else {
+ 					sfc_delay(1);
++
+ 					if (timeout++ > 10000) {
+ 						ret = SFC_TX_TIMEOUT;
+ 						break;
+@@ -146,8 +181,10 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 			/* SFC_READ == cmd.b.rw */
+ 			bytes = size & 0x3;
+ 			words = size >> 2;
++
+ 			while (words) {
+ 				fifostat.d32 = readl(g_sfc_reg + SFC_FSR);
++
+ 				if (fifostat.b.rxlevel > 0) {
+ 					u32 count;
+ 
+@@ -159,11 +196,14 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 								  SFC_DATA);
+ 						words--;
+ 					}
++
+ 					if (words == 0)
+ 						break;
++
+ 					timeout = 0;
+ 				} else {
+ 					sfc_delay(1);
++
+ 					if (timeout++ > 10000) {
+ 						ret = SFC_RX_TIMEOUT;
+ 						break;
+@@ -172,19 +212,24 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 			}
+ 
+ 			timeout = 0;
++
+ 			while (bytes) {
+ 				fifostat.d32 = readl(g_sfc_reg + SFC_FSR);
++
+ 				if (fifostat.b.rxlevel > 0) {
+ 					u8 *p_data1 = (u8 *)p_data;
+ 
+ 					words = readl(g_sfc_reg + SFC_DATA);
++
+ 					for (i = 0; i < bytes; i++)
+ 						p_data1[i] =
+-						(u8)((words >> (i * 8)) & 0xFF);
++							(u8)((words >> (i * 8)) & 0xFF);
++
+ 					break;
+ 				}
+ 
+ 				sfc_delay(1);
++
+ 				if (timeout++ > 10000) {
+ 					ret = SFC_RX_TIMEOUT;
+ 					break;
+@@ -195,13 +240,16 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 
+ exit_wait:
+ 	timeout = 0;    /* wait cmd or data send complete */
++
+ 	while (readl(g_sfc_reg + SFC_SR) & SFC_BUSY) {
+ 		sfc_delay(1);
++
+ 		if (timeout++ > 100000) {         /* wait 100ms */
+ 			ret = SFC_TX_TIMEOUT;
+ 			break;
+ 		}
+ 	}
++
+ 	sfc_delay(1); /* CS# High Time (read/write) >100ns */
+ 	return ret;
+ }
+diff --git a/drivers/rkflash/sfc.h b/drivers/rkflash/sfc.h
+index 3646e88565be..355cd26170c6 100644
+--- a/drivers/rkflash/sfc.h
++++ b/drivers/rkflash/sfc.h
+@@ -7,6 +7,7 @@
+ 
+ #define SFC_VER_3		0x3
+ #define SFC_VER_4		0x4
++#define SFC_VER_5		0x5
+ 
+ #define SFC_EN_INT		(0)         /* enable interrupt */
+ #define SFC_EN_DMA		(1)         /* enable dma */
+@@ -65,6 +66,11 @@
+ /* SFC_RCVR Register */
+ #define SFC_RESET	BIT(0)     /* controller reset */
+ 
++/* SFC_DLL_CTRL Register */
++#define SCLK_SMP_SEL_EN		BIT(15)	/* SCLK Sampling Selection */
++#define SCLK_SMP_SEL_MAX_V4	0xFF	/* SCLK Sampling Selection */
++#define SCLK_SMP_SEL_MAX_V5	0x1FF	/* SCLK Sampling Selection */
++
+ /* SFC_SR Register */
+ /* sfc busy flag. When busy, don't try to set the control register */
+ #define SFC_BUSY	BIT(0)
+@@ -86,6 +92,7 @@
+ #define SFC_RAWISR	0x28
+ #define SFC_VER		0x2C
+ #define SFC_QOP		0x30
++#define SFC_DLL_CTRL0	0x3C
+ #define SFC_DMA_TRIGGER	0x80
+ #define SFC_DMA_ADDR	0x84
+ #define SFC_LEN_CTRL	0x88
+@@ -207,6 +214,8 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size);
+ u16 sfc_get_version(void);
+ void sfc_clean_irq(void);
+ u32 sfc_get_max_iosize(void);
++void sfc_set_delay_lines(u16 cells);
++void sfc_disable_delay_lines(void);
+ void sfc_handle_irq(void);
+ unsigned long rksfc_dma_map_single(unsigned long ptr, int size, int dir);
+ void rksfc_dma_unmap_single(unsigned long ptr, int size, int dir);
+-- 
+2.35.3
+

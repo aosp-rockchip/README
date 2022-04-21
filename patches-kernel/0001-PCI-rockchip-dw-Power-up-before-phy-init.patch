@@ -1,0 +1,110 @@
+From 40173a73f0184b500e4bd52dda12532c4afcfeaa Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Thu, 31 Dec 2020 18:05:19 +0800
+Subject: [PATCH] PCI: rockchip: dw: Power up before phy init
+
+For external OSC phy, such as RK3568 PCIe 3.0, it needs the
+power supply to be stable before configuring phy parameter
+as the 100MHz refclk is also supplied by 3V3 power.
+
+Change-Id: Ic4c7b49d3613c55d7cd8b5b24e81581c9094294a
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/pci/controller/dwc/pcie-dw-rockchip.c | 41 ++++++++++---------
+ 1 file changed, 21 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-dw-rockchip.c b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+index 8db699597046..1e3ff48e6475 100644
+--- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c
++++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+@@ -426,21 +426,12 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
+ {
+ 	int retries;
+ 	struct rk_pcie *rk_pcie = to_rk_pcie(pci);
+-	int err = 0;
+ 
+ 	if (dw_pcie_link_up(pci)) {
+ 		dev_err(pci->dev, "link is already up\n");
+ 		return 0;
+ 	}
+ 
+-	if (!IS_ERR(rk_pcie->vpcie3v3)) {
+-		err = regulator_enable(rk_pcie->vpcie3v3);
+-		if (err) {
+-			dev_err(pci->dev, "fail to enable vpcie3v3 regulator\n");
+-			return err;
+-		}
+-	}
+-
+ 	/* Rest the device */
+ 	gpiod_set_value_cansleep(rk_pcie->rst_gpio, 0);
+ 	msleep(1000);
+@@ -1161,37 +1152,46 @@ static int rk_pcie_really_probe(void *p)
+ 		return ret;
+ 	}
+ 
++	/* DON'T MOVE ME: must be enable before phy init */
++	rk_pcie->vpcie3v3 = devm_regulator_get_optional(dev, "vpcie3v3");
++	if (IS_ERR(rk_pcie->vpcie3v3)) {
++		if (PTR_ERR(rk_pcie->vpcie3v3) != -ENODEV)
++			return PTR_ERR(rk_pcie->vpcie3v3);
++		dev_info(dev, "no vpcie3v3 regulator found\n");
++	}
++
++	if (!IS_ERR(rk_pcie->vpcie3v3)) {
++		ret = regulator_enable(rk_pcie->vpcie3v3);
++		if (ret) {
++			dev_err(pci->dev, "fail to enable vpcie3v3 regulator\n");
++			return ret;
++		}
++	}
++
+ 	ret = rk_pcie_phy_init(rk_pcie);
+ 	if (ret) {
+ 		dev_err(dev, "phy init failed\n");
+-		return ret;
++		goto disable_vpcie3v3;
+ 	}
+ 
+ 	ret = rk_pcie_reset_control_release(rk_pcie);
+ 	if (ret) {
+ 		dev_err(dev, "reset control init failed\n");
+-		return ret;
++		goto disable_vpcie3v3;
+ 	}
+ 
+ 	ret = rk_pcie_request_sys_irq(rk_pcie, pdev);
+ 	if (ret) {
+ 		dev_err(dev, "pcie irq init failed\n");
+-		return ret;
++		goto disable_vpcie3v3;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, rk_pcie);
+ 
+-	rk_pcie->vpcie3v3 = devm_regulator_get_optional(dev, "vpcie3v3");
+-	if (IS_ERR(rk_pcie->vpcie3v3)) {
+-		if (PTR_ERR(rk_pcie->vpcie3v3) != -ENODEV)
+-			return PTR_ERR(rk_pcie->vpcie3v3);
+-		dev_info(dev, "no vpcie3v3 regulator found\n");
+-	}
+-
+ 	ret = rk_pcie_clk_init(rk_pcie);
+ 	if (ret) {
+ 		dev_err(dev, "clock init failed\n");
+-		return ret;
++		goto disable_vpcie3v3;
+ 	}
+ 
+ 	dw_pcie_dbi_ro_wr_en(pci);
+@@ -1258,6 +1258,7 @@ static int rk_pcie_really_probe(void *p)
+ 
+ deinit_clk:
+ 	rk_pcie_clk_deinit(rk_pcie);
++disable_vpcie3v3:
+ 	if (!IS_ERR(rk_pcie->vpcie3v3))
+ 		regulator_disable(rk_pcie->vpcie3v3);
+ 	return ret;
+-- 
+2.35.3
+

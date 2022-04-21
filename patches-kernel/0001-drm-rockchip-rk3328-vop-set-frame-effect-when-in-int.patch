@@ -1,0 +1,118 @@
+From c1b0a95f96a5f544451de34067b4de840125898b Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Sat, 13 Jan 2018 20:06:50 +0800
+Subject: [PATCH] drm/rockchip: rk3328 vop: set frame effect when in interlace
+ mode
+
+we must make sure the pre overlay is configed at frame start time,
+so we set frame effect for interlace mode.
+
+Change-Id: Id85da3afe850d01d985573df9ac37d4b67ef8ddd
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 23 ++++++++++++++-------
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.c |  1 +
+ 3 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 981a0fe7a3b3..2e06502f1e88 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -205,6 +205,7 @@ struct vop {
+ 	u32 version;
+ 
+ 	struct drm_tv_connector_state active_tv_state;
++	bool pre_overlay;
+ 
+ 	/* mutex vsync_ work */
+ 	struct mutex vsync_mutex;
+@@ -1267,6 +1268,7 @@ static void vop_initial(struct drm_crtc *crtc)
+ 	VOP_CTRL_SET(vop, dsp_blank, 0);
+ 	VOP_CTRL_SET(vop, axi_outstanding_max_num, 30);
+ 	VOP_CTRL_SET(vop, axi_max_outstanding_en, 1);
++	VOP_CTRL_SET(vop, reg_done_frm, 1);
+ 
+ 	/*
+ 	 * restore the lut table.
+@@ -3055,6 +3057,9 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	struct vop *vop = to_vop(crtc);
+ 	struct drm_plane *plane;
+ 	int i;
++	unsigned long flags;
++	struct rockchip_crtc_state *s =
++		to_rockchip_crtc_state(crtc->state);
+ 
+ 	vop_cfg_update(crtc, old_crtc_state);
+ 
+@@ -3102,7 +3107,10 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	vop_update_cabc(crtc, old_crtc_state);
+ 	vop_update_hdr(crtc, old_crtc_state);
+ 
++	spin_lock_irqsave(&vop->irq_lock, flags);
++	vop->pre_overlay = s->hdr.pre_overlay;
+ 	vop_cfg_done(vop);
++	spin_unlock_irqrestore(&vop->irq_lock, flags);
+ 
+ 	/*
+ 	 * There is a (rather unlikely) possiblity that a vblank interrupt
+@@ -3409,7 +3417,6 @@ static irqreturn_t vop_isr(int irq, void *data)
+ {
+ 	struct vop *vop = data;
+ 	struct drm_crtc *crtc = &vop->crtc;
+-	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc->state);
+ 	uint32_t active_irqs;
+ 	unsigned long flags;
+ 	int ret = IRQ_NONE;
+@@ -3444,16 +3451,18 @@ static irqreturn_t vop_isr(int irq, void *data)
+ 	}
+ 
+ 	if (active_irqs & FS_INTR) {
++		/* This is IC design not reasonable, this two register bit need
++		 * frame effective, but actually it's effective immediately, so
++		 * we config this register at frame start.
++		 */
++		spin_lock_irqsave(&vop->irq_lock, flags);
++		VOP_CTRL_SET(vop, level2_overlay_en, vop->pre_overlay);
++		VOP_CTRL_SET(vop, alpha_hard_calc, vop->pre_overlay);
++		spin_unlock_irqrestore(&vop->irq_lock, flags);
+ 		drm_crtc_handle_vblank(crtc);
+ 		vop_handle_vblank(vop);
+ 		active_irqs &= ~FS_INTR;
+ 		ret = IRQ_HANDLED;
+-		/* This is IC design bug, this two register bit need frame
+-		 * effective, but actually it's effective immediately, so we
+-		 * config this register at frame start.
+-		 */
+-		VOP_CTRL_SET(vop, level2_overlay_en, s->hdr.pre_overlay);
+-		VOP_CTRL_SET(vop, alpha_hard_calc, s->hdr.pre_overlay);
+ 	}
+ 
+ #define ERROR_HANDLER(x) \
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index 7f6d8f095692..e62efd27a53f 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -228,6 +228,7 @@ struct vop_ctrl {
+ 	struct vop_reg st2084oetf_post_conv_en;
+ 	struct vop_reg win_csc_mode_sel;
+ 
++	struct vop_reg reg_done_frm;
+ 	struct vop_reg cfg_done;
+ };
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+index 193f3ca85cc5..a048ca9b053e 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+@@ -866,6 +866,7 @@ static const struct vop_ctrl rk3328_ctrl_data = {
+ 	.standby = VOP_REG(RK3328_SYS_CTRL, 0x1, 22),
+ 	.axi_outstanding_max_num = VOP_REG(RK3328_SYS_CTRL1, 0x1f, 13),
+ 	.axi_max_outstanding_en = VOP_REG(RK3328_SYS_CTRL1, 0x1, 12),
++	.reg_done_frm = VOP_REG(RK3328_SYS_CTRL1, 0x1, 24),
+ 	.auto_gate_en = VOP_REG(RK3328_SYS_CTRL, 0x1, 23),
+ 	.htotal_pw = VOP_REG(RK3328_DSP_HTOTAL_HS_END, 0x1fff1fff, 0),
+ 	.hact_st_end = VOP_REG(RK3328_DSP_HACT_ST_END, 0x1fff1fff, 0),
+-- 
+2.35.3
+

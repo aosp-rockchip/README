@@ -1,0 +1,237 @@
+From e623617072904dd363c42651427937e87aee1ee4 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 12 Jun 2019 10:24:36 +0800
+Subject: [PATCH] drm/rockchip: gem: Add GEM create ioctl support
+
+Rockchip Socs have GPU, we need allocate GPU accelerated buffers.
+So add special ioctls GEM_CREATE/GEM_MAP_OFFSET to support
+accelerated buffers.
+
+Change-Id: Ia4b13798aac97d16214da7a75a2479e6e334313a
+Signed-off-by: Mark Yao <mark.yao@rock-chips.com>
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c | 12 ++++
+ drivers/gpu/drm/rockchip/rockchip_drm_gem.c | 74 +++++++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_drm_gem.h | 14 ++++
+ include/uapi/drm/rockchip_drm.h             | 59 ++++++++++++++++
+ 4 files changed, 159 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 741d8b94218a..67d0f9adc66d 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -1006,6 +1006,16 @@ static void rockchip_drm_unbind(struct device *dev)
+ 	drm_dev_put(drm_dev);
+ }
+ 
++static const struct drm_ioctl_desc rockchip_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_CREATE, rockchip_gem_create_ioctl,
++			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_MAP_OFFSET,
++			  rockchip_gem_map_offset_ioctl,
++			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_GET_PHYS, rockchip_gem_get_phys_ioctl,
++			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
++};
++
+ static const struct file_operations rockchip_drm_driver_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = drm_open,
+@@ -1036,6 +1046,8 @@ static struct drm_driver rockchip_drm_driver = {
+ 	.gem_prime_mmap		= rockchip_gem_mmap_buf,
+ 	.gem_prime_begin_cpu_access = rockchip_gem_prime_begin_cpu_access,
+ 	.gem_prime_end_cpu_access = rockchip_gem_prime_end_cpu_access,
++	.ioctls			= rockchip_ioctls,
++	.num_ioctls		= ARRAY_SIZE(rockchip_ioctls),
+ 	.fops			= &rockchip_drm_driver_fops,
+ 	.name	= DRIVER_NAME,
+ 	.desc	= DRIVER_DESC,
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+index 97a31e46807b..cd8845bbec01 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.c
+@@ -839,6 +839,80 @@ void rockchip_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr)
+ 	/* Nothing to do if allocated by DMA mapping API. */
+ }
+ 
++static int rockchip_gem_dumb_map_offset(struct drm_file *file_priv,
++					struct drm_device *dev, uint32_t handle,
++					uint64_t *offset)
++{
++	struct drm_gem_object *obj;
++	int ret;
++
++	obj = drm_gem_object_lookup(file_priv, handle);
++	if (!obj) {
++		DRM_ERROR("failed to lookup gem object.\n");
++		return -EINVAL;
++	}
++
++	ret = drm_gem_create_mmap_offset(obj);
++	if (ret)
++		goto out;
++
++	*offset = drm_vma_node_offset_addr(&obj->vma_node);
++	DRM_DEBUG_KMS("offset = 0x%llx\n", *offset);
++
++out:
++	drm_gem_object_unreference_unlocked(obj);
++
++	return 0;
++}
++
++int rockchip_gem_create_ioctl(struct drm_device *dev, void *data,
++			      struct drm_file *file_priv)
++{
++	struct drm_rockchip_gem_create *args = data;
++	struct rockchip_gem_object *rk_obj;
++
++	rk_obj = rockchip_gem_create_with_handle(file_priv, dev, args->size,
++						 &args->handle, args->flags);
++	return PTR_ERR_OR_ZERO(rk_obj);
++}
++
++int rockchip_gem_map_offset_ioctl(struct drm_device *drm, void *data,
++				  struct drm_file *file_priv)
++{
++	struct drm_rockchip_gem_map_off *args = data;
++
++	return rockchip_gem_dumb_map_offset(file_priv, drm, args->handle,
++					    &args->offset);
++}
++
++int rockchip_gem_get_phys_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file_priv)
++{
++	struct drm_rockchip_gem_phys *args = data;
++	struct rockchip_gem_object *rk_obj;
++	struct drm_gem_object *obj;
++	int ret = 0;
++
++	obj = drm_gem_object_lookup(file_priv, args->handle);
++	if (!obj) {
++		DRM_ERROR("failed to lookup gem object.\n");
++		return -EINVAL;
++	}
++	rk_obj = to_rockchip_obj(obj);
++
++	if (!(rk_obj->flags & ROCKCHIP_BO_CONTIG)) {
++		DRM_ERROR("Can't get phys address from non-continue buf.\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	args->phy_addr = page_to_phys(rk_obj->pages[0]);
++
++out:
++	drm_gem_object_unreference_unlocked(obj);
++	return ret;
++}
++
+ int rockchip_gem_prime_begin_cpu_access(struct drm_gem_object *obj,
+ 					enum dma_data_direction dir)
+ {
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_gem.h b/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
+index 5a1bef717b8e..ce39f0537e74 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_gem.h
+@@ -68,6 +68,20 @@ void rockchip_gem_free_object(struct drm_gem_object *obj);
+ int rockchip_gem_dumb_create(struct drm_file *file_priv,
+ 			     struct drm_device *dev,
+ 			     struct drm_mode_create_dumb *args);
++/*
++ * request gem object creation and buffer allocation as the size
++ * that it is calculated with framebuffer information such as width,
++ * height and bpp.
++ */
++int rockchip_gem_create_ioctl(struct drm_device *dev, void *data,
++			      struct drm_file *file_priv);
++
++/* get buffer offset to map to user space. */
++int rockchip_gem_map_offset_ioctl(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv);
++
++int rockchip_gem_get_phys_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file_priv);
+ 
+ int rockchip_gem_prime_begin_cpu_access(struct drm_gem_object *obj,
+ 					enum dma_data_direction dir);
+diff --git a/include/uapi/drm/rockchip_drm.h b/include/uapi/drm/rockchip_drm.h
+index 62e7fe45168a..6b7fb33d6379 100644
+--- a/include/uapi/drm/rockchip_drm.h
++++ b/include/uapi/drm/rockchip_drm.h
+@@ -30,6 +30,45 @@ enum drm_rockchip_gem_mem_type {
+ 				ROCKCHIP_BO_WC
+ };
+ 
++/**
++ * User-desired buffer creation information structure.
++ *
++ * @size: user-desired memory allocation size.
++ * @flags: user request for setting memory type or cache attributes.
++ * @handle: returned a handle to created gem object.
++ *     - this handle will be set by gem module of kernel side.
++ */
++struct drm_rockchip_gem_create {
++	uint64_t size;
++	uint32_t flags;
++	uint32_t handle;
++};
++
++struct drm_rockchip_gem_phys {
++	uint32_t handle;
++	uint32_t phy_addr;
++};
++
++/**
++ * A structure for getting buffer offset.
++ *
++ * @handle: a pointer to gem object created.
++ * @pad: just padding to be 64-bit aligned.
++ * @offset: relatived offset value of the memory region allocated.
++ *     - this value should be set by user.
++ */
++struct drm_rockchip_gem_map_off {
++	uint32_t handle;
++	uint32_t pad;
++	uint64_t offset;
++};
++
++/* acquire type definitions. */
++enum drm_rockchip_gem_cpu_acquire_type {
++	DRM_ROCKCHIP_GEM_CPU_ACQUIRE_SHARED = 0x0,
++	DRM_ROCKCHIP_GEM_CPU_ACQUIRE_EXCLUSIVE = 0x1,
++};
++
+ enum rockchip_plane_feture {
+ 	ROCKCHIP_DRM_PLANE_FEATURE_SCALE,
+ 	ROCKCHIP_DRM_PLANE_FEATURE_ALPHA,
+@@ -51,4 +90,24 @@ enum rockchip_cabc_mode {
+ 	ROCKCHIP_DRM_CABC_MODE_USERSPACE,
+ };
+ 
++#define DRM_ROCKCHIP_GEM_CREATE		0x00
++#define DRM_ROCKCHIP_GEM_MAP_OFFSET	0x01
++#define DRM_ROCKCHIP_GEM_CPU_ACQUIRE	0x02
++#define DRM_ROCKCHIP_GEM_CPU_RELEASE	0x03
++#define DRM_ROCKCHIP_GEM_GET_PHYS	0x04
++
++#define DRM_IOCTL_ROCKCHIP_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_ROCKCHIP_GEM_CREATE, struct drm_rockchip_gem_create)
++
++#define DRM_IOCTL_ROCKCHIP_GEM_MAP_OFFSET	DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_ROCKCHIP_GEM_MAP_OFFSET, struct drm_rockchip_gem_map_off)
++
++#define DRM_IOCTL_ROCKCHIP_GEM_CPU_ACQUIRE	DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_ROCKCHIP_GEM_CPU_ACQUIRE, struct drm_rockchip_gem_cpu_acquire)
++
++#define DRM_IOCTL_ROCKCHIP_GEM_CPU_RELEASE	DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_ROCKCHIP_GEM_CPU_RELEASE, struct drm_rockchip_gem_cpu_release)
++
++#define DRM_IOCTL_ROCKCHIP_GEM_GET_PHYS		DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_ROCKCHIP_GEM_GET_PHYS, struct drm_rockchip_gem_phys)
+ #endif /* _UAPI_ROCKCHIP_DRM_H */
+-- 
+2.35.3
+

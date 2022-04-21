@@ -1,0 +1,110 @@
+From c139ec131a38532a29708319e296cac8eb56562c Mon Sep 17 00:00:00 2001
+From: Meng Dongyang <daniel.meng@rock-chips.com>
+Date: Fri, 1 Jun 2018 10:54:21 +0800
+Subject: [PATCH] UPSTREAM: usb: dwc3: gadget: cope with XferNotReady before
+ usb_ep_queue()
+
+If XferNotReady comes before usb_ep_queue() we will
+set our PENDING request flag and wait for a
+request. However, originally, we were assuming
+usb_ep_queue() would always happen before our first
+XferNotReady and that causes a corner case where we
+could try to issue ENDTRANSFER command before
+STARTTRANSFER.
+
+Let's fix that by tracking endpoints which have been
+started.
+
+Change-Id: I8432a70fff0da1b4bc1ea7d86e13d491e89a05bb
+Reported-by: Janusz Dziedzic <januszx.dziedzic@intel.com>
+Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+Signed-off-by: Meng Dongyang <daniel.meng@rock-chips.com>
+(cherry picked from commit 6cb2e4e3de10893f38dbf3923a9cc50c76548a89)
+---
+ drivers/usb/dwc3/core.h   |  1 +
+ drivers/usb/dwc3/gadget.c | 33 +++++++++++++++++++++++++++++----
+ 2 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 570e4583a42f..aca4cf60b88f 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -534,6 +534,7 @@ struct dwc3_ep {
+ #define DWC3_EP_BUSY		(1 << 4)
+ #define DWC3_EP_PENDING_REQUEST	(1 << 5)
+ #define DWC3_EP_MISSED_ISOC	(1 << 6)
++#define DWC3_EP_TRANSFER_STARTED (1 << 8)
+ 
+ 	/* This last one is specific to EP0 */
+ #define DWC3_EP0_DIR_IN		(1 << 31)
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index c257170c48dc..286a57dcd7f3 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -338,6 +338,20 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned cmd,
+ 
+ 	trace_dwc3_gadget_ep_cmd(dep, cmd, params, cmd_status);
+ 
++	if (ret == 0) {
++		switch (DWC3_DEPCMD_CMD(cmd)) {
++		case DWC3_DEPCMD_STARTTRANSFER:
++			dep->flags |= DWC3_EP_TRANSFER_STARTED;
++			break;
++		case DWC3_DEPCMD_ENDTRANSFER:
++			dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
++			break;
++		default:
++			/* nothing */
++			break;
++		}
++	}
++
+ 	if (unlikely(susphy)) {
+ 		reg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
+ 		reg |= DWC3_GUSB2PHYCFG_SUSPHY;
+@@ -1058,6 +1072,14 @@ static int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep, u16 cmd_param)
+ 	return 0;
+ }
+ 
++static int __dwc3_gadget_get_frame(struct dwc3 *dwc)
++{
++	u32		reg;
++
++	reg = dwc3_readl(dwc->regs, DWC3_DSTS);
++	return DWC3_DSTS_SOFFN(reg);
++}
++
+ static void __dwc3_gadget_start_isoc(struct dwc3 *dwc,
+ 		struct dwc3_ep *dep, u32 cur_uf)
+ {
+@@ -1178,9 +1200,14 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
+ 		 * notion of current microframe.
+ 		 */
+ 		if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
+-			if (list_empty(&dep->started_list)) {
++			if (dep->flags & DWC3_EP_TRANSFER_STARTED) {
+ 				dwc3_stop_active_transfer(dwc, dep->number, true);
+ 				dep->flags = DWC3_EP_ENABLED;
++			} else {
++				u32 cur_uf;
++
++				cur_uf = __dwc3_gadget_get_frame(dwc);
++				__dwc3_gadget_start_isoc(dwc, dep, cur_uf);
+ 			}
+ 			return 0;
+ 		}
+@@ -1451,10 +1478,8 @@ static const struct usb_ep_ops dwc3_gadget_ep_ops = {
+ static int dwc3_gadget_get_frame(struct usb_gadget *g)
+ {
+ 	struct dwc3		*dwc = gadget_to_dwc(g);
+-	u32			reg;
+ 
+-	reg = dwc3_readl(dwc->regs, DWC3_DSTS);
+-	return DWC3_DSTS_SOFFN(reg);
++	return __dwc3_gadget_get_frame(dwc);
+ }
+ 
+ static int __dwc3_gadget_wakeup(struct dwc3 *dwc)
+-- 
+2.35.3
+

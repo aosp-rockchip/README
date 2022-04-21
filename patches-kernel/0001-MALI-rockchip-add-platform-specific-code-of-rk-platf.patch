@@ -1,0 +1,347 @@
+From 4f613eb82ea9a5fdc8910de03a21bd0424d6395d Mon Sep 17 00:00:00 2001
+From: chenzhen <chenzhen@rock-chips.com>
+Date: Mon, 25 Apr 2016 19:56:37 +0800
+Subject: [PATCH] MALI: rockchip: add "platform specific code" of rk platform
+
+Change-Id: Ia58cba15b43f875ac572a3b35807b5ec48e3df01
+Signed-off-by: chenzhen <chenzhen@rock-chips.com>
+---
+ .../gpu/arm/midgard/platform/rk/custom_log.h  |  10 +-
+ .../platform/rk/mali_kbase_config_rk.c        | 192 ++++++++++++++++--
+ .../arm/midgard/platform/rk/mali_kbase_rk.h   |  30 +++
+ 3 files changed, 210 insertions(+), 22 deletions(-)
+ create mode 100644 drivers/gpu/arm/midgard/platform/rk/mali_kbase_rk.h
+
+diff --git a/drivers/gpu/arm/midgard/platform/rk/custom_log.h b/drivers/gpu/arm/midgard/platform/rk/custom_log.h
+index 644aff664f0d..646fe37498d0 100755
+--- a/drivers/gpu/arm/midgard/platform/rk/custom_log.h
++++ b/drivers/gpu/arm/midgard/platform/rk/custom_log.h
+@@ -63,7 +63,7 @@ extern "C" {
+ #ifdef ENABLE_DEBUG_LOG
+ /** Debug log. */
+ #define D(fmt, args...) \
+-	pr_debug("D : [File] : %s; [Line] : %d; [Func] : %s(); " fmt \
++	pr_info("D : [File] : %s; [Line] : %d; [Func] : %s(); " fmt \
+ 			"\n",	\
+ 		__FILE__,	\
+ 		__LINE__,	\
+@@ -121,17 +121,17 @@ extern "C" {
+ #define D_STR(p_str) \
+ do { \
+ 	if (!p_str) { \
+-		D(#p_str" = NULL."); \
++		D(#p_str " = NULL."); \
+ 	else \
+-		D(#p_str" = '%s'.", p_str); \
++		D(#p_str " = '%s'.", p_str); \
+ } while (0)
+ 
+ #define E_STR(p_str) \
+ do { \
+ 	if (!p_str) \
+-		E(#p_str" = NULL."); \
++		E(#p_str " = NULL."); \
+ 	else \
+-		E(#p_str" = '%s'.", p_str); \
++		E(#p_str " = '%s'.", p_str); \
+ } while (0)
+ 
+ #ifdef ENABLE_DEBUG_LOG
+diff --git a/drivers/gpu/arm/midgard/platform/rk/mali_kbase_config_rk.c b/drivers/gpu/arm/midgard/platform/rk/mali_kbase_config_rk.c
+index 5f522971aa4c..9514daf42a8a 100755
+--- a/drivers/gpu/arm/midgard/platform/rk/mali_kbase_config_rk.c
++++ b/drivers/gpu/arm/midgard/platform/rk/mali_kbase_config_rk.c
+@@ -8,7 +8,7 @@
+  * of such GNU licence.
+  */
+ 
+-#define ENABLE_DEBUG_LOG
++/* #define ENABLE_DEBUG_LOG */
+ #include "custom_log.h"
+ 
+ #include <mali_kbase.h>
+@@ -18,6 +18,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/suspend.h>
+ 
++#include "mali_kbase_rk.h"
++
+ /**
+  * @file mali_kbase_config_rk.c
+  * 对 platform_config_of_rk 的具体实现.
+@@ -37,12 +39,34 @@
+ 
+ /*---------------------------------------------------------------------------*/
+ 
+-int kbase_platform_rk_init(struct kbase_device *kbdev)
++static int rk_pm_enable_regulator(struct kbase_device *kbdev);
++
++static void rk_pm_disable_regulator(struct kbase_device *kbdev);
++
++static int rk_pm_enable_clk(struct kbase_device *kbdev);
++
++static void rk_pm_disable_clk(struct kbase_device *kbdev);
++
++/*---------------------------------------------------------------------------*/
++
++static int kbase_platform_rk_init(struct kbase_device *kbdev)
+ {
++	struct rk_context *platform;
++
++	platform = kzalloc(sizeof(*platform), GFP_KERNEL);
++	if (!platform) {
++		E("err.");
++		return -ENOMEM;
++	}
++
++	platform->is_powered = false;
++
++	kbdev->platform_context = (void *)platform;
++
+ 	return 0;
+ }
+ 
+-void kbase_platform_rk_term(struct kbase_device *kbdev)
++static void kbase_platform_rk_term(struct kbase_device *kbdev)
+ {
+ }
+ 
+@@ -53,47 +77,122 @@ struct kbase_platform_funcs_conf platform_funcs = {
+ 
+ /*---------------------------------------------------------------------------*/
+ 
+-static int pm_callback_power_on(struct kbase_device *kbdev)
++static int rk_pm_callback_runtime_on(struct kbase_device *kbdev)
+ {
+ 	return 0;
+ }
+ 
+-static void pm_callback_power_off(struct kbase_device *kbdev)
++static void rk_pm_callback_runtime_off(struct kbase_device *kbdev)
+ {
+ }
+ 
+-int kbase_device_runtime_init(struct kbase_device *kbdev)
++static int rk_pm_callback_power_on(struct kbase_device *kbdev)
+ {
+-	return 0;
++	int ret = 1; /* Assume GPU has been powered off */
++	int err = 0;
++	struct rk_context *platform;
++
++	platform = (struct rk_context *)kbdev->platform_context;
++	if (platform->is_powered) {
++		W("mali_device is already powered.");
++		return 0;
++	}
++
++	D("powering on.");
++
++	/* we must enable vdd_gpu before pd_gpu_in_chip. */
++	err = rk_pm_enable_regulator(kbdev);
++	if (err) {
++		E("fail to enable regulator, err : %d.", err);
++		return err;
++	}
++
++	/* 若 mali_dev 的 runtime_pm 是 enabled 的, 则... */
++	if (pm_runtime_enabled(kbdev->dev)) {
++		D("to resume mali_dev syncly.");
++		/* 对 pd_in_chip 的 on 操作,
++		 * 将在 pm_domain 的 runtime_pm_callbacks 中完成.
++		 */
++		err = pm_runtime_get_sync(kbdev->dev);
++		if (err < 0) {
++			E("failed to runtime resume device: %d.", err);
++			return err;
++		} else if (err == 1) { /* runtime_pm_status is still active */
++			D("chip has NOT been powered off, no need to re-init.");
++			ret = 0;
++		}
++	}
++
++	err = rk_pm_enable_clk(kbdev); /* clk is not relative to pd. */
++	if (err) {
++		E("failed to enable clk: %d", err);
++		return err;
++	}
++
++	platform->is_powered = true;
++	KBASE_TIMELINE_GPU_POWER(kbdev, 1);
++
++	return ret;
+ }
+ 
+-void kbase_device_runtime_disable(struct kbase_device *kbdev)
++static void rk_pm_callback_power_off(struct kbase_device *kbdev)
+ {
++	struct rk_context *platform =
++		(struct rk_context *)kbdev->platform_context;
++
++	if (!platform->is_powered) {
++		W("mali_dev is already powered off.");
++		return;
++	}
++
++	D("powering off.");
++
++	platform->is_powered = false;
++	KBASE_TIMELINE_GPU_POWER(kbdev, 0);
++
++	rk_pm_disable_clk(kbdev);
++
++	if (pm_runtime_enabled(kbdev->dev)) {
++		pm_runtime_mark_last_busy(kbdev->dev);
++		D("to put_sync_suspend mali_dev.");
++		pm_runtime_put_sync_suspend(kbdev->dev);
++	}
++
++	rk_pm_disable_regulator(kbdev);
+ }
+ 
+-static int pm_callback_runtime_on(struct kbase_device *kbdev)
++int rk_kbase_device_runtime_init(struct kbase_device *kbdev)
+ {
++	pm_runtime_set_autosuspend_delay(kbdev->dev, 200);
++	pm_runtime_use_autosuspend(kbdev->dev);
++
++	/* no need to call pm_runtime_set_active here. */
++
++	D("to enable pm_runtime.");
++	pm_runtime_enable(kbdev->dev);
++
+ 	return 0;
+ }
+ 
+-static void pm_callback_runtime_off(struct kbase_device *kbdev)
++void rk_kbase_device_runtime_disable(struct kbase_device *kbdev)
+ {
++	D("to disable pm_runtime.");
++	pm_runtime_disable(kbdev->dev);
+ }
+ 
+ struct kbase_pm_callback_conf pm_callbacks = {
+-	.power_on_callback =  pm_callback_power_on,
+-	.power_off_callback = pm_callback_power_off,
++	.power_on_callback = rk_pm_callback_power_on,
++	.power_off_callback = rk_pm_callback_power_off,
+ #ifdef CONFIG_PM
+-	.power_runtime_init_callback = kbase_device_runtime_init,
+-	.power_runtime_term_callback = kbase_device_runtime_disable,
+-	.power_runtime_on_callback = pm_callback_runtime_on,
+-	.power_runtime_off_callback = pm_callback_runtime_off,
++	.power_runtime_init_callback = rk_kbase_device_runtime_init,
++	.power_runtime_term_callback = rk_kbase_device_runtime_disable,
++	.power_runtime_on_callback = rk_pm_callback_runtime_on,
++	.power_runtime_off_callback = rk_pm_callback_runtime_off,
+ #else				/* CONFIG_PM */
+ 	.power_runtime_init_callback = NULL,
+ 	.power_runtime_term_callback = NULL,
+ 	.power_runtime_on_callback = NULL,
+ 	.power_runtime_off_callback = NULL,
+-
+ #endif				/* CONFIG_PM */
+ };
+ 
+@@ -103,3 +202,62 @@ int kbase_platform_early_init(void)
+ 	return 0;
+ }
+ 
++/*---------------------------------------------------------------------------*/
++
++static int rk_pm_enable_regulator(struct kbase_device *kbdev)
++{
++	int ret = 0;
++
++	if (!kbdev->regulator) {
++		W("no mali regulator control, no need to enable.");
++		goto EXIT;
++	}
++
++	D("to enable regulator.");
++	ret = regulator_enable(kbdev->regulator);
++	if (ret) {
++		E("fail to enable regulator, ret : %d.", ret);
++		goto EXIT;
++	}
++
++EXIT:
++	return ret;
++}
++
++static void rk_pm_disable_regulator(struct kbase_device *kbdev)
++{
++	if (!(kbdev->regulator)) {
++		W("no mali regulator control, no need to disable.");
++		return;
++	}
++
++	D("to disable regulator.");
++	regulator_disable(kbdev->regulator);
++}
++
++static int rk_pm_enable_clk(struct kbase_device *kbdev)
++{
++	int err = 0;
++
++	if (!(kbdev->clock)) {
++		W("no mali clock control, no need to enable.");
++	} else {
++		D("to enable clk.");
++		err = clk_enable(kbdev->clock);
++		if (err)
++			E("failed to enable clk: %d.", err);
++	}
++
++	return err;
++}
++
++static void rk_pm_disable_clk(struct kbase_device *kbdev)
++{
++	if (!(kbdev->clock)) {
++		W("no mali clock control, no need to disable.");
++	} else {
++		D("to disable clk.");
++		clk_disable(kbdev->clock);
++	}
++}
++
+diff --git a/drivers/gpu/arm/midgard/platform/rk/mali_kbase_rk.h b/drivers/gpu/arm/midgard/platform/rk/mali_kbase_rk.h
+new file mode 100644
+index 000000000000..a4ebd50415bb
+--- /dev/null
++++ b/drivers/gpu/arm/midgard/platform/rk/mali_kbase_rk.h
+@@ -0,0 +1,30 @@
++/* drivers/gpu/t6xx/kbase/src/platform/rk/mali_kbase_platform.h
++ * Rockchip SoC Mali-Midgard platform-dependent codes
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software FoundatIon.
++ */
++
++/**
++ * @file mali_kbase_rk.h
++ *
++ * defines work_context type of platform_dependent_part.
++ */
++
++#ifndef _MALI_KBASE_RK_H_
++#define _MALI_KBASE_RK_H_
++
++/*---------------------------------------------------------------------------*/
++
++/**
++ * struct rk_context - work_context of platform_dependent_part_of_rk.
++ * @is_powered: record the status
++ *      of common_parts calling 'power_on_callback' and 'power_off_callback'.
++ */
++struct rk_context {
++	bool is_powered;
++};
++
++#endif				/* _MALI_KBASE_RK_H_ */
++
+-- 
+2.35.3
+

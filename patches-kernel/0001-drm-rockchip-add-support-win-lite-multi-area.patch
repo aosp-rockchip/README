@@ -1,0 +1,125 @@
+From 306323472404bdc2cf0bb5203acb0d7e90423f06 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Thu, 2 Jul 2020 20:11:44 +0800
+Subject: [PATCH] drm/rockchip: add support win lite multi area
+
+like rk3288/rk3399/px30 win lite, the hardware can support multi area,
+we register them as normally plane to drm framwork, but they have some limitations:
+one group a multi areas need use same zpos, they can't overlap, etc.
+so we add SHARE_ID prop to identy them.
+
+Change-Id: Ia814e6b0896f0e74a53193afe6642eff145da562
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c |  6 +++++
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 29 ++++++++++++++++++---
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 089e417ee04f..d5f595950e17 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -1276,6 +1276,12 @@ static int rockchip_drm_create_properties(struct drm_device *dev)
+ 		return -ENOMEM;
+ 	private->async_commit_prop = prop;
+ 
++	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
++					 "SHARE_ID", 0, UINT_MAX);
++	if (!prop)
++		return -ENOMEM;
++	private->share_id_prop = prop;
++
+ 	return drm_mode_create_tv_properties(dev, 0, NULL);
+ }
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 5b8abb726539..7f0f715b5095 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -155,6 +155,7 @@ struct rockchip_drm_private {
+ 	struct drm_property *blend_mode_prop;
+ 	struct drm_property *alpha_scale_prop;
+ 	struct drm_property *async_commit_prop;
++	struct drm_property *share_id_prop;
+ 	struct drm_fb_helper *fbdev_helper;
+ 	struct drm_gem_object *fbdev_bo;
+ 	const struct rockchip_crtc_funcs *crtc_funcs[ROCKCHIP_MAX_CRTC];
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 752962a9c32c..d5c144630496 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -229,6 +229,7 @@ struct vop {
+ 	bool is_iommu_enabled;
+ 	bool is_iommu_needed;
+ 	bool is_enabled;
++	bool support_multi_area;
+ 
+ 	u32 version;
+ 
+@@ -2129,6 +2130,18 @@ static int vop_atomic_plane_get_property(struct drm_plane *plane,
+ 		return 0;
+ 	}
+ 
++	if (property == private->share_id_prop) {
++		int i;
++		struct drm_mode_object *obj = &plane->base;
++
++		for (i = 0; i < obj->properties->count; i++) {
++			if (obj->properties->properties[i] == property) {
++				*val = obj->properties->values[i];
++				return 0;
++			}
++		}
++	}
++
+ 	DRM_ERROR("failed to get vop plane property id:%d, name:%s\n",
+ 		   property->base.id, property->name);
+ 
+@@ -3996,9 +4009,8 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
+ 	if (win->parent)
+ 		share = &win->parent->base;
+ 
+-	ret = drm_share_plane_init(vop->drm_dev, &win->base, share,
+-				   possible_crtcs, &vop_plane_funcs,
+-				   win->data_formats, win->nformats, win->type);
++	ret = drm_universal_plane_init(vop->drm_dev, &win->base, possible_crtcs, &vop_plane_funcs,
++				       win->data_formats, win->nformats, NULL, win->type, NULL);
+ 	if (ret) {
+ 		DRM_ERROR("failed to initialize plane %d\n", ret);
+ 		return ret;
+@@ -4032,6 +4044,13 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
+ 	drm_object_attach_property(&win->base.base,
+ 				   private->async_commit_prop, 0);
+ 
++	if (win->parent)
++		drm_object_attach_property(&win->base.base, private->share_id_prop,
++					   win->parent->base.base.id);
++	else
++		drm_object_attach_property(&win->base.base, private->share_id_prop,
++					   win->base.base.id);
++
+ 	return 0;
+ }
+ 
+@@ -4317,6 +4336,9 @@ static int vop_win_init(struct vop *vop)
+ 
+ 		num_wins++;
+ 
++		if (!vop->support_multi_area)
++			continue;
++
+ 		for (j = 0; j < win_data->area_size; j++) {
+ 			struct vop_win *vop_area = &vop->win[num_wins];
+ 			const struct vop_win_phy *area = win_data->area[j];
+@@ -4453,6 +4475,7 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
+ 	vop->num_wins = num_wins;
+ 	vop->version = vop_data->version;
+ 	dev_set_drvdata(dev, vop);
++	vop->support_multi_area = of_property_read_bool(dev->of_node, "support-multi-area");
+ 
+ 	ret = vop_win_init(vop);
+ 	if (ret)
+-- 
+2.35.3
+

@@ -1,0 +1,600 @@
+From 13484d6e9e1ac24fe6e6f894f848ce132d3af5ab Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Sat, 21 Apr 2012 14:00:09 +0800
+Subject: [PATCH] rk30: i2c: update i2c drivers and add slave detect interface
+
+---
+ drivers/i2c/busses/Makefile           |   2 +-
+ drivers/i2c/busses/i2c-rk30-adapter.c | 102 ++++++++++---------
+ drivers/i2c/busses/i2c-rk30-test.c    | 138 --------------------------
+ drivers/i2c/busses/i2c-rk30.c         | 121 ++++++++++++++++++----
+ drivers/i2c/busses/i2c-rk30.h         |  20 +++-
+ 5 files changed, 174 insertions(+), 209 deletions(-)
+ delete mode 100644 drivers/i2c/busses/i2c-rk30-test.c
+
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index 7a0151b443c7..662633c19f95 100644
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -3,7 +3,7 @@
+ #
+ obj-$(CONFIG_I2C_RK29)		+= i2c-rk29.o
+ obj-$(CONFIG_I2C_DEV_RK29)	+= i2c-dev-rk29.o
+-obj-$(CONFIG_I2C_RK30)		+= i2c-rk30.o i2c-rk29-adapter.o i2c-rk30-adapter.o i2c-rk30-test.o
++obj-$(CONFIG_I2C_RK30)		+= i2c-rk30.o i2c-rk29-adapter.o i2c-rk30-adapter.o
+ 
+ # ACPI drivers
+ obj-$(CONFIG_I2C_SCMI)		+= i2c-scmi.o
+diff --git a/drivers/i2c/busses/i2c-rk30-adapter.c b/drivers/i2c/busses/i2c-rk30-adapter.c
+index c11b544500e2..c65b598b3a6b 100755
+--- a/drivers/i2c/busses/i2c-rk30-adapter.c
++++ b/drivers/i2c/busses/i2c-rk30-adapter.c
+@@ -204,14 +204,19 @@ static inline int is_msgend(struct rk30_i2c *i2c)
+ static void rk30_i2c_stop(struct rk30_i2c *i2c, int ret)
+ {
+ 
+-    i2c->msg_ptr = 0;
++        i2c->msg_ptr = 0;
+ 	i2c->msg = NULL;
+-	i2c->msg_num = 0;
+-	if (ret)
+-		i2c->msg_idx = ret;
++        if(ret == -EAGAIN){
++                i2c->state = STATE_IDLE;
++                i2c->is_busy = 0;
++                wake_up(&i2c->wait);
++                return;
++        }
++	i2c->error = ret;
+         i2c_writel(I2C_STOPIEN, i2c->regs + I2C_IEN);
+         i2c->state = STATE_STOP;
+         rk30_i2c_send_stop(i2c);
++        return;
+ }
+ static inline void rk30_set_rx_mode(struct rk30_i2c *i2c, unsigned int lastnak)
+ {
+@@ -233,7 +238,7 @@ static void rk30_irq_read_prepare(struct rk30_i2c *i2c)
+             rk30_set_rx_mode(i2c, 0);
+ 
+     if(is_msgend(i2c)) {
+-        rk30_i2c_stop(i2c, 0);
++        rk30_i2c_stop(i2c, i2c->error);
+         return;
+     }
+     if(len > 32)
+@@ -263,7 +268,7 @@ static void rk30_irq_write_prepare(struct rk30_i2c *i2c)
+     unsigned char byte;
+ 
+     if(is_msgend(i2c)) {
+-        rk30_i2c_stop(i2c, 0);
++        rk30_i2c_stop(i2c, i2c->error);
+         return;
+     }
+     for(i = 0; i < 8; i++){
+@@ -287,11 +292,6 @@ static void rk30_irq_write_prepare(struct rk30_i2c *i2c)
+ static void rk30_i2c_irq_nextblock(struct rk30_i2c *i2c, unsigned int ipd)
+ {
+         switch (i2c->state) {
+-        case STATE_IDLE:
+-                dev_err(i2c->dev, "Addr[0x%02x] called in STATE_IDLE\n", i2c->addr);
+-                rk30_show_regs(i2c);
+-                i2c_writel(I2C_IPD_ALL_CLEAN, i2c->regs + I2C_IPD);
+-                goto out;
+         case STATE_START:
+                 if(!(ipd & I2C_STARTIPD)){
+                         rk30_i2c_stop(i2c, -ENXIO);
+@@ -327,7 +327,7 @@ static void rk30_i2c_irq_nextblock(struct rk30_i2c *i2c, unsigned int ipd)
+         case STATE_READ:
+                 if(!(ipd & I2C_MBRFIPD)){
+                         rk30_i2c_stop(i2c, -ENXIO);
+-                        dev_err(i2c->dev, "Addr[0x%02x] no mbrf irq in STATE_READ\n", i2c->addr);
++                        dev_err(i2c->dev, "Addr[0x%02x] no mbrf irq in STATE_READ, ipd = 0x%x\n", i2c->addr, ipd);
+                         rk30_show_regs(i2c);
+                         i2c_writel(I2C_IPD_ALL_CLEAN, i2c->regs + I2C_IPD);
+                         goto out;
+@@ -348,6 +348,7 @@ static void rk30_i2c_irq_nextblock(struct rk30_i2c *i2c, unsigned int ipd)
+                 rk30_i2c_clean_stop(i2c);
+                 i2c_writel(I2C_STOPIPD, i2c->regs + I2C_IPD);
+                 i2c->state = STATE_IDLE;
++	        i2c->is_busy = 0;
+ 	        wake_up(&i2c->wait);
+                 break;
+         default:
+@@ -363,15 +364,17 @@ static irqreturn_t rk30_i2c_irq(int irq, void *dev_id)
+ 
+         spin_lock(&i2c->lock);
+         ipd = i2c_readl(i2c->regs + I2C_IPD);
+-#if 1
+-        if((ipd & I2C_NAKRCVIPD)  && (i2c->state != STATE_STOP)){
+-		dev_err(i2c->dev, "Addr[0x%02x] ack was not received\n", i2c->addr);
+-                rk30_show_regs(i2c);
++        if(i2c->state == STATE_IDLE){
++                dev_info(i2c->dev, "Addr[0x%02x]  irq in STATE_IDLE, ipd = 0x%x\n", i2c->addr, ipd);
++                i2c_writel(I2C_IPD_ALL_CLEAN, i2c->regs + I2C_IPD);
++                goto out;
++        }
++
++        if(ipd & I2C_NAKRCVIPD){
+                 i2c_writel(I2C_NAKRCVIPD, i2c->regs + I2C_IPD);
+-                rk30_i2c_stop(i2c, -EAGAIN);
++                i2c->error = -EAGAIN;
+                 goto out;
+         }
+-#endif
+         rk30_i2c_irq_nextblock(i2c, ipd);
+ out:
+         spin_unlock(&i2c->lock);
+@@ -448,48 +451,48 @@ static int rk30_i2c_set_master(struct rk30_i2c *i2c, struct i2c_msg *msgs, int n
+ static int rk30_i2c_doxfer(struct rk30_i2c *i2c,
+ 			      struct i2c_msg *msgs, int num)
+ {
+-	unsigned long timeout;
+-	int ret = 0;
++	unsigned long timeout, flags;
+ 
+ 	if (i2c->suspended)
+ 		return -EIO;
+ 
+-	ret = rk30_i2c_set_master(i2c, msgs, num);
+-	if (ret != 0) {
++	spin_lock_irqsave(&i2c->lock, flags);
++	if(rk30_i2c_set_master(i2c, msgs, num) < 0){
++	        spin_unlock_irqrestore(&i2c->lock, flags);
+                 dev_err(i2c->dev, "addr[0x%02x] set master error\n", msgs[0].addr);  
+-    	        return ret;
++    	        return -EIO;
+         }
+-	spin_lock_irq(&i2c->lock);
+-
+         i2c->addr = msgs[0].addr;
+-	i2c->msg_num = num;
+         i2c->msg_ptr = 0;
+-        i2c->msg_idx = num;
++        i2c->error = 0;
++	i2c->is_busy = 1;
+         i2c->state = STATE_START;
+-
+-	spin_unlock_irq(&i2c->lock);
+-
+         i2c_writel(I2C_STARTIEN, i2c->regs + I2C_IEN);
++	spin_unlock_irqrestore(&i2c->lock, flags);
++
+         rk30_i2c_enable(i2c, (i2c->count > 32)?0:1); //if count > 32,  byte(32) send ack
+-	//rk30_i2c_enable_irq(i2c);
+-        //rk30_i2c_send_start(i2c);
+ 
+-	timeout = wait_event_timeout(i2c->wait, (i2c->msg_num == 0), msecs_to_jiffies(I2C_WAIT_TIMEOUT));
++	timeout = wait_event_timeout(i2c->wait, (i2c->is_busy == 0), msecs_to_jiffies(I2C_WAIT_TIMEOUT));
+ 
+-	ret = i2c->msg_idx;
++	spin_lock_irqsave(&i2c->lock, flags);
++        i2c_writel(I2C_IPD_ALL_CLEAN, i2c->regs + I2C_IPD);
++	spin_unlock_irqrestore(&i2c->lock, flags);
+ 
+ 	if (timeout == 0){
+-                dev_err(i2c->dev, "addr[0x%02x] wait event timeout, state = %d\n", msgs[0].addr, i2c->state);  
+-                rk30_show_regs(i2c);
+-                if(i2c->state != STATE_STOP)
+-                        rk30_i2c_send_stop(i2c);
+-                ret = -ETIMEDOUT;
++                i2c->state = STATE_IDLE;
++                if(i2c->error < 0) i2c->error = -ETIMEDOUT;
++                rk30_i2c_send_stop(i2c);
++                dev_err(i2c->dev, "addr[0x%02x] wait event timeout, state: %d, is_busy: %d, error: %d\n", 
++                                msgs[0].addr, i2c->state, i2c->is_busy, i2c->error);  
++
+         }
+-        i2c_writel(I2C_IPD_ALL_CLEAN, i2c->regs + I2C_IPD);
+ 	rk30_i2c_disable_irq(i2c);
+         rk30_i2c_disable(i2c);
+-        i2c_dbg(i2c->dev, "i2c transfer finished ret = %d\n", ret);
+-	return ret;
++
++        if(i2c->error == -EAGAIN)
++                dev_err(i2c->dev, "No ack(retry %d), Maybe slave(addr: 0x%02x) not exist or abnormal power-on\n",
++                                i2c->adap.retries + 1, i2c->addr);
++	return i2c->error;
+ }
+ 
+ /* rk30_i2c_xfer
+@@ -517,18 +520,21 @@ static int rk30_i2c_xfer(struct i2c_adapter *adap,
+ 			msgs[0].addr, msgs[0].scl_rate/1000);
+ 		scl_rate = 10000;
+ 	}
+-        if(i2c->is_div_from_arm[i2c->adap.nr])
++        if(i2c->is_div_from_arm[i2c->adap.nr]){
++                mutex_lock(&i2c->m_lock);
+ 		wake_lock(&i2c->idlelock[i2c->adap.nr]);
++        }
+ 
+ 	rk30_i2c_set_clk(i2c, scl_rate);
+-        udelay(i2c->tx_setup);
+-        i2c_dbg(i2c->dev, "i2c transfer: addr[0x%x], scl_reate[%ldKhz], len = %d\n", msgs[0].addr, scl_rate/1000, i2c->count);
++        i2c_dbg(i2c->dev, "i2c transfer start: addr: 0x%x, scl_reate: %ldKhz, len: %d\n", msgs[0].addr, scl_rate/1000, num);
+ 	ret = rk30_i2c_doxfer(i2c, msgs, num);
++        i2c_dbg(i2c->dev, "i2c transfer stop: addr: 0x%x, state: %d, ret: %d\n", msgs[0].addr, ret, i2c->state);
+ 
+-        i2c->state = STATE_IDLE;
+-        if(i2c->is_div_from_arm[i2c->adap.nr])
++        if(i2c->is_div_from_arm[i2c->adap.nr]){
+ 		wake_unlock(&i2c->idlelock[i2c->adap.nr]);
+-	return ret;
++                mutex_unlock(&i2c->m_lock);
++        }
++	return (ret < 0)?ret:num;
+ }
+ 
+ /* declare our i2c functionality */
+diff --git a/drivers/i2c/busses/i2c-rk30-test.c b/drivers/i2c/busses/i2c-rk30-test.c
+deleted file mode 100644
+index d76f8a9c156a..000000000000
+--- a/drivers/i2c/busses/i2c-rk30-test.c
++++ /dev/null
+@@ -1,138 +0,0 @@
+-#include <linux/i2c.h>
+-#include <linux/module.h>
+-#include <linux/delay.h>
+-#include "i2c-rk30.h"
+-
+-#if 0
+-#define TEST_SCL_RATE (100 * 1000)
+-#define I2C_NUM     1
+-
+-struct rw_info {
+-    unsigned short addr;
+-    unsigned int reg;
+-    unsigned int reg_bytes;
+-    unsigned char tx_buf[100];
+-    unsigned char rx_buf[100];
+-    unsigned int rx_len;
+-    unsigned int tx_len;
+-};
+-
+-static int test_write(struct i2c_client *client, struct rw_info *info)
+-{
+-    int i, ret = 0;
+-    struct i2c_msg msg;
+-    
+-    char *buf = kzalloc(info->reg_bytes + info->tx_len, GFP_KERNEL);
+-    for(i = 0; i < info->reg_bytes; i++)
+-        buf[i] = (info->reg >> i)& 0xff;
+-    for(i = info->reg_bytes; i < info->tx_len; i++)
+-        buf[i] = info->tx_buf[i - info->reg_bytes];
+-
+-    msg.addr = client->addr;
+-    msg.flags = client->flags;
+-    msg.buf = buf;
+-    msg.len = info->reg_bytes + info->tx_len;
+-    msg.scl_rate = TEST_SCL_RATE;
+-    ret = i2c_transfer(client->adapter, &msg, 1);
+-    kfree(buf);
+-
+-    return ret;
+-
+-}
+-
+-static int test_read(struct i2c_client *client, struct rw_info *info)
+-{
+-    int i, ret = 0, msg_num = 0;
+-    char buf[4];
+-    struct i2c_msg msgs[2];
+-    if(info->reg_bytes == 0){
+-        msgs[0].addr = client->addr;
+-        msgs[0].flags = client->flags|I2C_M_RD;
+-        msgs[0].buf = info->rx_buf;
+-        msgs[0].len = info->rx_len;
+-        msgs[0].scl_rate = TEST_SCL_RATE;  
+-        msg_num = 1;
+-    }else {
+-        for(i = 0; i < info->reg_bytes; i++) {
+-            buf[i] = (info->reg >> i) & 0xff;
+-        }
+-        msgs[0].addr = client->addr;
+-        msgs[0].flags = client->flags;
+-        msgs[0].buf = buf;
+-        msgs[0].len = info->reg_bytes;
+-        msgs[0].scl_rate = TEST_SCL_RATE;  
+-
+-        msgs[1].addr = client->addr;
+-        msgs[1].flags = client->flags|I2C_M_RD;
+-        msgs[1].buf = info->rx_buf;
+-        msgs[1].len = info->rx_len;
+-        msgs[1].scl_rate = TEST_SCL_RATE;
+-        msg_num = 2;
+-    }
+-
+-
+-    ret = i2c_transfer(client->adapter, msgs, msg_num);
+-    return ret;
+-}
+-
+-static void test_set_client(struct i2c_client *client, __u16 addr, int nr)
+-{
+-    client->flags = 0;
+-    client->addr = addr;
+-    client->adapter = i2c_get_adapter(nr);
+-}
+-static int __init test_init(void)
+-{
+-    int nr = 0, ret = 0;
+-    unsigned long i = 0;
+-    struct i2c_client *client = NULL;
+-    struct rw_info info = {
+-        .addr = 0x51,
+-        .reg = 0x01,
+-        .reg_bytes = 1,
+-        .tx_len = 8,
+-        .tx_buf = 
+-        {
+-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+-        },
+-        .rx_len = 8,
+-    };
+-        
+-    client = kzalloc(sizeof(struct i2c_client) * I2C_NUM, GFP_KERNEL);
+-
+-    printk("%s: start\n", __func__);
+-    while(1) {
+-        for(nr = 0; nr < I2C_NUM; nr++){
+-            for(i = 0x51; i < 0x52; i++){
+-                info.addr = i;
+-                test_set_client(&client[nr], info.addr, nr);
+-                ret = test_write(&client[nr], &info);
+-                printk("i2c-%d: addr[0x%02x] write val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
+-                        nr, info.addr, info.tx_buf[0], info.tx_buf[1], info.tx_buf[2], info.tx_buf[3], 
+-                        info.tx_buf[4], info.tx_buf[5], info.tx_buf[6], info.tx_buf[7], ret);
+-                if(info.addr == 0x51 && ret < 0)
+-                    goto out;
+-                ret = test_read(&client[nr], &info);
+-                printk("i2c-%d: addr[0x%02x] read val [0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x], ret = %d\n",
+-                        nr, info.addr, info.rx_buf[0], info.rx_buf[1], info.rx_buf[2], info.rx_buf[3], 
+-                        info.rx_buf[4], info.rx_buf[5], info.rx_buf[6], info.rx_buf[7], ret);
+-                if(info.addr == 0x51 && ret < 0)
+-                    goto out;
+-            }
+-        }
+-    }
+-out:
+-    kfree(client);
+-    return 0;
+-}
+-
+-static void __exit test_exit(void)
+-{
+-    return;
+-}
+-
+-subsys_initcall_sync(test_init);
+-module_exit(test_exit);
+-
+-#endif
+-
+diff --git a/drivers/i2c/busses/i2c-rk30.c b/drivers/i2c/busses/i2c-rk30.c
+index 1438279ecf3b..24935c72740e 100755
+--- a/drivers/i2c/busses/i2c-rk30.c
++++ b/drivers/i2c/busses/i2c-rk30.c
+@@ -13,8 +13,8 @@
+  *
+  */
+ #include "i2c-rk30.h"
++#define TX_SETUP                        1
+ 
+-#define TX_SETUP                        1 //unit us
+ void i2c_adap_sel(struct rk30_i2c *i2c, int nr, int adap_type)
+ {
+         writel((1 << I2C_ADAP_SEL_BIT(nr)) | (1 << I2C_ADAP_SEL_MASK(nr)) ,
+@@ -29,25 +29,23 @@ static int rk30_i2c_cpufreq_transition(struct notifier_block *nb,
+ 					  unsigned long val, void *data)
+ {
+         struct rk30_i2c *i2c = freq_to_i2c(nb);
+-	unsigned long flags;
+-	int delta_f;
++        struct cpufreq_freqs *freqs = data;
+ 
+-	delta_f = clk_get_rate(i2c->clk) - i2c->i2c_rate;
++        if (freqs->cpu)
++                return 0;
+ 
+-	if ((val == CPUFREQ_POSTCHANGE && delta_f < 0) ||
+-	    (val == CPUFREQ_PRECHANGE && delta_f > 0)) 
+-	{
+-		spin_lock_irqsave(&i2c->lock, flags);
+-        i2c->i2c_set_clk(i2c, i2c->scl_rate);
+-		spin_unlock_irqrestore(&i2c->lock, flags);
+-	}
+-	return 0;
++        if(val == CPUFREQ_PRECHANGE)
++                mutex_lock(&i2c->m_lock);
++        else if(val == CPUFREQ_POSTCHANGE)
++                mutex_unlock(&i2c->m_lock);
++
++        return 0;
+ }
+ 
+ static inline int rk30_i2c_register_cpufreq(struct rk30_i2c *i2c)
+ {
+-    if (i2c->adap.nr != 0)
+-		return 0;
++        if(!i2c->is_div_from_arm[i2c->adap.nr])
++	        return 0;
+ 	i2c->freq_transition.notifier_call = rk30_i2c_cpufreq_transition;
+ 
+ 	return cpufreq_register_notifier(&i2c->freq_transition,
+@@ -56,7 +54,7 @@ static inline int rk30_i2c_register_cpufreq(struct rk30_i2c *i2c)
+ 
+ static inline void rk30_i2c_deregister_cpufreq(struct rk30_i2c *i2c)
+ {
+-    if (i2c->adap.nr != 0)
++        if(!i2c->is_div_from_arm[i2c->adap.nr])
+ 		return;
+ 	cpufreq_unregister_notifier(&i2c->freq_transition,
+ 				    CPUFREQ_TRANSITION_NOTIFIER);
+@@ -107,11 +105,12 @@ static int rk30_i2c_probe(struct platform_device *pdev)
+ 	i2c->adap.owner   = THIS_MODULE;
+ 	i2c->adap.class   = I2C_CLASS_HWMON | I2C_CLASS_SPD;
+ 	i2c->tx_setup     = TX_SETUP;
+-	i2c->adap.retries = 5;
+-        i2c->adap.timeout = msecs_to_jiffies(500);
++	i2c->adap.retries = 2;
++        i2c->adap.timeout = msecs_to_jiffies(100);
+ 
+ 	spin_lock_init(&i2c->lock);
+ 	init_waitqueue_head(&i2c->wait);
++        mutex_init(&i2c->m_lock); 
+ 
+ 	/* find the clock and enable it */
+ 
+@@ -300,6 +299,94 @@ static void __exit i2c_adap_exit(void)
+ }
+ module_exit(i2c_adap_exit);
+ 
++static int detect_read(struct i2c_client *client, char *buf, int len)
++{
++        struct i2c_msg msg;
++
++        msg.addr = client->addr;
++        msg.flags = client->flags | I2C_M_RD;
++        msg.buf = buf;
++        msg.len = len;
++        msg.scl_rate = 100 * 1000;
++
++        return i2c_transfer(client->adapter, &msg, 1);
++}
++
++static void detect_set_client(struct i2c_client *client, __u16 addr, int nr)
++{
++        client->flags = 0;
++        client->addr = addr;
++        client->adapter = i2c_get_adapter(nr);
++}
++static void slave_detect(int nr)
++{
++        int ret = 0;
++        unsigned short addr;
++        char val[8];
++        char buf[6 * 0x80 + 20];
++        struct i2c_client client;
++
++        memset(buf, 0, 6 * 0x80 + 20);
++        
++        sprintf(buf, "I2c%d slave list: ", nr);
++        do {
++                for(addr = 0x01; addr < 0x80; addr++){
++                        detect_set_client(&client, addr, nr);
++                        ret = detect_read(&client, val, 1);
++                        if(ret > 0)
++                                sprintf(buf, "%s  0x%02x", buf, addr);
++                }
++                printk("%s\n", buf);
++        }
++        while(0);
++}
++static ssize_t i2c_detect_write(struct file *file, 
++			const char __user *buf, size_t count, loff_t *offset)
++{
++        char nr_buf[8];
++        int nr = 0, ret;
++
++        if(count > 4)
++                return -EFAULT;
++        ret = copy_from_user(nr_buf, buf, count);
++        if(ret < 0)
++                return -EFAULT;
++
++        sscanf(nr_buf, "%d", &nr);
++        if(nr >= 5 || nr < 0)
++                return -EFAULT;
++
++        slave_detect(nr);
++
++        return count;
++}
++
++
++static const struct file_operations i2c_detect_fops = {
++	.write = i2c_detect_write,
++};
++static struct miscdevice i2c_detect_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "i2c_detect",
++	.fops = &i2c_detect_fops,
++};
++static int __init i2c_detect_init(void)
++{
++        return misc_register(&i2c_detect_device);
++}
++
++static void __exit i2c_detect_exit(void)
++{
++        misc_deregister(&i2c_detect_device);
++}
++module_init(i2c_detect_init);
++module_exit(i2c_detect_exit);
++
++
++
++
++
++
+ MODULE_DESCRIPTION("Driver for RK30 I2C Bus");
+ MODULE_AUTHOR("kfx, kfx@rock-chips.com");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/i2c/busses/i2c-rk30.h b/drivers/i2c/busses/i2c-rk30.h
+index c4e124f322dd..8446969b5e7c 100755
+--- a/drivers/i2c/busses/i2c-rk30.h
++++ b/drivers/i2c/busses/i2c-rk30.h
+@@ -1,6 +1,8 @@
+ #ifndef __RK30_I2C_H__
+ #define __RK30_I2C_H__
+ 
++#include <linux/uaccess.h>
++#include <linux/fs.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/wakelock.h>
+@@ -16,7 +18,8 @@
+ #include <linux/cpufreq.h>
+ #include <linux/slab.h>
+ #include <linux/io.h>
+-
++#include <linux/mutex.h>
++#include <linux/miscdevice.h>
+ #include <mach/board.h>
+ #include <mach/iomux.h>
+ #include <asm/irq.h>
+@@ -31,7 +34,7 @@
+ #define i2c_writel                 writel_relaxed
+ #define i2c_readl                  readl_relaxed
+ 
+-#define I2C_WAIT_TIMEOUT            200  //100ms
++#define I2C_WAIT_TIMEOUT            200  //200ms
+ 
+ #define rk30_set_bit(p, v, b)        (((p) & ~(1 << (b))) | ((v) << (b)))
+ #define rk30_get_bit(p, b)           (((p) & (1 << (b))) >> (b))
+@@ -53,13 +56,20 @@ enum rk30_i2c_state {
+ 	STATE_STOP
+ };
+ struct rk30_i2c {
+-	spinlock_t		    lock;
++	spinlock_t		lock;
+ 	wait_queue_head_t	wait;
++        struct mutex            m_lock;
+ 	unsigned int		suspended:1;
+ 
+ 	struct i2c_msg		*msg;
+-	unsigned int		msg_num;
+-	unsigned int		msg_idx;
++        union {
++	        unsigned int		msg_num;
++	        unsigned int		is_busy;
++        };
++        union {
++	        unsigned int		msg_idx;
++	        unsigned int		error;
++        };
+ 	unsigned int		msg_ptr;
+ 
+ 	unsigned int		tx_setup;
+-- 
+2.35.3
+

@@ -1,0 +1,293 @@
+From d9031d601b07273d0d367b8b95599d1b742b1aa9 Mon Sep 17 00:00:00 2001
+From: Yu Qiaowei <cerf.yu@rock-chips.com>
+Date: Fri, 7 Aug 2020 14:27:38 +0800
+Subject: [PATCH] video/rockchip: rga2: Support the color palette mode.
+
+1. add support for the BPP8/4/2/1 format used in color palette mode.
+2. Add pat support in rga2_get_dma_buf().
+3. Modify the parameters of configuring mmu in color palette mode.
+
+Signed-off-by: Yu Qiaowei <cerf.yu@rock-chips.com>
+Change-Id: I16b498b8d48575688c769486ac7536ddc2d918b4
+---
+ drivers/video/rockchip/rga2/rga2.h          |  6 ++
+ drivers/video/rockchip/rga2/rga2_drv.c      | 25 ++++++
+ drivers/video/rockchip/rga2/rga2_mmu_info.c | 91 ++++++++++++++++-----
+ drivers/video/rockchip/rga2/rga2_reg_info.c | 10 +++
+ 4 files changed, 111 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/video/rockchip/rga2/rga2.h b/drivers/video/rockchip/rga2/rga2.h
+index 8be85f449652..17776f1ce2d4 100644
+--- a/drivers/video/rockchip/rga2/rga2.h
++++ b/drivers/video/rockchip/rga2/rga2.h
+@@ -116,6 +116,11 @@ enum
+     RGA2_FORMAT_YCrCb_420_SP_10B = 0x21,
+     RGA2_FORMAT_YCbCr_422_SP_10B = 0x22,
+     RGA2_FORMAT_YCrCb_422_SP_10B = 0x23,
++
++	RGA2_FORMAT_BPP_1            = 0x24,
++	RGA2_FORMAT_BPP_2            = 0x25,
++	RGA2_FORMAT_BPP_4            = 0x26,
++	RGA2_FORMAT_BPP_8            = 0x27
+ };
+ 
+ typedef struct mdp_img
+@@ -548,6 +553,7 @@ struct rga2_req
+ 	struct dma_buf_attachment *attach_src0;
+ 	struct dma_buf_attachment *attach_src1;
+ 	struct dma_buf_attachment *attach_dst;
++	struct dma_buf_attachment *attach_els;
+ };
+ 
+ struct rga2_mmu_buf_t {
+diff --git a/drivers/video/rockchip/rga2/rga2_drv.c b/drivers/video/rockchip/rga2/rga2_drv.c
+index da089b33276e..8c2caf75f9b9 100644
+--- a/drivers/video/rockchip/rga2/rga2_drv.c
++++ b/drivers/video/rockchip/rga2/rga2_drv.c
+@@ -295,6 +295,14 @@ static const char *rga2_get_format_name(uint32_t format)
+ 		return "YCbCr422SP10B";
+ 	case RGA2_FORMAT_YCrCb_422_SP_10B:
+ 		return "YCrCb422SP10B";
++	case RGA2_FORMAT_BPP_1:
++		return "BPP1";
++	case RGA2_FORMAT_BPP_2:
++		return "BPP2";
++	case RGA2_FORMAT_BPP_4:
++		return "BPP4";
++	case RGA2_FORMAT_BPP_8:
++		return "BPP8";
+ 	default:
+ 		return "UNF";
+ 	}
+@@ -1175,6 +1183,7 @@ static int rga2_get_dma_buf(struct rga2_req *req)
+ 	req->attach_src0 = NULL;
+ 	req->attach_dst = NULL;
+ 	req->attach_src1 = NULL;
++	req->attach_els = NULL;
+ 	mmu_flag = req->mmu_info.src0_mmu_flag;
+ 	ret = rga2_get_img_info(&req->src, mmu_flag, &req->sg_src0,
+ 				&req->attach_src0);
+@@ -1199,8 +1208,24 @@ static int rga2_get_dma_buf(struct rga2_req *req)
+ 		goto err_src1;
+ 	}
+ 
++	mmu_flag = req->mmu_info.els_mmu_flag;
++	ret = rga2_get_img_info(&req->pat, mmu_flag, &req->sg_els,
++							&req->attach_els);
++	if (ret) {
++		pr_err("els:rga2_get_img_info fail\n");
++		goto err_els;
++	}
++
+ 	return ret;
+ 
++err_els:
++	if (req->sg_src1 && req->attach_src1) {
++		dma_buf_unmap_attachment(req->attach_src1,
++			req->sg_src1, DMA_BIDIRECTIONAL);
++		dma_buf = req->attach_src1->dmabuf;
++		dma_buf_detach(dma_buf, req->attach_src1);
++		dma_buf_put(dma_buf);
++	}
+ err_src1:
+ 	if (req->sg_dst && req->attach_dst) {
+ 		dma_buf_unmap_attachment(req->attach_dst,
+diff --git a/drivers/video/rockchip/rga2/rga2_mmu_info.c b/drivers/video/rockchip/rga2/rga2_mmu_info.c
+index 85fdf7ba4140..4d88f6169f58 100644
+--- a/drivers/video/rockchip/rga2/rga2_mmu_info.c
++++ b/drivers/video/rockchip/rga2/rga2_mmu_info.c
+@@ -696,7 +696,7 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+     uint32_t stride;
+ 
+     uint8_t shift;
+-    uint16_t sw, byte_num;
++    uint32_t sw, byte_num;
+ 
+     shift = 3 - (req->palette_mode & 3);
+     sw = req->src.vir_w*req->src.vir_h;
+@@ -710,6 +710,14 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+ 
+     do {
+         if (req->mmu_info.src0_mmu_flag) {
++            if (req->mmu_info.els_mmu_flag & 1) {
++                req->mmu_info.src0_mmu_flag = 0;
++                req->mmu_info.src1_mmu_flag = 0;
++            } else {
++                req->mmu_info.els_mmu_flag = req->mmu_info.src0_mmu_flag;
++                req->mmu_info.src0_mmu_flag = 0;
++            }
++
+             SrcMemSize = rga2_mem_size_cal(req->src.yrgb_addr, stride, &SrcStart);
+             if(SrcMemSize == 0) {
+                 return -EINVAL;
+@@ -748,8 +756,19 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+         mutex_unlock(&rga2_service.lock);
+ 
+         if(SrcMemSize) {
+-		ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0],
+-					 SrcStart, SrcMemSize, 0);
++            if (req->sg_src0) {
++                ret = rga2_MapION(req->sg_src0,
++                &MMU_Base[0], SrcMemSize);
++            } else {
++                ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0],
++                SrcStart, SrcMemSize, 0);
++#if RGA2_DEBUGFS
++                if (RGA2_CHECK_MODE)
++                rga2_UserMemory_cheeck(&pages[0], req->src.vir_w,
++                req->src.vir_h, req->src.format,
++                1);
++#endif
++            }
+             if (ret < 0) {
+                 pr_err("rga2 map src0 memory failed\n");
+                 status = ret;
+@@ -757,19 +776,29 @@ static int rga2_mmu_info_color_palette_mode(struct rga2_reg *reg, struct rga2_re
+             }
+ 
+             /* change the buf address in req struct */
+-            req->mmu_info.src0_base_addr = (((unsigned long)MMU_Base_phys));
++            req->mmu_info.els_base_addr = (((unsigned long)MMU_Base_phys));
+             req->src.yrgb_addr = (req->src.yrgb_addr & (~PAGE_MASK));
+         }
+ 
+         if(DstMemSize) {
+-		ret = rga2_MapUserMemory(&pages[0], MMU_Base + SrcMemSize,
+-					 DstStart, DstMemSize, 1);
++            if (req->sg_dst) {
++                ret = rga2_MapION(req->sg_dst,
++                MMU_Base + SrcMemSize, DstMemSize);
++            } else {
++                ret = rga2_MapUserMemory(&pages[0], MMU_Base + SrcMemSize,
++                DstStart, DstMemSize, 1);
++#if RGA2_DEBUGFS
++                if (RGA2_CHECK_MODE)
++                rga2_UserMemory_cheeck(&pages[0], req->dst.vir_w,
++                req->dst.vir_h, req->dst.format,
++                1);
++#endif
++            }
+             if (ret < 0) {
+                 pr_err("rga2 map dst memory failed\n");
+                 status = ret;
+                 break;
+             }
+-
+             /* change the buf address in req struct */
+             req->mmu_info.dst_base_addr  = ((unsigned long)(MMU_Base_phys + SrcMemSize));
+             req->dst.yrgb_addr = (req->dst.yrgb_addr & (~PAGE_MASK));
+@@ -859,24 +888,34 @@ static int rga2_mmu_info_color_fill_mode(struct rga2_reg *reg, struct rga2_req *
+ 
+ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct rga2_req *req)
+ {
+-    int SrcMemSize;
+-    unsigned long SrcStart;
++    int LutMemSize;
++    unsigned long LutStart;
+     struct page **pages = NULL;
+     uint32_t AllSize;
+     uint32_t *MMU_Base, *MMU_Base_phys;
+     int ret, status;
+ 
+     MMU_Base = NULL;
++    LutMemSize = 0;
++    LutStart = 0;
+ 
+     do {
+-        /* cal src buf mmu info */
+-        SrcMemSize = rga2_mem_size_cal(req->pat.yrgb_addr, req->pat.vir_w * req->pat.vir_h, &SrcStart);
+-        if(SrcMemSize == 0) {
+-            return -EINVAL;
++        /* cal lut buf mmu info */
++        if (req->mmu_info.els_mmu_flag & 1) {
++            req->mmu_info.src0_mmu_flag = req->mmu_info.src0_mmu_flag == 1 ? 0 : req->mmu_info.src0_mmu_flag;
++            req->mmu_info.src1_mmu_flag = req->mmu_info.src1_mmu_flag == 1 ? 0 : req->mmu_info.src1_mmu_flag;
++            req->mmu_info.dst_mmu_flag = req->mmu_info.dst_mmu_flag == 1 ? 0 : req->mmu_info.dst_mmu_flag;
++
++            LutMemSize = rga2_buf_size_cal(req->pat.yrgb_addr, req->pat.uv_addr, req->pat.v_addr,
++                                            req->pat.format, req->pat.vir_w, req->pat.vir_h,
++                                            &LutStart);
++            if(LutMemSize == 0) {
++                return -EINVAL;
++            }
+         }
+ 
+-        SrcMemSize = (SrcMemSize + 15) & (~15);
+-        AllSize = SrcMemSize;
++        LutMemSize = (LutMemSize + 15) & (~15);
++        AllSize = LutMemSize;
+ 
+         if (rga2_mmu_buf_get_try(&rga2_mmu_buf, AllSize)) {
+             pr_err("RGA2 Get MMU mem failed\n");
+@@ -884,16 +923,25 @@ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct
+             break;
+         }
+ 
++        pages = rga2_mmu_buf.pages;
++        if (pages == NULL) {
++            pr_err("RGA MMU malloc pages mem failed\n");
++            return -EINVAL;
++        }
++
+         mutex_lock(&rga2_service.lock);
+         MMU_Base = rga2_mmu_buf.buf_virtual + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
+         MMU_Base_phys = rga2_mmu_buf.buf + (rga2_mmu_buf.front & (rga2_mmu_buf.size - 1));
+         mutex_unlock(&rga2_service.lock);
+ 
+-        pages = kzalloc(AllSize * sizeof(struct page *), GFP_KERNEL);
+-
+-        if(SrcMemSize) {
+-		ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0],
+-					 SrcStart, SrcMemSize, 0);
++        if (LutMemSize) {
++            if (req->sg_els) {
++                ret = rga2_MapION(req->sg_els,
++                &MMU_Base[0], LutMemSize);
++            } else {
++                ret = rga2_MapUserMemory(&pages[0], &MMU_Base[0],
++                LutStart, LutMemSize, 0);
++            }
+             if (ret < 0) {
+                 pr_err("rga2 map palette memory failed\n");
+                 status = ret;
+@@ -901,7 +949,8 @@ static int rga2_mmu_info_update_palette_table_mode(struct rga2_reg *reg, struct
+             }
+ 
+             /* change the buf address in req struct */
+-            req->mmu_info.src0_base_addr = (((unsigned long)MMU_Base_phys));
++            req->mmu_info.els_base_addr = (((unsigned long)MMU_Base_phys));
++
+             req->pat.yrgb_addr = (req->pat.yrgb_addr & (~PAGE_MASK));
+         }
+ 
+diff --git a/drivers/video/rockchip/rga2/rga2_reg_info.c b/drivers/video/rockchip/rga2/rga2_reg_info.c
+index 94a42170bdd6..0d2962455b4d 100644
+--- a/drivers/video/rockchip/rga2/rga2_reg_info.c
++++ b/drivers/video/rockchip/rga2/rga2_reg_info.c
+@@ -957,6 +957,11 @@ static void format_name_convert(uint32_t *df, uint32_t sf)
+     RK_FORMAT_YCrCb_420_SP = 0xe,
+     RK_FORMAT_YCrCb_420_P  = 0xf,
+ 
++    RK_FORMAT_BPP1         = 0x10,
++    RK_FORMAT_BPP2         = 0x11,
++    RK_FORMAT_BPP4         = 0x12,
++    RK_FORMAT_BPP8         = 0x13,
++
+     RGA2_FORMAT_RGBA_8888    = 0x0,
+     RGA2_FORMAT_RGBX_8888    = 0x1,
+     RGA2_FORMAT_RGB_888      = 0x2,
+@@ -997,6 +1002,11 @@ static void format_name_convert(uint32_t *df, uint32_t sf)
+         case 0xe: *df = RGA2_FORMAT_YCrCb_420_SP; break;
+         case 0xf: *df = RGA2_FORMAT_YCrCb_420_P; break;
+ 
++        case 0x10: *df = RGA2_FORMAT_BPP_1; break;
++        case 0x11: *df = RGA2_FORMAT_BPP_2; break;
++        case 0x12: *df = RGA2_FORMAT_BPP_4; break;
++        case 0x13: *df = RGA2_FORMAT_BPP_8; break;
++
+ 	case 0x18: *df = RGA2_FORMAT_YVYU_422; break;
+ 	case 0x19: *df = RGA2_FORMAT_YVYU_420; break;
+ 	case 0x1a: *df = RGA2_FORMAT_VYUY_422; break;
+-- 
+2.35.3
+

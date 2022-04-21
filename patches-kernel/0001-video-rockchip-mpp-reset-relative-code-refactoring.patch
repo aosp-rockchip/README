@@ -1,0 +1,566 @@
+From ae6f03a436100cb61e638c77a157ddf799dbc855 Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Thu, 28 May 2020 17:03:50 +0800
+Subject: [PATCH] video: rockchip: mpp: reset relative code refactoring
+
+tips:
+1. it should not use reset->rw_sem when reset is not shared.
+2. if hardware is combo, and work is time sharing, which
+   reset_group in the same taskqueue, the reset->rw_sem
+   is also should turn off.
+
+Change-Id: I9d89e3118997cc8d1871ac77799faf85043743d3
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c  | 122 ++++++++---------------
+ drivers/video/rockchip/mpp/mpp_common.h  |  63 ++++++++++--
+ drivers/video/rockchip/mpp/mpp_iep2.c    |  18 ++--
+ drivers/video/rockchip/mpp/mpp_rkvdec.c  |  45 +++------
+ drivers/video/rockchip/mpp/mpp_rkvenc.c  |  22 ++--
+ drivers/video/rockchip/mpp/mpp_service.c |   2 +-
+ drivers/video/rockchip/mpp/mpp_vdpu1.c   |  13 +--
+ drivers/video/rockchip/mpp/mpp_vdpu2.c   |  13 +--
+ drivers/video/rockchip/mpp/mpp_vepu1.c   |  13 +--
+ drivers/video/rockchip/mpp/mpp_vepu2.c   |  13 +--
+ 10 files changed, 144 insertions(+), 180 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index e169fa0493b8..d8d8f081569d 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -317,7 +317,7 @@ static void mpp_task_timeout_work(struct work_struct *work_s)
+ 	mpp = session->mpp;
+ 
+ 	/* hardware maybe dead, reset it */
+-	up_read(&mpp->reset_group->rw_sem);
++	mpp_reset_up_read(mpp->reset_group);
+ 	mpp_dev_reset(mpp);
+ 	mpp_power_off(mpp);
+ 
+@@ -395,83 +395,54 @@ static int mpp_refresh_pm_runtime(struct mpp_iommu_info *info,
+ }
+ 
+ struct reset_control *
+-mpp_reset_control_get(struct mpp_dev *mpp, const char *name)
++mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char *name)
+ {
+-	struct mpp_reset_clk *rst_clk = NULL, *n;
+-	struct reset_control *clk = NULL;
+-	struct device *dev = mpp->dev;
+-	char shared_name[30] = "shared_";
+-	int index = 0;
+-	int clk_cnt = 0, i = 0;
+-	static const char * const clk_list[] = {
+-		"video_a", "video_h",
+-		"niu_a", "niu_h",
+-		"video_cabac", "video_core",
+-		"video_hevc_cabac",
+-	};
+-
+-	if (!name) {
+-		mpp_err("error: reset clk name is null\n");
+-		return NULL;
+-	}
++	int index;
++	struct reset_control *rst = NULL;
++	char shared_name[32] = "shared_";
++	struct mpp_reset_group *group;
+ 
+-	clk_cnt = ARRAY_SIZE(clk_list);
+-	for (i = 0; i < clk_cnt; i++) {
+-		if (!strcmp(clk_list[i], name))
+-			break;
++	/* check reset whether belone to device alone */
++	index = of_property_match_string(mpp->dev->of_node, "reset-names", name);
++	if (index >= 0) {
++		rst = devm_reset_control_get(mpp->dev, name);
++		mpp_safe_unreset(rst);
++
++		return rst;
+ 	}
+-	if (i == clk_cnt) {
+-		mpp_err("error: reset clk name is error\n");
++
++	/* check reset whether is shared */
++	strncat(shared_name, name,
++		sizeof(shared_name) - strlen(shared_name) - 1);
++	index = of_property_match_string(mpp->dev->of_node,
++					 "reset-names", shared_name);
++	if (index < 0) {
++		dev_err(mpp->dev, "%s is not found!\n", shared_name);
+ 		return NULL;
+ 	}
+ 
+-	if (!dev) {
+-		mpp_err("error: dev is null\n");
++	if (!mpp->reset_group) {
++		dev_err(mpp->dev, "reset group is empty!\n");
+ 		return NULL;
+ 	}
++	group = mpp->reset_group;
+ 
+-	/* not shared reset clk */
+-	index = of_property_match_string(dev->of_node, "reset-names", name);
+-	if (index >= 0) {
+-		clk = devm_reset_control_get(dev, name);
+-		return clk;
+-	}
+-
+-	/* shared reset clk */
+-	strncat(shared_name, name,
+-		sizeof(shared_name) - strlen(shared_name) - 1);
+-	index = of_property_match_string(dev->of_node, "reset-names",
+-					 shared_name);
+-	if (index >= 0) {
+-		down_write(&mpp->reset_group->rw_sem);
+-		list_for_each_entry_safe(rst_clk, n,
+-					 &mpp->reset_group->clk, link) {
+-			if (!strcmp(rst_clk->name, name)) {
+-				clk = rst_clk->clk;
+-				break;
+-			}
+-		}
+-		if (!clk) {
+-			rst_clk = devm_kzalloc(dev, sizeof(*rst_clk),
+-					       GFP_KERNEL);
+-			strncpy(rst_clk->name, name, sizeof(rst_clk->name));
+-			rst_clk->clk = devm_reset_control_get(dev,
+-							      shared_name);
+-			if (IS_ERR_OR_NULL(rst_clk->clk))
+-				goto fail;
+-
+-			INIT_LIST_HEAD(&rst_clk->link);
+-			list_add_tail(&rst_clk->link, &mpp->reset_group->clk);
+-			clk = rst_clk->clk;
+-		}
+-		up_write(&mpp->reset_group->rw_sem);
++	down_write(&group->rw_sem);
++	rst = group->resets[type];
++	if (!rst) {
++		rst = devm_reset_control_get(mpp->dev, shared_name);
++		mpp_safe_unreset(rst);
++		group->resets[type] = rst;
++		group->queue = mpp->queue;
+ 	}
++	/* if reset not in the same queue, it means different device
++	 * may reset in the same time, then rw_sem_on should set true.
++	 */
++	group->rw_sem_on |= (group->queue != mpp->queue) ? true : false;
++	dev_info(mpp->dev, "reset_group->rw_sem_on=%d\n", group->rw_sem_on);
++	up_write(&group->rw_sem);
+ 
+-	return clk;
+-fail:
+-	devm_kfree(dev, rst_clk);
+-	up_write(&mpp->reset_group->rw_sem);
+-	return NULL;
++	return rst;
+ }
+ 
+ int mpp_dev_reset(struct mpp_dev *mpp)
+@@ -491,7 +462,7 @@ int mpp_dev_reset(struct mpp_dev *mpp)
+ 		mpp->hw_ops->reduce_freq(mpp);
+ 	/* FIXME lock resource lock of the other devices in combo */
+ 	down_write(&mpp->iommu_info->rw_sem);
+-	down_write(&mpp->reset_group->rw_sem);
++	mpp_reset_down_write(mpp->reset_group);
+ 	atomic_set(&mpp->reset_request, 0);
+ 	mpp_iommu_detach(mpp->iommu_info);
+ 
+@@ -507,7 +478,7 @@ int mpp_dev_reset(struct mpp_dev *mpp)
+ 	mpp_refresh_pm_runtime(mpp->iommu_info, mpp->dev);
+ 
+ 	mpp_iommu_attach(mpp->iommu_info);
+-	up_write(&mpp->reset_group->rw_sem);
++	mpp_reset_up_write(mpp->reset_group);
+ 	up_write(&mpp->iommu_info->rw_sem);
+ 
+ 	dev_info(mpp->dev, "reset done\n");
+@@ -556,7 +527,7 @@ static int mpp_task_run(struct mpp_dev *mpp,
+ 	 * TODO: Lock the reader locker of the device resource lock here,
+ 	 * release at the finish operation
+ 	 */
+-	down_read(&mpp->reset_group->rw_sem);
++	mpp_reset_down_read(mpp->reset_group);
+ 
+ 	set_bit(TASK_STATE_START, &task->state);
+ 	schedule_delayed_work(&task->timeout_work,
+@@ -801,15 +772,6 @@ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+ 	return 0;
+ }
+ 
+-int mpp_reset_group_init(struct mpp_reset_group *group,
+-			 struct mpp_service *srv)
+-{
+-	init_rwsem(&group->rw_sem);
+-	INIT_LIST_HEAD(&group->clk);
+-
+-	return 0;
+-}
+-
+ static int mpp_check_cmd_v1(__u32 cmd)
+ {
+ 	int ret;
+@@ -1423,7 +1385,7 @@ int mpp_task_finish(struct mpp_session *session,
+ 	if (mpp->dev_ops->finish)
+ 		mpp->dev_ops->finish(mpp, task);
+ 
+-	up_read(&mpp->reset_group->rw_sem);
++	mpp_reset_up_read(mpp->reset_group);
+ 	if (atomic_read(&mpp->reset_request) > 0)
+ 		mpp_dev_reset(mpp);
+ 	mpp_power_off(mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index 50ea396b6b3e..d1aa2c572cc1 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -111,6 +111,18 @@ enum MPP_CLOCK_MODE {
+ 	CLK_MODE_BUTT,
+ };
+ 
++enum MPP_RESET_TYPE {
++	RST_TYPE_BASE		= 0,
++	RST_TYPE_A		= RST_TYPE_BASE,
++	RST_TYPE_H,
++	RST_TYPE_NIU_A,
++	RST_TYPE_NIU_H,
++	RST_TYPE_CORE,
++	RST_TYPE_CABAC,
++	RST_TYPE_HEVC_CABAC,
++	RST_TYPE_BUTT,
++};
++
+ /* data common struct for parse out */
+ struct mpp_request {
+ 	__u32 cmd;
+@@ -324,15 +336,13 @@ struct mpp_taskqueue {
+ 	struct list_head mmu_list;
+ };
+ 
+-struct mpp_reset_clk {
+-	struct list_head link;
+-	struct reset_control *clk;
+-	char name[20];
+-};
+-
+ struct mpp_reset_group {
++	/* the flag for whether use rw_sem */
++	u32 rw_sem_on;
+ 	struct rw_semaphore rw_sem;
+-	struct list_head clk;
++	struct reset_control *resets[RST_TYPE_BUTT];
++	/* for set rw_sem */
++	struct mpp_taskqueue *queue;
+ };
+ 
+ struct mpp_service {
+@@ -416,8 +426,6 @@ struct mpp_dev_ops {
+ 
+ int mpp_taskqueue_init(struct mpp_taskqueue *queue,
+ 		       struct mpp_service *srv);
+-int mpp_reset_group_init(struct mpp_reset_group *group,
+-			 struct mpp_service *srv);
+ 
+ struct mpp_mem_region *
+ mpp_task_attach_fd(struct mpp_task *task, int fd);
+@@ -454,8 +462,9 @@ int mpp_dev_reset(struct mpp_dev *mpp);
+ irqreturn_t mpp_dev_irq(int irq, void *param);
+ irqreturn_t mpp_dev_isr_sched(int irq, void *param);
+ 
+-struct reset_control *
+-mpp_reset_control_get(struct mpp_dev *mpp, const char *name);
++struct reset_control *mpp_reset_control_get(struct mpp_dev *mpp,
++					    enum MPP_RESET_TYPE type,
++					    const char *name);
+ 
+ u32 mpp_get_grf(struct mpp_grf_info *grf_info);
+ int mpp_set_grf(struct mpp_grf_info *grf_info);
+@@ -557,6 +566,38 @@ static inline int mpp_clk_safe_disable(struct clk *clk)
+ 	return 0;
+ }
+ 
++static inline int mpp_reset_down_read(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		down_read(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_up_read(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		up_read(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_down_write(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		down_write(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_up_write(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		up_write(&group->rw_sem);
++
++	return 0;
++}
++
+ /* workaround according hardware */
+ int px30_workaround_combo_init(struct mpp_dev *mpp);
+ int px30_workaround_combo_switch_grf(struct mpp_dev *mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_iep2.c b/drivers/video/rockchip/mpp/mpp_iep2.c
+index bc56ae3dd68d..02affcb2ed3a 100644
+--- a/drivers/video/rockchip/mpp/mpp_iep2.c
++++ b/drivers/video/rockchip/mpp/mpp_iep2.c
+@@ -822,21 +822,15 @@ static int iep2_init(struct mpp_dev *mpp)
+ 	/* Set default rates */
+ 	mpp_set_clk_info_rate_hz(&iep->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	iep->rst_a = devm_reset_control_get(mpp->dev, "rst_a");
+-	if (IS_ERR_OR_NULL(iep->rst_a)) {
++	iep->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "rst_a");
++	if (!iep->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		iep->rst_a = NULL;
+-	}
+-	iep->rst_h = devm_reset_control_get(mpp->dev, "rst_h");
+-	if (IS_ERR_OR_NULL(iep->rst_h)) {
++	iep->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "rst_h");
++	if (!iep->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		iep->rst_h = NULL;
+-	}
+-	iep->rst_s = devm_reset_control_get(mpp->dev, "rst_s");
+-	if (IS_ERR_OR_NULL(iep->rst_h)) {
++	iep->rst_s = mpp_reset_control_get(mpp, RST_TYPE_CORE, "rst_s");
++	if (!iep->rst_s)
+ 		mpp_err("No sclk reset resource define\n");
+-		iep->rst_s = NULL;
+-	}
+ 
+ 	iep->roi.size = IEP2_TILE_W_MAX * IEP2_TILE_H_MAX;
+ 	iep->roi.vaddr = dma_alloc_coherent(mpp->dev, iep->roi.size,
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index 3f0efb47240d..e456c6d45039 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -1182,41 +1182,28 @@ static int rkvdec_init(struct mpp_dev *mpp)
+ 	mpp_set_clk_info_rate_hz(&dec->cabac_clk_info, CLK_MODE_DEFAULT, 200 * MHZ);
+ 	mpp_set_clk_info_rate_hz(&dec->hevc_cabac_clk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+-	if (IS_ERR_OR_NULL(dec->rst_a)) {
++	/* Get reset control from dtsi */
++	dec->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!dec->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		dec->rst_a = NULL;
+-	}
+-	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+-	if (IS_ERR_OR_NULL(dec->rst_h)) {
++	dec->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!dec->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		dec->rst_h = NULL;
+-	}
+-	dec->rst_niu_a = mpp_reset_control_get(mpp, "niu_a");
+-	if (IS_ERR_OR_NULL(dec->rst_niu_a)) {
++	dec->rst_niu_a = mpp_reset_control_get(mpp, RST_TYPE_NIU_A, "niu_a");
++	if (!dec->rst_niu_a)
+ 		mpp_err("No niu aclk reset resource define\n");
+-		dec->rst_niu_a = NULL;
+-	}
+-	dec->rst_niu_h = mpp_reset_control_get(mpp, "niu_h");
+-	if (IS_ERR_OR_NULL(dec->rst_niu_h)) {
++	dec->rst_niu_h = mpp_reset_control_get(mpp, RST_TYPE_NIU_H, "niu_h");
++	if (!dec->rst_niu_h)
+ 		mpp_err("No niu hclk reset resource define\n");
+-		dec->rst_niu_h = NULL;
+-	}
+-	dec->rst_cabac = mpp_reset_control_get(mpp, "video_cabac");
+-	if (IS_ERR_OR_NULL(dec->rst_cabac)) {
+-		mpp_err("No cabac reset resource define\n");
+-		dec->rst_cabac = NULL;
+-	}
+-	dec->rst_core = mpp_reset_control_get(mpp, "video_core");
+-	if (IS_ERR_OR_NULL(dec->rst_core)) {
++	dec->rst_core = mpp_reset_control_get(mpp, RST_TYPE_CORE, "video_core");
++	if (!dec->rst_core)
+ 		mpp_err("No core reset resource define\n");
+-		dec->rst_core = NULL;
+-	}
+-	dec->rst_hevc_cabac = mpp_reset_control_get(mpp, "video_hevc_cabac");
+-	if (IS_ERR_OR_NULL(dec->rst_hevc_cabac)) {
++	dec->rst_cabac = mpp_reset_control_get(mpp, RST_TYPE_CABAC, "video_cabac");
++	if (!dec->rst_cabac)
++		mpp_err("No cabac reset resource define\n");
++	dec->rst_hevc_cabac = mpp_reset_control_get(mpp, RST_TYPE_HEVC_CABAC, "video_hevc_cabac");
++	if (!dec->rst_hevc_cabac)
+ 		mpp_err("No hevc cabac reset resource define\n");
+-		dec->rst_hevc_cabac = NULL;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 7a6116b30d81..727055b043fe 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -869,24 +869,16 @@ static int rkvenc_init(struct mpp_dev *mpp)
+ 	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 	mpp_set_clk_info_rate_hz(&enc->core_clk_info, CLK_MODE_DEFAULT, 600 * MHZ);
+ 
+-	enc->rst_a = devm_reset_control_get_shared(mpp->dev, "video_a");
+-	if (IS_ERR_OR_NULL(enc->rst_a)) {
++	/* Get reset control from dtsi */
++	enc->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!enc->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		enc->rst_a = NULL;
+-	}
+-	enc->rst_h = devm_reset_control_get_shared(mpp->dev, "video_h");
+-	if (IS_ERR_OR_NULL(enc->rst_h)) {
++	enc->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!enc->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		enc->rst_h = NULL;
+-	}
+-	enc->rst_core = devm_reset_control_get_shared(mpp->dev, "video_core");
+-	if (IS_ERR_OR_NULL(enc->rst_core)) {
++	enc->rst_core = mpp_reset_control_get(mpp, RST_TYPE_CORE, "video_core");
++	if (!enc->rst_core)
+ 		mpp_err("No core reset resource define\n");
+-		enc->rst_core = NULL;
+-	}
+-	mpp_safe_unreset(enc->rst_a);
+-	mpp_safe_unreset(enc->rst_h);
+-	mpp_safe_unreset(enc->rst_core);
+ 
+ #ifdef CONFIG_PM_DEVFREQ
+ 	ret = rkvenc_devfreq_init(mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_service.c b/drivers/video/rockchip/mpp/mpp_service.c
+index d6d34c5180ce..46c96b43194b 100644
+--- a/drivers/video/rockchip/mpp/mpp_service.c
++++ b/drivers/video/rockchip/mpp/mpp_service.c
+@@ -229,7 +229,7 @@ static int mpp_service_probe(struct platform_device *pdev)
+ 			if (!group)
+ 				continue;
+ 
+-			mpp_reset_group_init(group, srv);
++			init_rwsem(&group->rw_sem);
+ 			srv->reset_groups[i] = group;
+ 		}
+ 	}
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu1.c b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+index 184f26cc6810..8587c050be05 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+@@ -545,16 +545,13 @@ static int vdpu_init(struct mpp_dev *mpp)
+ 	/* Set default rates */
+ 	mpp_set_clk_info_rate_hz(&dec->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+-	if (IS_ERR_OR_NULL(dec->rst_a)) {
++	/* Get reset control from dtsi */
++	dec->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!dec->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		dec->rst_a = NULL;
+-	}
+-	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+-	if (IS_ERR_OR_NULL(dec->rst_h)) {
++	dec->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!dec->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		dec->rst_h = NULL;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu2.c b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+index 00a1c10815f0..7c51573231ad 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+@@ -498,16 +498,13 @@ static int vdpu_init(struct mpp_dev *mpp)
+ 	/* Set default rates */
+ 	mpp_set_clk_info_rate_hz(&dec->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+-	if (IS_ERR_OR_NULL(dec->rst_a)) {
++	/* Get reset control from dtsi */
++	dec->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!dec->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		dec->rst_a = NULL;
+-	}
+-	dec->rst_h = mpp_reset_control_get(mpp, "video_h");
+-	if (IS_ERR_OR_NULL(dec->rst_h)) {
++	dec->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!dec->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		dec->rst_h = NULL;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu1.c b/drivers/video/rockchip/mpp/mpp_vepu1.c
+index 6c8cc126e41e..de3bcfd258a4 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu1.c
+@@ -452,16 +452,13 @@ static int vepu_init(struct mpp_dev *mpp)
+ 	/* Set default rates */
+ 	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+-	if (IS_ERR_OR_NULL(enc->rst_a)) {
++	/* Get reset control from dtsi */
++	enc->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!enc->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		enc->rst_a = NULL;
+-	}
+-	enc->rst_h = mpp_reset_control_get(mpp, "video_h");
+-	if (IS_ERR_OR_NULL(enc->rst_h)) {
++	enc->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!enc->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		enc->rst_h = NULL;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index 006c32554866..72e942a0f046 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -464,16 +464,13 @@ static int vepu_init(struct mpp_dev *mpp)
+ 	/* Set default rates */
+ 	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+-	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+-	if (IS_ERR_OR_NULL(enc->rst_a)) {
++	/* Get reset control from dtsi */
++	enc->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "video_a");
++	if (!enc->rst_a)
+ 		mpp_err("No aclk reset resource define\n");
+-		enc->rst_a = NULL;
+-	}
+-	enc->rst_h = mpp_reset_control_get(mpp, "video_h");
+-	if (IS_ERR_OR_NULL(enc->rst_h)) {
++	enc->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "video_h");
++	if (!enc->rst_h)
+ 		mpp_err("No hclk reset resource define\n");
+-		enc->rst_h = NULL;
+-	}
+ 
+ 	return 0;
+ }
+-- 
+2.35.3
+

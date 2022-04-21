@@ -1,0 +1,277 @@
+From e41861ca07c04abc523fa54beae4ef33d1e7e0d6 Mon Sep 17 00:00:00 2001
+From: Alex Zhao <zzc@rock-chips.com>
+Date: Wed, 13 Jan 2021 08:38:32 +0000
+Subject: [PATCH] net: rfkill: rk: add wifi/bt main power control
+
+Signed-off-by: Alex Zhao <zzc@rock-chips.com>
+Change-Id: I56e106056fc2a6e0b8ec4460eb2e90ffa56dfbfa
+---
+ include/linux/rfkill-wlan.h |   4 +-
+ net/rfkill/rfkill-bt.c      |  30 +++++++---
+ net/rfkill/rfkill-wlan.c    | 113 +++++++++++++++++++++++++++++++-----
+ 3 files changed, 122 insertions(+), 25 deletions(-)
+
+diff --git a/include/linux/rfkill-wlan.h b/include/linux/rfkill-wlan.h
+index 5e00f8808e6f..431e71a7a844 100644
+--- a/include/linux/rfkill-wlan.h
++++ b/include/linux/rfkill-wlan.h
+@@ -46,9 +46,9 @@ struct rksdmmc_gpio_wifi_moudle {
+ 	struct clk *ext_clk;
+ };
+ 
+-int rfkill_get_wifi_power_state(int *power, int *vref_ctrl_enable);
++int rfkill_get_wifi_power_state(int *power);
+ void *rockchip_mem_prealloc(int section, unsigned long size);
+-int rockchip_wifi_ref_voltage(int on);
++int rfkill_set_wifi_bt_power(int on);
+ int rockchip_wifi_power(int on);
+ int rockchip_wifi_set_carddetect(int val);
+ int rockchip_wifi_get_oob_irq(void);
+diff --git a/net/rfkill/rfkill-bt.c b/net/rfkill/rfkill-bt.c
+index 85299bdf77eb..2b9be2085441 100644
+--- a/net/rfkill/rfkill-bt.c
++++ b/net/rfkill/rfkill-bt.c
+@@ -284,7 +284,7 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+ 	struct rfkill_rk_gpio *reset = &rfkill->pdata->reset_gpio;
+ 	struct rfkill_rk_gpio *rts = &rfkill->pdata->rts_gpio;
+ 	struct pinctrl *pinctrl = rfkill->pdata->pinctrl;
+-	int power = 0, vref_ctrl_enable = 0;
++	int wifi_power = 0;
+ 	bool toggle = false;
+ 
+ 	DBG("Enter %s\n", __func__);
+@@ -292,18 +292,22 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+ 	DBG("Set blocked:%d\n", blocked);
+ 
+ 	toggle = rfkill->pdata->power_toggle;
+-	if (!rfkill_get_wifi_power_state(&power, &vref_ctrl_enable)) {
+-		if (toggle && 1 == power) {
+-			LOG("%s: bt shouldn't control the power\n",
+-			    __func__);
+-			return 0;
++
++	if (toggle) {
++		if (rfkill_get_wifi_power_state(&wifi_power)) {
++			LOG("%s: cannot get wifi power state!\n", __func__);
++			return -1;
+ 		}
+-	} else {
+-		LOG("%s: cannot get wifi power state!\n", __func__);
+-		return -1;
+ 	}
+ 
++	DBG("%s: toggle = %s\n", __func__, toggle ? "true" : "false");
++
+ 	if (!blocked) {
++		if (toggle) {
++			rfkill_set_wifi_bt_power(1);
++			msleep(100);
++		}
++
+ 		rfkill_rk_sleep_bt(BT_WAKEUP); // ensure bt is wakeup
+ 
+ 		if (gpio_is_valid(wake_host->io)) {
+@@ -365,6 +369,14 @@ static int rfkill_rk_set_power(void *data, bool blocked)
+ 				msleep(20);
+ 			}
+ 		}
++		if (toggle) {
++			if (!wifi_power) {
++				LOG("%s: bt will set vbat to low\n", __func__);
++				rfkill_set_wifi_bt_power(0);
++			} else {
++				LOG("%s: bt shouldn't control the vbat\n", __func__);
++			}
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/net/rfkill/rfkill-wlan.c b/net/rfkill/rfkill-wlan.c
+index 45e524052ee4..a4e326e9b342 100644
+--- a/net/rfkill/rfkill-wlan.c
++++ b/net/rfkill/rfkill-wlan.c
+@@ -63,6 +63,8 @@ struct rfkill_wlan_data {
+ 
+ static struct rfkill_wlan_data *g_rfkill = NULL;
+ static int power_set_time = 0;
++static int wifi_bt_vbat_state;
++static int wifi_power_state;
+ 
+ static const char wlan_name[] = "rkwifi";
+ 
+@@ -170,13 +172,37 @@ void *rockchip_mem_prealloc(int section, unsigned long size)
+ #endif
+ EXPORT_SYMBOL(rockchip_mem_prealloc);
+ 
++int rfkill_set_wifi_bt_power(int on)
++{
++	struct rfkill_wlan_data *mrfkill = g_rfkill;
++	struct rksdmmc_gpio *vbat;
++
++	LOG("%s: %d\n", __func__, on);
++
++	if (!mrfkill) {
++		LOG("%s: rfkill-wlan driver has not Successful initialized\n",
++		    __func__);
++		return -1;
++	}
++
++	vbat = &mrfkill->pdata->vbat_n;
++	if (on) {
++		if (gpio_is_valid(vbat->io))
++			gpio_direction_output(vbat->io, vbat->enable);
++	} else {
++		if (gpio_is_valid(vbat->io))
++			gpio_direction_output(vbat->io, !(vbat->enable));
++	}
++	wifi_bt_vbat_state = on;
++	return 0;
++}
++
+ /**************************************************************************
+  *
+  * get wifi power state Func
+  *
+  *************************************************************************/
+-static int wifi_power_state = 0;
+-int rfkill_get_wifi_power_state(int *power, int *vref_ctrl_enable)
++int rfkill_get_wifi_power_state(int *power)
+ {
+ 	struct rfkill_wlan_data *mrfkill = g_rfkill;
+ 
+@@ -203,7 +229,7 @@ int rockchip_wifi_power(int on)
+ 	struct rfkill_wlan_data *mrfkill = g_rfkill;
+ 	struct rksdmmc_gpio *poweron, *reset;
+ 	struct regulator *ldo = NULL;
+-	int power = 0;
++	int bt_power = 0;
+ 	bool toggle = false;
+ 
+ 	LOG("%s: %d\n", __func__, on);
+@@ -223,12 +249,8 @@ int rockchip_wifi_power(int on)
+ 	}
+ 	power_set_time++;
+ 
+-	if (!rfkill_get_bt_power_state(&power, &toggle)) {
+-		if (toggle && power == 1) {
+-			LOG("%s: wifi shouldn't control the power\n",
+-			    __func__);
+-			return 0;
+-		}
++	if (!rfkill_get_bt_power_state(&bt_power, &toggle)) {
++		LOG("%s: toggle = %s\n", __func__, toggle ? "true" : "false");
+ 	}
+ 
+ 	if (mrfkill->pdata->mregulator.power_ctrl_by_pmu) {
+@@ -265,6 +287,11 @@ int rockchip_wifi_power(int on)
+ 		reset = &mrfkill->pdata->reset_n;
+ 
+ 		if (on) {
++			if (toggle) {
++				rfkill_set_wifi_bt_power(1);
++				msleep(100);
++			}
++
+ 			if (gpio_is_valid(poweron->io)) {
+ 				gpio_direction_output(poweron->io, poweron->enable);
+ 				msleep(100);
+@@ -289,6 +316,14 @@ int rockchip_wifi_power(int on)
+ 			}
+ 
+ 			wifi_power_state = 0;
++			if (toggle) {
++				if (!bt_power) {
++					LOG("%s: wifi will set vbat to low\n", __func__);
++					rfkill_set_wifi_bt_power(0);
++				} else {
++					LOG("%s: wifi shouldn't control the vbat\n", __func__);
++				}
++			}
+ 			LOG("wifi shut off power [GPIO%d-%d]\n", poweron->io, !poweron->enable);
+ 		}
+ 	}
+@@ -698,7 +733,12 @@ static struct notifier_block rfkill_wlan_fb_notifier = {
+ 	.notifier_call = rfkill_wlan_fb_event_notify,
+ };
+ 
+-static ssize_t wifi_power_write_store(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
++static ssize_t wifi_power_show(struct class *cls, struct class_attribute *attr, char *_buf)
++{
++	return sprintf(_buf, "%d\n", wifi_power_state);
++}
++
++static ssize_t wifi_power_store(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
+ {
+ 	long poweren = 0;
+ 
+@@ -715,9 +755,55 @@ static ssize_t wifi_power_write_store(struct class *cls, struct class_attribute
+ 	return _count;
+ }
+ 
+-static CLASS_ATTR_WO(wifi_power_write);
++static CLASS_ATTR_RW(wifi_power);
++
++static ssize_t wifi_bt_vbat_show(struct class *cls, struct class_attribute *attr, char *_buf)
++{
++	return sprintf(_buf, "%d\n", wifi_bt_vbat_state);
++}
++
++static ssize_t wifi_bt_vbat_store(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
++{
++	long vbat = 0;
++
++	if (kstrtol(_buf, 10, &vbat) < 0)
++		return -EINVAL;
++
++	LOG("%s: vbat = %ld\n", __func__, vbat);
++
++	if (vbat > 0)
++		rfkill_set_wifi_bt_power(1);
++	else
++		rfkill_set_wifi_bt_power(0);
++
++	return _count;
++}
++
++static CLASS_ATTR_RW(wifi_bt_vbat);
++
++static ssize_t wifi_set_carddetect_store(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
++{
++	long val = 0;
++
++	if (kstrtol(_buf, 10, &val) < 0)
++		return -EINVAL;
++
++	LOG("%s: val = %ld\n", __func__, val);
++
++	if (val > 0)
++		rockchip_wifi_set_carddetect(1);
++	else
++		rockchip_wifi_set_carddetect(0);
++
++	return _count;
++}
++
++static CLASS_ATTR_WO(wifi_set_carddetect);
++
+ static struct attribute *rkwifi_power_attrs[] = {
+-	&class_attr_wifi_power_write.attr,
++	&class_attr_wifi_power.attr,
++	&class_attr_wifi_bt_vbat.attr,
++	&class_attr_wifi_set_carddetect.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(rkwifi_power);
+@@ -783,8 +869,7 @@ static int rfkill_wlan_probe(struct platform_device *pdev)
+ 	wake_lock_init(&rfkill->wlan_irq_wl, WAKE_LOCK_SUSPEND,
+ 		       "rfkill_wlan_wake");
+ 
+-	if (gpio_is_valid(pdata->vbat_n.io))
+-		gpio_direction_output(pdata->vbat_n.io, pdata->vbat_n.enable);
++	rfkill_set_wifi_bt_power(1);
+ 
+ #ifdef CONFIG_SDIO_KEEPALIVE
+ 	if (primary_sdio_host && primary_sdio_host->support_chip_alive)
+-- 
+2.35.3
+

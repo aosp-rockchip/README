@@ -1,0 +1,131 @@
+From 6a874737c200772c5446447e8a6d903041bb0a82 Mon Sep 17 00:00:00 2001
+From: xbw <xbw@rock-chips.com>
+Date: Thu, 8 May 2014 18:36:21 +0800
+Subject: [PATCH] SDMMC: modify the crash bug in suspend-rusume process when
+ the sdcard is present in your machine.
+
+---
+ arch/arm/boot/dts/rk3288.dtsi |  1 +
+ drivers/mmc/host/rk_sdmmc.c   | 38 +++++++++++++++++++++++++++++++++--
+ drivers/mmc/host/rk_sdmmc.h   |  2 +-
+ 3 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm/boot/dts/rk3288.dtsi b/arch/arm/boot/dts/rk3288.dtsi
+index 7e16ec221367..ff5d7e5fd3de 100755
+--- a/arch/arm/boot/dts/rk3288.dtsi
++++ b/arch/arm/boot/dts/rk3288.dtsi
+@@ -283,6 +283,7 @@
+ 		pinctrl-names = "default", "idle";
+ 		pinctrl-0 = <&sdmmc0_clk &sdmmc0_cmd &sdmmc0_dectn &sdmmc0_bus4>;
+ 		pinctrl-1 = <&sdmmc0_gpio>;
++	        cd-gpios = <&gpio6 GPIO_C6 GPIO_ACTIVE_HIGH>;/*CD GPIO*/
+ 		clocks = <&clk_sdmmc>, <&clk_gates8 3>;
+ 		clock-names = "clk_mmc", "hclk_mmc";
+ 		num-slots = <1>;
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index 680df561759a..4bfbd77c4952 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -2401,6 +2401,7 @@ static irqreturn_t dw_mci_interrupt(int irq, void *dev_id)
+ 
+ 		if (pending & SDMMC_INT_CD) {
+ 			mci_writel(host, RINTSTS, SDMMC_INT_CD);
++			rk_send_wakeup_key();//wake up system
+ 			queue_work(host->card_workqueue, &host->card_work);
+ 		}
+ 
+@@ -2640,7 +2641,7 @@ static int dw_mci_of_get_wp_gpio(struct device *dev, u8 slot)
+ static void dw_mci_of_get_cd_gpio(struct device *dev, u8 slot,
+ 					struct mmc_host *mmc)
+ {
+-	struct device_node *np = dw_mci_of_find_slot_node(dev, slot);
++	struct device_node *np = dev->of_node;//dw_mci_of_find_slot_node(dev, slot);
+ 	int gpio;
+ 
+ 	if (!np)
+@@ -2786,6 +2787,8 @@ static int dw_mci_init_slot(struct dw_mci *host, unsigned int id)
+ 		mmc->caps |= MMC_CAP_POWER_OFF_CARD;
+ 	if (of_find_property(host->dev->of_node, "cap-sdio-irq", NULL))
+ 		mmc->caps |= MMC_CAP_SDIO_IRQ;
++	if (of_find_property(host->dev->of_node, "poll-hw-reset", NULL))
++		mmc->caps |= MMC_CAP_HW_RESET;
+ 	if (of_find_property(host->dev->of_node, "full-pwr-cycle", NULL))
+ 		mmc->caps2 |= MMC_CAP2_FULL_PWR_CYCLE;
+ 	if (of_find_property(host->dev->of_node, "keep-power-in-suspend", NULL))
+@@ -2851,7 +2854,6 @@ static int dw_mci_init_slot(struct dw_mci *host, unsigned int id)
+     }
+     
+ 	slot->wp_gpio = dw_mci_of_get_wp_gpio(host->dev, slot->id);
+-	dw_mci_of_get_cd_gpio(host->dev, slot->id, mmc);
+ 	
+     if (mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
+         clear_bit(DW_MMC_CARD_PRESENT, &slot->flags);
+@@ -2870,6 +2872,15 @@ static int dw_mci_init_slot(struct dw_mci *host, unsigned int id)
+             printk("%s: Warning : No pinctrl used!\n",mmc_hostname(host->mmc));
+         else
+         {
++            host->pins_idle= pinctrl_lookup_state(host->pinctrl,PINCTRL_STATE_IDLE);
++            if(IS_ERR(host->pins_default))
++                printk("%s: Warning : No IDLE pinctrl matched!\n", mmc_hostname(host->mmc));
++            else
++            { 
++                if(pinctrl_select_state(host->pinctrl, host->pins_idle) < 0)
++                    printk("%s: Warning :  Idle pinctrl setting failed!\n", mmc_hostname(host->mmc));  
++            }
++        
+             host->pins_default = pinctrl_lookup_state(host->pinctrl,PINCTRL_STATE_DEFAULT);
+             if(IS_ERR(host->pins_default))
+                 printk("%s: Warning : No default pinctrl matched!\n", mmc_hostname(host->mmc));
+@@ -3369,6 +3380,16 @@ int dw_mci_suspend(struct dw_mci *host)
+ 	if (host->vmmc)
+ 		regulator_disable(host->vmmc);
+ 
++	/*only for sdmmc controller*/
++	if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD) {
++	    disable_irq(host->irq);
++	    
++	    if(pinctrl_select_state(host->pinctrl, host->pins_idle) < 0)
++		    printk("%s: Warning :  Idle pinctrl setting failed!\n", mmc_hostname(host->mmc));  
++	    dw_mci_of_get_cd_gpio(host->dev,0,host->mmc);
++	    
++	    enable_irq_wake(host->mmc->slot.cd_irq);
++    }
+ 	return 0;
+ }
+ EXPORT_SYMBOL(dw_mci_suspend);
+@@ -3421,6 +3442,19 @@ int dw_mci_resume(struct dw_mci *host)
+ 			dw_mci_setup_bus(slot, true);
+ 		}
+ 	}
++	
++	/*only for sdmmc controller*/
++	if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD) {
++	    disable_irq_wake(host->mmc->slot.cd_irq);
++
++	    mmc_gpio_free_cd(host->mmc);
++	    if(pinctrl_select_state(host->pinctrl, host->pins_default) < 0)
++		    printk("%s: Warning :  Default pinctrl setting failed!\n", mmc_hostname(host->mmc));  
++
++        enable_irq(host->irq);
++	    
++    }	
++	
+ 	return 0;
+ }
+ EXPORT_SYMBOL(dw_mci_resume);
+diff --git a/drivers/mmc/host/rk_sdmmc.h b/drivers/mmc/host/rk_sdmmc.h
+index 262db2025c3e..01a86fd9df5c 100755
+--- a/drivers/mmc/host/rk_sdmmc.h
++++ b/drivers/mmc/host/rk_sdmmc.h
+@@ -258,7 +258,7 @@ static struct sdmmc_reg dw_mci_regs[] =
+ #define mci_writeq(dev, reg, value)			\
+ 	(*(volatile u64 __force *)((dev)->regs + SDMMC_##reg) = (value))
+ #endif
+-
++extern void rk_send_wakeup_key(void);
+ extern int dw_mci_probe(struct dw_mci *host);
+ extern void dw_mci_remove(struct dw_mci *host);
+ #ifdef CONFIG_PM
+-- 
+2.35.3
+

@@ -1,0 +1,121 @@
+From a94285268a84fee1d52777c163943209c35cd35d Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Mon, 21 Jan 2019 19:22:01 +0800
+Subject: [PATCH] usb: xhci: fix issues introduced by enable TRB ENT
+
+This patch fixes two bugs introduced by commit c0bd48bb3e6e
+("usb: xhci: set xhci trb ent quirk based on platform data").
+
+1. Connect with VFAT USB 3.0 disk, do "mount" command cause
+   the error log:
+
+   usb 8-1: reset SuperSpeed USB device number 2 using xhci-hcd
+   sd 0:0:0:0: [sda] tag#0 FAILED Result: hostbyte=DID_ERROR driverbyte=DRIVER_OK
+   sd 0:0:0:0: [sda] tag#0 CDB: Read(10) 28 00 00 00 0d a9 00 00 f0 00
+   blk_update_request: I/O error, dev sda, sector 3497
+
+2. Connect with USB 3.0 disks which support UAS mode, mount
+   fail with the error log:
+
+   xhci-hcd xhci-hcd.12.auto: ERROR Transfer event for disabled endpoint slot 1 ep 7 or incorrect stream ring
+   xhci-hcd xhci-hcd.12.auto: @00000000f704d1c0 00000000 00000000 0a000000 01088000
+   sd 0:0:0:0: [sda] tag#1 uas_eh_abort_handler 0 uas-tag 2 inflight: CMD OUT
+   sd 0:0:0:0: [sda] tag#1 CDB: Write(10) 2a 00 00 60 08 06 00 00 02 00
+   sd 0:0:0:0: [sda] tag#0 uas_eh_abort_handler 0 uas-tag 1 inflight: CMD OUT
+   sd 0:0:0:0: [sda] tag#0 CDB: Write(10) 2a 00 00 00 08 16 00 00 02 00
+   scsi host0: uas_eh_bus_reset_handler start
+   xhci-hcd xhci-hcd.12.auto: ERROR Transfer event for disabled endpoint slot 1 ep 4 or incorrect stream ring
+
+It's because that in the above two cases, the transfer length
+of the first TRB in the URB maybe not an integer multiple of
+the EP maxpacket, and if we enable the ENT flag in the any
+TRB of the URB, it will cause xHCI babble error.
+
+This patch avoids to enable the ENT flag if the transfer
+length of the first TRB isn't an integer multiple of the
+EP maxpacket, or if the EP support bulk streaming protocol.
+
+Fixes: c0bd48bb3e6e ("usb: xhci: set xhci trb ent quirk based on platform data")
+Change-Id: I07fef2903bd1024f6e5aa1e253cb86f538083e31
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/host/xhci-ring.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index e3b3383eb839..beadfcf077dc 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -3222,6 +3222,7 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 	int last_trb_num;
+ 	u64 addr;
+ 	bool more_trbs_coming;
++	bool en_trb_ent;
+ 
+ 	struct xhci_generic_trb *start_trb;
+ 	int start_cycle;
+@@ -3284,6 +3285,17 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 	if (trb_buff_len > urb->transfer_buffer_length)
+ 		trb_buff_len = urb->transfer_buffer_length;
+ 
++	/*
++	 * Don't enable the ENT flag in the TRB in the following cases:
++	 * 1. The transfer length of the first TRB isn't an integer
++	 *    multiple of the EP maxpacket.
++	 * 2. The EP support bulk streaming protocol.
++	 */
++	if (trb_buff_len % usb_endpoint_maxp(&urb->ep->desc) || urb->stream_id)
++		en_trb_ent = false;
++	else
++		en_trb_ent = true;
++
+ 	first_trb = true;
+ 	last_trb_num = zero_length_needed ? 2 : 1;
+ 	/* Queue the first TRB, even if it's zero-length */
+@@ -3305,7 +3317,7 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 		 */
+ 		if (num_trbs > last_trb_num) {
+ 			field |= TRB_CHAIN;
+-			if (xhci->quirks & XHCI_TRB_ENT_QUIRK)
++			if (xhci->quirks & XHCI_TRB_ENT_QUIRK && en_trb_ent)
+ 				field |= TRB_ENT;
+ 		} else if (num_trbs == last_trb_num) {
+ 			td->last_trb = ep_ring->enqueue;
+@@ -3391,6 +3403,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 	int last_trb_num;
+ 	bool more_trbs_coming;
+ 	bool zero_length_needed;
++	bool en_trb_ent;
+ 	int start_cycle;
+ 	u32 field, length_field;
+ 
+@@ -3463,6 +3476,17 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 	if (trb_buff_len > urb->transfer_buffer_length)
+ 		trb_buff_len = urb->transfer_buffer_length;
+ 
++	/*
++	 * Don't enable the ENT flag in the TRB in the following cases:
++	 * 1. The transfer length of the first TRB isn't an integer
++	 *    multiple of the EP maxpacket.
++	 * 2. The EP support bulk streaming protocol.
++	 */
++	if (trb_buff_len % usb_endpoint_maxp(&urb->ep->desc) || urb->stream_id)
++		en_trb_ent = false;
++	else
++		en_trb_ent = true;
++
+ 	first_trb = true;
+ 	last_trb_num = zero_length_needed ? 2 : 1;
+ 	/* Queue the first TRB, even if it's zero-length */
+@@ -3483,7 +3507,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 		 */
+ 		if (num_trbs > last_trb_num) {
+ 			field |= TRB_CHAIN;
+-			if (xhci->quirks & XHCI_TRB_ENT_QUIRK)
++			if (xhci->quirks & XHCI_TRB_ENT_QUIRK && en_trb_ent)
+ 				field |= TRB_ENT;
+ 		} else if (num_trbs == last_trb_num) {
+ 			td->last_trb = ep_ring->enqueue;
+-- 
+2.35.3
+

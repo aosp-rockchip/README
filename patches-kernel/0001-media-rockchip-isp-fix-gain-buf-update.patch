@@ -1,0 +1,229 @@
+From 076891bc3ee7be8a68b659239948115c91f667dc Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 14 Jan 2021 19:47:22 +0800
+Subject: [PATCH] media: rockchip: isp: fix gain buf update
+
+isp2.0 one frame read back many times and gain
+address will updated at each read back end. To make
+sure gain buffer update right, so one last read back
+to the frame start to config next buf, and the frame end
+will update to shadow reg for ready to receive next frame.
+
+Change-Id: I1be92f92f9489b7d1ffb5ca72a510e9ea45f5ab0
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  | 82 +++++++++----------
+ drivers/media/platform/rockchip/isp/bridge.h  |  1 +
+ drivers/media/platform/rockchip/isp/csi.c     |  4 +
+ drivers/media/platform/rockchip/isp/csi.h     |  2 +
+ .../media/platform/rockchip/isp/isp_ispp.h    |  2 +-
+ drivers/media/platform/rockchip/isp/rkisp.c   |  5 ++
+ 6 files changed, 53 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 23bc8ee42aec..10ac7afd299c 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -20,34 +20,6 @@ struct rkisp_bridge_buf *to_bridge_buf(struct rkisp_ispp_buf *dbufs)
+ 	return container_of(dbufs, struct rkisp_bridge_buf, dbufs);
+ }
+ 
+-static void update_mi(struct rkisp_bridge_device *dev)
+-{
+-	struct rkisp_hw_dev *hw = dev->ispdev->hw_dev;
+-	struct rkisp_bridge_buf *buf;
+-	u32 val;
+-
+-	if (hw->nxt_buf) {
+-		buf = to_bridge_buf(hw->nxt_buf);
+-		val = buf->dummy[GROUP_BUF_PIC].dma_addr;
+-		rkisp_write(dev->ispdev,
+-			    dev->cfg->reg.y0_base, val, true);
+-		val += dev->cfg->offset;
+-		rkisp_write(dev->ispdev,
+-			    dev->cfg->reg.uv0_base, val, true);
+-		val = buf->dummy[GROUP_BUF_GAIN].dma_addr;
+-		rkisp_write(dev->ispdev,
+-			    dev->cfg->reg.g0_base, val, true);
+-	}
+-
+-	v4l2_dbg(3, rkisp_debug, &dev->sd,
+-		 "%s pic(shd:0x%x base:0x%x) gain(shd:0x%x base:0x%x)\n",
+-		 __func__,
+-		 rkisp_read(dev->ispdev, dev->cfg->reg.y0_base_shd, true),
+-		 rkisp_read(dev->ispdev, dev->cfg->reg.y0_base, true),
+-		 rkisp_read(dev->ispdev, dev->cfg->reg.g0_base_shd, true),
+-		 rkisp_read(dev->ispdev, dev->cfg->reg.g0_base, true));
+-}
+-
+ static void dump_dbg_reg(struct rkisp_bridge_device *dev, struct rkisp_ispp_reg *reg_buf)
+ {
+ 	struct rkisp_isp2x_stat_buffer *tmp_statsbuf;
+@@ -586,16 +558,6 @@ static int frame_end(struct rkisp_bridge_device *dev, bool en)
+ 		hw->nxt_buf = NULL;
+ 	}
+ 
+-	spin_lock_irqsave(&hw->buf_lock, lock_flags);
+-	if (!list_empty(&hw->list)) {
+-		hw->nxt_buf = list_first_entry(&hw->list,
+-				struct rkisp_ispp_buf, list);
+-		list_del(&hw->nxt_buf->list);
+-	}
+-	spin_unlock_irqrestore(&hw->buf_lock, lock_flags);
+-
+-	update_mi(dev);
+-
+ 	return 0;
+ }
+ 
+@@ -1003,9 +965,6 @@ static int bridge_start(struct rkisp_bridge_device *dev)
+ 		rkisp_config_dmatx_valid_buf(dev->ispdev);
+ 		force_cfg_update(dev->ispdev);
+ 		rkisp_update_spstream_buf(sp_stream);
+-
+-		if (!(dev->work_mode & ISP_ISPP_QUICK))
+-			update_mi(dev);
+ 		hdr_update_dmatx_buf(dev->ispdev);
+ 	}
+ 	dev->ispdev->skip_frame = 0;
+@@ -1434,6 +1393,44 @@ void rkisp_bridge_stop_spstream(struct rkisp_device *dev)
+ 	spin_unlock_irqrestore(&hw->buf_lock, lock_flags);
+ }
+ 
++void rkisp_bridge_update_mi(struct rkisp_device *dev)
++{
++	struct rkisp_bridge_device *br = &dev->br_dev;
++	struct rkisp_hw_dev *hw = dev->hw_dev;
++	struct rkisp_bridge_buf *buf;
++	unsigned long lock_flags = 0;
++	u32 val;
++
++	if (dev->isp_ver != ISP_V20 || !br->en ||
++	    br->work_mode & ISP_ISPP_QUICK)
++		return;
++
++	spin_lock_irqsave(&hw->buf_lock, lock_flags);
++	if (!hw->nxt_buf && !list_empty(&hw->list)) {
++		hw->nxt_buf = list_first_entry(&hw->list,
++				struct rkisp_ispp_buf, list);
++		list_del(&hw->nxt_buf->list);
++	}
++	spin_unlock_irqrestore(&hw->buf_lock, lock_flags);
++
++	if (hw->nxt_buf) {
++		buf = to_bridge_buf(hw->nxt_buf);
++		val = buf->dummy[GROUP_BUF_PIC].dma_addr;
++		rkisp_write(dev, br->cfg->reg.y0_base, val, true);
++		val += br->cfg->offset;
++		rkisp_write(dev, br->cfg->reg.uv0_base, val, true);
++		val = buf->dummy[GROUP_BUF_GAIN].dma_addr;
++		rkisp_write(dev, br->cfg->reg.g0_base, val, true);
++	}
++
++	v4l2_dbg(2, rkisp_debug, &br->sd,
++		 "update pic(shd:0x%x base:0x%x) gain(shd:0x%x base:0x%x)\n",
++		 rkisp_read(dev, br->cfg->reg.y0_base_shd, true),
++		 rkisp_read(dev, br->cfg->reg.y0_base, true),
++		 rkisp_read(dev, br->cfg->reg.g0_base_shd, true),
++		 rkisp_read(dev, br->cfg->reg.g0_base, true));
++}
++
+ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev)
+ {
+ 	struct rkisp_bridge_device *bridge = &dev->br_dev;
+@@ -1486,7 +1483,8 @@ int rkisp_register_bridge_subdev(struct rkisp_device *dev,
+ 	v4l2_subdev_init(sd, &bridge_v4l2_ops);
+ 	//sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 	sd->entity.obj_type = 0;
+-	snprintf(sd->name, sizeof(sd->name), BRIDGE_DEV_NAME);
++	snprintf(sd->name, sizeof(sd->name),
++		 "%s%d", BRIDGE_DEV_NAME, dev->dev_id);
+ 	bridge->pad.flags = MEDIA_PAD_FL_SINK;
+ 	ret = media_entity_pads_init(&sd->entity, 1, &bridge->pad);
+ 	if (ret < 0)
+diff --git a/drivers/media/platform/rockchip/isp/bridge.h b/drivers/media/platform/rockchip/isp/bridge.h
+index 0e5dfa074dc4..f8dbe291b52a 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.h
++++ b/drivers/media/platform/rockchip/isp/bridge.h
+@@ -66,6 +66,7 @@ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev);
+ void rkisp_bridge_sendtopp_buffer(struct rkisp_device *dev, u32 dev_id, u32 buf_idx);
+ void rkisp_bridge_save_spbuf(struct rkisp_device *dev, struct rkisp_buffer *sp_buf);
+ void rkisp_bridge_stop_spstream(struct rkisp_device *dev);
++void rkisp_bridge_update_mi(struct rkisp_device *dev);
+ void rkisp_get_bridge_sd(struct platform_device *dev,
+ 			 struct v4l2_subdev **sd);
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index 3e65068c894b..f67ca02c716c 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -470,6 +470,7 @@ int rkisp_csi_config_patch(struct rkisp_device *dev)
+ 		rkisp_set_bits(dev, CTRL_SWS_CFG,
+ 			       0, SW_MPIP_DROP_FRM_DIS, true);
+ 	}
++	memset(dev->csi_dev.filt_state, 0, sizeof(dev->csi_dev.filt_state));
+ 	dev->csi_dev.frame_cnt = -1;
+ 	dev->csi_dev.frame_cnt_x1 = -1;
+ 	dev->csi_dev.frame_cnt_x2 = -1;
+@@ -579,6 +580,9 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 		rkisp_write(dev, ISP_CTRL, val, true);
+ 	}
+ 
++	memset(csi->filt_state, 0, sizeof(csi->filt_state));
++	csi->filt_state[CSI_F_VS] = dma2frm;
++
+ 	val = rkisp_read(dev, CSI2RX_CTRL0, true);
+ 	val &= ~SW_IBUF_OP_MODE(0xf);
+ 	tmp = SW_IBUF_OP_MODE(csi->rd_mode);
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index c49c2328faa5..a73c455d8f51 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -70,6 +70,7 @@ struct sink_info {
+  * rdbk_kfifo: read back event fifo
+  * rdbk_lock: lock for read back event
+  * mipi_di: Data Identifier (vc[7:6],dt[5:0])
++ * filt_state: multiframe read back mode to filt irq event
+  * tx_first: flags for dmatx first Y_STATE irq
+  * memory: compact or big/little endian byte order for tx/rx
+  */
+@@ -87,6 +88,7 @@ struct rkisp_csi_device {
+ 	int frame_cnt_x3;
+ 	u32 rd_mode;
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
++	u8 filt_state[CSI_F_MAX];
+ 	u8 tx_first[HDR_DMA_MAX];
+ 	u8 memory;
+ };
+diff --git a/drivers/media/platform/rockchip/isp/isp_ispp.h b/drivers/media/platform/rockchip/isp/isp_ispp.h
+index ccbd10ebcef7..a86e3543e347 100644
+--- a/drivers/media/platform/rockchip/isp/isp_ispp.h
++++ b/drivers/media/platform/rockchip/isp/isp_ispp.h
+@@ -10,7 +10,7 @@
+ #include <linux/rkisp1-config.h>
+ #include <linux/rkispp-config.h>
+ 
+-#define RKISP_BUF_MAX 3
++#define RKISP_BUF_MAX 2
+ #define RKISPP_BUF_MAX 2
+ #define RKISP_ISPP_BUF_MAX (RKISP_BUF_MAX + RKISPP_BUF_MAX + (2 * (DEV_MAX - 1)))
+ 
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index fcb310a451a1..6895384fea80 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -2294,6 +2294,11 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 		rkisp_set_state(dev, ISP_FRAME_VS);
+ 		if (IS_HDR_RDBK(dev->hdr.op_mode)) {
+ 			rkisp_stats_rdbk_enable(&dev->stats_vdev, true);
++			/* last readback to config next buf */
++			if (!dev->csi_dev.filt_state[CSI_F_VS])
++				rkisp_bridge_update_mi(dev);
++			else
++				dev->csi_dev.filt_state[CSI_F_VS]--;
+ 			goto vs_skip;
+ 		}
+ 		if (dev->cap_dev.stream[RKISP_STREAM_SP].interlaced) {
+-- 
+2.35.3
+

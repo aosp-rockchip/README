@@ -1,0 +1,357 @@
+From 71a461a76455cc8b3082c0125f5d0be3287f1420 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Fri, 24 Jul 2015 11:05:37 +0800
+Subject: [PATCH] hdmi: hdmi_submit_work function support synchronous
+ operation.
+
+If hdmi_submit_work work in synchronous mode, the malloced delayed_work
+is free by caller, not by hdmi_work_queue, to prevent delayed_work is
+free before flush_delayed_work fucntion is executed.
+
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+---
+ .../video/rockchip/hdmi/rockchip-hdmi-core.c  | 29 +++++++++++--------
+ .../video/rockchip/hdmi/rockchip-hdmi-sysfs.c | 10 +++----
+ drivers/video/rockchip/hdmi/rockchip-hdmi.h   |  4 +--
+ .../hdmi/rockchip-hdmiv1/rockchip_hdmiv1.c    | 15 +++-------
+ .../hdmi/rockchip-hdmiv1/rockchip_hdmiv1_hw.c |  4 +--
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c    | 19 ++++--------
+ .../rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c    |  6 ++--
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c |  4 +--
+ 8 files changed, 41 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+index a97c9209a7cd..bd2a20f069c0 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+@@ -7,6 +7,7 @@ struct hdmi_delayed_work {
+ 	struct delayed_work work;
+ 	struct hdmi *hdmi;
+ 	int event;
++	int sync;
+ 	void *data;
+ };
+ 
+@@ -19,12 +20,13 @@ struct hdmi_id_ref_info {
+ static int uboot_vic;
+ static void hdmi_work_queue(struct work_struct *work);
+ 
+-struct delayed_work *hdmi_submit_work(struct hdmi *hdmi,
+-				      int event, int delay, void *data)
++void hdmi_submit_work(struct hdmi *hdmi,
++		      int event, int delay, int sync)
+ {
+ 	struct hdmi_delayed_work *work;
+ 
+-	DBG("%s event %04x delay %d\n", __func__, event, delay);
++	DBG("%s event %04x delay %d sync %d\n",
++	    __func__, event, delay, sync);
+ 
+ 	work = kmalloc(sizeof(*work), GFP_ATOMIC);
+ 
+@@ -32,16 +34,18 @@ struct delayed_work *hdmi_submit_work(struct hdmi *hdmi,
+ 		INIT_DELAYED_WORK(&work->work, hdmi_work_queue);
+ 		work->hdmi = hdmi;
+ 		work->event = event;
+-		work->data = data;
++		work->data = NULL;
++		work->sync = sync;
+ 		queue_delayed_work(hdmi->workqueue,
+ 				   &work->work,
+ 				   msecs_to_jiffies(delay));
++		if (sync) {
++			flush_delayed_work(&work->work);
++			kfree(work);
++		}
+ 	} else {
+ 		pr_warn("HDMI: Cannot allocate memory to create work\n");
+-		return 0;
+ 	}
+-
+-	return &work->work;
+ }
+ 
+ static void hdmi_send_uevent(struct hdmi *hdmi, int uevent)
+@@ -236,7 +240,7 @@ static void hdmi_wq_insert(struct hdmi *hdmi)
+ 		#endif
+ 		hdmi_wq_set_audio(hdmi);
+ 		hdmi_wq_set_output(hdmi, hdmi->mute);
+-		hdmi_submit_work(hdmi, HDMI_ENABLE_HDCP, 100, NULL);
++		hdmi_submit_work(hdmi, HDMI_ENABLE_HDCP, 100, 0);
+ 		if (hdmi->ops->setcec)
+ 			hdmi->ops->setcec(hdmi);
+ 	}
+@@ -424,7 +428,8 @@ static void hdmi_work_queue(struct work_struct *work)
+ 	}
+ 
+ 	kfree(hdmi_w->data);
+-	kfree(hdmi_w);
++	if (!hdmi_w->sync)
++		kfree(hdmi_w);
+ 
+ 	DBG("\nhdmi_work_queue() - exit evt= %x %d\n",
+ 	    (event & 0xFF00) >> 8,
+@@ -599,7 +604,7 @@ int hdmi_config_audio(struct hdmi_audio	*audio)
+ 		}*/
+ 		memcpy(&hdmi->audio, audio, sizeof(struct hdmi_audio));
+ 		if (hdmi->hotplug == HDMI_HPD_ACTIVED)
+-			hdmi_submit_work(hdmi, HDMI_SET_AUDIO, 0, NULL);
++			hdmi_submit_work(hdmi, HDMI_SET_AUDIO, 0, 0);
+ 	}
+ 	return 0;
+ }
+@@ -661,9 +666,9 @@ void hdmi_audio_mute(int mute)
+ 		hdmi = ref_info[i].hdmi;
+ 
+ 		if (mute)
+-			hdmi_submit_work(hdmi, HDMI_MUTE_AUDIO, 0, NULL);
++			hdmi_submit_work(hdmi, HDMI_MUTE_AUDIO, 0, 0);
+ 		else
+-			hdmi_submit_work(hdmi, HDMI_UNMUTE_AUDIO, 0, NULL);
++			hdmi_submit_work(hdmi, HDMI_UNMUTE_AUDIO, 0, 0);
+ 	}
+ }
+ 
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+index 95c95f294462..73e678713501 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+@@ -18,9 +18,9 @@ static int hdmi_set_enable(struct rk_display_device *device, int enable)
+ 	struct hdmi *hdmi = device->priv_data;
+ 
+ 	if (enable == 0)
+-		hdmi_submit_work(hdmi, HDMI_DISABLE_CTL, 0, NULL);
++		hdmi_submit_work(hdmi, HDMI_DISABLE_CTL, 0, 0);
+ 	else
+-		hdmi_submit_work(hdmi, HDMI_ENABLE_CTL, 0, NULL);
++		hdmi_submit_work(hdmi, HDMI_ENABLE_CTL, 0, 0);
+ 	return 0;
+ }
+ 
+@@ -62,7 +62,7 @@ static int hdmi_set_mode(struct rk_display_device *device,
+ 	if (vic && hdmi->vic != vic) {
+ 		hdmi->vic = vic;
+ 		if (hdmi->hotplug == HDMI_HPD_ACTIVED)
+-			hdmi_submit_work(hdmi, HDMI_SET_VIDEO, 0, NULL);
++			hdmi_submit_work(hdmi, HDMI_SET_VIDEO, 0, 0);
+ 	}
+ 	return 0;
+ }
+@@ -118,7 +118,7 @@ static int hdmi_set_3dmode(struct rk_display_device *device, int mode)
+ 	if (hdmi->mode_3d != mode) {
+ 		hdmi->mode_3d = mode;
+ 		if (hdmi->hotplug == HDMI_HPD_ACTIVED)
+-			hdmi_submit_work(hdmi, HDMI_SET_3D, 0, NULL);
++			hdmi_submit_work(hdmi, HDMI_SET_3D, 0, 0);
+ 	}
+ 	return 0;
+ }
+@@ -251,7 +251,7 @@ static int hdmi_set_color(struct rk_display_device *device,
+ 		return -1;
+ 	}
+ 	if (hdmi->hotplug == HDMI_HPD_ACTIVED)
+-		hdmi_submit_work(hdmi, HDMI_SET_COLOR, 0, NULL);
++		hdmi_submit_work(hdmi, HDMI_SET_COLOR, 0, 0);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi.h b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+index 86830682a88b..861ca15f4e9b 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+@@ -492,8 +492,8 @@ struct hdmi {
+ struct hdmi *rockchip_hdmi_register(struct hdmi_property *property,
+ 				    struct hdmi_ops *ops);
+ void rockchip_hdmi_unregister(struct hdmi *hdmi);
+-struct delayed_work *hdmi_submit_work(struct hdmi *hdmi,
+-				      int event, int delay, void *data);
++void hdmi_submit_work(struct hdmi *hdmi,
++		      int event, int delay, int sync);
+ 
+ struct rk_display_device *hdmi_register_display_sysfs(struct hdmi *hdmi,
+ 						      struct device *parent);
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1.c
+index c81f766375d6..03be0991d24c 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1.c
+@@ -130,13 +130,10 @@ static int rockchip_hdmiv1_clk_disable(struct hdmi_dev *hdmi_dev)
+ static void rockchip_hdmiv1_early_suspend(void)
+ {
+ 	struct hdmi *hdmi_drv =  hdmi_dev->hdmi;
+-	struct delayed_work *delay_work;
+ 
+ 	dev_info(hdmi_drv->dev, "hdmi suspend\n");
+-	delay_work = hdmi_submit_work(hdmi_drv,
+-				      HDMI_SUSPEND_CTL, 0, NULL);
+-	if (delay_work)
+-		flush_delayed_work(delay_work);
++	hdmi_submit_work(hdmi_drv,
++			 HDMI_SUSPEND_CTL, 0, 1);
+ 	mutex_lock(&hdmi_drv->lock);
+ 	if (hdmi_dev->irq)
+ 		disable_irq(hdmi_dev->irq);
+@@ -157,7 +154,7 @@ static void rockchip_hdmiv1_early_resume(void)
+ 		enable_irq(hdmi_dev->irq);
+ 	}
+ 	mutex_unlock(&hdmi_drv->lock);
+-	hdmi_submit_work(hdmi_drv, HDMI_RESUME_CTL, 0, NULL);
++	hdmi_submit_work(hdmi_drv, HDMI_RESUME_CTL, 0, 0);
+ }
+ 
+ static int rockchip_hdmiv1_fb_event_notify(struct notifier_block *self,
+@@ -271,7 +268,6 @@ static int rockchip_hdmiv1_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+ 	struct resource *res;
+-	struct delayed_work *delay_work;
+ 
+ 	hdmi_dev = devm_kzalloc(&pdev->dev,
+ 				sizeof(struct hdmi_dev),
+@@ -337,10 +333,7 @@ static int rockchip_hdmiv1_probe(struct platform_device *pdev)
+ 	rockchip_hdmiv1_initial(hdmi_dev->hdmi);
+ 
+ 	rk_display_device_enable(hdmi_dev->hdmi->ddev);
+-	delay_work = hdmi_submit_work(hdmi_dev->hdmi,
+-				      HDMI_HPD_CHANGE, 0, NULL);
+-	if (delay_work)
+-		flush_delayed_work(delay_work);
++	hdmi_submit_work(hdmi_dev->hdmi, HDMI_HPD_CHANGE, 0, 1);
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ 	hdmi_dev->debugfs_dir = debugfs_create_dir("rockchip_hdmiv1", NULL);
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1_hw.c
+index 64d21851ca29..88d7d3221596 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv1/rockchip_hdmiv1_hw.c
+@@ -879,7 +879,7 @@ static int rockchip_hdmiv1_enable(struct hdmi *hdmi_drv)
+ 		hdmi_msk_reg(hdmi_dev, HDMI_STATUS,
+ 			     m_MASK_INT_HOTPLUG, v_MASK_INT_HOTPLUG(1));
+ 	}
+-	hdmi_submit_work(hdmi_drv, HDMI_HPD_CHANGE, 10, NULL);
++	hdmi_submit_work(hdmi_drv, HDMI_HPD_CHANGE, 10, 0);
+ 	return 0;
+ }
+ 
+@@ -910,7 +910,7 @@ void rockchip_hdmiv1_irq(struct hdmi *hdmi_drv)
+ 	if (interrupt)
+ 		hdmi_writel(hdmi_dev, HDMI_STATUS, interrupt);
+ 	if (interrupt & m_INT_HOTPLUG)
+-		hdmi_submit_work(hdmi_drv, HDMI_HPD_CHANGE, 20, NULL);
++		hdmi_submit_work(hdmi_drv, HDMI_HPD_CHANGE, 20, 0);
+ 
+ 	if (hdmi_drv->ops->hdcp_irq_cb)
+ 		hdmi_drv->ops->hdcp_irq_cb(0);
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+index 9eab961642d4..224cf6423301 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+@@ -146,13 +146,10 @@ HDMI_DEBUG_ENTRY(regs_ctrl);
+ static void rockchip_hdmiv2_early_suspend(struct early_suspend *h)
+ {
+ 	struct hdmi *hdmi = hdmi_dev->hdmi;
+-	struct delay_work *delay_work;
+ 	struct pinctrl_state *gpio_state;
+ 
+ 	HDMIDBG("hdmi enter early suspend\n");
+-	delay_work = hdmi_submit_work(hdmi, HDMI_SUSPEND_CTL, 0, NULL);
+-	if (delay_work)
+-		flush_delayed_work_sync(delay_work);
++	hdmi_submit_work(hdmi, HDMI_SUSPEND_CTL, 0, 1);
+ 	/* iomux to gpio and pull down when suspend */
+ 	gpio_state = pinctrl_lookup_state(hdmi_dev->dev->pins->p, "gpio");
+ 	pinctrl_select_state(hdmi_dev->dev->pins->p, gpio_state);
+@@ -171,7 +168,7 @@ static void rockchip_hdmiv2_early_resume(struct early_suspend *h)
+ 	hdmi_dev_initial(hdmi_dev);
+ 	if (hdmi->ops->hdcp_power_on_cb)
+ 		hdmi->ops->hdcp_power_on_cb();
+-	hdmi_submit_work(hdmi, HDMI_RESUME_CTL, 0, NULL);
++	hdmi_submit_work(hdmi, HDMI_RESUME_CTL, 0, 0);
+ }
+ #endif
+ 
+@@ -276,7 +273,6 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 	struct fb_event *event = data;
+ 	int blank_mode = *((int *)event->data);
+ 	struct hdmi *hdmi = hdmi_dev->hdmi;
+-	struct delayed_work *delay_work;
+ 	struct pinctrl_state *gpio_state;
+ #ifdef CONFIG_PINCTRL
+ 	struct dev_pin_info *pins = hdmi_dev->dev->pins;
+@@ -289,12 +285,9 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 		default:
+ 			HDMIDBG("suspend hdmi\n");
+ 			if (!hdmi->sleep) {
+-				delay_work =
+-					hdmi_submit_work(hdmi,
+-							 HDMI_SUSPEND_CTL,
+-							 0, NULL);
+-				if (delay_work)
+-					flush_delayed_work(delay_work);
++				hdmi_submit_work(hdmi,
++						 HDMI_SUSPEND_CTL,
++						 0, 1);
+ 				if (hdmi_dev->hdcp2_en)
+ 					hdmi_dev->hdcp2_en(0);
+ 				rockchip_hdmiv2_clk_disable(hdmi_dev);
+@@ -331,7 +324,7 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 				if (hdmi_dev->hdcp2_en)
+ 					hdmi_dev->hdcp2_en(1);
+ 				hdmi_submit_work(hdmi, HDMI_RESUME_CTL,
+-						 0, NULL);
++						 0, 0);
+ 			}
+ 			break;
+ 		default:
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
+index 80640ccbf7bf..06856a616fca 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hdcp.c
+@@ -520,12 +520,12 @@ void rockchip_hdmiv2_hdcp_isr(struct hdmi_dev *hdmi_dev, int hdcp_int)
+ 
+ 	if (hdcp_int & m_KSVSHA1_CALC_INT) {
+ 		pr_info("hdcp sink is a repeater\n");
+-		hdmi_submit_work(hdcp->hdmi, HDMI_HDCP_AUTH_2ND, 0, NULL);
++		hdmi_submit_work(hdcp->hdmi, HDMI_HDCP_AUTH_2ND, 0, 0);
+ 	}
+ 	if (hdcp_int & 0x40) {
+ 		pr_info("hdcp check failed\n");
+ 		rockchip_hdmiv2_hdcp_stop(hdmi_dev->hdmi);
+-		hdmi_submit_work(hdcp->hdmi, HDMI_ENABLE_HDCP, 0, NULL);
++		hdmi_submit_work(hdcp->hdmi, HDMI_ENABLE_HDCP, 0, 0);
+ 	}
+ }
+ 
+@@ -557,7 +557,7 @@ static ssize_t hdcp_enable_write(struct device *device,
+ 
+ 	if (hdcp->enable != enable) {
+ 		if (!hdcp->enable)
+-			hdmi_submit_work(hdcp->hdmi, HDMI_ENABLE_HDCP, 0, NULL);
++			hdmi_submit_work(hdcp->hdmi, HDMI_ENABLE_HDCP, 0, 0);
+ 		else
+ 			rockchip_hdmiv2_hdcp_stop(hdcp->hdmi);
+ 		hdcp->enable =	enable;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index 49495bffc18e..ba94ca1e1560 100755
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -1609,7 +1609,7 @@ static int hdmi_dev_enable(struct hdmi *hdmi)
+ 		hdmi_writel(hdmi_dev, IH_MUTE, 0x00);
+ 		hdmi_dev->enable = 1;
+ 	}
+-	hdmi_submit_work(hdmi, HDMI_HPD_CHANGE, 10, NULL);
++	hdmi_submit_work(hdmi, HDMI_HPD_CHANGE, 10, 0);
+ 	return 0;
+ }
+ 
+@@ -1714,7 +1714,7 @@ irqreturn_t rockchip_hdmiv2_dev_irq(int irq, void *priv)
+ 		hdmi_writel(hdmi_dev, PHY_POL0, phy_pol);
+ 		hdmi_writel(hdmi_dev, IH_PHY_STAT0, phy_int);
+ 		if ((phy_int & m_HPD) || ((phy_int & 0x3c) == 0x3c))
+-			hdmi_submit_work(hdmi, HDMI_HPD_CHANGE, 20, NULL);
++			hdmi_submit_work(hdmi, HDMI_HPD_CHANGE, 20, 0);
+ 	}
+ 
+ 	/* Audio error */
+-- 
+2.35.3
+

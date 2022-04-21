@@ -1,0 +1,428 @@
+From 850053192e046143de7f241d16bce2c08ce683ea Mon Sep 17 00:00:00 2001
+From: luowei <lw@rock-chips.com>
+Date: Sat, 28 Aug 2010 21:47:00 +0800
+Subject: [PATCH] improve spi_uart.c for bt
+
+---
+ arch/arm/mach-rk2818/include/mach/spi_fpga.h |   2 +-
+ drivers/fpga/spi_fpga_init.c                 | 200 ++++++++++++++++++-
+ drivers/fpga/spi_uart.c                      |  50 ++---
+ 3 files changed, 223 insertions(+), 29 deletions(-)
+
+diff --git a/arch/arm/mach-rk2818/include/mach/spi_fpga.h b/arch/arm/mach-rk2818/include/mach/spi_fpga.h
+index f507f8311804..d5c702360812 100755
+--- a/arch/arm/mach-rk2818/include/mach/spi_fpga.h
++++ b/arch/arm/mach-rk2818/include/mach/spi_fpga.h
+@@ -15,7 +15,7 @@ defines of FPGA chip ICE65L08's register
+ 
+ #define SPI_FPGA_I2C_EVENT	1
+ #define SPI_FPGA_POLL_WAIT	0
+-#define SPI_FPGA_TRANS_WORK	0
++#define SPI_FPGA_TRANS_WORK	1
+ #define SPI_FPGA_TEST_DEBUG	0
+ #if SPI_FPGA_TEST_DEBUG
+ #define SPI_FPGA_TEST_DEBUG_PIN RK2818_PIN_PE0
+diff --git a/drivers/fpga/spi_fpga_init.c b/drivers/fpga/spi_fpga_init.c
+index 06cda28ba850..71bc6c7fae7d 100755
+--- a/drivers/fpga/spi_fpga_init.c
++++ b/drivers/fpga/spi_fpga_init.c
+@@ -43,7 +43,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/i2c.h>
+ #include <mach/rk2818_iomap.h>
+-
++#include <linux/poll.h>
+ #include <mach/spi_fpga.h>
+ 
+ #if defined(CONFIG_SPI_FPGA_INIT_DEBUG)
+@@ -54,6 +54,178 @@
+ 
+ struct spi_fpga_port *pFpgaPort;
+ 
++#if SPI_FPGA_TRANS_WORK
++#define ID_SPI_FPGA_WRITE 1
++#define ID_SPI_FPGA_READ 2
++struct spi_fpga_transfer
++{
++	const u8 *txbuf;
++	unsigned n_tx;
++	u8 *rxbuf;
++	unsigned n_rx;
++	int id;
++	struct list_head	queue;
++};
++
++static void spi_fpga_trans_work_handler(struct work_struct *work)
++{
++	struct spi_fpga_port *port =
++		container_of(work, struct spi_fpga_port, fpga_trans_work);
++
++	while (!list_empty(&port->trans_queue)) 
++	{
++		struct spi_fpga_transfer	*t = NULL;
++		list_for_each_entry(t, &port->trans_queue, queue)
++		{
++
++			if (t->id == 0) 
++				break;	
++			DBG("%s:id=%d,txbuf=0x%x\n",__FUNCTION__,t->id,(int)t->txbuf);
++			switch(t->id)
++			{
++				case ID_SPI_FPGA_WRITE:
++					spi_write(port->spi, t->txbuf, t->n_tx);
++					break;
++				default:
++					break;
++					
++			}
++			kfree(t);
++			kfree(t->txbuf);
++		}
++		list_del_init(&port->trans_queue);
++	}
++
++}
++
++int spi_write_work(struct spi_device *spi, const u8 *buf, size_t len)
++{
++	struct spi_fpga_port *port = spi_get_drvdata(spi);
++	struct spi_fpga_transfer *t;
++	unsigned long flags;
++
++	t = kzalloc(sizeof(struct spi_fpga_transfer), GFP_KERNEL);
++	if (!t)
++	{
++		printk("err:%s:ENOMEM\n",__FUNCTION__);
++		return ;
++	}
++
++	t->txbuf = (char *)kmalloc(32, GFP_KERNEL);
++	if(t->txbuf == NULL)
++	{
++	    printk("%s:t->txbuf kzalloc err!!!\n",__FUNCTION__);
++	    return -ENOMEM;
++	}
++
++	memcpy(t->txbuf, buf, len);
++	t->n_tx = len;
++	t->id = ID_SPI_FPGA_WRITE;
++
++	spin_lock_irqsave(&port->work_lock, flags);
++	list_add_tail(&t->queue, &port->trans_queue);
++	queue_work(port->fpga_trans_workqueue, &port->fpga_trans_work);
++	spin_unlock_irqrestore(&port->work_lock, flags);
++
++	return 0;
++
++}
++
++#endif
++
++
++#if SPI_FPGA_POLL_WAIT
++
++#define SPI_BUFSIZE 1028
++static void spi_fpga_complete(void *arg)
++{
++	struct spi_fpga_port *port = pFpgaPort;
++	msleep(5);
++	wake_up_interruptible(&port->spi_wait_q);
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++}
++
++int spi_fpga_write(struct spi_device *spi, const u8 *buf, size_t len)
++{
++	struct spi_transfer	t = {
++			.tx_buf		= buf,
++			.len		= len,
++		};
++	struct spi_message	m;
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	spi_message_init(&m);
++	spi_message_add_tail(&t, &m);
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	return spi_async(spi, &m);
++}
++
++struct poll_table_struct wait;
++struct file filp;
++int spi_fpga_write_then_read(struct spi_device *spi,
++		const u8 *txbuf, unsigned n_tx,
++		u8 *rxbuf, unsigned n_rx)
++{
++	struct spi_fpga_port *port = spi_get_drvdata(spi);
++	int			status;
++	struct spi_message	message;
++	struct spi_transfer	x[2];
++	u8			*local_buf;
++	printk("%s:line=%d,n_tx+n_rx=%d\n",__FUNCTION__,__LINE__,(n_tx + n_rx));
++	/* Use preallocated DMA-safe buffer.  We can't avoid copying here,
++	 * (as a pure convenience thing), but we can keep heap costs
++	 * out of the hot path ...
++	 */
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++
++	if ((n_tx + n_rx) > SPI_BUFSIZE)
++		return -EINVAL;
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++
++	spi_message_init(&message);
++	memset(x, 0, sizeof x);
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	if (n_tx) {
++		x[0].len = n_tx;
++		spi_message_add_tail(&x[0], &message);
++	}
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++
++	if (n_rx) {
++		x[1].len = n_rx;
++		spi_message_add_tail(&x[1], &message);
++	}
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	/* ... unless someone else is using the pre-allocated buffer */
++
++	local_buf = kmalloc(SPI_BUFSIZE, GFP_KERNEL);
++	if (!local_buf)
++		return -ENOMEM;
++
++	memcpy(local_buf, txbuf, n_tx);
++	x[0].tx_buf = local_buf;
++	x[1].rx_buf = local_buf + n_tx;
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	message.complete = spi_fpga_complete;
++
++	/* do the i/o */
++	status = spi_async(spi, &message);
++#if 1
++	//poll_wait(&filp, &port->spi_wait_q, &wait);
++
++	//if (status == 0)
++	memcpy(rxbuf, x[1].rx_buf, n_rx);
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++	kfree(local_buf);
++	printk("%s:line=%d\n",__FUNCTION__,__LINE__);
++#endif
++	return status;
++}
++
++#define spi_write spi_fpga_write
++#define spi_write_then_read spi_fpga_write_then_read 
++
++#endif
++
+ /*------------------------spi读写的基本函数-----------------------*/
+ unsigned int spi_in(struct spi_fpga_port *port, int reg, int type)
+ {
+@@ -138,7 +310,7 @@ void spi_out(struct spi_fpga_port *port, int reg, int value, int type)
+ {
+ 	unsigned char index = 0;
+ 	unsigned char tx_buf[3];
+-	//printk("index2=%d,",index);
++	int reg_temp = reg;
+ 	switch(type)
+ 	{
+ #if defined(CONFIG_SPI_FPGA_UART)
+@@ -148,6 +320,9 @@ void spi_out(struct spi_fpga_port *port, int reg, int value, int type)
+ 			tx_buf[0] = reg & 0xff;
+ 			tx_buf[1] = (value>>8) & 0xff;
+ 			tx_buf[2] = value & 0xff;
++			if(reg_temp == UART_IER)
++			spi_write_work(port->spi, (const u8 *)&tx_buf, sizeof(tx_buf));
++			else
+ 			spi_write(port->spi, (const u8 *)&tx_buf, sizeof(tx_buf));
+ 			DBG("%s,SEL_UART reg=0x%x,value=0x%x\n",__FUNCTION__,reg&0xff,value&0xffff);
+ 			break;
+@@ -347,12 +522,27 @@ static int __devinit spi_fpga_probe(struct spi_device * spi)
+ 	if (!port)
+ 		return -ENOMEM;
+ 	DBG("port=0x%x\n",(int)port);
+-
+-	spin_lock_init(&port->work_lock);
++	
+ 	mutex_init(&port->spi_lock);
+-
++	spin_lock_init(&port->work_lock);
++	
+ 	spi_open_sysclk(GPIO_HIGH);
+ 
++#if SPI_FPGA_TRANS_WORK
++	init_waitqueue_head(&port->wait_wq);
++	init_waitqueue_head(&port->wait_rq);
++	port->write_en = TRUE;
++	port->read_en = TRUE;
++	sprintf(b, "fpga_trans_workqueue");
++	port->fpga_trans_workqueue = create_freezeable_workqueue(b);
++	if (!port->fpga_trans_workqueue) {
++		printk("cannot create workqueue\n");
++		return -EBUSY;
++	}
++	INIT_WORK(&port->fpga_trans_work, spi_fpga_trans_work_handler);
++	INIT_LIST_HEAD(&port->trans_queue);
++#endif
++
+ 	spi_fpga_rst();
+ 	sprintf(b, "fpga_irq_workqueue");
+ 	port->fpga_irq_workqueue = create_freezeable_workqueue(b);
+diff --git a/drivers/fpga/spi_uart.c b/drivers/fpga/spi_uart.c
+index 407d0eec8f5b..e0b024296275 100755
+--- a/drivers/fpga/spi_uart.c
++++ b/drivers/fpga/spi_uart.c
+@@ -37,7 +37,7 @@
+ #endif
+ 
+ #define SPI_UART_TEST 0
+-
++int gBaud = 0;
+ #define SPI_UART_FIFO_LEN	32
+ #define SPI_UART_TXRX_BUF	1		//send or recieve several bytes one time
+ 
+@@ -309,6 +309,7 @@ static void spi_uart_change_speed(struct spi_uart *uart,
+ 	}
+ 	//quot = (2 * uart->uartclk + baud) / (2 * baud);
+ 	quot = (uart->uartclk / baud);
++	//gBaud = baud;
+ 	printk("baud=%d,quot=0x%x\n",baud,quot);
+ 	if (baud < 2400)
+ 		fcr = UART_FCR_ENABLE_FIFO | UART_FCR_TRIGGER_1;
+@@ -348,19 +349,17 @@ static void spi_uart_change_speed(struct spi_uart *uart,
+ 	 */
+ 	uart->ier &= ~UART_IER_MSI;
+ 	if ((termios->c_cflag & CRTSCTS) || !(termios->c_cflag & CLOCAL))
+-	{
+-		//uart->ier |= UART_IER_MSI;
+-		//uart->mcr = UART_MCR_RTS;//mcr = UART_MCR_RTS while start RTSCTS
+-	}
++		uart->ier |= UART_IER_MSI;
+ 
+ 	uart->lcr = cval;
+-
+-	spi_out(port, UART_IER, uart->ier, SEL_UART);
++	
+ 	spi_out(port, UART_LCR, cval | UART_LCR_DLAB, SEL_UART);
+ 	spi_out(port, UART_DLL, quot & 0xff, SEL_UART);
+ 	spi_out(port, UART_DLM, quot >> 8, SEL_UART);
+ 	spi_out(port, UART_LCR, cval, SEL_UART);
+ 	spi_out(port, UART_FCR, fcr, SEL_UART);
++	spi_out(port, UART_IER, uart->ier, SEL_UART);//slow
++
+ 	DBG("%s:LINE=%d,baud=%d,uart->ier=0x%x,cval=0x%x,fcr=0x%x,quot=0x%x\n",
+ 		__FUNCTION__,__LINE__,baud,uart->ier,cval,fcr,quot);
+ 	spi_uart_write_mctrl(uart, uart->mctrl);
+@@ -369,30 +368,22 @@ static void spi_uart_change_speed(struct spi_uart *uart,
+ static void spi_uart_start_tx(struct spi_uart *uart)
+ {
+ 	struct spi_fpga_port *port = container_of(uart, struct spi_fpga_port, uart);
+-#if 1
+-	//unsigned long flags;
+ 	if (!(uart->ier & UART_IER_THRI)) {
+-		//spin_lock_irqsave(&uart->write_lock, flags);
+ 		uart->ier |= UART_IER_THRI;
+ 		spi_out(port, UART_IER, uart->ier, SEL_UART);
+-		//spin_unlock_irqrestore(&uart->write_lock, flags);	
+ 		printk("t,");
+ 	}	
+ 	
+ 	DBG("%s:UART_IER=0x%x\n",__FUNCTION__,uart->ier);
+-#endif
++
+ }
+ 
+ static void spi_uart_stop_tx(struct spi_uart *uart)
+ {
+ 	struct spi_fpga_port *port = container_of(uart, struct spi_fpga_port, uart);
+-	//unsigned long flags;
+ 	if (uart->ier & UART_IER_THRI) {
+-		//spin_lock_irqsave(&uart->write_lock, flags);
+ 		uart->ier &= ~UART_IER_THRI;
+ 		spi_out(port, UART_IER, uart->ier, SEL_UART);
+-		//spin_unlock_irqrestore(&uart->write_lock, flags);	
+-		//printk("p");
+ 	}
+ 	DBG("%s:UART_IER=0x%x\n",__FUNCTION__,uart->ier);
+ }
+@@ -411,12 +402,18 @@ static void spi_uart_receive_chars(struct spi_uart *uart, unsigned int *status)
+ 	struct spi_fpga_port *port = container_of(uart, struct spi_fpga_port, uart);
+ 	unsigned int ch, flag;
+ 	int max_count = 1024;
+-
++	//printk("rx:");
+ #if SPI_UART_TXRX_BUF
+ 	int ret,count,stat = 0,num = 0;
++	int i;
+ 	unsigned char buf[SPI_UART_FIFO_LEN];
+ 	while (max_count >0 )
+ 	{
++		stat = spi_in(port, UART_LSR, SEL_UART);
++		if((((stat >> 8) & 0x3f) != 0) && (!(stat & UART_LSR_DR)))
++		printk("%s:warning:no receive data but count =%d \n",__FUNCTION__,((stat >> 8) & 0x3f));
++		if(!(stat & UART_LSR_DR))
++			break;
+ 		ret = spi_in(port, UART_RX, SEL_UART);
+ 		count = (ret >> 8) & 0x3f;	
+ 		DBG("%s:count=%d\n",__FUNCTION__,count);
+@@ -430,21 +427,23 @@ static void spi_uart_receive_chars(struct spi_uart *uart, unsigned int *status)
+ 			printk("err:%s:stat=%d,fail to read uart data because of spi bus error!\n",__FUNCTION__,stat);	
+ 		}
+ 		max_count -= count;
+-		while (count-- >0 )
++		for(i=0;i<count;i++)
+ 		{
+ 			flag = TTY_NORMAL;
+ 			uart->icount.rx++;
+ 			ch = buf[num++];
+ 			tty_insert_flip_char(tty, ch, flag);
+-			//printk("%c,",ch);
++			//if(gBaud == 1500000)
++			//printk("0x%x,",ch);
+ 		}
+ 		//printk("\n");
+-	}
++	}	
+ 
+ 	tty_flip_buffer_push(tty); 
++	//if(gBaud == 1500000)
++	//printk("\n");
+ 	
+ #else	
+-	//printk("rx:");
+ 	while (--max_count >0 )
+ 	{
+ 		ch = spi_in(port, UART_RX, SEL_UART);//
+@@ -533,10 +532,15 @@ static void spi_uart_transmit_chars(struct spi_uart *uart)
+ 		if (circ_empty(xmit))
+ 		break;
+ 		buf[SPI_UART_FIFO_LEN - count] = xmit->buf[xmit->tail];
++		//if(gBaud == 1500000)
++		//printk("0x%x,",buf[SPI_UART_FIFO_LEN - count]&0xff);
+ 		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+ 		uart->icount.tx++;
+ 		--count;
++
+ 	}
++	//if(gBaud == 1500000)
++	//printk("\n");
+ 	if(SPI_UART_FIFO_LEN - count > 0)
+ 	spi_uart_write_buf(uart,buf,SPI_UART_FIFO_LEN - count);
+ #else
+@@ -573,7 +577,7 @@ static void spi_uart_transmit_chars(struct spi_uart *uart)
+ 	DBG("uart->tty->hw_stopped = %d\n",uart->tty->hw_stopped);
+ }
+ 
+-#if 0
++#if 1
+ static void spi_uart_check_modem_status(struct spi_uart *uart)
+ {
+ 	int status;
+@@ -744,7 +748,7 @@ void spi_uart_handle_irq(struct spi_device *spi)
+ 		spi_uart_receive_chars(uart, &lsr);	
+ 	}
+ 
+-	//spi_uart_check_modem_status(uart);
++	spi_uart_check_modem_status(uart);
+ 	
+ 	
+ 	if (lsr & UART_LSR_THRE)
+-- 
+2.35.3
+

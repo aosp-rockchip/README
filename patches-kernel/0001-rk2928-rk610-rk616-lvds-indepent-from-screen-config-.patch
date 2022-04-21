@@ -1,0 +1,1253 @@
+From 00bb9ed2ab27f8b38d3bd439ca01ea61a42e4fab Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Fri, 31 May 2013 12:23:48 +0800
+Subject: [PATCH] rk2928 rk610 rk616 lvds:indepent from screen config file
+
+---
+ drivers/mfd/rk610-core.c                      | 123 ++-
+ .../video/rockchip/transmitter/rk2928_lvds.c  |   4 +-
+ .../video/rockchip/transmitter/rk610_lcd.c    | 885 ++++++++++--------
+ .../video/rockchip/transmitter/rk616_lvds.c   |  38 +-
+ include/linux/mfd/rk610_core.h                |   2 +
+ include/linux/rk_screen.h                     |   2 +-
+ 6 files changed, 584 insertions(+), 470 deletions(-)
+
+diff --git a/drivers/mfd/rk610-core.c b/drivers/mfd/rk610-core.c
+index f9011f89e709..e511a1c29492 100755
+--- a/drivers/mfd/rk610-core.c
++++ b/drivers/mfd/rk610-core.c
+@@ -4,20 +4,23 @@
+ #include <linux/device.h>
+ #include <linux/delay.h>
+ #include <asm/gpio.h>
++#include <linux/mfd/core.h>
+ #include <linux/mfd/rk610_core.h>
+ #include <linux/clk.h>
+ #include <mach/iomux.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
+ 
+-#if defined(CONFIG_ARCH_RK3066B)
+-#define RK610_RESET_PIN   RK30_PIN2_PC5
+-#elif defined(CONFIG_ARCH_RK30)
+-#define RK610_RESET_PIN   RK30_PIN0_PC6
+-#else
+-#define RK610_RESET_PIN   RK29_PIN6_PC1
++#if defined(CONFIG_DEBUG_FS)
++#include <linux/fs.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
++
+ #endif
+ 
++
++
+ /*
+  * Debug
+  */
+@@ -28,11 +31,15 @@
+ #endif
+ 
+ static struct i2c_client *rk610_control_client = NULL;
+-#ifdef CONFIG_RK610_LVDS
+-extern int rk610_lcd_init(struct rk610_core_info *rk610_core_info);
+-#else
+-int rk610_lcd_init(struct rk610_core_info *rk610_core_info){}
+-#endif
++
++
++static struct mfd_cell rk610_devs[] = {
++	{
++		.name = "rk610-lcd",
++		.id = 0,
++	},
++};
++
+ int rk610_control_send_byte(const char reg, const char data)
+ {
+ 	int ret;
+@@ -157,7 +164,7 @@ void rk610_control_init_codec(void)
+     DBG("[%s] RK610_CONTROL_REG_CLOCK_CON1 is %x\n", __FUNCTION__, data);
+ }
+ #endif
+-#ifdef RK610_DEBUG
++
+ static int rk610_read_p0_reg(struct i2c_client *client, char reg, char *val)
+ {
+ 	return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+@@ -167,43 +174,58 @@ static int rk610_write_p0_reg(struct i2c_client *client, char reg, char *val)
+ {
+ 	return i2c_master_reg8_send(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+ }
+-static ssize_t rk610_show_reg_attrs(struct device *dev,
+-					      struct device_attribute *attr,
+-					      char *buf)
+-{
+ 
+-	int i,size=0;
+-	char val;
+-	struct i2c_client *client=rk610_control_client;
+ 
+-	for(i=0;i<256;i++)
++#if defined(CONFIG_DEBUG_FS)
++static int rk610_reg_show(struct seq_file *s, void *v)
++{
++	char reg = 0;
++	u8 val = 0;
++	struct rk610_core_info *core_info = s->private;
++	if(!core_info)
+ 	{
+-		rk610_read_p0_reg(client, i,  &val);
+-		if(i%16==0)
+-			size += sprintf(buf+size,"\n>>>rk610_ctl %x:",i);
+-		size += sprintf(buf+size," %2x",val);
++		dev_err(core_info->dev,"no mfd rk610!\n");
++		return 0;
+ 	}
+ 
+-	return size;
++	for(reg=C_PLL_CON0;reg<= I2C_CON;reg++)
++	{
++		rk610_read_p0_reg(core_info->client, reg,  &val);
++		if(reg%8==0)
++			seq_printf(s,"\n0x%02x:",reg);
++		seq_printf(s," %02x",val);
++	}
++	seq_printf(s,"\n");
++
++	return 0;
++}
++
++static ssize_t rk610_reg_write (struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{ 
++	struct rk610_core_info *core_info = file->f_path.dentry->d_inode->i_private;
++	u32 reg,val;
++	
++	char kbuf[25];
++	if (copy_from_user(kbuf, buf, count))
++		return -EFAULT;
++	sscanf(kbuf, "%x%x", &reg,&val);
++	rk610_write_p0_reg(core_info->client, reg,  (u8*)&val);
++	return count;
+ }
+-static ssize_t rk610_store_reg_attrs(struct device *dev,
+-						struct device_attribute *attr,
+-			 			const char *buf, size_t size)
++
++static int rk610_reg_open(struct inode *inode, struct file *file)
+ {
+-	struct i2c_client *client=NULL;
+-	static char val=0,reg=0;
+-	client = rk610_control_client;
+-	DBG("/**********rk610 reg config******/");
+-
+-	sscanf(buf, "%x%x", &val,&reg);
+-	DBG("reg=%x val=%x\n",reg,val);
+-	rk610_write_p0_reg(client, reg,  &val);
+-	DBG("val=%x\n",val);
+-	return size;
++	struct rk610_core_info *core_info = inode->i_private;
++	return single_open(file,rk610_reg_show,core_info);
+ }
+ 
+-static struct device_attribute rk610_attrs[] = {
+-	__ATTR(reg_ctl, 0777,rk610_show_reg_attrs,rk610_store_reg_attrs),
++static const struct file_operations rk610_reg_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rk610_reg_open,
++	.read		= seq_read,
++	.write          = rk610_reg_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
+ };
+ #endif
+ 
+@@ -248,14 +270,25 @@ static int rk610_control_probe(struct i2c_client *client,
+ 	}
+ 
+ 	rk610_control_client = client;
+-	msleep(100);
+ 	if(core_info->pdata->rk610_power_on_init)
+ 		core_info->pdata->rk610_power_on_init();
+ 	core_info->client = client;
+-	rk610_lcd_init(core_info);
+-#ifdef RK610_DEBUG
+-	device_create_file(&(client->dev), &rk610_attrs[0]);
++	core_info->dev = &client->dev;
++	i2c_set_clientdata(client,core_info);
++	ret = mfd_add_devices(&client->dev, -1,
++				      rk610_devs, ARRAY_SIZE(rk610_devs),
++				      NULL,0);
++	
++#if defined(CONFIG_DEBUG_FS)
++	core_info->debugfs_dir = debugfs_create_dir("rk610", NULL);
++	if (IS_ERR(core_info->debugfs_dir))
++	{
++		dev_err(&client->dev,"failed to create debugfs dir for rk610!\n");
++	}
++	else
++		debugfs_create_file("core", S_IRUSR,core_info->debugfs_dir,core_info,&rk610_reg_fops);
+ #endif
++
+     return 0;
+ }
+ 
+@@ -281,7 +314,6 @@ static struct i2c_driver rk610_control_driver = {
+ 
+ static int __init rk610_control_init(void)
+ {
+-	DBG("[%s] start\n", __FUNCTION__);
+ 	return i2c_add_driver(&rk610_control_driver);
+ }
+ 
+@@ -291,7 +323,6 @@ static void __exit rk610_control_exit(void)
+ }
+ 
+ subsys_initcall_sync(rk610_control_init);
+-//module_init(rk610_control_init);
+ module_exit(rk610_control_exit);
+ 
+ 
+diff --git a/drivers/video/rockchip/transmitter/rk2928_lvds.c b/drivers/video/rockchip/transmitter/rk2928_lvds.c
+index 1c130cea26ea..1686be30d1d3 100644
+--- a/drivers/video/rockchip/transmitter/rk2928_lvds.c
++++ b/drivers/video/rockchip/transmitter/rk2928_lvds.c
+@@ -9,7 +9,7 @@ static void rk_output_lvds(rk_screen *screen)
+ {
+ 	LVDSWrReg(m_PDN_CBG(1)|m_PD_PLL(0)|m_PDN(1)|m_OEN(0) 	\
+ 					|m_DS(DS_10PF)|m_MSBSEL(DATA_D0_MSB) 	\
+-					|m_OUT_FORMAT(screen->hw_format) 		\
++					|m_OUT_FORMAT(screen->lvds_format) 		\
+ 					|m_LCDC_SEL(screen->lcdc_id));
+ 
+        printk("%s>>connect to lcdc output interface%d\n",__func__,screen->lcdc_id);
+@@ -19,7 +19,7 @@ static void rk_output_lvttl(rk_screen *screen)
+ {
+ 	LVDSWrReg(m_PDN_CBG(0)|m_PD_PLL(1)|m_PDN(0)|m_OEN(1) 	\
+ 					|m_DS(DS_10PF)|m_MSBSEL(DATA_D0_MSB) 	\
+-					|m_OUT_FORMAT(screen->hw_format) 		\
++					|m_OUT_FORMAT(screen->lvds_format) 		\
+ 					|m_LCDC_SEL(screen->lcdc_id));
+         printk("%s>>connect to lcdc output interface%d\n",__func__,screen->lcdc_id);
+ }
+diff --git a/drivers/video/rockchip/transmitter/rk610_lcd.c b/drivers/video/rockchip/transmitter/rk610_lcd.c
+index ef51241959c2..fe58f4422b97 100644
+--- a/drivers/video/rockchip/transmitter/rk610_lcd.c
++++ b/drivers/video/rockchip/transmitter/rk610_lcd.c
+@@ -1,414 +1,475 @@
+-#include <linux/fb.h>
+-#include <linux/delay.h>
+-#include <mach/gpio.h>
+-#include <mach/iomux.h>
+-#include <mach/board.h>
+-#include "rk610_lcd.h"
+-#include <linux/mfd/rk610_core.h>
+-#include <linux/rk_fb.h>
+-#include "../../rockchip/hdmi/rk_hdmi.h"
+-
+-static struct rk610_lcd_info *g_lcd_inf = NULL;
+-//static int rk610_scaler_read_p0_reg(struct i2c_client *client, char reg, char *val)
+-//{
+-	//return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+-//}
+-
+-static int rk610_scaler_write_p0_reg(struct i2c_client *client, char reg, char *val)
+-{
+-	return i2c_master_reg8_send(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+-}
+-static void rk610_scaler_pll_enable(struct i2c_client *client)
+-{
+-    char c;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-
+-    g_lcd_inf->scl_inf.pll_pwr = ENABLE;
+-    
+-    c = S_PLL_PWR(0)|S_PLL_RESET(0)|S_PLL_BYPASS(0);
+-	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+-}
+-static void rk610_scaler_pll_disable(struct i2c_client *client)
+-{
+-    char c;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    
+-    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
+-
+-    c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
+-	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+-}
+-static void rk610_scaler_enable(struct i2c_client *client)
+-{
+-    char c;
+-    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    g_lcd_inf->scl_inf.scl_pwr = ENABLE;
+-    #if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
+-    if(g_lcd_inf->screen !=NULL){
+-        den_inv = g_lcd_inf->screen->s_den_inv;
+-        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
+-        clk_inv = g_lcd_inf->screen->s_clk_inv;
+-    }
+-    #endif
+-    c= SCL_BYPASS(0) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(ENABLE);  
+-	rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+-}
+-static void rk610_scaler_disable(struct i2c_client *client)
+-{
+-    char c;
+-    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    
+-    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
+-    #if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
+-    if(g_lcd_inf->screen !=NULL){
+-        den_inv = g_lcd_inf->screen->s_den_inv;
+-        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
+-        clk_inv = g_lcd_inf->screen->s_clk_inv;
+-    }
+-    #endif
+-    c= SCL_BYPASS(1) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(DISABLE); 
+-    rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+-}
+-
+-static int rk610_output_config(struct i2c_client *client,struct rk29fb_screen *screen,int mode)
+-{
+-    char c=0;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-     if(SCREEN_LVDS == screen->type){
+-        if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
+-            c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(1) |LVDS_PLL_PWR_PIN(0) \
+-                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
+-                |LVDS_OUTPUT_FORMAT(screen->hw_format) | LVDS_BIASE_PWR(1); 
+-	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
+-            c = LVDS_OUT_ENABLE(0x0) |LVDS_TX_PWR_ENABLE(0x0); 
+-	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
+-	    }
+-	    else{
+-	        c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(0) |LVDS_PLL_PWR_PIN(1) \
+-                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
+-                |LVDS_OUTPUT_FORMAT(screen->hw_format) | LVDS_BIASE_PWR(0); 
+-	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
+-            c = LVDS_OUT_ENABLE(0xf) |LVDS_TX_PWR_ENABLE(0xf); 
+-	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
+-             
+-	    }
+-	}else if(SCREEN_RGB == screen->type){
+-	    if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
+-            c = LCD1_OUT_ENABLE(LCD1_AS_OUT) | LCD1_OUT_SRC((mode == LCD_OUT_SCL)?LCD1_FROM_SCL : LCD1_FROM_LCD0);
+-	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
+-	    }
+-	    else {
+-            c = LCD1_OUT_ENABLE(LCD1_AS_IN);
+-	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
+-	    }
+-	}
+-	return 0;
+-}
+-#if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
+-static int rk610_scaler_pll_set(struct i2c_client *client,struct rk29fb_screen *screen,u32 clkin )
+-{
+-    char c=0;
+-    char M=0,N=0,OD=0;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-	/***************SET SCALER PLL FROM CLKIN ,DIV 0*/
+-    if(screen->s_pixclock != 0){
+-        OD = (screen->s_pixclock)&0x3;
+-        N = (screen->s_pixclock >>4)&0xf;
+-        M = (screen->s_pixclock >>8)&0xff;
+-    }else {
+-        RK610_ERR(&client->dev,"RK610 Scaler pll not support rate \n");
+-    }
+-    c = S_PLL_FROM_DIV<<3 | S_PLL_DIV(0);
+-	rk610_scaler_write_p0_reg(client, CLOCK_CON0, &c);
+-    
+-    c = S_DIV_N(N)| S_DIV_OD(OD);
+-	rk610_scaler_write_p0_reg(client, S_PLL_CON0, &c);
+-    c = S_DIV_M(M);
+-    rk610_scaler_write_p0_reg(client, S_PLL_CON1, &c);
+-    rk610_scaler_pll_enable(client);
+-	return 0;
+-}
+-
+-
+-static int  scale_hv_factor(struct i2c_client *client ,u32 Hin_act, u32 Hout_act, u32 Vin_act, u32 Vout_act)
+-   {
+-    char c;
+-  	u32 hfactor_f,vfactor_f,scl_factor_f;
+-	int  hfactor;
+-	int  vfactor;
+-	struct scl_hv_info  HV2;
+-	hfactor_f = ((Hin_act-1)*4096)/(Hout_act-1);
+-    if(hfactor_f==4096)
+-	    {hfactor = 0x1000;}
+- 	else if(hfactor_f>(int)hfactor_f)
+-	  	{hfactor = (int)hfactor_f+1;}
+-	else
+-	  	{hfactor = (int)hfactor_f;}
+-	  
+-	scl_factor_f = Vin_act/Vout_act;
+-	if(scl_factor_f<2)
+-	    {vfactor_f = ((Vin_act-1)*4096)/(Vout_act-1);}
+-	else
+-	  	{vfactor_f = ((Vin_act-2)*4096)/(Vout_act-1);} 
+-	if(vfactor_f==4096)
+-	    {vfactor = 0x1000;}
+-	else if(vfactor_f>(int)vfactor_f)
+-	  	{vfactor = (int)vfactor_f+1;}
+-	else
+-	  	{vfactor = (int)vfactor_f;}
+-	  
+-    HV2.scl_h= hfactor;
+-    HV2.scl_v= vfactor; 
+-           /*       SCL FACTOR          */
+-    c = SCL_H_FACTOR_LSB(HV2.scl_h);
+-	rk610_scaler_write_p0_reg(client, SCL_CON1, &c);
+-    c = SCL_H_FACTOR_MSB(HV2.scl_h);
+-	rk610_scaler_write_p0_reg(client, SCL_CON2, &c);
+-
+-    c = SCL_V_FACTOR_LSB(HV2.scl_v);
+-	rk610_scaler_write_p0_reg(client, SCL_CON3, &c);
+-    c = SCL_V_FACTOR_MSB(HV2.scl_v);
+-	rk610_scaler_write_p0_reg(client, SCL_CON4, &c);
+-  	return 0;
+-   }
+-
+-static int rk610_scaler_fator_config(struct i2c_client *client ,struct rk29fb_screen *screen)
+-{
+-    switch(screen->hdmi_resolution){
+-        case HDMI_1920x1080p_60Hz:
+-        case HDMI_1920x1080p_50Hz:
+-            rk610_scaler_pll_set(client,screen,148500000);
+-            /***************set scaler factor********************/
+-            scale_hv_factor(client,1920,screen->x_res,1080,screen->y_res);
+-            break;
+-        case HDMI_1280x720p_60Hz:
+-        case HDMI_1280x720p_50Hz:
+-            rk610_scaler_pll_set(client,screen,74250000);
+-            /***************set scaler factor********************/
+-            scale_hv_factor(client,1280,screen->x_res,720,screen->y_res);
+-        break;
+-        case HDMI_720x576p_50Hz_16_9:
+-        case HDMI_720x576p_50Hz_4_3:
+-            rk610_scaler_pll_set(client,screen,27000000);
+-            /***************set scaler factor********************/
+-            scale_hv_factor(client,720,screen->x_res,576,screen->y_res);
+-            break;
+-        case HDMI_720x480p_60Hz_16_9:
+-        case HDMI_720x480p_60Hz_4_3:
+-            rk610_scaler_pll_set(client,screen,27000000);
+-            /***************set scaler factor********************/
+-            scale_hv_factor(client,720,screen->x_res,480,screen->y_res);
+-        break;
+-    default :
+-        RK610_ERR(&client->dev,"RK610 not support dual display at hdmi resolution=%d \n",screen->hdmi_resolution); 
+-        return -1;
+-        break;
+-    }
+-    return 0;
+-}
+-static int rk610_scaler_output_timing_config(struct i2c_client *client,struct rk29fb_screen *screen)
+-{
+-    char c;
+-    int h_st = screen->s_hsync_st;
+-    int hs_end = screen->s_hsync_len;
+-    int h_act_st = hs_end + screen->s_left_margin;
+-    int xres = screen->x_res;
+-    int h_act_end = h_act_st + xres;
+-    int h_total = h_act_end + screen->s_right_margin;
+-    int v_st = screen->s_vsync_st;
+-    int vs_end = screen->s_vsync_len;
+-    int v_act_st = vs_end + screen->s_upper_margin;
+-    int yres = screen->y_res;    
+-    int v_act_end = v_act_st + yres;
+-    int v_total = v_act_end + screen->s_lower_margin;
+-
+-    /*      SCL display Frame start point   */
+-    c = SCL_DSP_HST_LSB(h_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON5, &c);
+-    c = SCL_DSP_HST_MSB(h_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON6, &c);
+-
+-    c = SCL_DSP_VST_LSB(v_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON7, &c);
+-    c = SCL_DSP_VST_MSB(v_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON8, &c);
+-    /*      SCL output timing       */
+-
+-    c = SCL_DSP_HTOTAL_LSB(h_total);
+-	rk610_scaler_write_p0_reg(client, SCL_CON9, &c);
+-    c = SCL_DSP_HTOTAL_MSB(h_total);
+-	rk610_scaler_write_p0_reg(client, SCL_CON10, &c);
+-
+-    c = SCL_DSP_HS_END(hs_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON11, &c);
+-
+-    c = SCL_DSP_HACT_ST_LSB(h_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON12, &c);
+-    c = SCL_DSP_HACT_ST_MSB(h_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON13, &c);
+-
+-    c = SCL_DSP_HACT_END_LSB(h_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON14, &c);
+-    c = SCL_DSP_HACT_END_MSB(h_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON15, &c);
+-
+-    c = SCL_DSP_VTOTAL_LSB(v_total);
+-	rk610_scaler_write_p0_reg(client, SCL_CON16, &c);
+-    c = SCL_DSP_VTOTAL_MSB(v_total);
+-	rk610_scaler_write_p0_reg(client, SCL_CON17, &c);
+-
+-    c = SCL_DSP_VS_END(vs_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON18, &c);
+-
+-    c = SCL_DSP_VACT_ST(v_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON19, &c);
+-
+-    c = SCL_DSP_VACT_END_LSB(v_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON20, &c);
+-    c = SCL_DSP_VACT_END_MSB(v_act_end); 
+-	rk610_scaler_write_p0_reg(client, SCL_CON21, &c);
+- 
+-    c = SCL_H_BORD_ST_LSB(h_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON22, &c);
+-    c = SCL_H_BORD_ST_MSB(h_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON23, &c);
+-
+-    c = SCL_H_BORD_END_LSB(h_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON24, &c);
+-    c = SCL_H_BORD_END_MSB(h_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON25, &c);
+-
+-    c = SCL_V_BORD_ST(v_act_st);
+-	rk610_scaler_write_p0_reg(client, SCL_CON26, &c);
+-
+-    c = SCL_V_BORD_END_LSB(v_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON27, &c);
+-    c = SCL_V_BORD_END_MSB(v_act_end);
+-	rk610_scaler_write_p0_reg(client, SCL_CON28, &c);
+-	
+-	return 0;
+-}
+-static int rk610_scaler_chg(struct i2c_client *client ,struct rk29fb_screen *screen)
+-{
+-
+-    RK610_DBG(&client->dev,"%s screen->hdmi_resolution=%d\n",__FUNCTION__,screen->hdmi_resolution);
+-    rk610_scaler_fator_config(client,screen);
+-    rk610_scaler_enable(client);
+-    rk610_scaler_output_timing_config(client,screen); 
+-    
+-    return 0;
+-
+-}
+-#endif
+-static int rk610_lcd_scaler_bypass(struct i2c_client *client,bool enable)//enable:0 bypass 1: scale
+-{
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    
+-    rk610_scaler_disable(client);       
+-    rk610_scaler_pll_disable(client);
+-    
+-    return 0;
+-}
+-
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-static void rk610_lcd_early_suspend(struct early_suspend *h)
+-{
+-    struct i2c_client *client = g_lcd_inf->client;
+-    char c;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    if(g_lcd_inf->screen != NULL){
+-        rk610_output_config(client,g_lcd_inf->screen,LCD_OUT_DISABLE);
+-    }
+-
+-    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
+-        c= SCL_BYPASS(1) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(DISABLE); 
+-        rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+-    }
+-    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
+-        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
+-	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+-    }
+-}
+-
+-static void rk610_lcd_early_resume(struct early_suspend *h)
+-{
+-    struct i2c_client *client = g_lcd_inf->client;
+-    char c;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-
+-    if(g_lcd_inf->screen != NULL){
+-        rk610_output_config(client,g_lcd_inf->screen,g_lcd_inf->disp_mode);
+-    }
+-    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
+-        c= SCL_BYPASS(0) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(ENABLE);  
+-	    rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+-    }
+-    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
+-        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
+-	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+-    }
+-}
+-#endif
+-int rk610_lcd_scaler_set_param(struct rk29fb_screen *screen,bool enable )//enable:0 bypass 1: scale
+-{
+-    int ret=0;
+-    struct i2c_client *client = g_lcd_inf->client;
+-    if(client == NULL){
+-        printk("%s client == NULL FAIL\n",__FUNCTION__);
+-        return -1;
+-    }
+-    if(screen == NULL){
+-        printk("%s screen == NULL FAIL\n",__FUNCTION__);
+-        return -1;
+-    }
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    
+-    g_lcd_inf->screen = screen;
+-    
+-#if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
+-    if(enable == 1){
+-        g_lcd_inf->disp_mode = LCD_OUT_SCL;
+-        rk610_output_config(client,screen,LCD_OUT_SCL);
+-        ret = rk610_scaler_chg(client,screen);
+-	}
+-	else 
+-#endif
+-	{
+-	    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
+-	    rk610_output_config(client,screen,LCD_OUT_BYPASS);
+-	    ret = rk610_lcd_scaler_bypass(client,enable);
+-	}
+-	return ret;
+-}
+-int rk610_lcd_init(struct rk610_core_info *rk610_core_info)
+-{
+-    if(rk610_core_info->client == NULL){
+-        printk("%s client == NULL FAIL\n",__FUNCTION__);
+-        return -1;
+-    }
+-    RK610_DBG(&rk610_core_info->client->dev,"%s \n",__FUNCTION__);
+-
+-    g_lcd_inf = kmalloc(sizeof(struct rk610_lcd_info), GFP_KERNEL);
+-    if(!g_lcd_inf)
++#include <linux/fb.h>
++#include <linux/delay.h>
++#include <mach/gpio.h>
++#include <mach/iomux.h>
++#include <mach/board.h>
++#include "rk610_lcd.h"
++#include <linux/mfd/rk610_core.h>
++#include <linux/rk_fb.h>
++#include "../hdmi/rk_hdmi.h"
++
++static struct rk610_lcd_info *g_lcd_inf = NULL;
++//static int rk610_scaler_read_p0_reg(struct i2c_client *client, char reg, char *val)
++//{
++	//return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
++//}
++
++static int rk610_scaler_write_p0_reg(struct i2c_client *client, char reg, char *val)
++{
++	return i2c_master_reg8_send(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
++}
++static void rk610_scaler_pll_enable(struct i2c_client *client)
++{
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++
++    g_lcd_inf->scl_inf.pll_pwr = ENABLE;
++    
++    c = S_PLL_PWR(0)|S_PLL_RESET(0)|S_PLL_BYPASS(0);
++	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++}
++static void rk610_scaler_pll_disable(struct i2c_client *client)
++{
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
++
++    c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
++	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++}
++static void rk610_scaler_enable(struct i2c_client *client)
++{
++    char c;
++    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    g_lcd_inf->scl_inf.scl_pwr = ENABLE;
++    #if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++    if(g_lcd_inf->screen !=NULL){
++        den_inv = g_lcd_inf->screen->s_den_inv;
++        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
++        clk_inv = g_lcd_inf->screen->s_clk_inv;
++    }
++    #endif
++    c= SCL_BYPASS(0) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(ENABLE);  
++	rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++}
++static void rk610_scaler_disable(struct i2c_client *client)
++{
++    char c;
++    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
++    #if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++    if(g_lcd_inf->screen !=NULL){
++        den_inv = g_lcd_inf->screen->s_den_inv;
++        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
++        clk_inv = g_lcd_inf->screen->s_clk_inv;
++    }
++    #endif
++    c= SCL_BYPASS(1) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(DISABLE); 
++    rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++}
++
++static int rk610_output_config(struct i2c_client *client,struct rk29fb_screen *screen,int mode)
++{
++    char c=0;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++     if(SCREEN_LVDS == screen->type){
++        if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
++            c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(1) |LVDS_PLL_PWR_PIN(0) \
++                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
++                |LVDS_OUTPUT_FORMAT(screen->lvds_format) | LVDS_BIASE_PWR(1); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
++            c = LVDS_OUT_ENABLE(0x0) |LVDS_TX_PWR_ENABLE(0x0); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
++	    }
++	    else{
++	        c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(0) |LVDS_PLL_PWR_PIN(1) \
++                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
++                |LVDS_OUTPUT_FORMAT(screen->lvds_format) | LVDS_BIASE_PWR(0); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
++            c = LVDS_OUT_ENABLE(0xf) |LVDS_TX_PWR_ENABLE(0xf); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
++             
++	    }
++	}else if(SCREEN_RGB == screen->type){
++	    if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
++            c = LCD1_OUT_ENABLE(LCD1_AS_OUT) | LCD1_OUT_SRC((mode == LCD_OUT_SCL)?LCD1_FROM_SCL : LCD1_FROM_LCD0);
++	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
++	    }
++	    else {
++            c = LCD1_OUT_ENABLE(LCD1_AS_IN);
++	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
++	    }
++	}
++	return 0;
++}
++#if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++static int rk610_scaler_pll_set(struct i2c_client *client,struct rk29fb_screen *screen,u32 clkin )
++{
++    char c=0;
++    char M=0,N=0,OD=0;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++	/***************SET SCALER PLL FROM CLKIN ,DIV 0*/
++    if(screen->s_pixclock != 0){
++        OD = (screen->s_pixclock)&0x3;
++        N = (screen->s_pixclock >>4)&0xf;
++        M = (screen->s_pixclock >>8)&0xff;
++    }else {
++        RK610_ERR(&client->dev,"RK610 Scaler pll not support rate \n");
++    }
++    c = S_PLL_FROM_DIV<<3 | S_PLL_DIV(0);
++	rk610_scaler_write_p0_reg(client, CLOCK_CON0, &c);
++    
++    c = S_DIV_N(N)| S_DIV_OD(OD);
++	rk610_scaler_write_p0_reg(client, S_PLL_CON0, &c);
++    c = S_DIV_M(M);
++    rk610_scaler_write_p0_reg(client, S_PLL_CON1, &c);
++    rk610_scaler_pll_enable(client);
++	return 0;
++}
++
++
++static int  scale_hv_factor(struct i2c_client *client ,u32 Hin_act, u32 Hout_act, u32 Vin_act, u32 Vout_act)
++   {
++    char c;
++  	u32 hfactor_f,vfactor_f,scl_factor_f;
++	int  hfactor;
++	int  vfactor;
++	struct scl_hv_info  HV2;
++	hfactor_f = ((Hin_act-1)*4096)/(Hout_act-1);
++    if(hfactor_f==4096)
++	    {hfactor = 0x1000;}
++ 	else if(hfactor_f>(int)hfactor_f)
++	  	{hfactor = (int)hfactor_f+1;}
++	else
++	  	{hfactor = (int)hfactor_f;}
++	  
++	scl_factor_f = Vin_act/Vout_act;
++	if(scl_factor_f<2)
++	    {vfactor_f = ((Vin_act-1)*4096)/(Vout_act-1);}
++	else
++	  	{vfactor_f = ((Vin_act-2)*4096)/(Vout_act-1);} 
++	if(vfactor_f==4096)
++	    {vfactor = 0x1000;}
++	else if(vfactor_f>(int)vfactor_f)
++	  	{vfactor = (int)vfactor_f+1;}
++	else
++	  	{vfactor = (int)vfactor_f;}
++	  
++    HV2.scl_h= hfactor;
++    HV2.scl_v= vfactor; 
++           /*       SCL FACTOR          */
++    c = SCL_H_FACTOR_LSB(HV2.scl_h);
++	rk610_scaler_write_p0_reg(client, SCL_CON1, &c);
++    c = SCL_H_FACTOR_MSB(HV2.scl_h);
++	rk610_scaler_write_p0_reg(client, SCL_CON2, &c);
++
++    c = SCL_V_FACTOR_LSB(HV2.scl_v);
++	rk610_scaler_write_p0_reg(client, SCL_CON3, &c);
++    c = SCL_V_FACTOR_MSB(HV2.scl_v);
++	rk610_scaler_write_p0_reg(client, SCL_CON4, &c);
++  	return 0;
++   }
++
++static int rk610_scaler_fator_config(struct i2c_client *client ,struct rk29fb_screen *screen)
++{
++    switch(screen->hdmi_resolution){
++        case HDMI_1920x1080p_60Hz:
++        case HDMI_1920x1080p_50Hz:
++            rk610_scaler_pll_set(client,screen,148500000);
++            /***************set scaler factor********************/
++            scale_hv_factor(client,1920,screen->x_res,1080,screen->y_res);
++            break;
++        case HDMI_1280x720p_60Hz:
++        case HDMI_1280x720p_50Hz:
++            rk610_scaler_pll_set(client,screen,74250000);
++            /***************set scaler factor********************/
++            scale_hv_factor(client,1280,screen->x_res,720,screen->y_res);
++        break;
++        case HDMI_720x576p_50Hz_16_9:
++        case HDMI_720x576p_50Hz_4_3:
++            rk610_scaler_pll_set(client,screen,27000000);
++            /***************set scaler factor********************/
++            scale_hv_factor(client,720,screen->x_res,576,screen->y_res);
++            break;
++        case HDMI_720x480p_60Hz_16_9:
++        case HDMI_720x480p_60Hz_4_3:
++            rk610_scaler_pll_set(client,screen,27000000);
++            /***************set scaler factor********************/
++            scale_hv_factor(client,720,screen->x_res,480,screen->y_res);
++        break;
++    default :
++        RK610_ERR(&client->dev,"RK610 not support dual display at hdmi resolution=%d \n",screen->hdmi_resolution); 
++        return -1;
++        break;
++    }
++    return 0;
++}
++static int rk610_scaler_output_timing_config(struct i2c_client *client,struct rk29fb_screen *screen)
++{
++    char c;
++    int h_st = screen->s_hsync_st;
++    int hs_end = screen->s_hsync_len;
++    int h_act_st = hs_end + screen->s_left_margin;
++    int xres = screen->x_res;
++    int h_act_end = h_act_st + xres;
++    int h_total = h_act_end + screen->s_right_margin;
++    int v_st = screen->s_vsync_st;
++    int vs_end = screen->s_vsync_len;
++    int v_act_st = vs_end + screen->s_upper_margin;
++    int yres = screen->y_res;    
++    int v_act_end = v_act_st + yres;
++    int v_total = v_act_end + screen->s_lower_margin;
++
++    /*      SCL display Frame start point   */
++    c = SCL_DSP_HST_LSB(h_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON5, &c);
++    c = SCL_DSP_HST_MSB(h_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON6, &c);
++
++    c = SCL_DSP_VST_LSB(v_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON7, &c);
++    c = SCL_DSP_VST_MSB(v_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON8, &c);
++    /*      SCL output timing       */
++
++    c = SCL_DSP_HTOTAL_LSB(h_total);
++	rk610_scaler_write_p0_reg(client, SCL_CON9, &c);
++    c = SCL_DSP_HTOTAL_MSB(h_total);
++	rk610_scaler_write_p0_reg(client, SCL_CON10, &c);
++
++    c = SCL_DSP_HS_END(hs_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON11, &c);
++
++    c = SCL_DSP_HACT_ST_LSB(h_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON12, &c);
++    c = SCL_DSP_HACT_ST_MSB(h_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON13, &c);
++
++    c = SCL_DSP_HACT_END_LSB(h_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON14, &c);
++    c = SCL_DSP_HACT_END_MSB(h_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON15, &c);
++
++    c = SCL_DSP_VTOTAL_LSB(v_total);
++	rk610_scaler_write_p0_reg(client, SCL_CON16, &c);
++    c = SCL_DSP_VTOTAL_MSB(v_total);
++	rk610_scaler_write_p0_reg(client, SCL_CON17, &c);
++
++    c = SCL_DSP_VS_END(vs_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON18, &c);
++
++    c = SCL_DSP_VACT_ST(v_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON19, &c);
++
++    c = SCL_DSP_VACT_END_LSB(v_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON20, &c);
++    c = SCL_DSP_VACT_END_MSB(v_act_end); 
++	rk610_scaler_write_p0_reg(client, SCL_CON21, &c);
++ 
++    c = SCL_H_BORD_ST_LSB(h_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON22, &c);
++    c = SCL_H_BORD_ST_MSB(h_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON23, &c);
++
++    c = SCL_H_BORD_END_LSB(h_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON24, &c);
++    c = SCL_H_BORD_END_MSB(h_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON25, &c);
++
++    c = SCL_V_BORD_ST(v_act_st);
++	rk610_scaler_write_p0_reg(client, SCL_CON26, &c);
++
++    c = SCL_V_BORD_END_LSB(v_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON27, &c);
++    c = SCL_V_BORD_END_MSB(v_act_end);
++	rk610_scaler_write_p0_reg(client, SCL_CON28, &c);
++	
++	return 0;
++}
++static int rk610_scaler_chg(struct i2c_client *client ,struct rk29fb_screen *screen)
++{
++
++    RK610_DBG(&client->dev,"%s screen->hdmi_resolution=%d\n",__FUNCTION__,screen->hdmi_resolution);
++    rk610_scaler_fator_config(client,screen);
++    rk610_scaler_enable(client);
++    rk610_scaler_output_timing_config(client,screen); 
++    
++    return 0;
++
++}
++#endif
++static int rk610_lcd_scaler_bypass(struct i2c_client *client,bool enable)//enable:0 bypass 1: scale
++{
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    rk610_scaler_disable(client);       
++    rk610_scaler_pll_disable(client);
++    
++    return 0;
++}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void rk610_lcd_early_suspend(struct early_suspend *h)
++{
++    struct i2c_client *client = g_lcd_inf->client;
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    if(g_lcd_inf->screen != NULL){
++        rk610_output_config(client,g_lcd_inf->screen,LCD_OUT_DISABLE);
++    }
++
++    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
++        c= SCL_BYPASS(1) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(DISABLE); 
++        rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
++        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
++	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++    }
++}
++
++static void rk610_lcd_early_resume(struct early_suspend *h)
++{
++    struct i2c_client *client = g_lcd_inf->client;
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++
++    if(g_lcd_inf->screen != NULL){
++        rk610_output_config(client,g_lcd_inf->screen,g_lcd_inf->disp_mode);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
++        c= SCL_BYPASS(0) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(ENABLE);  
++	    rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
++        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
++	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++    }
++}
++#endif
++int rk610_lcd_scaler_set_param(struct rk29fb_screen *screen,bool enable )//enable:0 bypass 1: scale
++{
++    int ret=0;
++    struct i2c_client *client = g_lcd_inf->client;
++    if(client == NULL){
++        printk("%s client == NULL FAIL\n",__FUNCTION__);
++        return -1;
++    }
++    if(screen == NULL){
++        printk("%s screen == NULL FAIL\n",__FUNCTION__);
++        return -1;
++    }
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    g_lcd_inf->screen = screen;
++    
++#if defined(CONFIG_HDMI_DUAL_DISP) || defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++    if(enable == 1){
++        g_lcd_inf->disp_mode = LCD_OUT_SCL;
++        rk610_output_config(client,screen,LCD_OUT_SCL);
++        ret = rk610_scaler_chg(client,screen);
++	}
++	else 
++#endif
++	{
++	    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
++	    rk610_output_config(client,screen,LCD_OUT_BYPASS);
++	    ret = rk610_lcd_scaler_bypass(client,enable);
++	}
++	return ret;
++}
++int rk610_lcd_init(struct rk610_core_info *rk610_core_info)
++{
++    if(rk610_core_info->client == NULL){
++        printk("%s client == NULL FAIL\n",__FUNCTION__);
++        return -1;
++    }
++    RK610_DBG(&rk610_core_info->client->dev,"%s \n",__FUNCTION__);
++
++    g_lcd_inf = kmalloc(sizeof(struct rk610_lcd_info), GFP_KERNEL);
++    if(!g_lcd_inf)
+     {
+-        dev_err(&rk610_core_info->client->dev, ">> rk610 inf kmalloc fail!");
+-        return -ENOMEM;
+-    }
+-    memset(g_lcd_inf, 0, sizeof(struct rk610_lcd_info));
+-
+-    g_lcd_inf->client= rk610_core_info->client;
+-    
+-    rk610_core_info->lcd_pdata = (void *)g_lcd_inf;
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-	g_lcd_inf->early_suspend.suspend = rk610_lcd_early_suspend;
+-	g_lcd_inf->early_suspend.resume = rk610_lcd_early_resume;
++        dev_err(&rk610_core_info->client->dev, ">> rk610 inf kmalloc fail!");
++        return -ENOMEM;
++    }
++    memset(g_lcd_inf, 0, sizeof(struct rk610_lcd_info));
++
++    g_lcd_inf->client= rk610_core_info->client;
++    
++    rk610_core_info->lcd_pdata = (void *)g_lcd_inf;
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	g_lcd_inf->early_suspend.suspend = rk610_lcd_early_suspend;
++	g_lcd_inf->early_suspend.resume = rk610_lcd_early_resume;
+ 	g_lcd_inf->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB- 1;
+-	register_early_suspend(&g_lcd_inf->early_suspend);
+-#endif
+-    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
+-    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
+-    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
+-    return 0;
+-}
++	register_early_suspend(&g_lcd_inf->early_suspend);
++#endif
++    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
++    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
++    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
++    return 0;
++}
++
++static int rk610_lcd_probe(struct platform_device *pdev)
++{
++	struct rk610_core_info *core_info = NULL;
++	rk_screen *screen = NULL;
++
++	core_info = dev_get_drvdata(pdev->dev.parent);
++	if(!core_info)
++	{
++		dev_err(&pdev->dev,"rk610 core info is null\n");
++		return -ENODEV;
++	}
++	screen = rk_fb_get_prmry_screen();
++	if(!screen)
++	{
++		dev_err(&pdev->dev,"the fb prmry screen is null!\n");
++		return -ENODEV;
++	}
++	
++#if defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++	screen->sscreen_set = rk610_lcd_scaler_set_param;
++#endif
++ 	rk610_lcd_init(core_info);
++	rk610_lcd_scaler_set_param(screen,0);
++
++	return 0;
++	
++}
++static int rk610_lcd_remove(struct platform_device *pdev)
++{
++	
++	return 0;
++}
++
++static void rk610_lcd_shutdown(struct platform_device *pdev)
++{
++	
++	return;
++}
++
++static struct platform_driver rk610_lcd_driver = {
++	.driver		= {
++		.name	= "rk610-lcd",
++		.owner	= THIS_MODULE,
++	},
++	.probe		= rk610_lcd_probe,
++	.remove		= rk610_lcd_remove,
++	.shutdown	= rk610_lcd_shutdown,
++};
++
++static int __init rk610_lcd_module_init(void)
++{
++	return platform_driver_register(&rk610_lcd_driver);
++}
++fs_initcall(rk610_lcd_module_init);
++static void __exit rk610_lcd_exit(void)
++{
++	platform_driver_unregister(&rk610_lcd_driver);
++}
++module_exit(rk610_lcd_exit);
++
+diff --git a/drivers/video/rockchip/transmitter/rk616_lvds.c b/drivers/video/rockchip/transmitter/rk616_lvds.c
+index fd1339481755..79f8743bd508 100644
+--- a/drivers/video/rockchip/transmitter/rk616_lvds.c
++++ b/drivers/video/rockchip/transmitter/rk616_lvds.c
+@@ -39,7 +39,7 @@ static int rk616_lvds_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 				val = 0;
+ 				val &= ~(LVDS_CH0TTL_EN | LVDS_CH1TTL_EN | LVDS_PLL_PWR_DN);
+ 				val = (LVDS_DCLK_INV)|(LVDS_CH1_PWR_EN) |(LVDS_CH0_PWR_EN) | LVDS_HBP_ODD(odd) |
+-					(LVDS_CBG_PWR_EN) | (LVDS_CH_SEL) | (LVDS_OUT_FORMAT(screen->hw_format)) | 
++					(LVDS_CBG_PWR_EN) | (LVDS_CH_SEL) | (LVDS_OUT_FORMAT(screen->lvds_format)) | 
+ 					(LVDS_CH0TTL_EN << 16) | (LVDS_CH1TTL_EN << 16) |(LVDS_CH1_PWR_EN << 16) | 
+ 					(LVDS_CH0_PWR_EN << 16) | (LVDS_CBG_PWR_EN << 16) | (LVDS_CH_SEL << 16) | 
+ 					(LVDS_OUT_FORMAT_MASK) | (LVDS_DCLK_INV << 16) | (LVDS_PLL_PWR_DN << 16) |
+@@ -52,7 +52,7 @@ static int rk616_lvds_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
+ 			{
+ 				val = 0;
+ 				val &= ~(LVDS_CH0TTL_EN | LVDS_CH1TTL_EN | LVDS_CH1_PWR_EN | LVDS_PLL_PWR_DN | LVDS_CH_SEL); //use channel 0
+-				val |= (LVDS_CH0_PWR_EN) |(LVDS_CBG_PWR_EN) | (LVDS_OUT_FORMAT(screen->hw_format)) | 
++				val |= (LVDS_CH0_PWR_EN) |(LVDS_CBG_PWR_EN) | (LVDS_OUT_FORMAT(screen->lvds_format)) | 
+ 				      (LVDS_CH0TTL_EN << 16) | (LVDS_CH1TTL_EN << 16) |(LVDS_CH0_PWR_EN << 16) | 
+ 				       (LVDS_DCLK_INV ) | (LVDS_CH0TTL_EN << 16) | (LVDS_CH1TTL_EN << 16) |(LVDS_CH0_PWR_EN << 16) | 
+ 				        (LVDS_CBG_PWR_EN << 16)|(LVDS_CH_SEL << 16) | (LVDS_PLL_PWR_DN << 16)| 
+@@ -104,7 +104,7 @@ static int rk616_dither_cfg(struct mfd_rk616 *rk616,rk_screen *screen,bool enabl
+ 
+ 
+ 
+-int rk610_lcd_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass 1: scale
++int rk616_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass 1: scale
+ {
+ 	int ret;
+ 	struct mfd_rk616 *rk616 = g_lvds->rk616;
+@@ -113,7 +113,7 @@ int rk610_lcd_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass
+ 		printk(KERN_ERR "%s:mfd rk616 is null!\n",__func__);
+ 		return -1;
+ 	}
+-	g_lvds->screen = screen;
++	
+ 	ret = rk616_display_router_cfg(rk616,screen,enable);
+ 	
+ 	ret = rk616_dither_cfg(rk616,screen,enable);
+@@ -122,6 +122,16 @@ int rk610_lcd_scaler_set_param(rk_screen *screen,bool enable )//enable:0 bypass
+ }
+ 
+ 
++static int rk616_lvds_init_cfg(struct mfd_rk616 *rk616,rk_screen *screen)
++{
++	int ret ;
++	ret = rk616_display_router_cfg(rk616,screen,0);
++	
++	ret = rk616_dither_cfg(rk616,screen,0);
++	ret = rk616_lvds_cfg(rk616,screen);
++
++	return ret;
++}
+ 
+ #if	defined(CONFIG_HAS_EARLYSUSPEND)
+ static void rk616_lvds_early_suspend(struct early_suspend *h)
+@@ -155,7 +165,7 @@ static int rk616_lvds_probe(struct platform_device *pdev)
+ {
+ 	struct rk616_lvds *lvds = NULL; 
+ 	struct mfd_rk616 *rk616 = NULL;
+-
++	rk_screen *screen = NULL;
+ 	lvds = kzalloc(sizeof(struct rk616_lvds),GFP_KERNEL);
+ 	if(!lvds)
+ 	{
+@@ -171,8 +181,19 @@ static int rk616_lvds_probe(struct platform_device *pdev)
+ 	}
+ 	else
+ 		g_lvds = lvds;
+-		lvds->rk616 = rk616;
+-
++	lvds->rk616 = rk616;
++	
++	screen = rk_fb_get_prmry_screen();
++	if(!screen)
++	{
++		dev_err(&pdev->dev,"the fb prmry screen is null!\n");
++		return -ENODEV;
++	}
++	lvds->screen = screen;
++#if defined(CONFIG_ONE_LCDC_DUAL_OUTPUT_INF)
++	screen->sscreen_set = rk616_scaler_set_param;
++#endif
++ 	rk616_lvds_init_cfg(rk616,screen);
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ 	lvds->early_suspend.suspend = rk616_lvds_early_suspend;
+ 	lvds->early_suspend.resume = rk616_lvds_late_resume;
+@@ -213,8 +234,7 @@ static int __init rk616_lvds_init(void)
+ {
+ 	return platform_driver_register(&rk616_lvds_driver);
+ }
+-subsys_initcall_sync(rk616_lvds_init);
+-
++fs_initcall(rk616_lvds_init);
+ static void __exit rk616_lvds_exit(void)
+ {
+ 	platform_driver_unregister(&rk616_lvds_driver);
+diff --git a/include/linux/mfd/rk610_core.h b/include/linux/mfd/rk610_core.h
+index 48adbde9ebee..13bfccd4ec20 100644
+--- a/include/linux/mfd/rk610_core.h
++++ b/include/linux/mfd/rk610_core.h
+@@ -141,7 +141,9 @@ struct rk610_ctl_platform_data {
+ };
+ struct rk610_core_info{
+     struct i2c_client *client;
++    struct device *dev;
+     struct rk610_ctl_platform_data *pdata;
++    struct dentry *debugfs_dir;
+     void *lcd_pdata;
+ };
+ 
+diff --git a/include/linux/rk_screen.h b/include/linux/rk_screen.h
+index 4b969b8b7caa..6f3f0469c322 100644
+--- a/include/linux/rk_screen.h
++++ b/include/linux/rk_screen.h
+@@ -109,7 +109,7 @@ struct rk29lcd_info {
+ typedef struct rk29fb_screen {
+ 	/* screen type & hardware connect format & out face */
+ 	u16 type;
+-	u16 hw_format;  //lvds data format
++	u16 lvds_format;  //lvds data format
+ 	u16 face;
+ 	u8 lcdc_id;    //which output interface the screeen connect to
+ 	u8 screen_id; //screen number
+-- 
+2.35.3
+

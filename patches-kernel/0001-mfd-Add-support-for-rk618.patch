@@ -1,0 +1,371 @@
+From 2ef4ee93f4f2fffba7e7e11a0f4f0c212a4f5bc1 Mon Sep 17 00:00:00 2001
+From: Wyon Bi <bivvy.bi@rock-chips.com>
+Date: Sun, 9 Jul 2017 10:01:18 +0800
+Subject: [PATCH] mfd: Add support for rk618
+
+RK618 is a partner chip for Rockchip mobile application processor.
+
+RK618 includes two RGB display input interface with double data rate.
+With the internal MUX function, it can output 1080P HDMI signal to
+TV and output RGB/LVDS/MIPI signal to TFT panel. In this case, RK618
+can support dual panel (TV and TFT) display.
+
+RK618 includes a audio codec, which with two I2S/PCM interface, two
+differential microphone input and audio processing function.
+
+Change-Id: Id18c251cbe1613de98e84c2b022826f85b3dd82b
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ .../devicetree/bindings/mfd/rk618.txt         |  31 +++
+ drivers/mfd/Kconfig                           |  10 +
+ drivers/mfd/Makefile                          |   1 +
+ drivers/mfd/rk618.c                           | 225 ++++++++++++++++++
+ include/linux/mfd/rk618.h                     |  33 +++
+ 5 files changed, 300 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/mfd/rk618.txt
+ create mode 100644 drivers/mfd/rk618.c
+ create mode 100644 include/linux/mfd/rk618.h
+
+diff --git a/Documentation/devicetree/bindings/mfd/rk618.txt b/Documentation/devicetree/bindings/mfd/rk618.txt
+new file mode 100644
+index 000000000000..18979633c516
+--- /dev/null
++++ b/Documentation/devicetree/bindings/mfd/rk618.txt
+@@ -0,0 +1,31 @@
++Device-Tree bindings for Rockchip RK618 MFD driver
++
++Required properties:
++ - compatible: value should be one of the following:
++   "rockchip,rk618"
++ - reg: I2C device address.
++ - clocks: phandle to the clkin clock provider
++ - clock-names: Must be "clkin"
++ - reset-gpios: a GPIO spec for the reset pin
++
++Optional properties:
++ - power-supply: regulator to provide the supply voltage
++ - enable-gpios: a GPIO spec for the enable pin
++
++Example:
++
++&i2c5 {
++	status = "okay";
++
++	rk618: rk618@50 {
++		compatible = "rockchip,rk618";
++		reg = <0x50>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&i2s_8ch_mclk &lcdc_lcdc &state_video_phy_ttl>;
++		pinctrl-1 = <&lcdc_gpio>;
++		clocks = <&cru SCLK_I2S_8CH_OUT>;
++		clock-names = "clkin";
++		reset-gpios = <&gpio3 14 GPIO_ACTIVE_LOW>;
++	};
++};
++
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index 7b4c6044bf56..8851f64d8279 100644
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -778,6 +778,16 @@ config MFD_RC5T583
+ 	  Additional drivers must be enabled in order to use the
+ 	  different functionality of the device.
+ 
++config MFD_RK618
++	tristate "Rockchip RK618 MFD Driver"
++	depends on I2C
++	depends on OF
++	select MFD_CORE
++	select REGMAP_I2C
++	select REGMAP_IRQ
++	help
++	  if you say yes here you get support for the RK618 from Rockchip.
++
+ config MFD_RK808
+ 	tristate "Rockchip RK808 Power Management chip"
+ 	depends on I2C && OF
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index f57ceffd7fc0..f9b80e005e97 100644
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -173,6 +173,7 @@ obj-$(CONFIG_MFD_INTEL_MSIC)	+= intel_msic.o
+ obj-$(CONFIG_MFD_PALMAS)	+= palmas.o
+ obj-$(CONFIG_MFD_VIPERBOARD)    += viperboard.o
+ obj-$(CONFIG_MFD_RC5T583)	+= rc5t583.o rc5t583-irq.o
++obj-$(CONFIG_MFD_RK618)		+= rk618.o
+ obj-$(CONFIG_MFD_RK808)		+= rk808.o
+ obj-$(CONFIG_MFD_RN5T618)	+= rn5t618.o
+ obj-$(CONFIG_MFD_SEC_CORE)	+= sec-core.o sec-irq.o
+diff --git a/drivers/mfd/rk618.c b/drivers/mfd/rk618.c
+new file mode 100644
+index 000000000000..d419e6235ff8
+--- /dev/null
++++ b/drivers/mfd/rk618.c
+@@ -0,0 +1,225 @@
++/*
++ * Copyright (c) 2017 Rockchip Electronics Co. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/i2c.h>
++#include <linux/gpio/consumer.h>
++#include <linux/regulator/consumer.h>
++#include <linux/mfd/core.h>
++#include <linux/mfd/rk618.h>
++
++static const struct mfd_cell rk618_devs[] = {
++	{
++		.name = "rk618-cru",
++		.of_compatible = "rockchip,rk618-cru",
++	}, {
++		.name = "rk618-hdmi",
++		.of_compatible = "rockchip,rk618-hdmi",
++	}, {
++		.name = "rk618-lvds",
++		.of_compatible = "rockchip,rk618-lvds",
++	}, {
++		.name = "rk618-rgb",
++		.of_compatible = "rockchip,rk618-rgb",
++	}, {
++		.name = "rk618-mipi-dphy",
++		.of_compatible = "rockchip,rk618-mipi-dphy",
++	}, {
++		.name = "rk618-mipi-dsi",
++		.of_compatible = "rockchip,rk618-mipi-dsi",
++	}, {
++		.name = "rk618-codec",
++		.of_compatible = "rockchip,rk618-codec",
++	},
++};
++
++static int rk618_power_on(struct rk618 *rk618)
++{
++	int ret;
++
++	ret = regulator_enable(rk618->supply);
++	if (ret < 0) {
++		dev_err(rk618->dev, "failed to enable supply: %d\n", ret);
++		return ret;
++	}
++
++	if (rk618->enable_gpio)
++		gpiod_direction_output(rk618->enable_gpio, 1);
++
++	usleep_range(1000, 2000);
++	gpiod_direction_output(rk618->reset_gpio, 0);
++	usleep_range(2000, 4000);
++	gpiod_direction_output(rk618->reset_gpio, 1);
++	usleep_range(50000, 60000);
++	gpiod_direction_output(rk618->reset_gpio, 0);
++
++	return 0;
++}
++
++static void rk618_power_off(struct rk618 *rk618)
++{
++	gpiod_direction_output(rk618->reset_gpio, 1);
++
++	if (rk618->enable_gpio)
++		gpiod_direction_output(rk618->enable_gpio, 0);
++
++	regulator_disable(rk618->supply);
++}
++
++static const struct regmap_config rk618_regmap_config = {
++	.name = "core",
++	.reg_bits = 16,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = 0x9c,
++	.reg_format_endian = REGMAP_ENDIAN_NATIVE,
++	.val_format_endian = REGMAP_ENDIAN_NATIVE,
++};
++
++static int
++rk618_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct device *dev = &client->dev;
++	struct rk618 *rk618;
++	int ret;
++
++	rk618 = devm_kzalloc(dev, sizeof(*rk618), GFP_KERNEL);
++	if (!rk618)
++		return -ENOMEM;
++
++	rk618->dev = dev;
++	rk618->client = client;
++	i2c_set_clientdata(client, rk618);
++
++	rk618->supply = devm_regulator_get(dev, "power");
++	if (IS_ERR(rk618->supply))
++		return PTR_ERR(rk618->supply);
++
++	rk618->enable_gpio = devm_gpiod_get_optional(dev, "enable", 0);
++	if (IS_ERR(rk618->enable_gpio)) {
++		ret = PTR_ERR(rk618->enable_gpio);
++		dev_err(dev, "failed to request enable GPIO: %d\n", ret);
++		return ret;
++	}
++
++	rk618->reset_gpio = devm_gpiod_get(dev, "reset", 0);
++	if (IS_ERR(rk618->reset_gpio)) {
++		ret = PTR_ERR(rk618->reset_gpio);
++		dev_err(dev, "failed to request reset GPIO: %d\n", ret);
++		return ret;
++	}
++
++	rk618->clkin = devm_clk_get(dev, "clkin");
++	if (IS_ERR(rk618->clkin)) {
++		dev_err(dev, "failed to get clock\n");
++		return PTR_ERR(rk618->clkin);
++	}
++
++	ret = clk_prepare_enable(rk618->clkin);
++	if (ret) {
++		dev_err(dev, "unable to enable clock: %d\n", ret);
++		return ret;
++	}
++
++	ret = rk618_power_on(rk618);
++	if (ret)
++		goto err_clk_disable;
++
++	rk618->regmap = devm_regmap_init_i2c(client, &rk618_regmap_config);
++	if (IS_ERR(rk618->regmap)) {
++		ret = PTR_ERR(rk618->regmap);
++		dev_err(dev, "failed to allocate register map: %d\n", ret);
++		goto err_clk_disable;
++	}
++
++	ret = mfd_add_devices(dev, -1, rk618_devs, ARRAY_SIZE(rk618_devs),
++			      NULL, 0, NULL);
++	if (ret) {
++		dev_err(dev, "failed to add subdev: %d\n", ret);
++		goto err_clk_disable;
++	}
++
++	return 0;
++
++err_clk_disable:
++	clk_disable_unprepare(rk618->clkin);
++	return ret;
++}
++
++static int rk618_remove(struct i2c_client *client)
++{
++	struct rk618 *rk618 = i2c_get_clientdata(client);
++
++	mfd_remove_devices(rk618->dev);
++	rk618_power_off(rk618);
++	clk_disable_unprepare(rk618->clkin);
++
++	return 0;
++}
++
++static void rk618_shutdown(struct i2c_client *client)
++{
++	struct rk618 *rk618 = i2c_get_clientdata(client);
++
++	rk618_power_off(rk618);
++	clk_disable_unprepare(rk618->clkin);
++}
++
++static int __maybe_unused rk618_suspend(struct device *dev)
++{
++	pinctrl_pm_select_sleep_state(dev);
++
++	return 0;
++}
++
++static int __maybe_unused rk618_resume(struct device *dev)
++{
++	pinctrl_pm_select_default_state(dev);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rk618_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(rk618_suspend, rk618_resume)
++};
++
++static const struct of_device_id rk618_of_match[] = {
++	{ .compatible = "rockchip,rk618", },
++	{}
++};
++MODULE_DEVICE_TABLE(of, rk618_of_match);
++
++static const struct i2c_device_id rk618_i2c_id[] = {
++	{ "rk618", 0 },
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, rk618_i2c_id);
++
++static struct i2c_driver rk618_driver = {
++	.driver = {
++		.name = "rk618",
++		.of_match_table = of_match_ptr(rk618_of_match),
++		.pm = &rk618_pm_ops,
++	},
++	.probe = rk618_probe,
++	.remove = rk618_remove,
++	.shutdown = rk618_shutdown,
++	.id_table = rk618_i2c_id,
++};
++module_i2c_driver(rk618_driver);
++
++MODULE_AUTHOR("Wyon Bi <bivvy.bi@rock-chips.com>");
++MODULE_DESCRIPTION("Rockchip rk618 i2c driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/linux/mfd/rk618.h b/include/linux/mfd/rk618.h
+new file mode 100644
+index 000000000000..6e6acd989777
+--- /dev/null
++++ b/include/linux/mfd/rk618.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (c) 2017 Rockchip Electronics Co. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __RK618_H__
++#define __RK618_H__
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/regmap.h>
++
++struct rk618 {
++	struct device *dev;
++	struct i2c_client *client;
++	struct clk *clkin;
++	struct regmap *regmap;
++
++	struct regulator *supply;
++	struct gpio_desc *enable_gpio;
++	struct gpio_desc *reset_gpio;	/* power on reset */
++};
++
++#endif
+-- 
+2.35.3
+

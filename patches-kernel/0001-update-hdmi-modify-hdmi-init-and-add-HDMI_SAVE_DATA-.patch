@@ -1,0 +1,270 @@
+From 07f1c995f7e24c824e6a3b6b5e0f57db7dfd39b7 Mon Sep 17 00:00:00 2001
+From: yzq <yzq@rock-chips.com>
+Date: Mon, 5 Dec 2011 16:42:45 +0800
+Subject: [PATCH] update hdmi: modify hdmi init and add HDMI_SAVE_DATA config
+
+---
+ drivers/rtc/rtc-HYM8563.c          | 37 ++++++++++++++++++++++++++++--
+ drivers/video/hdmi/Kconfig         |  6 +++++
+ drivers/video/hdmi/chips/anx7150.c | 28 +++++++++++++++++++---
+ drivers/video/hdmi/hdmi-core.c     |  4 +++-
+ drivers/video/hdmi/hdmi-sysfs.c    | 35 +++++++++++++++++++++++++---
+ include/linux/hdmi.h               |  2 ++
+ 6 files changed, 103 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/rtc/rtc-HYM8563.c b/drivers/rtc/rtc-HYM8563.c
+index ab18d469ddd8..2c292af643dc 100755
+--- a/drivers/rtc/rtc-HYM8563.c
++++ b/drivers/rtc/rtc-HYM8563.c
+@@ -38,7 +38,7 @@ struct hym8563 {
+ 	struct rtc_wkalrm alarm;
+ 	struct wake_lock wake_lock;
+ };
+-
++static struct i2c_client *gClient = NULL;
+ static int hym8563_i2c_read_regs(struct i2c_client *client, u8 reg, u8 buf[], unsigned len)
+ {
+ 	int ret; 
+@@ -275,7 +275,40 @@ static int hym8563_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
+ 	mutex_unlock(&hym8563->mutex);
+ 	return 0;
+ }
++#ifdef CONFIG_HDMI_SAVE_DATA
++int hdmi_get_data(void)
++{
++    u8 regs=0;
++    if(gClient)
++        hym8563_i2c_read_regs(gClient, RTC_T_COUNT, &regs, 1);
++    else 
++    {
++        printk("%s rtc has no init\n",__func__);
++        return -1;
++    }
++    if(regs==0 || regs==0xff){
++        printk("%s rtc has no hdmi data\n",__func__);
++        return -1;
++    }
++    return (regs-1);
++}
++
++int hdmi_set_data(int data)
++{
++    u8 regs = (data+1)&0xff;
++    if(gClient)
++        hym8563_i2c_set_regs(gClient, RTC_T_COUNT, &regs, 1);
++    else 
++    {
++        printk("%s rtc has no init\n",__func__);
++        return -1;
++    }   
++    return 0;
++}
+ 
++EXPORT_SYMBOL(hdmi_get_data);
++EXPORT_SYMBOL(hdmi_set_data);
++#endif
+ #if defined(CONFIG_RTC_INTF_DEV) || defined(CONFIG_RTC_INTF_DEV_MODULE)
+ static int hym8563_i2c_open_alarm(struct i2c_client *client)
+ {
+@@ -400,7 +433,7 @@ static int __devinit hym8563_probe(struct i2c_client *client, const struct i2c_d
+ 	if (!hym8563) {
+ 		return -ENOMEM;
+ 	}
+-		
++	gClient = client;	
+ 	hym8563->client = client;
+ 	mutex_init(&hym8563->mutex);
+ 	wake_lock_init(&hym8563->wake_lock, WAKE_LOCK_SUSPEND, "rtc_hym8563");
+diff --git a/drivers/video/hdmi/Kconfig b/drivers/video/hdmi/Kconfig
+index 2b01022ee40e..2d68da6d7f92 100755
+--- a/drivers/video/hdmi/Kconfig
++++ b/drivers/video/hdmi/Kconfig
+@@ -9,6 +9,12 @@ config HDMI
+ if HDMI
+ source "drivers/video/hdmi/chips/Kconfig"
+ 
++
++config HDMI_SAVE_DATA
++	bool "enable hdmi save data"	
++	help 
++		Enable hdmi save data in rtc register
++
+ #config HDMI_DUAL_DISP
+ #	bool "hdmi support dual display"
+ #	help
+diff --git a/drivers/video/hdmi/chips/anx7150.c b/drivers/video/hdmi/chips/anx7150.c
+index e1a479b1fe20..8a6239cf1c19 100755
+--- a/drivers/video/hdmi/chips/anx7150.c
++++ b/drivers/video/hdmi/chips/anx7150.c
+@@ -116,15 +116,35 @@ static int anx7150_set_param(struct hdmi *hdmi)
+ 	anx7150_param_chg(anx);
+ 	return 0;
+ }
++
+ static int anx7150_init(struct hdmi *hdmi)
+ {
+ 	struct anx7150_pdata *anx = hdmi_priv(hdmi);
+-
++#ifdef CONFIG_HDMI_SAVE_DATA
++    int hdmi_data = hdmi_get_data();
++    if(hdmi_data<0){
++    hdmi_set_data((hdmi->resolution&0x7)|((hdmi->scale&0x1f)<<3));
++    }
++    else{
++    hdmi->resolution = hdmi_data&0x7;
++    hdmi->scale_set= ((hdmi_data>>3)&0x1f) + MIN_SCALE;
++    hdmi->scale = hdmi->scale_set;
++    }
++#endif
+ 	anx->init = 0;
+-	hdmi_changed(hdmi, 1);
++	hdmi_changed(hdmi,1);
+ 
+ 	return 0;
+ }
++static void anx7150_init_work_func(struct work_struct *work)
++{
++    struct anx7150_pdata *anx = container_of(work, struct anx7150_pdata, work.work);
++
++    if(anx!=NULL)
++        anx7150_init(anx->hdmi);
++    else
++        printk("anx7150_init_work_func  err\n");
++}
+ static struct hdmi_ops anx7150_ops = {
+ 	.set_param = anx7150_set_param,
+ 	.hdmi_precent = anx7150_precent,
+@@ -172,7 +192,7 @@ static int anx7150_i2c_probe(struct i2c_client *client,const struct i2c_device_i
+         return -ENOMEM;
+     }
+ 	hdmi->ops = &anx7150_ops;
+-	hdmi->display_on = HDMI_DISABLE;
++	hdmi->display_on = HDMI_DEFAULT_MODE;
+ 	hdmi->hdcp_on = HDMI_DISABLE;
+ 	hdmi->audio_fs = HDMI_I2S_DEFAULT_Fs;
+ 	hdmi->resolution = HDMI_DEFAULT_RESOLUTION;
+@@ -209,6 +229,8 @@ static int anx7150_i2c_probe(struct i2c_client *client,const struct i2c_device_i
+ 	register_early_suspend(&anx->early_suspend);
+ #endif
+ 	anx7150_unplug(anx->client);
++	INIT_DELAYED_WORK(&anx->work,anx7150_init_work_func);
++	schedule_delayed_work(&anx->work, msecs_to_jiffies(2000));
+     dev_info(&client->dev, "anx7150 i2c probe ok\n");
+     return 0;
+ err_gpio_free:
+diff --git a/drivers/video/hdmi/hdmi-core.c b/drivers/video/hdmi/hdmi-core.c
+index 3d9b6ab0f36a..6e16767e35ad 100755
+--- a/drivers/video/hdmi/hdmi-core.c
++++ b/drivers/video/hdmi/hdmi-core.c
+@@ -189,8 +189,10 @@ int hdmi_get_scale(void)
+ 	struct hdmi* hdmi = get_hdmi_struct(0);
+ 	if(!hdmi)
+ 		return 100;
+-	else
++	else if(hdmi->mode == DISP_ON_HDMI)
+ 		return hdmi->scale;
++	else
++	    return 100;
+ }
+ 
+ int hdmi_set_scale(int event, char *data, int len)
+diff --git a/drivers/video/hdmi/hdmi-sysfs.c b/drivers/video/hdmi/hdmi-sysfs.c
+index afe20d9da28e..9a7b44fe5fd8 100755
+--- a/drivers/video/hdmi/hdmi-sysfs.c
++++ b/drivers/video/hdmi/hdmi-sysfs.c
+@@ -3,6 +3,18 @@
+ #include <linux/string.h>
+ 
+ int debug_en = 0;
++
++#ifndef CONFIG_HDMI_SAVE_DATA
++int hdmi_get_data(void)
++{
++return 0;
++}
++int hdmi_set_data(int data)
++{
++return 0;
++}
++#endif
++
+ static ssize_t hdmi_show_state_attrs(struct device *dev,
+ 					      struct device_attribute *attr,
+ 					      char *buf) 
+@@ -45,7 +57,9 @@ static ssize_t hdmi_restore_state_attrs(struct device *dev,
+ 	char *p;
+ 	const char *q;
+ 	int set_param = 0, tmp = 0;
+-
++	#ifdef CONFIG_HDMI_SAVE_DATA
++    int hdmi_data=0;
++    #endif
+ 	if(hdmi->mode == DISP_ON_LCD)
+ 	{
+ 		dev_err(dev, "display on lcd, do not set parameter!\n");
+@@ -107,6 +121,13 @@ static ssize_t hdmi_restore_state_attrs(struct device *dev,
+ 				hdmi->scale_set = tmp;
+ 				hdmi_dbg(dev, "set scale = %d\n", tmp);
+ 				hdmi->scale = tmp;
++				#ifdef CONFIG_HDMI_SAVE_DATA
++				hdmi_data = hdmi_get_data();
++				if(hdmi_data<0)
++				    hdmi->ops->init(hdmi);
++				hdmi_data = (((hdmi->scale-MIN_SCALE)&0x1f)<<3) | (hdmi_data & 0x7);
++				hdmi_set_data(hdmi_data);
++				#endif
+ 			}
+ 			else
+ 			{
+@@ -125,6 +146,13 @@ static ssize_t hdmi_restore_state_attrs(struct device *dev,
+ 					set_param |= 1;
+ 					hdmi_dbg(dev, "set resolution = %d\n", tmp);
+ 					hdmi->resolution = tmp;
++					#ifdef CONFIG_HDMI_SAVE_DATA
++					hdmi_data = hdmi_get_data();
++					if(hdmi_data<0)
++				        hdmi->ops->init(hdmi);
++					hdmi_data = (hdmi->resolution&0x7) | (hdmi_data & 0xf8);
++					hdmi_set_data(hdmi_data);
++					#endif
+ 				}
+ 			}
+ 			else
+@@ -194,6 +222,7 @@ static ssize_t hdmi_restore_debug_attrs(struct device *dev,
+ 		debug_en = tmp;
+ 	return size;
+ }
++#if 0
+ static ssize_t hdmi_restore_init_attrs(struct device *dev, 
+ 						struct device_attribute *attr,
+ 			 			const char *buf, size_t size)
+@@ -217,13 +246,13 @@ static ssize_t hdmi_restore_init_attrs(struct device *dev,
+ 		hdmi->ops->init(hdmi);
+ 	return size;
+ }
++#endif
+ static struct device_attribute hdmi_attrs[] = {
+ 	__ATTR(state, 0777, hdmi_show_state_attrs, hdmi_restore_state_attrs),
+ 	__ATTR(enable, 0777, hdmi_show_switch_attrs, hdmi_restore_switch_attrs),
+ 	__ATTR(debug, 0777, hdmi_show_debug_attrs, hdmi_restore_debug_attrs),
+-	__ATTR(init, 0777, NULL, hdmi_restore_init_attrs),
++	//__ATTR(init, 0777, NULL, hdmi_restore_init_attrs),
+ };
+-
+ int hdmi_create_attrs(struct hdmi *hdmi)
+ {
+ 	int rc = 0;
+diff --git a/include/linux/hdmi.h b/include/linux/hdmi.h
+index b10f7f8fceea..551d2694f0fa 100755
+--- a/include/linux/hdmi.h
++++ b/include/linux/hdmi.h
+@@ -119,4 +119,6 @@ extern int hdmi_get_scale(void);
+ extern int hdmi_set_scale(int event, char *data, int len);
+ extern int fb_get_video_mode(void);
+ extern int display_on_hdmi(void);
++extern int hdmi_get_data(void);
++extern int hdmi_set_data(int data);
+ #endif
+-- 
+2.35.3
+

@@ -1,0 +1,210 @@
+From 5237212dd7a84b7540d87a2847a792727a259962 Mon Sep 17 00:00:00 2001
+From: Frank Wang <frank.wang@rock-chips.com>
+Date: Wed, 10 Oct 2018 15:21:34 +0800
+Subject: [PATCH] hwspinlock: rockchip: add hardware spinlock driver
+
+The Hardware spinlock device on Rockchip platform provides hardware
+assistance for synchronization between the multiple processors in the
+system.
+
+Change-Id: Ib118dfe38c2ceb665556d5ec3aaf7be13552d2d9
+Signed-off-by: Frank Wang <frank.wang@rock-chips.com>
+---
+ drivers/hwspinlock/Kconfig               |  12 ++
+ drivers/hwspinlock/Makefile              |   1 +
+ drivers/hwspinlock/rockchip_hwspinlock.c | 149 +++++++++++++++++++++++
+ 3 files changed, 162 insertions(+)
+ create mode 100644 drivers/hwspinlock/rockchip_hwspinlock.c
+
+diff --git a/drivers/hwspinlock/Kconfig b/drivers/hwspinlock/Kconfig
+index 73a401662853..e2360091322b 100644
+--- a/drivers/hwspinlock/Kconfig
++++ b/drivers/hwspinlock/Kconfig
+@@ -30,6 +30,18 @@ config HWSPINLOCK_QCOM
+ 
+ 	  If unsure, say N.
+ 
++config HWSPINLOCK_ROCKCHIP
++	tristate "Rockchip Hardware Spinlock device"
++	depends on ARCH_ROCKCHIP
++	select HWSPINLOCK
++	help
++	  Say y here to support the Rockchip Hardware Spinlock device, which
++	  provides a synchronisation mechanism for the various processors
++	  on the SoC.
++
++	  It's safe to say n here if you're not interested in Rockchip hardware
++	  spinlock or just want a bare minimum kernel.
++
+ config HWSPINLOCK_SIRF
+ 	tristate "SIRF Hardware Spinlock device"
+ 	depends on ARCH_SIRF
+diff --git a/drivers/hwspinlock/Makefile b/drivers/hwspinlock/Makefile
+index 6b59cb5a4f3a..a6cf15efff50 100644
+--- a/drivers/hwspinlock/Makefile
++++ b/drivers/hwspinlock/Makefile
+@@ -5,5 +5,6 @@
+ obj-$(CONFIG_HWSPINLOCK)		+= hwspinlock_core.o
+ obj-$(CONFIG_HWSPINLOCK_OMAP)		+= omap_hwspinlock.o
+ obj-$(CONFIG_HWSPINLOCK_QCOM)		+= qcom_hwspinlock.o
++obj-$(CONFIG_HWSPINLOCK_ROCKCHIP)	+= rockchip_hwspinlock.o
+ obj-$(CONFIG_HWSPINLOCK_SIRF)		+= sirf_hwspinlock.o
+ obj-$(CONFIG_HSEM_U8500)		+= u8500_hsem.o
+diff --git a/drivers/hwspinlock/rockchip_hwspinlock.c b/drivers/hwspinlock/rockchip_hwspinlock.c
+new file mode 100644
+index 000000000000..2d62aff57f72
+--- /dev/null
++++ b/drivers/hwspinlock/rockchip_hwspinlock.c
+@@ -0,0 +1,149 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2018 Fuzhou Rockchip Electronics Co., Ltd
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/hwspinlock.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++
++#include "hwspinlock_internal.h"
++
++struct rockchip_hwspinlock {
++	void __iomem *io_base;
++	struct hwspinlock_device bank;
++};
++
++/* Number of Hardware Spinlocks*/
++#define	HWSPINLOCK_NUMBER	64
++
++/* Hardware spinlock register offsets */
++#define HWSPINLOCK_OFFSET(x)	(0x4 * (x))
++
++#define HWSPINLOCK_OWNER_ID	0x01
++
++static int rockchip_hwspinlock_trylock(struct hwspinlock *lock)
++{
++	void __iomem *lock_addr = lock->priv;
++
++	writel(HWSPINLOCK_OWNER_ID, lock_addr);
++
++	/*
++	 * Get only first 4 bits and compare to HWSPINLOCK_OWNER_ID,
++	 * if equal, we attempt to acquire the lock, otherwise,
++	 * someone else has it.
++	 */
++	return (HWSPINLOCK_OWNER_ID == (0x0F & readl(lock_addr)));
++}
++
++static void rockchip_hwspinlock_unlock(struct hwspinlock *lock)
++{
++	void __iomem *lock_addr = lock->priv;
++
++	/* Release the lock by writing 0 to it */
++	writel(0, lock_addr);
++}
++
++static const struct hwspinlock_ops rockchip_hwspinlock_ops = {
++	.trylock = rockchip_hwspinlock_trylock,
++	.unlock = rockchip_hwspinlock_unlock,
++};
++
++static int rockchip_hwspinlock_probe(struct platform_device *pdev)
++{
++	struct rockchip_hwspinlock *hwspin;
++	struct hwspinlock *hwlock;
++	struct resource *res;
++	int idx, ret;
++
++	if (!pdev->dev.of_node)
++		return -ENODEV;
++
++	hwspin = devm_kzalloc(&pdev->dev, sizeof(*hwspin) +
++			      sizeof(*hwlock) * HWSPINLOCK_NUMBER, GFP_KERNEL);
++	if (!hwspin)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	hwspin->io_base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(hwspin->io_base))
++		return PTR_ERR(hwspin->io_base);
++
++	for (idx = 0; idx < HWSPINLOCK_NUMBER; idx++) {
++		hwlock = &hwspin->bank.lock[idx];
++		hwlock->priv = hwspin->io_base + HWSPINLOCK_OFFSET(idx);
++	}
++
++	platform_set_drvdata(pdev, hwspin);
++
++	pm_runtime_enable(&pdev->dev);
++
++	ret = hwspin_lock_register(&hwspin->bank, &pdev->dev,
++				   &rockchip_hwspinlock_ops, 0,
++				   HWSPINLOCK_NUMBER);
++	if (ret)
++		goto reg_fail;
++
++	return 0;
++
++reg_fail:
++	pm_runtime_disable(&pdev->dev);
++	iounmap(hwspin->io_base);
++
++	return ret;
++}
++
++static int rockchip_hwspinlock_remove(struct platform_device *pdev)
++{
++	struct rockchip_hwspinlock *hwspin = platform_get_drvdata(pdev);
++	int ret;
++
++	ret = hwspin_lock_unregister(&hwspin->bank);
++	if (ret) {
++		dev_err(&pdev->dev, "%s failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	pm_runtime_disable(&pdev->dev);
++
++	iounmap(hwspin->io_base);
++
++	return 0;
++}
++
++static const struct of_device_id rockchip_hwpinlock_ids[] = {
++	{ .compatible = "rockchip,hwspinlock", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, rockchip_hwpinlock_ids);
++
++static struct platform_driver rockchip_hwspinlock_driver = {
++	.probe = rockchip_hwspinlock_probe,
++	.remove = rockchip_hwspinlock_remove,
++	.driver = {
++		.name = "rockchip_hwspinlock",
++		.of_match_table = of_match_ptr(rockchip_hwpinlock_ids),
++	},
++};
++
++static int __init rockchip_hwspinlock_init(void)
++{
++	return platform_driver_register(&rockchip_hwspinlock_driver);
++}
++postcore_initcall(rockchip_hwspinlock_init);
++
++static void __exit rockchip_hwspinlock_exit(void)
++{
++	platform_driver_unregister(&rockchip_hwspinlock_driver);
++}
++module_exit(rockchip_hwspinlock_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Rockchip Hardware spinlock driver");
++MODULE_AUTHOR("Frank Wang <frank.wang@rock-chips.com>");
+-- 
+2.35.3
+

@@ -1,0 +1,216 @@
+From e84dbc3a64bf4e9719003ffd3f2428d21842b443 Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Wed, 10 Dec 2014 22:18:58 +0800
+Subject: [PATCH] rk312x: add support for ehci to all rk312x series
+
+---
+ arch/arm/boot/dts/rk312x.dtsi           |  16 ++--
+ drivers/usb/dwc_otg_310/usbdev_rk.h     |   1 +
+ drivers/usb/dwc_otg_310/usbdev_rk3126.c | 111 +++++++++++++++++++++++-
+ drivers/usb/host/ehci-rockchip.c        |   8 +-
+ 4 files changed, 126 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arm/boot/dts/rk312x.dtsi b/arch/arm/boot/dts/rk312x.dtsi
+index bfd45e82e295..062f7df90ac1 100755
+--- a/arch/arm/boot/dts/rk312x.dtsi
++++ b/arch/arm/boot/dts/rk312x.dtsi
+@@ -707,17 +707,23 @@
+ 		rockchip,usb-mode = <0>;
+ 	};
+ 
+-	usb1: usb@101c0000 {
+-		compatible = "rockchip,rk3126_usb20_host";
+-		reg = <0x101c0000 0x40000>;
++	ehci: usb@101c0000 {
++		compatible = "rockchip,rk3126_ehci";
++		reg = <0x101c0000 0x20000>;
+ 		interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
+-		clocks = <&clk_gates1 6>, <&clk_gates10 14>;
+-		clock-names = "clk_usbphy1", "hclk_usb1";
++		clocks = <&clk_gates1 6>, <&clk_gates7 3>, <&clk_gates10 14>;
++		clock-names = "clk_usbphy1", "hclk_hoct0_3126","hclk_host0_3126b";
+ 		resets = <&reset RK3128_RST_USBOTG1>, <&reset RK3128_RST_UTMI1>,
+ 				<&reset RK3128_RST_OTGC1>;
+ 		reset-names = "host_ahb", "host_phy", "host_controller";
+ 	};
+ 
++	ohci: usb@101e0000 {
++		compatible = "rockchip,rk3126_ohci";
++		reg = <0x101e0000 0x20000>;
++		interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	fb: fb{
+ 		compatible = "rockchip,rk-fb";
+ 		rockchip,disp-mode = <ONE_DUAL>;
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk.h b/drivers/usb/dwc_otg_310/usbdev_rk.h
+index 682d8a627fd1..16ef6d78c54b 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk.h
++++ b/drivers/usb/dwc_otg_310/usbdev_rk.h
+@@ -70,6 +70,7 @@ extern struct dwc_otg_platform_data usb20host_pdata_rk3036;
+ extern struct dwc_otg_platform_data usb20otg_pdata_rk3126;
+ extern struct dwc_otg_platform_data usb20host_pdata_rk3126;
+ extern struct dwc_otg_platform_data usb20ohci_pdata_rk3126;
++extern struct rkehci_platform_data usb20ehci_pdata_rk3126;
+ 
+ struct dwc_otg_platform_data {
+ 	void *privdata;
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk3126.c b/drivers/usb/dwc_otg_310/usbdev_rk3126.c
+index 628bd6974954..67676c492cc1 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk3126.c
++++ b/drivers/usb/dwc_otg_310/usbdev_rk3126.c
+@@ -213,7 +213,7 @@ struct dwc_otg_platform_data usb20otg_pdata_rk3126 = {
+ };
+ #endif
+ 
+-#ifdef CONFIG_USB20_HOST
++#if defined(CONFIG_USB20_HOST) || defined(CONFIG_USB_EHCI_RK)
+ static void usb20host_hw_init(void)
+ {
+ 	/* Turn off differential receiver in suspend mode */
+@@ -382,6 +382,115 @@ struct dwc_otg_platform_data usb20host_pdata_rk3126 = {
+ };
+ #endif
+ 
++#ifdef CONFIG_USB_EHCI_RK
++static void usb20ehci_phy_suspend(void *pdata, int suspend)
++{
++	struct rkehci_platform_data *usbpdata = pdata;
++
++	if (suspend) {
++		/* enable soft control */
++		writel(UOC_HIWORD_UPDATE(0x1d5, 0x1ff, 0),
++		       RK_GRF_VIRT + RK312X_GRF_UOC1_CON5);
++		usbpdata->phy_status = 1;
++	} else {
++		/* exit suspend */
++		writel(UOC_HIWORD_UPDATE(0x0, 0x1, 0),
++		       RK_GRF_VIRT + RK312X_GRF_UOC1_CON5);
++		usbpdata->phy_status = 0;
++	}
++}
++
++static void usb20ehci_soft_reset(void *pdata, enum rkusb_rst_flag rst_type)
++{
++	struct rkehci_platform_data *usbpdata = pdata;
++	struct reset_control *rst_host_h, *rst_host_p, *rst_host_c;
++
++	rst_host_h = devm_reset_control_get(usbpdata->dev, "host_ahb");
++	rst_host_p = devm_reset_control_get(usbpdata->dev, "host_phy");
++	rst_host_c = devm_reset_control_get(usbpdata->dev, "host_controller");
++	if (IS_ERR(rst_host_h) || IS_ERR(rst_host_p) || IS_ERR(rst_host_c)) {
++		dev_err(usbpdata->dev, "Fail to get reset control from dts\n");
++		return;
++	}
++
++	switch(rst_type) {
++	case RST_POR:
++		/* PHY reset */
++		writel(UOC_HIWORD_UPDATE(0x1, 0x3, 0),
++			   RK_GRF_VIRT + RK312X_GRF_UOC1_CON5);
++		reset_control_assert(rst_host_p);
++		udelay(15);
++		writel(UOC_HIWORD_UPDATE(0x2, 0x3, 0),
++			   RK_GRF_VIRT + RK312X_GRF_UOC1_CON5);
++
++		udelay(1500);
++		reset_control_deassert(rst_host_p);
++
++		/* Controller reset */
++		reset_control_assert(rst_host_c);
++		reset_control_assert(rst_host_h);
++
++		udelay(5);
++
++		reset_control_deassert(rst_host_c);
++		reset_control_deassert(rst_host_h);
++		break;
++
++	default:
++		break;
++	}
++}
++
++static void usb20ehci_clock_init(void *pdata)
++{
++	struct rkehci_platform_data *usbpdata = pdata;
++	struct clk *ahbclk, *phyclk;
++
++	if (soc_is_rk3126b())
++		ahbclk = devm_clk_get(usbpdata->dev, "hclk_hoct0_3126b");
++	else
++		ahbclk = devm_clk_get(usbpdata->dev, "hclk_hoct0_3126");
++	if (IS_ERR(ahbclk)) {
++		dev_err(usbpdata->dev, "Failed to get hclk_usb1\n");
++		return;
++	}
++
++	phyclk = devm_clk_get(usbpdata->dev, "clk_usbphy1");
++	if (IS_ERR(phyclk)) {
++		dev_err(usbpdata->dev, "Failed to get clk_usbphy1\n");
++		return;
++	}
++
++	usbpdata->phyclk = phyclk;
++	usbpdata->ahbclk = ahbclk;
++}
++
++static void usb20ehci_clock_enable(void *pdata, int enable)
++{
++	struct rkehci_platform_data *usbpdata = pdata;
++
++	if (enable) {
++		clk_prepare_enable(usbpdata->ahbclk);
++		clk_prepare_enable(usbpdata->phyclk);
++	} else {
++		clk_disable_unprepare(usbpdata->ahbclk);
++		clk_disable_unprepare(usbpdata->phyclk);
++	}
++}
++
++struct rkehci_platform_data usb20ehci_pdata_rk3126 = {
++	.phyclk = NULL,
++	.ahbclk = NULL,
++	.phy_status = 0,
++	.hw_init = usb20host_hw_init,
++	.phy_suspend = usb20ehci_phy_suspend,
++	.soft_reset = usb20ehci_soft_reset,
++	.clock_init = usb20ehci_clock_init,
++	.clock_enable = usb20ehci_clock_enable,
++	.get_status = usb20host_get_status,
++};
++#endif
++
+ struct dwc_otg_platform_data usb20ohci_pdata_rk3126;
+ 
+ #ifdef CONFIG_OF
+diff --git a/drivers/usb/host/ehci-rockchip.c b/drivers/usb/host/ehci-rockchip.c
+index 16b1558673c3..874f8008150e 100755
+--- a/drivers/usb/host/ehci-rockchip.c
++++ b/drivers/usb/host/ehci-rockchip.c
+@@ -68,11 +68,7 @@ static void rk_ehci_hcd_enable(struct work_struct *work)
+ 		}
+ 
+ 		EHCI_PRINT("%s, disable host controller\n", __func__);
+-		usb_remove_hcd(hcd);
+ 
+-		/* reset cru and reinitialize EHCI controller */
+-		pldata->soft_reset(pldata, RST_RECNT);
+-		usb_add_hcd(hcd, hcd->irq, IRQF_DISABLED | IRQF_SHARED);
+ 		if (pldata->phy_suspend)
+ 			pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+ 		/* do not disable EHCI clk, otherwise RK3288
+@@ -253,6 +249,10 @@ static struct of_device_id rk_ehci_of_match[] = {
+ 	 .compatible = "rockchip,rk3288_rk_ehci_host",
+ 	 .data = &rkehci_pdata_rk3288,
+ 	 },
++	{
++	 .compatible = "rockchip,rk3126_ehci",
++	 .data = &usb20ehci_pdata_rk3126,
++	 },
+ 	{},
+ };
+ 
+-- 
+2.35.3
+

@@ -1,0 +1,179 @@
+From 2652e6302a14c7ab2d01b9a9b7bff02b4a51517c Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Thu, 21 Nov 2019 16:28:11 +0800
+Subject: [PATCH] clk: rockchip: implement the composite brother branch type
+
+There is a new clock branch have a form like
+            |--\
+---[GPLL]---|   \                        |--\
+---[CPLL]---|mux|-----[GATE]--[DVI]------|   \
+---[HPLL]---|   /  |                     |mux|--[GATE]--
+            |--/   |--[GATE]--[HALFDVI]--|   /
+                                         |--/
+This patch registers two composite clocks for this branch type,
+and make them become brother clock for each oher.
+
+Change-Id: I46aeab26e478f341600114014db1c7d58e234f11
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/clk/rockchip/clk.c | 68 ++++++++++++++++++++++++++++++++++++++
+ drivers/clk/rockchip/clk.h | 43 ++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/drivers/clk/rockchip/clk.c b/drivers/clk/rockchip/clk.c
+index 73f049a2dd03..5b9cde56455e 100644
+--- a/drivers/clk/rockchip/clk.c
++++ b/drivers/clk/rockchip/clk.c
+@@ -403,6 +403,61 @@ static struct clk *rockchip_clk_register_factor_branch(const char *name,
+ 	return clk;
+ }
+ 
++static struct clk *rockchip_clk_register_composite_brother_branch(
++		struct rockchip_clk_provider *ctx, const char *name,
++		const char *const *parent_names, u8 num_parents,
++		void __iomem *base, int muxdiv_offset, u8 mux_shift,
++		u8 mux_width, u8 mux_flags, u32 *mux_table,
++		int div_offset, u8 div_shift, u8 div_width, u8 div_flags,
++		struct clk_div_table *div_table, int gate_offset,
++		u8 gate_shift, u8 gate_flags, unsigned long flags,
++		struct rockchip_clk_branch *brother, spinlock_t *lock)
++{
++	struct clk *clk, *brother_clk;
++	struct clk_composite *composite, *brother_composite;
++	struct clk_hw *hw, *brother_hw;
++
++	if (brother && brother->branch_type != branch_half_divider) {
++		pr_err("%s: composite brother for %s can only be a halfdiv\n",
++		       __func__, name);
++		return ERR_PTR(-EINVAL);
++	}
++
++	clk = rockchip_clk_register_branch(name, parent_names, num_parents,
++					   base, muxdiv_offset, mux_shift,
++					   mux_width, mux_flags, mux_table,
++					   div_offset, div_shift, div_width,
++					   div_flags, div_table,
++					   gate_offset, gate_shift, gate_flags,
++					   flags, lock);
++	if (IS_ERR(clk))
++		return clk;
++
++	brother_clk = rockchip_clk_register_halfdiv(brother->name,
++				brother->parent_names, brother->num_parents,
++				base, brother->muxdiv_offset,
++				brother->mux_shift, brother->mux_width,
++				brother->mux_flags, brother->div_offset,
++				brother->div_shift, brother->div_width,
++				brother->div_flags, brother->gate_offset,
++				brother->gate_shift, brother->gate_flags,
++				flags, lock);
++	if (IS_ERR(brother_clk))
++		return brother_clk;
++	rockchip_clk_add_lookup(ctx, brother_clk, brother->id);
++
++	hw = __clk_get_hw(clk);
++	brother_hw = __clk_get_hw(brother_clk);
++	if (hw && brother_hw) {
++		composite = to_clk_composite(hw);
++		brother_composite = to_clk_composite(brother_hw);
++		composite->brother_hw = brother_hw;
++		brother_composite->brother_hw = hw;
++	}
++
++	return clk;
++}
++
+ struct rockchip_clk_provider * __init rockchip_clk_init(struct device_node *np,
+ 			void __iomem *base, unsigned long nr_clks)
+ {
+@@ -580,6 +635,19 @@ void __init rockchip_clk_register_branches(
+ 				list->gate_offset, list->gate_shift,
+ 				list->gate_flags, flags, &ctx->lock);
+ 			break;
++		case branch_composite_brother:
++			clk = rockchip_clk_register_composite_brother_branch(
++				ctx, list->name, list->parent_names,
++				list->num_parents, ctx->reg_base,
++				list->muxdiv_offset, list->mux_shift,
++				list->mux_width, list->mux_flags,
++				list->mux_table, list->div_offset,
++				list->div_shift, list->div_width,
++				list->div_flags, list->div_table,
++				list->gate_offset, list->gate_shift,
++				list->gate_flags, flags, list->child,
++				&ctx->lock);
++			break;
+ 		case branch_mmc:
+ 			clk = rockchip_clk_register_mmc(
+ 				list->name,
+diff --git a/drivers/clk/rockchip/clk.h b/drivers/clk/rockchip/clk.h
+index 5de18b9d29f0..9eacb67f8909 100644
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -447,6 +447,7 @@ struct clk *rockchip_clk_register_muxgrf(const char *name,
+ 
+ enum rockchip_clk_branch_type {
+ 	branch_composite,
++	branch_composite_brother,
+ 	branch_mux,
+ 	branch_muxgrf,
+ 	branch_muxpmugrf,
+@@ -506,6 +507,28 @@ struct rockchip_clk_branch {
+ 		.gate_flags	= gf,				\
+ 	}
+ 
++#define COMPOSITE_BROTHER(_id, cname, pnames, f, mo, ms, mw, mf,\
++			  ds, dw, df, go, gs, gf, bro)		\
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_composite_brother,	\
++		.name		= cname,			\
++		.parent_names	= pnames,			\
++		.num_parents	= ARRAY_SIZE(pnames),		\
++		.flags		= f,				\
++		.muxdiv_offset	= mo,				\
++		.mux_shift	= ms,				\
++		.mux_width	= mw,				\
++		.mux_flags	= mf,				\
++		.div_shift	= ds,				\
++		.div_width	= dw,				\
++		.div_flags	= df,				\
++		.gate_offset	= go,				\
++		.gate_shift	= gs,				\
++		.gate_flags	= gf,				\
++		.child		= bro,				\
++	}
++
+ #define COMPOSITE_MUXTBL(_id, cname, pnames, f, mo, ms, mw, mf,	\
+ 		 mt, ds, dw, df, go, gs, gf)			\
+ 	{							\
+@@ -624,6 +647,26 @@ struct rockchip_clk_branch {
+ 		.gate_offset	= -1,				\
+ 	}
+ 
++#define COMPOSITE_BROTHER_NOGATE(_id, cname, pnames, f, mo, ms, \
++				 mw, mf, ds, dw, df, bro)	\
++	{							\
++		.id		= _id,				\
++		.branch_type	= branch_composite_brother,	\
++		.name		= cname,			\
++		.parent_names	= pnames,			\
++		.num_parents	= ARRAY_SIZE(pnames),		\
++		.flags		= f,				\
++		.muxdiv_offset	= mo,				\
++		.mux_shift	= ms,				\
++		.mux_width	= mw,				\
++		.mux_flags	= mf,				\
++		.div_shift	= ds,				\
++		.div_width	= dw,				\
++		.div_flags	= df,				\
++		.gate_offset	= -1,				\
++		.child		= bro,				\
++	}
++
+ #define COMPOSITE_NOGATE_DIVTBL(_id, cname, pnames, f, mo, ms,	\
+ 				mw, mf, ds, dw, df, dt)		\
+ 	{							\
+-- 
+2.35.3
+

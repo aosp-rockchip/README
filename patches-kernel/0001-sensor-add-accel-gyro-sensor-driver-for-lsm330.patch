@@ -1,0 +1,685 @@
+From 7593f95cd9559a9d7102cfcfeb1fa87061e37ae9 Mon Sep 17 00:00:00 2001
+From: Bin Yang <yangbin@rock-chips.com>
+Date: Tue, 2 Aug 2016 10:17:08 +0800
+Subject: [PATCH] sensor: add accel&gyro sensor driver for lsm330
+
+Change-Id: Ibb0b6fe769774abc1a0f619eb9c626340e8b8bcc
+Signed-off-by: Bin Yang <yangbin@rock-chips.com>
+---
+ drivers/input/sensors/accel/Kconfig      |   8 +
+ drivers/input/sensors/accel/Makefile     |   1 +
+ drivers/input/sensors/accel/lsm330_acc.c | 277 +++++++++++++++++++++++
+ drivers/input/sensors/gyro/Kconfig       |   4 +
+ drivers/input/sensors/gyro/Makefile      |   3 +-
+ drivers/input/sensors/gyro/lsm330_gyro.c | 261 +++++++++++++++++++++
+ drivers/input/sensors/sensor-dev.c       |   6 +-
+ include/linux/sensor-dev.h               |   2 +
+ 8 files changed, 559 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/input/sensors/accel/lsm330_acc.c
+ create mode 100644 drivers/input/sensors/gyro/lsm330_gyro.c
+
+diff --git a/drivers/input/sensors/accel/Kconfig b/drivers/input/sensors/accel/Kconfig
+index 4d4f1cd48959..b564e288b23b 100755
+--- a/drivers/input/sensors/accel/Kconfig
++++ b/drivers/input/sensors/accel/Kconfig
+@@ -88,5 +88,13 @@ config GS_BMA023
+   help
+     To have support for your specific gsesnor you will have to
+     select the proper drivers which depend on this option.
++
++config LSM330_ACC
++	bool "gsensor lsm330"
++	default y
++	help
++	  To have support for your specific gsesnor you will have to
++	  select the proper drivers which depend on this option.
++
+ endif
+ 
+diff --git a/drivers/input/sensors/accel/Makefile b/drivers/input/sensors/accel/Makefile
+index add3a9541704..11db17905c96 100755
+--- a/drivers/input/sensors/accel/Makefile
++++ b/drivers/input/sensors/accel/Makefile
+@@ -9,3 +9,4 @@ obj-$(CONFIG_GS_LSM303D)    += lsm303d.o
+ obj-$(CONFIG_GS_MC3230)    += mc3230.o
+ obj-$(CONFIG_MPU6880_ACC)   += mpu6880_acc.o
+ obj-$(CONFIG_MPU6500_ACC)   += mpu6500_acc.o
++obj-$(CONFIG_LSM330_ACC)   += lsm330_acc.o
+\ No newline at end of file
+diff --git a/drivers/input/sensors/accel/lsm330_acc.c b/drivers/input/sensors/accel/lsm330_acc.c
+new file mode 100644
+index 000000000000..35dba51892f6
+--- /dev/null
++++ b/drivers/input/sensors/accel/lsm330_acc.c
+@@ -0,0 +1,277 @@
++/*
++ * kernel/drivers/input/sensors/accel/lsm330_acc.c
++ *
++ * Copyright (C) 2012-2016 Rockchip Co.,Ltd.
++ * Author: Bin Yang <yangbin@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++/* Linear acceleration  register */
++#define	WHO_AM_I_A	0x0F
++#define	OFF_X	0x10
++#define	OFF_Y	0x11
++#define	OFF_Z	0x12
++#define	CS_X	0x13
++#define	CS_Y	0x14
++#define	CS_Z	0x15
++#define	LC_L	0x16
++#define	LC_H	0x17
++#define	STAT	0x18
++#define	VFC_1	0x1B
++#define	VFC_2	0x1C
++#define	VFC_3	0x1D
++#define	VFC_4	0x1E
++#define	THRS3	0x1F
++#define	CTRL_REG2_A	0x21
++#define	CTRL_REG3_A	0x22
++#define	CTRL_REG4_A	0x23
++#define	CTRL_REG5_A	0x20
++#define	CTRL_REG6_A	0x24
++#define	CTRL_REG7_A	0x25
++#define	STATUS_REG_A	0x27
++#define	OUT_X_L_A	0x28
++#define	OUT_X_H_A	0x29
++#define	OUT_Y_L_A	0x2A
++#define	OUT_Y_H_A	0x2B
++#define	OUT_Z_L_A	0x2C
++#define	OUT_Z_H_A	0x2D
++#define	FIFO_CTRL_REG	0x2E
++#define	FIFO_SRC_REG	0x2F
++
++#define	INT1_CFG_A	0x30
++#define	INT1_SOURCE_A	0x31
++#define	INT1_THS_A	0x32
++#define	INT1_DURATION_A	0x33
++#define	INT2_CFG_A	0x34
++#define	INT2_SOURCE_A	0x35
++#define	INT2_THS_A	0x36
++#define	INT2_DURATION_A	0x37
++#define	CLICK_CFG_A	0x38
++#define	CLICK_SRC_A	0x39
++#define	CLICK_THS_A	0x3A
++#define	TIME_LIMIT_A	0x3B
++#define	TIME_LATENCY_A	0x3C
++#define	TIME_WINDOW_A	0x3D
++#define	ACT_THS	0x3E
++#define	ACT_DUR	0x3F
++
++#define	LSM330_DEVICE_ID_A	0x40
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *)i2c_get_clientdata(client);
++	int result = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	if (enable)
++		result = sensor_write_reg(client,
++			sensor->ops->ctrl_reg,
++			sensor->ops->ctrl_data | 0x07);
++	else
++		result = sensor_write_reg(client, sensor->ops->ctrl_reg, 0x00);
++
++	if (result)
++		dev_err(&client->dev, "%s:fail to active sensor\n", __func__);
++
++	DBG("%s:reg=0x%x,reg_ctrl=0x%x,enable=%d\n",
++		__func__,
++		sensor->ops->ctrl_reg,
++		sensor->ops->ctrl_data, enable);
++
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *)i2c_get_clientdata(client);
++	int result = 0;
++
++	result = sensor->ops->active(client, 0, 0);
++	if (result) {
++		dev_err(&client->dev, "%s:line=%d,error\n",
++			__func__, __LINE__);
++		return result;
++	}
++	sensor->status_cur = SENSOR_OFF;
++
++	result = sensor_write_reg(client, CTRL_REG4_A, 0xE8);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to set CTRL_REG4_A.\n",
++			__func__);
++		return result;
++	}
++	/* Normal / Low power mode (1600 Hz) */
++	result = sensor_write_reg(client, CTRL_REG5_A, 0x90);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to set CTRL_REG5_A.\n",
++			__func__);
++		return result;
++	}
++	result = sensor_write_reg(client, CTRL_REG6_A, 0x00);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to set CTRL_REG6_A.\n",
++			__func__);
++		return result;
++	}
++	result = sensor_write_reg(client, CTRL_REG7_A, 0x00);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to set CTRL_REG7_A.\n",
++			__func__);
++		return result;
++	}
++
++	return result;
++}
++
++static int gsensor_report_value(struct i2c_client *client,
++				struct sensor_axis *axis)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *)i2c_get_clientdata(client);
++
++	input_report_abs(sensor->input_dev, ABS_X, axis->x);
++	input_report_abs(sensor->input_dev, ABS_Y, axis->y);
++	input_report_abs(sensor->input_dev, ABS_Z, axis->z);
++	input_sync(sensor->input_dev);
++	DBG("Gsensor x==%d  y==%d z==%d\n", axis->x, axis->y, axis->z);
++
++	return 0;
++}
++
++#define GSENSOR_MIN 10
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *)i2c_get_clientdata(client);
++	struct sensor_platform_data *pdata = sensor->pdata;
++	char buffer[6];
++	int ret = 0;
++	char value = 0;
++	struct sensor_axis axis;
++	short x, y, z;
++	unsigned char reg_buf = 0;
++	unsigned char i = 0;
++
++	if (sensor->ops->read_len < 6) {
++		dev_err(&client->dev, "%s:Read len is error,len=%d\n",
++			__func__,
++			sensor->ops->read_len);
++		return -1;
++	}
++	memset(buffer, 0, 6);
++
++	reg_buf = sensor->ops->read_reg;
++	for (i = 0; i < sensor->ops->read_len; i++) {
++		buffer[i] = sensor_read_reg(client, reg_buf);
++		reg_buf++;
++	}
++
++	x = ((buffer[1] << 8) & 0xFF00) + (buffer[0] & 0xFF);
++	y = ((buffer[3] << 8) & 0xFF00) + (buffer[2] & 0xFF);
++	z = ((buffer[5] << 8) & 0xFF00) + (buffer[4] & 0xFF);
++
++	axis.x = (pdata->orientation[0]) * x +
++		(pdata->orientation[1]) * y +
++		(pdata->orientation[2]) * z;
++	axis.y = (pdata->orientation[3]) * x +
++		(pdata->orientation[4]) * y +
++		(pdata->orientation[5]) * z;
++	axis.z = (pdata->orientation[6]) * x +
++		(pdata->orientation[7]) * y +
++		(pdata->orientation[8]) * z;
++
++	axis.x = 61 * axis.x;
++	axis.y = 61 * axis.y;
++	axis.z = 61 * axis.z;
++
++	if ((abs(sensor->axis.x - axis.x) > GSENSOR_MIN) ||
++	    (abs(sensor->axis.y - axis.y) > GSENSOR_MIN) ||
++	    (abs(sensor->axis.z - axis.z) > GSENSOR_MIN)) {
++		gsensor_report_value(client, &axis);
++		mutex_lock(&sensor->data_mutex);
++		sensor->axis = axis;
++		mutex_unlock(&sensor->data_mutex);
++	}
++
++	if (sensor->pdata->irq_enable) {
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++		DBG("%s:gsensor int status :0x%x\n", __func__, value);
++	}
++
++	return ret;
++}
++
++struct sensor_operate gsensor_lsm330_ops = {
++	.name			= "lsm330_acc",
++	.type			= SENSOR_TYPE_ACCEL,
++	.id_i2c			= ACCEL_ID_LSM330,
++	.read_reg		= OUT_X_L_A,
++	.read_len		= 6,
++	.id_reg			= WHO_AM_I_A,
++	.id_data		= LSM330_DEVICE_ID_A,
++	.precision		= 16,
++	.ctrl_reg		= CTRL_REG5_A,
++	.int_status_reg	= STATUS_REG_A,
++	.range			= {-0xffff, 0xffff},
++	.trig			= IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
++	.active			= sensor_active,
++	.init			= sensor_init,
++	.report			= sensor_report_value,
++};
++
++static struct sensor_operate *gsensor_get_ops(void)
++{
++	return &gsensor_lsm330_ops;
++}
++
++static int __init gsensor_lsm330_init(void)
++{
++	struct sensor_operate *ops = gsensor_get_ops();
++	int result = 0;
++	int type = ops->type;
++
++	result = sensor_register_slave(type, NULL, NULL, gsensor_get_ops);
++
++	return result;
++}
++
++static void __exit gsensor_lsm330_exit(void)
++{
++	struct sensor_operate *ops = gsensor_get_ops();
++	int type = ops->type;
++
++	sensor_unregister_slave(type, NULL, NULL, gsensor_get_ops);
++}
++
++module_init(gsensor_lsm330_init);
++module_exit(gsensor_lsm330_exit);
+diff --git a/drivers/input/sensors/gyro/Kconfig b/drivers/input/sensors/gyro/Kconfig
+index 98c1662a61f5..88034e778444 100755
+--- a/drivers/input/sensors/gyro/Kconfig
++++ b/drivers/input/sensors/gyro/Kconfig
+@@ -27,4 +27,8 @@ config GYRO_EWTSA
+ config GYRO_MPU6880
+   bool "gyroscope mpu6880_gyro"
+ 	default y
++
++config GYRO_LSM330
++	bool "gyroscope lsm330_gyro"
++	default y
+ endif
+diff --git a/drivers/input/sensors/gyro/Makefile b/drivers/input/sensors/gyro/Makefile
+index cc50f0a94282..bee9fbb3a215 100755
+--- a/drivers/input/sensors/gyro/Makefile
++++ b/drivers/input/sensors/gyro/Makefile
+@@ -4,4 +4,5 @@ obj-$(CONFIG_GYRO_SENSOR_K3G) 	+= k3g.o
+ obj-$(CONFIG_GYRO_L3G4200D) 	+= l3g4200d.o
+ obj-$(CONFIG_GYRO_L3G20D) 	+= l3g20d.o
+ obj-$(CONFIG_GYRO_EWTSA) 	+= ewtsa.o
+-obj-$(CONFIG_GYRO_MPU6880)    += mpu6880_gyro.o
+\ No newline at end of file
++obj-$(CONFIG_GYRO_MPU6880)    += mpu6880_gyro.o
++obj-$(CONFIG_GYRO_LSM330)   += lsm330_gyro.o
+\ No newline at end of file
+diff --git a/drivers/input/sensors/gyro/lsm330_gyro.c b/drivers/input/sensors/gyro/lsm330_gyro.c
+new file mode 100644
+index 000000000000..1ebbb0a4b31f
+--- /dev/null
++++ b/drivers/input/sensors/gyro/lsm330_gyro.c
+@@ -0,0 +1,261 @@
++/*
++ * kernel/drivers/input/sensors/accel/lsm330_gyro.c
++ *
++ * Copyright (C) 2012-2016 Rockchip Co.,Ltd.
++ * Author: Bin Yang <yangbin@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++
++/* Angular rate sensor register */
++#define	WHO_AM_I_G	0x0F
++#define	CTRL_REG1_G	0x20
++#define	CTRL_REG2_G	0x21
++#define	CTRL_REG3_G	0x22
++#define	CTRL_REG4_G	0x23
++#define	CTRL_REG5_G	0x24
++#define	REFERENCE_G	0x25
++#define	OUT_TEMP_G	0x26
++#define	STATUS_REG_G	0x27
++#define	OUT_X_L_G	0x28
++#define	OUT_X_H_G	0x29
++#define	OUT_Y_L_G	0x2A
++#define	OUT_Y_H_G	0x2B
++#define	OUT_Z_L_G	0x2C
++#define	OUT_Z_H_G	0x2D
++#define	FIFO_CTRL_REG_G	0x2E
++#define	FIFO_SRC_REG_G	0x2F
++#define	INT1_CFG_G	0x30
++#define	INT1_SRC_G	0x31
++#define	INT1_TSH_XH_G	0x32
++#define	INT1_TSH_XL_G	0x33
++#define	INT1_TSH_YH_G	0x34
++#define	INT1_TSH_YL_G	0x35
++#define	INT1_TSH_ZH_G	0x36
++#define	INT1_TSH_ZL_G	0x37
++#define	INT1_DURATION_G	0x38
++
++#define	LSM330_DEVICE_ID_G	0xD4
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *)i2c_get_clientdata(client);
++	int result = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	if (enable)
++		result = sensor_write_reg(client,
++		sensor->ops->ctrl_reg,
++		sensor->ops->ctrl_data | 0x0F);
++	else
++		result = sensor_write_reg(client,
++		sensor->ops->ctrl_reg,
++		0x00);
++
++	if (result)
++		dev_err(&client->dev, "%s:fail to active sensor\n", __func__);
++
++	DBG("%s:reg=0x%x,reg_ctrl=0x%x,enable=%d\n",
++		__func__,
++		sensor->ops->ctrl_reg,
++		sensor->ops->ctrl_data, enable);
++
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *)i2c_get_clientdata(client);
++	int result = 0;
++
++	result = sensor->ops->active(client, 0, 0);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:line=%d,error\n",
++			__func__,
++			__LINE__);
++		return result;
++	}
++	sensor->status_cur = SENSOR_OFF;
++
++	/*ODR: 760Hz, Cut-off: 100Hz*/
++	result = sensor_write_reg(client, CTRL_REG1_G, 0xF0);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:fail to set CTRL_REG1_A.\n",
++			__func__);
++		return result;
++	}
++	result = sensor_write_reg(client, CTRL_REG3_G, 0x80);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:fail to set CTRL_REG3_G.\n",
++			__func__);
++		return result;
++	}
++	/*Full-scale selection: 2000dps*/
++	result = sensor_write_reg(client, CTRL_REG4_G, 0x30);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:fail to set CTRL_REG4_G.\n",
++			__func__);
++		return result;
++	}
++	result = sensor_write_reg(client, INT1_CFG_G, 0x7F);
++	if (result) {
++		dev_err(&client->dev, "%s:fail to set INT1_CFG_G.\n", __func__);
++		return result;
++	}
++
++	return result;
++}
++
++static int gyro_report_value(struct i2c_client *client,
++				struct sensor_axis *axis)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *)i2c_get_clientdata(client);
++
++	input_report_rel(sensor->input_dev, ABS_RX, axis->x);
++	input_report_rel(sensor->input_dev, ABS_RY, axis->y);
++	input_report_rel(sensor->input_dev, ABS_RZ, axis->z);
++	input_sync(sensor->input_dev);
++	DBG("gyro x==%d  y==%d z==%d\n", axis->x, axis->y, axis->z);
++
++	return 0;
++}
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *)i2c_get_clientdata(client);
++	struct sensor_platform_data *pdata = sensor->pdata;
++	char buffer[6];
++	int ret = 0;
++	char value = 0;
++	struct sensor_axis axis;
++	short x, y, z;
++	unsigned char reg_buf = 0;
++	unsigned char i = 0;
++
++	if (sensor->ops->read_len < 6) {
++		dev_err(&client->dev, "%s:Read len is error,len=%d\n",
++			__func__,
++			sensor->ops->read_len);
++		return -1;
++	}
++	memset(buffer, 0, 6);
++
++	reg_buf = sensor->ops->read_reg;
++	for (i = 0; i < sensor->ops->read_len; i++) {
++		buffer[i] = sensor_read_reg(client, reg_buf);
++		reg_buf++;
++	}
++
++	x = ((buffer[1] << 8) & 0xFF00) + (buffer[0] & 0xFF);
++	y = ((buffer[3] << 8) & 0xFF00) + (buffer[2] & 0xFF);
++	z = ((buffer[5] << 8) & 0xFF00) + (buffer[4] & 0xFF);
++
++	axis.x = (pdata->orientation[0]) * x +
++		(pdata->orientation[1]) * y +
++		(pdata->orientation[2]) * z;
++	axis.y = (pdata->orientation[3]) * x +
++		(pdata->orientation[4]) * y +
++		(pdata->orientation[5]) * z;
++	axis.z = (pdata->orientation[6]) * x +
++		(pdata->orientation[7]) * y +
++		(pdata->orientation[8]) * z;
++
++	axis.x = (axis.x * 872) / 1000;
++	axis.y = (axis.y * 872) / 1000;
++	axis.z = (axis.z * 872) / 1000;
++
++	if ((abs(axis.x) > pdata->x_min) ||
++		(abs(axis.y) > pdata->y_min) ||
++		(abs(axis.z) > pdata->z_min)) {
++		gyro_report_value(client, &axis);
++		mutex_lock(&sensor->data_mutex);
++		sensor->axis = axis;
++		mutex_unlock(&sensor->data_mutex);
++	}
++
++	if (sensor->pdata->irq_enable) {
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++		DBG("%s:gyro int status :0x%x\n", __func__, value);
++	}
++
++	return ret;
++}
++
++struct sensor_operate gyro_lsm330_ops = {
++	.name			= "lsm330_gyro",
++	.type			= SENSOR_TYPE_GYROSCOPE,
++	.id_i2c			= GYRO_ID_LSM330,
++	.read_reg		= OUT_X_L_G,
++	.read_len		= 6,
++	.id_reg			= WHO_AM_I_G,
++	.id_data		= LSM330_DEVICE_ID_G,
++	.precision		= 16,
++	.ctrl_reg		= CTRL_REG1_G,
++	.int_status_reg	= INT1_SRC_G,
++	.range			= {-0xffff, 0xffff},
++	.trig			= IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
++	.active			= sensor_active,
++	.init			= sensor_init,
++	.report			= sensor_report_value,
++};
++
++static struct sensor_operate *gyro_get_ops(void)
++{
++	return &gyro_lsm330_ops;
++}
++
++static int __init gyro_lsm330_init(void)
++{
++	struct sensor_operate *ops = gyro_get_ops();
++	int result = 0;
++	int type = ops->type;
++
++	result = sensor_register_slave(type, NULL, NULL, gyro_get_ops);
++
++	return result;
++}
++
++static void __exit gyro_lsm330_exit(void)
++{
++	struct sensor_operate *ops = gyro_get_ops();
++	int type = ops->type;
++
++	sensor_unregister_slave(type, NULL, NULL, gyro_get_ops);
++}
++
++module_init(gyro_lsm330_init);
++module_exit(gyro_lsm330_exit);
+diff --git a/drivers/input/sensors/sensor-dev.c b/drivers/input/sensors/sensor-dev.c
+index 56793036fa72..cd18a44f397a 100755
+--- a/drivers/input/sensors/sensor-dev.c
++++ b/drivers/input/sensors/sensor-dev.c
+@@ -2212,6 +2212,7 @@ static const struct i2c_device_id sensor_id[] = {
+ 	{"gs_mc3230",ACCEL_ID_MC3230},
+ 	{"mpu6880_acc",ACCEL_ID_MPU6880},
+ 	{"mpu6500_acc",ACCEL_ID_MPU6500},
++	{"lsm330_acc", ACCEL_ID_LSM330},
+ 	/*compass*/
+ 	{"compass", COMPASS_ID_ALL},
+ 	{"ak8975", COMPASS_ID_AK8975},	
+@@ -2225,6 +2226,7 @@ static const struct i2c_device_id sensor_id[] = {
+ 	{"ewtsa_gyro", GYRO_ID_EWTSA},
+ 	{"k3g", GYRO_ID_K3G},
+ 	{"mpu6880_gyro",GYRO_ID_MPU6880},
++	{"lsm330_gyro", GYRO_ID_LSM330},
+ 	/*light sensor*/
+ 	{"lightsensor", LIGHT_ID_ALL},	
+ 	{"light_cm3217", LIGHT_ID_CM3217},
+@@ -2261,7 +2263,7 @@ static struct of_device_id sensor_dt_ids[] = {
+ 	{ .compatible = "gs_mma7660" },
+ 	{ .compatible = "gs_mxc6225" },
+ 	{ .compatible = "gs_mc3230" },
+-	
++	{ .compatible = "lsm330_acc" },
+ 	/*compass*/
+ 	{ .compatible = "ak8975" },
+ 	{ .compatible = "ak8963" },
+@@ -2273,7 +2275,7 @@ static struct of_device_id sensor_dt_ids[] = {
+ 	{ .compatible = "l3g20d_gyro" },
+ 	{ .compatible = "ewtsa_gyro" },
+ 	{ .compatible = "k3g" },
+-	
++	{ .compatible = "lsm330_gyro" },
+ 	
+ 	/*light sensor*/
+ 	{ .compatible = "light_cm3217" },
+diff --git a/include/linux/sensor-dev.h b/include/linux/sensor-dev.h
+index 6949aca903db..d979edcc4b2a 100755
+--- a/include/linux/sensor-dev.h
++++ b/include/linux/sensor-dev.h
+@@ -57,6 +57,7 @@ enum sensor_id {
+ 	ACCEL_ID_MC3230,
+ 	ACCEL_ID_MPU6880,
+         ACCEL_ID_MPU6500,
++	ACCEL_ID_LSM330,
+ 	COMPASS_ID_ALL,
+ 	COMPASS_ID_AK8975,
+ 	COMPASS_ID_AK8963,
+@@ -79,6 +80,7 @@ enum sensor_id {
+ 	GYRO_ID_EWTSA,
+ 	GYRO_ID_K3G,
+ 	GYRO_ID_MPU6880,
++	GYRO_ID_LSM330,
+ 	LIGHT_ID_ALL,
+ 	LIGHT_ID_CM3217,
+ 	LIGHT_ID_CM3218,
+-- 
+2.35.3
+

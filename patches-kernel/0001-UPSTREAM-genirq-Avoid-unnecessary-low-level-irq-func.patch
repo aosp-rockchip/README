@@ -1,0 +1,130 @@
+From ff9c8bc3f80583aae0931597a8a8d54d46a3fe7f Mon Sep 17 00:00:00 2001
+From: Jeffy Chen <jeffy.chen@rock-chips.com>
+Date: Mon, 26 Jun 2017 19:33:34 +0800
+Subject: [PATCH] UPSTREAM: genirq: Avoid unnecessary low level irq function
+ calls
+
+Check irq state in enable/disable/unmask/mask_irq to avoid unnecessary
+low level irq function calls.
+
+This has two advantages:
+    - Conditionals are faster than hardware access
+
+    - Solves issues with the underlying refcounting of the pinctrl
+      infrastructure
+
+Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Jeffy Chen <jeffy.chen@rock-chips.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: tfiga@chromium.org
+Cc: briannorris@chromium.org
+Cc: dianders@chromium.org
+Link: http://lkml.kernel.org/r/1498476814-12563-2-git-send-email-jeffy.chen@rock-chips.com
+(cherry picked from commit bf22ff45bed664aefb5c4e43029057a199b7070c)
+
+Change-Id: Ie70a49de0b177e48b44e725432ff7199d40adf47
+Signed-off-by: Jeffy Chen <jeffy.chen@rock-chips.com>
+---
+ kernel/irq/chip.c | 53 +++++++++++++++++++++++++++++------------------
+ 1 file changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index e0190c9662c5..3395a5b1969e 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -248,22 +248,32 @@ void irq_shutdown(struct irq_desc *desc)
+ 
+ void irq_enable(struct irq_desc *desc)
+ {
+-	irq_state_clr_disabled(desc);
+-	if (desc->irq_data.chip->irq_enable)
+-		desc->irq_data.chip->irq_enable(&desc->irq_data);
+-	else
+-		desc->irq_data.chip->irq_unmask(&desc->irq_data);
+-	irq_state_clr_masked(desc);
++	if (!irqd_irq_disabled(&desc->irq_data)) {
++		unmask_irq(desc);
++	} else {
++		irq_state_clr_disabled(desc);
++		if (desc->irq_data.chip->irq_enable) {
++			desc->irq_data.chip->irq_enable(&desc->irq_data);
++			irq_state_clr_masked(desc);
++		} else {
++			unmask_irq(desc);
++		}
++	}
+ }
+ 
+ static void __irq_disable(struct irq_desc *desc, bool mask)
+ {
+-	irq_state_set_disabled(desc);
+-	if (desc->irq_data.chip->irq_disable) {
+-		desc->irq_data.chip->irq_disable(&desc->irq_data);
+-		irq_state_set_masked(desc);
+-	} else if (mask) {
+-		mask_irq(desc);
++	if (irqd_irq_disabled(&desc->irq_data)) {
++		if (mask)
++			mask_irq(desc);
++	} else {
++		irq_state_set_disabled(desc);
++		if (desc->irq_data.chip->irq_disable) {
++			desc->irq_data.chip->irq_disable(&desc->irq_data);
++			irq_state_set_masked(desc);
++		} else if (mask) {
++			mask_irq(desc);
++		}
+ 	}
+ }
+ 
+@@ -312,18 +322,21 @@ void irq_percpu_disable(struct irq_desc *desc, unsigned int cpu)
+ 
+ static inline void mask_ack_irq(struct irq_desc *desc)
+ {
+-	if (desc->irq_data.chip->irq_mask_ack)
++	if (desc->irq_data.chip->irq_mask_ack) {
+ 		desc->irq_data.chip->irq_mask_ack(&desc->irq_data);
+-	else {
+-		desc->irq_data.chip->irq_mask(&desc->irq_data);
++		irq_state_set_masked(desc);
++	} else {
++		mask_irq(desc);
+ 		if (desc->irq_data.chip->irq_ack)
+ 			desc->irq_data.chip->irq_ack(&desc->irq_data);
+ 	}
+-	irq_state_set_masked(desc);
+ }
+ 
+ void mask_irq(struct irq_desc *desc)
+ {
++	if (irqd_irq_masked(&desc->irq_data))
++		return;
++
+ 	if (desc->irq_data.chip->irq_mask) {
+ 		desc->irq_data.chip->irq_mask(&desc->irq_data);
+ 		irq_state_set_masked(desc);
+@@ -332,6 +345,9 @@ void mask_irq(struct irq_desc *desc)
+ 
+ void unmask_irq(struct irq_desc *desc)
+ {
++	if (!irqd_irq_masked(&desc->irq_data))
++		return;
++
+ 	if (desc->irq_data.chip->irq_unmask) {
+ 		desc->irq_data.chip->irq_unmask(&desc->irq_data);
+ 		irq_state_clr_masked(desc);
+@@ -345,10 +361,7 @@ void unmask_threaded_irq(struct irq_desc *desc)
+ 	if (chip->flags & IRQCHIP_EOI_THREADED)
+ 		chip->irq_eoi(&desc->irq_data);
+ 
+-	if (chip->irq_unmask) {
+-		chip->irq_unmask(&desc->irq_data);
+-		irq_state_clr_masked(desc);
+-	}
++	unmask_irq(desc);
+ }
+ 
+ /*
+-- 
+2.35.3
+

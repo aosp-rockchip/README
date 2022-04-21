@@ -1,0 +1,142 @@
+From c3749364645273d0727ce552ae91c65305a827ce Mon Sep 17 00:00:00 2001
+From: Bin Yang <yangbin@rock-chips.com>
+Date: Mon, 13 Mar 2017 18:02:59 +0800
+Subject: [PATCH] drm/bridge: dw_hdmi: clear ih_mute register when system
+ resume
+
+HDMI PD is power off when system suspend, so ih_mute register
+bit0 mute_all_interrupt will be reset to 1 when system resume.
+HPD interrupt will be mask, that would cause hdmi plugin could
+not be detected.
+
+Change-Id: I3bf2e6116e902cd516a7ac69fbe8569ca943e853
+Signed-off-by: Bin Yang <yangbin@rock-chips.com>
+---
+ drivers/gpu/drm/bridge/dw-hdmi.c            | 45 +++++++++++++++++++++
+ drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c | 20 +++++++++
+ include/drm/bridge/dw_hdmi.h                |  2 +
+ 3 files changed, 67 insertions(+)
+
+diff --git a/drivers/gpu/drm/bridge/dw-hdmi.c b/drivers/gpu/drm/bridge/dw-hdmi.c
+index e9eb6d5ca7d7..4a484a018a70 100644
+--- a/drivers/gpu/drm/bridge/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/dw-hdmi.c
+@@ -223,6 +223,7 @@ struct dw_hdmi {
+ #ifdef CONFIG_SWITCH
+ 	struct switch_dev switchdev;
+ #endif
++	int irq;
+ 
+ 	void (*write)(struct dw_hdmi *hdmi, u8 val, int offset);
+ 	u8 (*read)(struct dw_hdmi *hdmi, int offset);
+@@ -2131,6 +2132,7 @@ int dw_hdmi_bind(struct device *dev, struct device *master,
+ 	hdmi->disabled = true;
+ 	hdmi->rxsense = true;
+ 	hdmi->phy_mask = (u8)~(HDMI_PHY_HPD | HDMI_PHY_RX_SENSE);
++	hdmi->irq = irq;
+ 
+ 	mutex_init(&hdmi->mutex);
+ 	mutex_init(&hdmi->audio_mutex);
+@@ -2330,6 +2332,49 @@ void dw_hdmi_unbind(struct device *dev, struct device *master, void *data)
+ }
+ EXPORT_SYMBOL_GPL(dw_hdmi_unbind);
+ 
++static void dw_hdmi_reg_initial(struct dw_hdmi *hdmi)
++{
++	if (hdmi_readb(hdmi, HDMI_IH_MUTE)) {
++		initialize_hdmi_ih_mutes(hdmi);
++		hdmi_writeb(hdmi, HDMI_PHY_I2CM_INT_ADDR_DONE_POL,
++			    HDMI_PHY_I2CM_INT_ADDR);
++
++		hdmi_writeb(hdmi, HDMI_PHY_I2CM_CTLINT_ADDR_NAC_POL |
++			    HDMI_PHY_I2CM_CTLINT_ADDR_ARBITRATION_POL,
++			    HDMI_PHY_I2CM_CTLINT_ADDR);
++
++		hdmi_writeb(hdmi, HDMI_PHY_HPD | HDMI_PHY_RX_SENSE,
++			    HDMI_PHY_POL0);
++		hdmi_writeb(hdmi, hdmi->phy_mask, HDMI_PHY_MASK0);
++		hdmi_writeb(hdmi, ~(HDMI_IH_PHY_STAT0_HPD |
++			    HDMI_IH_PHY_STAT0_RX_SENSE),
++			    HDMI_IH_MUTE_PHY_STAT0);
++	}
++}
++
++void dw_hdmi_suspend(struct device *dev)
++{
++	struct dw_hdmi *hdmi = dev_get_drvdata(dev);
++
++	mutex_lock(&hdmi->mutex);
++	if (hdmi->irq)
++		disable_irq(hdmi->irq);
++	mutex_unlock(&hdmi->mutex);
++}
++EXPORT_SYMBOL_GPL(dw_hdmi_suspend);
++
++void dw_hdmi_resume(struct device *dev)
++{
++	struct dw_hdmi *hdmi = dev_get_drvdata(dev);
++
++	mutex_lock(&hdmi->mutex);
++	dw_hdmi_reg_initial(hdmi);
++	if (hdmi->irq)
++		enable_irq(hdmi->irq);
++	mutex_unlock(&hdmi->mutex);
++}
++EXPORT_SYMBOL_GPL(dw_hdmi_resume);
++
+ MODULE_AUTHOR("Sascha Hauer <s.hauer@pengutronix.de>");
+ MODULE_AUTHOR("Andy Yan <andy.yan@rock-chips.com>");
+ MODULE_AUTHOR("Yakir Yang <ykk@rock-chips.com>");
+diff --git a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+index 5b25a8f53ba5..4cbefe86b6ef 100644
+--- a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+@@ -464,12 +464,32 @@ static int dw_hdmi_rockchip_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static int dw_hdmi_rockchip_suspend(struct device *dev)
++{
++	dw_hdmi_suspend(dev);
++
++	return 0;
++}
++
++static int dw_hdmi_rockchip_resume(struct device *dev)
++{
++	dw_hdmi_resume(dev);
++
++	return  0;
++}
++
++static const struct dev_pm_ops dw_hdmi_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(dw_hdmi_rockchip_suspend,
++				dw_hdmi_rockchip_resume)
++};
++
+ static struct platform_driver dw_hdmi_rockchip_pltfm_driver = {
+ 	.probe  = dw_hdmi_rockchip_probe,
+ 	.remove = dw_hdmi_rockchip_remove,
+ 	.driver = {
+ 		.name = "dwhdmi-rockchip",
+ 		.of_match_table = dw_hdmi_rockchip_dt_ids,
++		.pm = &dw_hdmi_pm_ops,
+ 	},
+ };
+ 
+diff --git a/include/drm/bridge/dw_hdmi.h b/include/drm/bridge/dw_hdmi.h
+index 2fb760eb9797..f06e2be0c0e9 100644
+--- a/include/drm/bridge/dw_hdmi.h
++++ b/include/drm/bridge/dw_hdmi.h
+@@ -75,6 +75,8 @@ int dw_hdmi_bind(struct device *dev, struct device *master,
+ 		 void *data, struct drm_encoder *encoder,
+ 		 struct resource *iores, int irq,
+ 		 const struct dw_hdmi_plat_data *plat_data);
++void dw_hdmi_suspend(struct device *dev);
++void dw_hdmi_resume(struct device *dev);
+ 
+ void dw_hdmi_set_sample_rate(struct dw_hdmi *hdmi, unsigned int rate);
+ void dw_hdmi_audio_enable(struct dw_hdmi *hdmi);
+-- 
+2.35.3
+

@@ -1,0 +1,256 @@
+From e7a88fdcaee5f34972bff92d42e1ad9c08e675d7 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Fri, 30 Mar 2012 12:17:29 +0800
+Subject: [PATCH] rk30 fb: fix load_creen init err,add frame start interrupt
+ for sync
+
+---
+ drivers/video/rockchip/chips/rk30_lcdc.c | 42 ++++++++++++++++++---
+ drivers/video/rockchip/chips/rk30_lcdc.h | 47 +++++++++++++-----------
+ drivers/video/rockchip/rk_fb.c           |  4 +-
+ include/linux/rk_fb.h                    |  8 +++-
+ 4 files changed, 72 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index 26a7a1af000e..13d1c6bace46 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -73,6 +73,9 @@ static int init_rk30_lcdc(struct rk30_lcdc_device *lcdc_dev)
+    	}
+ 	clk_enable(lcdc_dev->hclk);  //enable aclk for register config
+ 	LcdSetBit(lcdc_dev,DSP_CTRL0, m_LCDC_AXICLK_AUTO_ENABLE);//eanble axi-clk auto gating for low power
++	LcdMskReg(lcdc_dev,INT_STATUS,m_FRM_START_INT_CLEAR | m_BUS_ERR_INT_CLEAR | m_LINE_FLAG_INT_EN |
++              m_FRM_START_INT_EN | m_HOR_START_INT_EN,v_FRM_START_INT_CLEAR(1) | v_BUS_ERR_INT_CLEAR(0) |
++              v_LINE_FLAG_INT_EN(0) | v_FRM_START_INT_EN(1) | v_HOR_START_INT_EN(0));
+ 	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);  // write any value to  REG_CFG_DONE let config become effective
+ 	return 0;
+ }
+@@ -384,7 +387,10 @@ static int win1_set_par(struct rk30_lcdc_device *lcdc_dev,rk_screen *screen,
+ 
+ {
+ 	u32 xact, yact, xvir, yvir, xpos, ypos;
+-	u32 ScaleYrgbX,ScaleYrgbY, ScaleCbrX, ScaleCbrY;
++	u32 ScaleYrgbX = 0x1000;
++	u32 ScaleYrgbY = 0x1000;
++	u32 ScaleCbrX = 0x1000;
++	u32 ScaleCbrY = 0x1000;
+ 	
+ 	xact = par->xact;			
+ 	yact = par->yact;
+@@ -482,7 +488,7 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		printk(KERN_ERR "screen is null!\n");
+ 		return -ENOENT;	
+ 	}
+-	
++	wait_for_completion(&dev_drv->frame_done);
+ 	if(layer_id==0)
+ 	{
+ 		par = &(dev_drv->layer_par[0]);
+@@ -493,6 +499,7 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		par = &(dev_drv->layer_par[1]);
+         	win1_display(lcdc_dev,par);
+ 	}
++	INIT_COMPLETION(dev_drv->frame_done);
+ 	
+     return 0;
+ }
+@@ -529,6 +536,15 @@ int rk30_lcdc_resume(struct layer_par *layer_par)
+     return 0;
+ }
+ 
++static irqreturn_t rk30_lcdc_isr(int irq, void *dev_id)
++{
++	struct rk30_lcdc_device *lcdc_dev = (struct rk30_lcdc_device *)dev_id;
++	LcdMskReg(lcdc_dev, INT_STATUS, m_FRM_START_INT_CLEAR, v_FRM_START_INT_CLEAR(1));
++	//LcdMskReg(lcdc_dev, INT_STATUS, m_LINE_FLAG_INT_CLEAR, v_LINE_FLAG_INT_CLEAR(1));
++	complete_all(&(lcdc_dev->driver.frame_done));
++	return IRQ_HANDLED;
++}
++
+ static struct layer_par lcdc_layer[] = {
+ 	[0] = {
+        	.name  		= "win0",
+@@ -560,7 +576,6 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 	rk_screen *screen;
+ 	struct resource *res = NULL;
+ 	struct resource *mem;
+-	
+ 	int ret = 0;
+ 	
+ 	/*************Malloc rk30lcdc_inf and set it to pdev for drvdata**********/
+@@ -607,8 +622,23 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 		ret = -ENXIO;
+ 		goto err2;
+ 	}
++	
+     	lcdc_dev->preg = (LCDC_REG*)lcdc_dev->reg_vir_base;
+ 	printk("lcdc%d:reg_phy_base = 0x%08x,reg_vir_base:0x%p\n",pdev->id,lcdc_dev->reg_phy_base, lcdc_dev->preg);
++	lcdc_dev->irq = platform_get_irq(pdev, 0);
++	if(lcdc_dev->irq < 0)
++	{
++		dev_err(&pdev->dev, "cannot find IRQ\n");
++		goto err3;
++	}
++	ret = request_irq(lcdc_dev->irq, rk30_lcdc_isr, IRQF_DISABLED,dev_name(&pdev->dev),lcdc_dev);
++	if (ret)
++	{
++	       dev_err(&pdev->dev, "cannot requeset irq %d - err %d\n", lcdc_dev->irq, ret);
++	       ret = -EBUSY;
++	       goto err3;
++	}
++	
+ 	init_lcdc_device_driver(&lcdc_driver,&(lcdc_dev->driver),lcdc_dev->id);
+ 	lcdc_dev->driver.dev=&pdev->dev;
+ 	
+@@ -620,7 +650,7 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 	if(ret < 0)
+ 	{
+ 		printk(KERN_ERR "init rk30 lcdc failed!\n");
+-		goto err3;
++		goto err4;
+ 	}
+ 	ret = rk30_load_screen(&(lcdc_dev->driver),1);
+ 	if(ret < 0)
+@@ -633,12 +663,14 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 	if(ret < 0)
+ 	{
+ 		printk(KERN_ERR "registe fb for lcdc0 failed!\n");
+-		goto err3;
++		goto err4;
+ 	}
+ 	printk("rk30 lcdc%d probe ok!\n",lcdc_dev->id);
+ 
+ 	return 0;
+ 
++err4:
++	free_irq(lcdc_dev->irq, pdev);
+ err3:	
+ 	iounmap(lcdc_dev->reg_vir_base);
+ err2:
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.h b/drivers/video/rockchip/chips/rk30_lcdc.h
+index f8a8fbec4d44..2e48095ddabd 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.h
++++ b/drivers/video/rockchip/chips/rk30_lcdc.h
+@@ -40,7 +40,7 @@ typedef volatile struct tagLCDC_REG
+     unsigned int WIN0_SCL_OFFSET;         //0x50 Win0 Cbr scaling start point offset
+     unsigned int WIN1_YRGB_MST;           //0x54 Win1 active YRGB memory start address
+     unsigned int WIN1_CBR_MST;            //0x58 Win1 active Cbr memory start address
+-	unsigned int WIN1_VIR;                //0x5c WIN1 virtual display width/height
++    unsigned int WIN1_VIR;                //0x5c WIN1 virtual display width/height
+     unsigned int WIN1_ACT_INFO;           //0x60 Win1 active window width/height
+     unsigned int WIN1_DSP_INFO;           //0x64 Win1 display width/height on panel
+     unsigned int WIN1_DSP_ST;             //0x68 Win1 display start point on panel
+@@ -228,26 +228,29 @@ typedef volatile struct tagLCDC_REG
+ 
+ 
+ //LCDC_INT_STATUS
+-#define m_HOR_START         (1<<0)
+-#define m_FRM_START         (1<<1)
+-#define m_SCANNING_FLAG     (1<<2)
+-#define m_HOR_STARTMASK     (1<<3)
+-#define m_FRM_STARTMASK     (1<<4)
+-#define m_SCANNING_MASK     (1<<5)
+-#define m_HOR_STARTCLEAR    (1<<6)
+-#define m_FRM_STARTCLEAR    (1<<7)
+-#define m_SCANNING_CLEAR    (1<<8)
+-#define m_SCAN_LINE_NUM     (0x7ff<<9)
+-#define v_HOR_START(x)         (((x)&1)<<0)
+-#define v_FRM_START(x)         (((x)&1)<<1)
+-#define v_SCANNING_FLAG(x)     (((x)&1)<<2)
+-#define v_HOR_STARTMASK(x)     (((x)&1)<<3)
+-#define v_FRM_STARTMASK(x)     (((x)&1)<<4)
+-#define v_SCANNING_MASK(x)     (((x)&1)<<5)
+-#define v_HOR_STARTCLEAR(x)    (((x)&1)<<6)
+-#define v_FRM_STARTCLEAR(x)    (((x)&1)<<7)
+-#define v_SCANNING_CLEAR(x)    (((x)&1)<<8)
+-#define v_SCAN_LINE_NUM(x)     (((x)&0x7ff)<<9)
++#define v_HOR_START_INT_STA        (1<<0)  //status
++#define v_FRM_START_INT_STA        (1<<1)
++#define v_LINE_FLAG_INT_STA        (1<<2)
++#define v_BUS_ERR_INT_STA	   (1<<3)
++#define m_HOR_START_INT_EN     	   (1<<4)  //enable
++#define m_FRM_START_INT_EN          (1<<5)
++#define m_LINE_FLAG_INT_EN         (1<<6)
++#define m_BUS_ERR_INT_EN	   (1<<7)
++#define m_HOR_START_INT_CLEAR      (1<<8) //auto clear
++#define m_FRM_START_INT_CLEAR      (1<<9)
++#define m_LINE_FLAG_INT_CLEAR      (1<<10)
++#define m_BUS_ERR_INT_CLEAR        (1<<11)
++#define m_LINE_FLAG_NUM		   (0xfff<<12)
++#define v_HOR_START_INT_EN(x)      (((x)&1)<<4)
++#define v_FRM_START_INT_EN(x)      (((x)&1)<<5)
++#define v_LINE_FLAG_INT_EN(x)      (((x)&1)<<6)
++#define v_BUS_ERR_INT_EN(x)	   (((x)&1)<<7)
++#define v_HOR_START_INT_CLEAR(x)      (((x)&1)<<8)
++#define v_FRM_START_INT_CLEAR(x)     (((x)&1)<<9)
++#define v_LINE_FLAG_INT_CLEAR(x)     (((x)&1)<<10)
++#define v_BUS_ERR_INT_CLEAR(x)        (((x)&1)<<11)
++#define v_LINE_FLAG_NUM(x)	   (((x)&0xfff)<<12)
++
+ 
+ 
+ //LCDC_MCU_TIMING_CTRL
+@@ -456,6 +459,8 @@ struct rk30_lcdc_device{
+ 	void __iomem *reg_vir_base;  // virtual basic address of lcdc register
+ 	u32 reg_phy_base;       // physical basic address of lcdc register
+ 	u32 len;               // physical map length of lcdc register
++
++	unsigned int		irq;
+ 	
+ 	struct clk		*hclk;				//lcdc AHP clk
+ 	struct clk		*dclk;				//lcdc dclk
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 0e2aa8e23a9a..abd811ab368f 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -24,7 +24,6 @@
+ #include <linux/device.h>
+ #include <linux/fb.h>
+ #include <linux/init.h>
+-#include <linux/interrupt.h>
+ #include <linux/platform_device.h>
+ #include <linux/earlysuspend.h>
+ #include <asm/div64.h>
+@@ -733,7 +732,8 @@ int init_lcdc_device_driver(struct rk_lcdc_device_driver *def_drv,
+ 	dev_drv->pan_display = def_drv->pan_display;
+ 	dev_drv->suspend = def_drv->suspend;
+ 	dev_drv->resume = def_drv->resume;
+-	dev_drv->load_screen = dev_drv->load_screen;
++	dev_drv->load_screen = def_drv->load_screen;
++	init_completion(&dev_drv->frame_done);
+ 	
+ 	return 0;
+ }
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index c3907d2b80fe..e1a3ee3452ae 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -1,4 +1,4 @@
+-/* drivers/video/rk30_fb.h
++/* drivers/video/rk_fb.h
+  *
+  * Copyright (C) 2010 ROCKCHIP, Inc.
+  *
+@@ -16,6 +16,9 @@
+ #ifndef __ARCH_ARM_MACH_RK30_FB_H
+ #define __ARCH_ARM_MACH_RK30_FB_H
+ 
++
++#include<linux/completion.h>
++
+ #define RK30_MAX_LCDC_SUPPORT	4
+ #define RK30_MAX_LAYER_SUPPORT	4
+ #define RK_MAX_FB_SUPPORT     4
+@@ -183,6 +186,9 @@ struct rk_lcdc_device_driver{
+ 	int fb_index_base;                     //the first fb index of the lcdc device
+ 	rk_screen *screen;
+ 	u32 pixclock;
++
++	struct completion  frame_done;
++	
+ 	int (*ioctl)(struct rk_lcdc_device_driver *dev_drv, unsigned int cmd,unsigned long arg,int layer_id);
+ 	int (*suspend)(struct layer_par *layer_par);
+ 	int (*resume)(struct layer_par *layer_par);
+-- 
+2.35.3
+

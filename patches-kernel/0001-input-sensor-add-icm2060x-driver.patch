@@ -1,0 +1,784 @@
+From 63e9e260e9933c363055bedf2ab91196e6b9d843 Mon Sep 17 00:00:00 2001
+From: Wang Jie <dave.wang@rock-chips.com>
+Date: Mon, 23 Nov 2020 14:16:55 +0800
+Subject: [PATCH] input: sensor: add icm2060x driver
+
+Signed-off-by: Wang Jie <dave.wang@rock-chips.com>
+Change-Id: Icd7e7d09fa0d25e48b999ee99c3bebb6570e18bf
+---
+ drivers/input/sensors/accel/Kconfig        |   6 +
+ drivers/input/sensors/accel/Makefile       |   1 +
+ drivers/input/sensors/accel/icm2060x_acc.c | 260 +++++++++++++++++++++
+ drivers/input/sensors/gyro/Kconfig         |   3 +
+ drivers/input/sensors/gyro/Makefile        |   1 +
+ drivers/input/sensors/gyro/icm2060x_gyro.c | 216 +++++++++++++++++
+ include/linux/icm2060x.h                   | 200 ++++++++++++++++
+ include/linux/sensor-dev.h                 |   2 +
+ 8 files changed, 689 insertions(+)
+ create mode 100644 drivers/input/sensors/accel/icm2060x_acc.c
+ create mode 100644 drivers/input/sensors/gyro/icm2060x_gyro.c
+ create mode 100644 include/linux/icm2060x.h
+
+diff --git a/drivers/input/sensors/accel/Kconfig b/drivers/input/sensors/accel/Kconfig
+index 7c7820c7ba3a..724cb2ca1e7a 100644
+--- a/drivers/input/sensors/accel/Kconfig
++++ b/drivers/input/sensors/accel/Kconfig
+@@ -140,4 +140,10 @@ config GS_DA223
+ 	  To have support for your specific gsesnor you will have to
+ 	  select the proper drivers which depend on this option.
+ 
++config ICM2060X_ACC
++	tristate "gsensor icm2060x"
++	help
++	  To have support for your specific gsesnor you will have to
++	  select the proper drivers which depend on this option.
++
+ endif
+diff --git a/drivers/input/sensors/accel/Makefile b/drivers/input/sensors/accel/Makefile
+index 08a45fdbc573..de250ef4a282 100644
+--- a/drivers/input/sensors/accel/Makefile
++++ b/drivers/input/sensors/accel/Makefile
+@@ -18,4 +18,5 @@ obj-$(CONFIG_LSM330_ACC)	+= lsm330_acc.o
+ obj-$(CONFIG_BMA2XX_ACC)	+= bma2xx.o
+ obj-$(CONFIG_STK8BAXX_ACC)	+= stk8baxx.o
+ obj-$(CONFIG_GS_DA223)		+= da223.o
++obj-$(CONFIG_ICM2060X_ACC)	+= icm2060x_acc.o
+ da223-y	:= da223_cust.o da223_core.o
+diff --git a/drivers/input/sensors/accel/icm2060x_acc.c b/drivers/input/sensors/accel/icm2060x_acc.c
+new file mode 100644
+index 000000000000..80a5c96e6207
+--- /dev/null
++++ b/drivers/input/sensors/accel/icm2060x_acc.c
+@@ -0,0 +1,260 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel/drivers/input/sensors/accel/icm2060x_acc.c
++ *
++ * Copyright (C) 2020 Rockchip Co.,Ltd.
++ * Author: Wang Jie <dave.wang@rock-chips.com>
++ */
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++#include <linux/icm2060x.h>
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	int status = 0;
++	u8 pwrm1 = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	pwrm1 = sensor_read_reg(client, ICM2060X_PWR_MGMT_1);
++
++	if (!enable) {
++		status = BIT_ACCEL_STBY;
++		sensor->ops->ctrl_data |= status;
++		if ((sensor->ops->ctrl_data & BIT_GYRO_STBY) == BIT_GYRO_STBY)
++			pwrm1 |= ICM2060X_PWRM1_SLEEP;
++	} else {
++		status = ~BIT_ACCEL_STBY;
++		sensor->ops->ctrl_data &= status;
++		pwrm1 &= ~ICM2060X_PWRM1_SLEEP;
++	}
++
++	result = sensor_write_reg(client, sensor->ops->ctrl_reg,
++						sensor->ops->ctrl_data);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set pwrm2(%d)\n", __func__, result);
++		return result;
++	}
++
++	msleep(20);
++
++	result = sensor_write_reg(client, ICM2060X_PWR_MGMT_1, pwrm1);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:fail to set pwrm1(%d)\n", __func__, result);
++		return result;
++	}
++	msleep(50);
++
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	int res = 0;
++	u8 device_id = 0;
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++
++	device_id = sensor_read_reg(client, ICM2060X_WHOAMI);
++	if (device_id != ICM20600_DEVICE_ID &&
++	    device_id != ICM20607_DEVICE_ID) {
++		dev_err(&client->dev, "%s: check id err, read_id: %d\n",
++			__func__, device_id);
++		return -1;
++	}
++
++	res = sensor_write_reg(client, ICM2060X_PWR_MGMT_1, 0x80);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_PWR_MGMT_1 error,res: %d!\n", res);
++		return res;
++	}
++	usleep_range(1000, 2000);
++
++	res = sensor_write_reg(client, ICM2060X_GYRO_CONFIG, 0x18);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_GYRO_CONFIG error,res: %d!\n", res);
++		return res;
++	}
++	usleep_range(1000, 2000);
++
++	res = sensor_write_reg(client, ICM2060X_ACCEL_CONFIG, 0x00);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_ACCEL_CONFIG error,res: %d!\n", res);
++		return res;
++	}
++	usleep_range(1000, 2000);
++
++	res = sensor_write_reg(client, ICM2060X_ACCEL_CONFIG2, 0x00);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_ACCEL_CONFIG2 error,res: %d!\n", res);
++		return res;
++	}
++
++	res = sensor_write_reg(client, ICM2060X_PWR_MGMT_2, 0x3F);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_PWR_MGMT_2 error,res: %d!\n", res);
++		return res;
++	}
++	usleep_range(1000, 2000);
++
++	res = sensor_write_reg(client, ICM2060X_PWR_MGMT_1, 0x41);
++	if (res) {
++		dev_err(&client->dev,
++			"set ICM2060X_PWR_MGMT_1 error,res: %d!\n", res);
++		return res;
++	}
++	usleep_range(1000, 2000);
++
++	res = sensor->ops->active(client, 0, sensor->pdata->poll_delay_ms);
++	if (res) {
++		dev_err(&client->dev,
++			"%s: fail to active sensor(%d)\n", __func__, res);
++		return res;
++	}
++
++	return res;
++}
++
++static int gsensor_report_value(struct i2c_client *client,
++				struct sensor_axis *axis)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++
++	if (sensor->status_cur == SENSOR_ON) {
++		/* Report acceleration sensor information */
++		input_report_abs(sensor->input_dev, ABS_X, axis->x);
++		input_report_abs(sensor->input_dev, ABS_Y, axis->y);
++		input_report_abs(sensor->input_dev, ABS_Z, axis->z);
++		input_sync(sensor->input_dev);
++	}
++
++	return 0;
++}
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	struct sensor_platform_data *pdata = sensor->pdata;
++	int ret = 0;
++	short x, y, z;
++	struct sensor_axis axis;
++	u8 buffer[6] = {0};
++	char value = 0;
++
++	if (sensor->ops->read_len < 6) {
++		dev_err(&client->dev, "%s: length is error, len = %d\n",
++			__func__, sensor->ops->read_len);
++		return -EINVAL;
++	}
++
++	/* Data bytes from hardware xL, xH, yL, yH, zL, zH */
++	*buffer = sensor->ops->read_reg;
++	ret = sensor_rx_data(client, buffer, sensor->ops->read_len);
++	if (ret < 0) {
++		dev_err(&client->dev,
++			"%s: read data failed, ret = %d\n", __func__, ret);
++		return ret;
++	}
++
++	x = ((buffer[0] << 8) & 0xff00) + (buffer[1] & 0xFF);
++	y = ((buffer[2] << 8) & 0xff00) + (buffer[3] & 0xFF);
++	z = ((buffer[4] << 8) & 0xff00) + (buffer[5] & 0xFF);
++
++	axis.x = (pdata->orientation[0]) * x + (pdata->orientation[1]) * y +
++		 (pdata->orientation[2]) * z;
++	axis.y = (pdata->orientation[3]) * x + (pdata->orientation[4]) * y +
++		 (pdata->orientation[5]) * z;
++	axis.z = (pdata->orientation[6]) * x + (pdata->orientation[7]) * y +
++		 (pdata->orientation[8]) * z;
++
++	gsensor_report_value(client, &axis);
++
++	mutex_lock(&(sensor->data_mutex));
++	sensor->axis = axis;
++	mutex_unlock(&(sensor->data_mutex));
++
++	if ((sensor->pdata->irq_enable) && (sensor->ops->int_status_reg >= 0))
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++
++	return ret;
++}
++
++struct sensor_operate gsensor_icm2060x_ops = {
++	.name		= "icm2060x_acc",
++	.type		= SENSOR_TYPE_ACCEL,
++	.id_i2c		= ACCEL_ID_ICM2060X,
++	.read_reg	= ICM2060X_ACCEL_XOUT_H,
++	.read_len	= 6,
++	.id_reg		= SENSOR_UNKNOW_DATA,
++	.id_data	= SENSOR_UNKNOW_DATA,
++	.precision	= ICM2060X_PRECISION,
++	.ctrl_reg	= ICM2060X_PWR_MGMT_2,
++	.int_status_reg = ICM2060X_INT_STATUS,
++	.range		= {-32768, 32768},
++	.trig		= IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
++	.active		= sensor_active,
++	.init		= sensor_init,
++	.report		= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++static int gsensor_icm2060x_probe(struct i2c_client *client,
++				 const struct i2c_device_id *devid)
++{
++	return sensor_register_device(client, NULL, devid, &gsensor_icm2060x_ops);
++}
++
++static int gsensor_icm2060x_remove(struct i2c_client *client)
++{
++	return sensor_unregister_device(client, NULL, &gsensor_icm2060x_ops);
++}
++
++static const struct i2c_device_id gsensor_icm2060x_id[] = {
++	{"icm2060x_acc", ACCEL_ID_ICM2060X},
++	{}
++};
++
++static struct i2c_driver gsensor_icm2060x_driver = {
++	.probe = gsensor_icm2060x_probe,
++	.remove = gsensor_icm2060x_remove,
++	.shutdown = sensor_shutdown,
++	.id_table = gsensor_icm2060x_id,
++	.driver = {
++		.name = "gsensor_icm2060x",
++#ifdef CONFIG_PM
++		.pm = &sensor_pm_ops,
++#endif
++	},
++};
++
++module_i2c_driver(gsensor_icm2060x_driver);
++
++MODULE_AUTHOR("Wang Jie <dave.wang@rock-chips.com>");
++MODULE_DESCRIPTION("icm2060x_acc 3-Axis accelerometer driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/input/sensors/gyro/Kconfig b/drivers/input/sensors/gyro/Kconfig
+index e810e8fa3871..fb721d4cb30d 100644
+--- a/drivers/input/sensors/gyro/Kconfig
++++ b/drivers/input/sensors/gyro/Kconfig
+@@ -36,4 +36,7 @@ config GYRO_MPU6880
+ config GYRO_LSM330
+ 	tristate "gyroscope lsm330_gyro"
+ 	default n
++
++config GYRO_ICM2060X
++	tristate "gyroscope icm2060x_gyro"
+ endif
+diff --git a/drivers/input/sensors/gyro/Makefile b/drivers/input/sensors/gyro/Makefile
+index b4310fff7f14..0943257a11de 100644
+--- a/drivers/input/sensors/gyro/Makefile
++++ b/drivers/input/sensors/gyro/Makefile
+@@ -8,3 +8,4 @@ obj-$(CONFIG_GYRO_EWTSA) 	+= ewtsa.o
+ obj-$(CONFIG_GYRO_MPU6500)    += mpu6500_gyro.o
+ obj-$(CONFIG_GYRO_MPU6880)    += mpu6880_gyro.o
+ obj-$(CONFIG_GYRO_LSM330)   += lsm330_gyro.o
++obj-$(CONFIG_GYRO_ICM2060X) += icm2060x_gyro.o
+diff --git a/drivers/input/sensors/gyro/icm2060x_gyro.c b/drivers/input/sensors/gyro/icm2060x_gyro.c
+new file mode 100644
+index 000000000000..3d4624b5dbd6
+--- /dev/null
++++ b/drivers/input/sensors/gyro/icm2060x_gyro.c
+@@ -0,0 +1,216 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel/drivers/input/sensors/gyro/icm2060x_gyro.c
++ *
++ * Copyright (C) 2020 Rockchip Co.,Ltd.
++ * Author: Wang Jie <dave.wang@rock-chips.com>
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/sensor-dev.h>
++#include <linux/icm2060x.h>
++
++static int sensor_active(struct i2c_client *client, int enable, int rate)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	int status = 0;
++	u8 pwrm1 = 0;
++
++	sensor->ops->ctrl_data = sensor_read_reg(client, sensor->ops->ctrl_reg);
++	pwrm1 = sensor_read_reg(client, ICM2060X_PWR_MGMT_1);
++
++	if (!enable) {
++		status = BIT_GYRO_STBY;
++		sensor->ops->ctrl_data |= status;
++		if ((sensor->ops->ctrl_data & BIT_ACCEL_STBY) == BIT_ACCEL_STBY)
++			pwrm1 |= ICM2060X_PWRM1_SLEEP;
++	} else {
++		status = ~BIT_GYRO_STBY;
++		sensor->ops->ctrl_data &= status;
++		pwrm1 &= ~ICM2060X_PWRM1_SLEEP;
++	}
++
++	result = sensor_write_reg(client, sensor->ops->ctrl_reg,
++					sensor->ops->ctrl_data);
++	if (result) {
++		dev_err(&client->dev,
++			"%s:fail to set ctrl_reg(%d)\n", __func__, result);
++		return result;
++	}
++	msleep(20);
++
++	result = sensor_write_reg(client, ICM2060X_PWR_MGMT_1, pwrm1);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: fail to set pwrm1(%d)\n", __func__, result);
++		return result;
++	}
++	msleep(50);
++
++	return result;
++}
++
++static int sensor_init(struct i2c_client *client)
++{
++	int result;
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++
++	/* init on icm2060x_acc.c */
++	result = sensor->ops->active(client, 0, sensor->pdata->poll_delay_ms);
++	if (result) {
++		dev_err(&client->dev,
++			"%s: sensor init err(%d)\n", __func__, result);
++		return result;
++	}
++
++	return result;
++}
++
++static int gyro_report_value(struct i2c_client *client,
++			     struct sensor_axis *axis)
++{
++	struct sensor_private_data *sensor =
++	    (struct sensor_private_data *) i2c_get_clientdata(client);
++
++	if (sensor->status_cur == SENSOR_ON) {
++		/* Report gyro sensor information */
++		input_report_rel(sensor->input_dev, ABS_RX, axis->x);
++		input_report_rel(sensor->input_dev, ABS_RY, axis->y);
++		input_report_rel(sensor->input_dev, ABS_RZ, axis->z);
++		input_sync(sensor->input_dev);
++	}
++
++	return 0;
++}
++
++static int sensor_report_value(struct i2c_client *client)
++{
++	struct sensor_private_data *sensor =
++		(struct sensor_private_data *) i2c_get_clientdata(client);
++	struct sensor_platform_data *pdata = sensor->pdata;
++	int ret = 0;
++	short x, y, z;
++	struct sensor_axis axis;
++	u8 buffer[6] = {0};
++	char value = 0;
++
++	if (sensor->ops->read_len < 6) {
++		dev_err(&client->dev, "%s: length is error,len = %d\n",
++			__func__, sensor->ops->read_len);
++		return -1;
++	}
++
++	*buffer = sensor->ops->read_reg;
++	ret = sensor_rx_data(client, buffer, sensor->ops->read_len);
++	if (ret < 0) {
++		dev_err(&client->dev,
++			"%s: read data failed, ret = %d\n", __func__, ret);
++		return ret;
++	}
++
++	x = ((buffer[0] << 8) & 0xFF00) + (buffer[1] & 0xFF);
++	y = ((buffer[2] << 8) & 0xFF00) + (buffer[3] & 0xFF);
++	z = ((buffer[4] << 8) & 0xFF00) + (buffer[5] & 0xFF);
++
++	axis.x = (pdata->orientation[0]) * x + (pdata->orientation[1]) * y +
++		 (pdata->orientation[2]) * z;
++	axis.y = (pdata->orientation[3]) * x + (pdata->orientation[4]) * y +
++		 (pdata->orientation[5]) * z;
++	axis.z = (pdata->orientation[6]) * x + (pdata->orientation[7]) * y +
++		 (pdata->orientation[8]) * z;
++
++	gyro_report_value(client, &axis);
++
++	mutex_lock(&(sensor->data_mutex));
++	sensor->axis = axis;
++	mutex_unlock(&(sensor->data_mutex));
++
++	if ((sensor->pdata->irq_enable) && (sensor->ops->int_status_reg >= 0))
++		value = sensor_read_reg(client, sensor->ops->int_status_reg);
++
++	return ret;
++}
++
++struct sensor_operate gyro_icm2060x_ops = {
++	.name		= "icm2060x_gyro",
++	.type		= SENSOR_TYPE_GYROSCOPE,
++	.id_i2c		= GYRO_ID_ICM2060X,
++	.read_reg	= ICM2060X_GYRO_XOUT_H,
++	.read_len	= 6,
++	.id_reg		= SENSOR_UNKNOW_DATA,
++	.id_data	= SENSOR_UNKNOW_DATA,
++	.precision	= ICM2060X_PRECISION,
++	.ctrl_reg	= ICM2060X_PWR_MGMT_2,
++	.int_status_reg = ICM2060X_INT_STATUS,
++	.range		= {-32768, 32768},
++	.trig		= IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
++	.active		= sensor_active,
++	.init		= sensor_init,
++	.report		= sensor_report_value,
++};
++
++/****************operate according to sensor chip:end************/
++static int gyro_icm2060x_probe(struct i2c_client *client,
++				const struct i2c_device_id *devid)
++{
++	return sensor_register_device(client, NULL, devid, &gyro_icm2060x_ops);
++}
++
++static int gyro_icm2060x_remove(struct i2c_client *client)
++{
++	return sensor_unregister_device(client, NULL, &gyro_icm2060x_ops);
++}
++
++static const struct i2c_device_id gyro_icm2060x_id[] = {
++	{"icm2060x_gyro", GYRO_ID_ICM2060X},
++	{}
++};
++
++static struct i2c_driver gyro_icm2060x_driver = {
++	.probe = gyro_icm2060x_probe,
++	.remove = gyro_icm2060x_remove,
++	.shutdown = sensor_shutdown,
++	.id_table = gyro_icm2060x_id,
++	.driver = {
++		.name = "gyro_icm2060x",
++#ifdef CONFIG_PM
++		.pm = &sensor_pm_ops,
++#endif
++	},
++};
++
++static int __init gyro_icm2060x_init(void)
++{
++	return i2c_add_driver(&gyro_icm2060x_driver);
++}
++
++static void __exit gyro_icm2060x_exit(void)
++{
++	i2c_del_driver(&gyro_icm2060x_driver);
++}
++
++/* must register after icm2060x_acc */
++device_initcall_sync(gyro_icm2060x_init);
++module_exit(gyro_icm2060x_exit);
++
++MODULE_AUTHOR("Wang Jie <dave.wang@rock-chips.com>");
++MODULE_DESCRIPTION("icm2060x_gyro 3-Axis Gyroscope driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/icm2060x.h b/include/linux/icm2060x.h
+new file mode 100644
+index 000000000000..1c4a4ae99099
+--- /dev/null
++++ b/include/linux/icm2060x.h
+@@ -0,0 +1,200 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Definitions for icm2060x chip.
++ */
++#ifndef __ICM2060X_H
++#define __ICM2060X_H
++
++#include <linux/ioctl.h>
++#define ICM2060X_PRECISION	16
++#define ICM2060X_RANGE		2000000
++
++#define ICM2060X_SMPLRT_DIV	0x19
++#define ICM2060X_CONFIG		0x1A
++#define ICM2060X_GYRO_CONFIG	0x1B
++#define ICM2060X_ACCEL_CONFIG	0x1C
++#define ICM2060X_ACCEL_CONFIG2	0x1D
++#define ICM2060X_LP_ACCEL_ODR   0x1E
++#define ICM2060X_WOM_THRESH	0x1F
++#define ICM2060X_FIFO_EN	0x23
++#define ICM2060X_INT_PIN_CFG	0x37
++#define ICM2060X_INT_ENABLE	0x38
++#define ICM2060X_DMP_INT_STATUS	0x39
++#define ICM2060X_INT_STATUS	0x3A
++#define ICM2060X_ACCEL_XOUT_H	0x3B
++#define ICM2060X_TEMP_OUT_H	0x41
++#define ICM2060X_GYRO_XOUT_H	0x43
++#define ICM2060X_ACCEL_INTEL_CTRL 0x69
++#define ICM2060X_USER_CTRL	0x6A
++#define ICM2060X_PWR_MGMT_1	0x6B
++#define ICM2060X_PWR_MGMT_2	0x6C
++#define ICM2060X_PRGM_STRT_ADDRH 0x70
++#define ICM2060X_FIFO_COUNTH	0x72
++#define ICM2060X_FIFO_R_W	0x74
++#define ICM2060X_WHOAMI		0x75
++
++/* DEVICE ID */
++#define ICM20600_DEVICE_ID	0x11
++#define ICM20607_DEVICE_ID	0x05
++
++/* ICM2060X_CONFIG */
++#define DLPF_CFG_250HZ		0x00
++#define DLPF_CFG_184HZ		0x01
++#define DLPF_CFG_98HZ		0x02
++#define DLPF_CFG_41HZ		0x03
++#define DLPF_CFG_20HZ		0x04
++#define DLPF_CFG_10HZ		0x05
++#define DLPF_CFG_5HZ		0x06
++#define DLPF_CFG_3600HZ		0x07
++#define EXT_SYNC_SET_TEMP	0x08
++#define EXT_SYNC_SET_GYRO_X	0x10
++#define EXT_SYNC_SET_GYRO_Y	0x18
++#define EXT_SYNC_SET_GYRO_Z	0x20
++#define EXT_SYNC_SET_ACCEL_X	0x28
++#define EXT_SYNC_SET_ACCEL_Y	0x30
++#define EXT_SYNC_SET_ACCEL_Z	0x38
++
++
++/* ICM2060X_GYRO_CONFIG */
++#define GFSR_250DPS		(0 << 3)
++#define GFSR_500DPS		(1 << 3)
++#define GFSR_1000DPS		(2 << 3)
++#define GFSR_2000DPS		(3 << 3)
++
++/* ICM2060X_ACCEL_CONFIG */
++#define AFSR_2G		(0 << 3)
++#define AFSR_4G		(1 << 3)
++#define AFSR_8G		(2 << 3)
++#define AFSR_16G	(3 << 3)
++
++
++/* ICM2060X_ACCEL_CONFIG2 */
++#define A_DLPF_CFG_460HZ	0x00
++#define A_DLPF_CFG_184HZ	0x01
++#define A_DLPF_CFG_92HZ		0x02
++#define A_DLPF_CFG_41HZ		0x03
++#define A_DLPF_CFG_20HZ		0x04
++#define A_DLPF_CFG_10HZ		0x05
++#define A_DLPF_CFG_5HZ		0x06
++/* #define A_DLPF_CFG_460HZ      0x07 */
++#define BIT_FIFO_SIZE_1K	0x40
++#define BIT_ACCEL_FCHOICE_B	0x08
++
++
++/* ICM2060X_LP_ACCEL_ODR */
++#define LPA_CLK_P24HZ	0x0
++#define LPA_CLK_P49HZ	0x1
++#define LPA_CLK_P98HZ	0x2
++#define LPA_CLK_1P95HZ	0x3
++#define LPA_CLK_3P91HZ	0x4
++#define LPA_CLK_7P81HZ	0x5
++#define LPA_CLK_15P63HZ	0x6
++#define LPA_CLK_31P25HZ	0x7
++#define LPA_CLK_62P50HZ	0x8
++#define LPA_CLK_125HZ	0x9
++#define LPA_CLK_250HZ	0xa
++#define LPA_CLK_500HZ	0xb
++
++
++/* ICM2060X_PWR_MGMT_1 */
++#define BIT_H_RESET		(1<<7)
++#define BIT_SLEEP		(1<<6)
++#define BIT_CYCLE		(1<<5)
++#define BIT_GYRO_STANDBY	(1<<4)
++#define BIT_PD_PTAT		(1<<3)
++#define BIT_CLKSEL		(1<<0)
++
++#define CLKSEL_INTERNAL		0
++#define CLKSEL_PLL		1
++
++/* ICM2060X_PWR_MGMT_2 */
++#define BIT_ACCEL_STBY		0x38
++#define BIT_GYRO_STBY		0x07
++#define BITS_LPA_WAKE_CTRL	0xC0
++#define BITS_LPA_WAKE_1HZ	0x00
++#define BITS_LPA_WAKE_2HZ	0x40
++#define BITS_LPA_WAKE_20HZ	0x80
++
++#define ICM2060X_PWRM1_SLEEP		0x40
++#define ICM2060X_PWRM1_GYRO_STANDBY	0x10
++#define ICM2060X_PWRM2_ACCEL_DISABLE	0x38
++#define ICM2060X_PWRM2_GYRO_DISABLE	0x07
++
++/* ICM2060X_ACCEL_INTEL_CTRL */
++#define BIT_ACCEL_INTEL_EN	0x80
++#define BIT_ACCEL_INTEL_MODE	0x40
++
++
++/* ICM2060X_USER_CTRL */
++#define BIT_FIFO_RST		0x04
++#define BIT_DMP_RST		0x08
++#define BIT_I2C_MST_EN		0x20
++#define BIT_FIFO_EN		0x40
++#define BIT_DMP_EN		0x80
++
++
++/* ICM2060X_FIFO_EN */
++#define BIT_ACCEL_OUT		0x08
++#define BITS_GYRO_OUT		0x70
++
++
++/* ICM2060X_INT_PIN_CFG */
++#define BIT_BYPASS_EN		0x2
++
++/* ICM2060X_INT_EN/INT_STATUS */
++#define BIT_FIFO_OVERLOW	0x80
++#define BIT_MOT_INT		0x40
++#define BIT_MPU_RDY		0x04
++#define BIT_DMP_INT		0x02
++#define BIT_RAW_RDY		0x01
++#define DMP_START_ADDR		0x400
++#define AXIS_NUM 3
++#define AXIS_ADC_BYTE 2
++#define SENSOR_PACKET (AXIS_NUM * AXIS_ADC_BYTE)
++
++/* self-test parameter */
++
++#define DEF_ST_PRECISION		1000
++#define DEF_ST_ICM2060X_ACCEL_LPF	2
++#define DEF_STABLE_TIME_ST		50
++#define DEF_SELFTEST_GYRO_FS		(0 << 3)
++#define DEF_SELFTEST_ACCEL_FS		(2 << 3)
++#define DEF_SELFTEST_6500_ACCEL_FS	(0 << 3)
++#define DEF_SW_SELFTEST_SENSITIVITY	((2000 * DEF_ST_PRECISION) / 32768)
++
++#define DEF_SW_SELFTEST_SAMPLE_COUNT	75
++#define DEF_SW_SELFTEST_SAMPLE_TIME	75
++#define DEF_SW_ACCEL_CAL_SAMPLE_TIME	50
++#define DEF_SW_SKIP_COUNT		10
++
++#define DEF_ST_6500_STABLE_TIME		20
++#define BYTES_PER_SENSOR		6
++#define DEF_SELFTEST_SAMPLE_RATE	0
++#define DEF_GYRO_WAIT_TIME		50
++#define THREE_AXIS			3
++#define INIT_ST_SAMPLES			200
++#define FIFO_COUNT_BYTE			2
++#define DEF_ST_TRY_TIMES		2
++#define REG_6500_XG_ST_DATA		0x0
++#define REG_6500_XA_ST_DATA		0xD
++#define BITS_SELF_TEST_EN		0xE0
++
++#define DEF_ST_SCAL			(1L << 15)
++
++/*---- ICM2060X Self Test Pass/Fail Criteria ----*/
++/* Gyro Offset Max Value (dps) */
++#define DEF_GYRO_OFFSET_MAX		20
++/* Gyro Self Test Absolute Limits ST_AL (dps) */
++#define DEF_GYRO_ST_AL			60
++/* Accel Self Test Absolute Limits ST_AL (mg) */
++#define DEF_ACCEL_ST_AL_MIN		225
++#define DEF_ACCEL_ST_AL_MAX		675
++#define DEF_6500_ACCEL_ST_SHIFT_DELTA	500
++#define DEF_6500_GYRO_CT_SHIFT_DELTA	500
++#define DEF_ST_ICM2060X_ACCEL_LPF	2
++#define DEF_ST_6500_ACCEL_FS_MG		2000UL
++#define DEF_SELFTEST_6500_ACCEL_FS	(0 << 3)
++
++#define DEF_SELFTEST_GYRO_SENS		(32768 / 250)
++#endif
++
+diff --git a/include/linux/sensor-dev.h b/include/linux/sensor-dev.h
+index 54b472466302..36c86d6050b7 100644
+--- a/include/linux/sensor-dev.h
++++ b/include/linux/sensor-dev.h
+@@ -66,6 +66,7 @@ enum sensor_id {
+ 	ACCEL_ID_BMA2XX,
+ 	ACCEL_ID_STK8BAXX,
+ 	ACCEL_ID_MIR3DA,
++	ACCEL_ID_ICM2060X,
+ 	COMPASS_ID_ALL,
+ 	COMPASS_ID_AK8975,
+ 	COMPASS_ID_AK8963,
+@@ -90,6 +91,7 @@ enum sensor_id {
+ 	GYRO_ID_MPU6500,
+ 	GYRO_ID_MPU6880,
+ 	GYRO_ID_LSM330,
++	GYRO_ID_ICM2060X,
+ 	LIGHT_ID_ALL,
+ 	LIGHT_ID_CM3217,
+ 	LIGHT_ID_CM3218,
+-- 
+2.35.3
+

@@ -1,0 +1,107 @@
+From f92148b537f02ca0a9e32c04275fb74bd372f17d Mon Sep 17 00:00:00 2001
+From: hjc <hjc@rock-chips.com>
+Date: Mon, 21 Apr 2014 09:35:47 +0800
+Subject: [PATCH] rk fb: make sure lcdc display current config addr
+
+---
+ drivers/video/rockchip/lcdc/rk3288_lcdc.c | 13 ++++++++----
+ drivers/video/rockchip/rk_fb.c            | 25 ++++++++++++++++++++---
+ 2 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/video/rockchip/lcdc/rk3288_lcdc.c b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+index 1d5b6ae1e766..9ef386145ce5 100755
+--- a/drivers/video/rockchip/lcdc/rk3288_lcdc.c
++++ b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+@@ -855,7 +855,11 @@ static int rk3288_lcdc_reg_update(struct rk_lcdc_driver *dev_drv)
+ 
+ static int rk3288_lcdc_reg_restore(struct lcdc_device *lcdc_dev)
+ {
+-	memcpy((u8 *) lcdc_dev->regs, (u8 *) lcdc_dev->regsbak, 0x1f8);
++#ifdef CONFIG_ROCKCHIP_IOMMU
++	memcpy((u8 *) lcdc_dev->regs, (u8 *) lcdc_dev->regsbak, 0x330);
++#else
++	memcpy((u8 *) lcdc_dev->regs, (u8 *) lcdc_dev->regsbak, 0x1fc);
++#endif
+ 	return 0;
+ }
+ static int rk3288_lcdc_mmu_en(struct rk_lcdc_driver *dev_drv)
+@@ -1196,7 +1200,7 @@ static int rk3288_lcdc_open(struct rk_lcdc_driver *dev_drv, int win_id,
+ 		rk3288_lcdc_pre_init(dev_drv);
+ 		rk3288_lcdc_clk_enable(lcdc_dev);
+ 		rk3288_lcdc_reg_restore(lcdc_dev);
+-		#ifdef USE_ION_MMU
++		#ifdef CONFIG_ROCKCHIP_IOMMU
+ 			rk3288_lcdc_mmu_en(dev_drv);
+ 		#endif
+ 		if ((support_uboot_display()&&(lcdc_dev->prop == PRMRY))) {
+@@ -2987,13 +2991,14 @@ static int rk3288_lcdc_get_dsp_addr(struct rk_lcdc_driver *dev_drv,unsigned int
+ {
+ 	struct lcdc_device *lcdc_dev =
+ 	    container_of(dev_drv, struct lcdc_device, driver);
+-
++	spin_lock(&lcdc_dev->reg_lock);
+ 	if(lcdc_dev->clk_on){
+ 		dsp_addr[0] = lcdc_readl(lcdc_dev, WIN0_YRGB_MST);
+ 		dsp_addr[1] = lcdc_readl(lcdc_dev, WIN1_YRGB_MST);
+ 		dsp_addr[2] = lcdc_readl(lcdc_dev, WIN2_MST0);
+ 		dsp_addr[3] = lcdc_readl(lcdc_dev, WIN3_MST0);
+ 	}
++	spin_unlock(&lcdc_dev->reg_lock);
+ 	return 0;
+ }
+ 
+@@ -3357,7 +3362,7 @@ static int rk3288_lcdc_probe(struct platform_device *pdev)
+ 			lcdc_dev->irq, ret);
+ 		return ret;
+ 	}
+-#ifdef USE_ION_MMU
++#ifdef CONFIG_ROCKCHIP_IOMMU
+ 		if(lcdc_dev->id == 0){
+ 			strcpy(dev_drv->mmu_dts_name, "iommu,vopb_mmu");
+ 		}else{
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index ecb1263fcfed..34c351c74d32 100755
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -1112,6 +1112,9 @@ static void rk_fb_update_reg(struct rk_lcdc_driver * dev_drv,struct rk_fb_reg_da
+ 	struct rk_fb *rk_fb =  platform_get_drvdata(fb_pdev);
+ 	struct rk_lcdc_driver *ext_dev_drv;
+ 	struct rk_lcdc_win *ext_win;
++	bool wait_for_vsync;
++	int count = 100;
++	unsigned int dsp_addr[4];
+ 
+ 	for(i=0;i<dev_drv->lcdc_win_num;i++){ 
+ 		//old_reg_win_data[i]= regs->reg_win_data[i];
+@@ -1208,9 +1211,25 @@ static void rk_fb_update_reg(struct rk_lcdc_driver * dev_drv,struct rk_fb_reg_da
+ 	/*dev_drv->atv_layer_cnt = regs->win_num;
+ 	dev_drv->ops->set_par(dev_drv,0);*/
+ 
+-	ret = wait_event_interruptible_timeout(dev_drv->vsync_info.wait,
+-			!ktime_equal(timestamp, dev_drv->vsync_info.timestamp),msecs_to_jiffies(dev_drv->cur_screen->ft+5));
+-	
++	//ret = wait_event_interruptible_timeout(dev_drv->vsync_info.wait,
++	//		!ktime_equal(timestamp, dev_drv->vsync_info.timestamp),msecs_to_jiffies(dev_drv->cur_screen->ft+5));
++	do {
++		ret = wait_event_interruptible_timeout(dev_drv->vsync_info.wait,
++				!ktime_equal(timestamp, dev_drv->vsync_info.timestamp),msecs_to_jiffies(dev_drv->cur_screen->ft+5));		
++		dev_drv->ops->get_dsp_addr(dev_drv,dsp_addr);
++		wait_for_vsync = false;
++		for (i = 0; i < dev_drv->lcdc_win_num; i++) {
++			if(dev_drv->win[i]->state == 1){
++				u32 new_start = regs->reg_win_data[i].reg_area_data[0].smem_start +
++						regs->reg_win_data[i].reg_area_data[0].y_offset;
++				u32 reg_start = dsp_addr[i];
++				if (unlikely(new_start != reg_start)) {
++					wait_for_vsync = true;
++					break;
++				}
++			}
++		}
++	} while (wait_for_vsync && count--);
+ #ifdef H_USE_FENCE
+ 	sw_sync_timeline_inc(dev_drv->timeline, 1);
+ #endif
+-- 
+2.35.3
+

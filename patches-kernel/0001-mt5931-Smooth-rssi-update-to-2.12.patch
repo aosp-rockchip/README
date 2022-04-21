@@ -1,0 +1,585 @@
+From 2667c7b7b68c1384f9e7a77e91bad7915f63572e Mon Sep 17 00:00:00 2001
+From: hwg <hwg@rock-chips.com>
+Date: Wed, 20 Mar 2013 17:02:26 +0800
+Subject: [PATCH] mt5931: Smooth rssi, update to 2.12
+
+---
+ drivers/net/wireless/mt5931/Makefile          |  2 +-
+ drivers/net/wireless/mt5931/common/wlan_lib.c |  6 +-
+ drivers/net/wireless/mt5931/common/wlan_oid.c | 97 ++++++++++++-------
+ .../net/wireless/mt5931/include/wlan_oid.h    | 10 ++
+ drivers/net/wireless/mt5931/mgmt/scan.c       | 91 ++++++++++++++++-
+ drivers/net/wireless/mt5931/mgmt/scan_fsm.c   |  6 +-
+ .../wireless/mt5931/os/linux/gl_cfg80211.c    | 75 ++++++++++++++
+ .../net/wireless/mt5931/os/linux/gl_init.c    |  6 ++
+ .../wireless/mt5931/os/linux/hif/sdio/sdio.c  |  8 ++
+ .../wireless/mt5931/os/linux/include/gl_kal.h |  4 +-
+ drivers/net/wireless/mt5931/os/wifi_version.h |  2 +-
+ 11 files changed, 263 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/wireless/mt5931/Makefile b/drivers/net/wireless/mt5931/Makefile
+index 90833aa5bfaa..eaf16c44529c 100755
+--- a/drivers/net/wireless/mt5931/Makefile
++++ b/drivers/net/wireless/mt5931/Makefile
+@@ -33,7 +33,7 @@ MODULE_NAME := wlan  ##mark skynine modify MT6620-->MT5931
+ 
+ ccflags-y += -D_HIF_SDIO=1
+ 
+-ccflags-y += -DRSSI_ENHANCE=0
++ccflags-y += -DRSSI_ENHANCE=1
+ 
+ ccflags-y += -DDBG=0
+ ccflags-y += -I$(src)/os -I$(src)/os/linux/include -I$(src)/os/linux/hif/sdio/include
+diff --git a/drivers/net/wireless/mt5931/common/wlan_lib.c b/drivers/net/wireless/mt5931/common/wlan_lib.c
+index 8af357150ba4..76bead149da0 100755
+--- a/drivers/net/wireless/mt5931/common/wlan_lib.c
++++ b/drivers/net/wireless/mt5931/common/wlan_lib.c
+@@ -4068,7 +4068,7 @@ wlanSecurityFrameTxTimeout(
+             WLAN_STATUS_FAILURE);
+ }
+ 
+-
++void sortAvgRssi(void);
+ /*----------------------------------------------------------------------------*/
+ /*!
+ * @brief This function is called before AIS is starting a new scan
+@@ -4088,6 +4088,10 @@ wlanClearScanningResult(
+ 
+     ASSERT(prAdapter);
+ 
++#if RSSI_ENHANCE
++	sortAvgRssi();
++#endif
++
+     // clear scanning result
+     if(kalGetMediaStateIndicated(prAdapter->prGlueInfo) == PARAM_MEDIA_STATE_CONNECTED) {
+         for(i = 0 ; i < prAdapter->rWlanInfo.u4ScanResultNum ; i++) {
+diff --git a/drivers/net/wireless/mt5931/common/wlan_oid.c b/drivers/net/wireless/mt5931/common/wlan_oid.c
+index e4b767bb923d..b0ae362ffc9f 100755
+--- a/drivers/net/wireless/mt5931/common/wlan_oid.c
++++ b/drivers/net/wireless/mt5931/common/wlan_oid.c
+@@ -1066,6 +1066,22 @@ extern UINT_32 u4DebugModule;
+ UINT_32 u4DebugModuleTemp;
+ #endif /* DBG */
+ 
++#if RSSI_ENHANCE
++int numOfTblRssi;
++TABLE_RSSI mTABLE_RSSI[MAX_SCAN_RSSI_NUM];
++int mTblRssiStatus[MAX_SCAN_RSSI_NUM];
++
++void initScanRssiHistory(void)
++{
++	int i;
++	numOfTblRssi = 0;
++	memset(mTABLE_RSSI, 0, MAX_SCAN_RSSI_NUM*sizeof(TABLE_RSSI));
++	for(i = 0; i < MAX_SCAN_RSSI_NUM; i++) {
++		mTblRssiStatus[i] = 0;
++	}
++}
++#endif
++
+ /******************************************************************************
+ *                           P R I V A T E   D A T A
+ *******************************************************************************
+@@ -1422,10 +1438,11 @@ wlanoidQueryBssidList (
+ #endif
+ 
+     P_GLUE_INFO_T prGlueInfo;
+-    UINT_32 i, u4BssidListExLen;
++    UINT_32 i,j, u4BssidListExLen;
+     P_PARAM_BSSID_LIST_EX_T prList;
+     P_PARAM_BSSID_EX_T prBssidEx;
+     PUINT_8 cp;
++	BOOLEAN bInitial = TRUE;
+ 
+     DEBUGFUNC("wlanoidQueryBssidList");
+ 
+@@ -1499,6 +1516,7 @@ wlanoidQueryBssidList (
+ 
+     prList = (P_PARAM_BSSID_LIST_EX_T) pvQueryBuffer;
+     cp = (PUINT_8)&prList->arBssid[0];
++	
+ 
+     if(prAdapter->fgIsRadioOff == FALSE && prAdapter->rWlanInfo.u4ScanResultNum > 0) {
+         // fill up for each entry
+@@ -1509,27 +1527,36 @@ wlanoidQueryBssidList (
+             kalMemCopy(prBssidEx,
+                     &(prAdapter->rWlanInfo.arScanResult[i]),
+                     OFFSET_OF(PARAM_BSSID_EX_T, aucIEs));
+-			
+-#if RSSI_ENHANCE
+-            BOOLEAN bInitial = FALSE;
+- 
+-            if (!(prBssidEx->AvgRssiX8 | prBssidEx->AvgRssi))
+-            {
+-                bInitial = TRUE;
+-            }
+ 
++#if RSSI_ENHANCE
++			bInitial = TRUE;
++			
++//			printk(KERN_INFO "%s::first  prAdapter->rWlanInfo.arScanResult[i].AvgRssiX8 = %d, prBssidEx->rRssi= %d\n", __func__, prAdapter->rWlanInfo.arScanResult[i].AvgRssiX8, prBssidEx->rRssi);
++			for(j=0;j<prAdapter->rWlanInfo.u4ScanResultNum;j++)
++			{
++				if(EQUAL_MAC_ADDR(&(prAdapter->rWlanInfo.arScanResult[i].arMacAddress), mTABLE_RSSI[j].arMacAddress))
++				{
++					bInitial = FALSE;
++					prBssidEx->AvgRssiX8 = mTABLE_RSSI[j].AvgRssiX8;
++					prBssidEx->AvgRssi = mTABLE_RSSI[j].AvgRssi;
++					break;
++				}
++			}
++			
+             if (bInitial)
+             {
+-                prBssidEx->AvgRssiX8 = prBssidEx->rRssi << 3;
+-                prBssidEx->AvgRssi  = prBssidEx->rRssi;
++            	prBssidEx->AvgRssiX8 = prBssidEx->rRssi << 3;
++                prBssidEx->AvgRssi   = prBssidEx->rRssi;             
++				//printk(KERN_INFO "%s:: bInitial --- prBssidEx->AvgRssiX8 = %d, prBssidEx->AvgRssi = %d, prBssidEx->rRssi= %d\n", __func__, prBssidEx->AvgRssiX8, prBssidEx->AvgRssi, prBssidEx->rRssi);
+             } else {
+-                prBssidEx->AvgRssiX8 = (prBssidEx->AvgRssiX8 - prBssidEx->AvgRssi) + prBssidEx->rRssi;
+-            //DBGLOG(REQ, WARN,  ("%s:: prBssidEx->AvgRssiX8 = %d, prBssidEx->AvgRssi = %d, prBssidEx->rRssi= %d\n", __func__, prBssidEx->AvgRssiX8, prBssidEx->AvgRssi, prBssidEx->rRssi));
++                prBssidEx->AvgRssiX8 = (prBssidEx->AvgRssiX8 - prBssidEx->AvgRssi) + prBssidEx->rRssi;  
++                //printk(KERN_INFO "%s:: prBssidEx->AvgRssiX8 = %d, prBssidEx->AvgRssi = %d, prBssidEx->rRssi= %d\n", __func__, prBssidEx->AvgRssiX8, prBssidEx->AvgRssi, prBssidEx->rRssi);
+             }
+ 
+             prBssidEx->AvgRssi = prBssidEx->AvgRssiX8 >> 3;
+-            prBssidEx->AvgRssi +=10;
+-            prBssidEx->rRssi = prBssidEx->AvgRssi;			
++            //prBssidEx->AvgRssi +=8;
++            prBssidEx->rRssi = prBssidEx->AvgRssi + 10;	
++		    prAdapter->rWlanInfo.arScanResult[i].rRssi = prBssidEx->AvgRssi;
+ #endif
+             /*For WHQL test, Rssi should be in range -10 ~ -200 dBm*/
+             if(prBssidEx->rRssi > PARAM_WHQL_RSSI_MAX_DBM) {
+@@ -1549,6 +1576,23 @@ wlanoidQueryBssidList (
+             cp += prBssidEx->u4Length;
+             prList->u4NumberOfItems++;
+         }
++#if RSSI_ENHANCE
++		for(i = 0 ; i < prAdapter->rWlanInfo.u4ScanResultNum ; i++)
++		{
++			COPY_MAC_ADDR(mTABLE_RSSI[i].arMacAddress,prAdapter->rWlanInfo.arScanResult[i].arMacAddress);
++			mTABLE_RSSI[i].AvgRssi = prAdapter->rWlanInfo.arScanResult[i].rRssi;
++			mTABLE_RSSI[i].AvgRssiX8= prAdapter->rWlanInfo.arScanResult[i].rRssi << 3;
++		}
++		for(i = prAdapter->rWlanInfo.u4ScanResultNum ; i < MAX_SCAN_RSSI_NUM ; i++)
++		{
++			mTABLE_RSSI[i].arMacAddress[0]=0;
++			mTABLE_RSSI[i].arMacAddress[1]=0;
++			mTABLE_RSSI[i].arMacAddress[2]=0;
++			mTABLE_RSSI[i].arMacAddress[3]=0;
++			mTABLE_RSSI[i].arMacAddress[4]=0;
++			mTABLE_RSSI[i].arMacAddress[5]=0;
++		}
++#endif
+     }
+ 
+ #if (CFG_NVRAM_EXISTENCE_CHECK == 1)
+@@ -1837,9 +1881,6 @@ wlanoidSetBssidListScanExt (
+ * \retval WLAN_STATUS_ADAPTER_NOT_READY
+ */
+ /*----------------------------------------------------------------------------*/
+-#if RSSI_ENHANCE
+-static int ORssi = 0;time = 2; // add by gwl 
+-#endif
+ WLAN_STATUS
+ wlanoidSetBssid (
+     IN  P_ADAPTER_T       prAdapter,
+@@ -4363,7 +4404,6 @@ wlanoidQueryVendorId (
+     return WLAN_STATUS_SUCCESS;
+ } /* wlanoidQueryVendorId */
+ 
+-
+ /*----------------------------------------------------------------------------*/
+ /*!
+ * \brief This routine is called to query the current RSSI value.
+@@ -4411,24 +4451,7 @@ wlanoidQueryRssi (
+             (kalGetTimeTick() - prAdapter->rLinkQualityUpdateTime) <= CFG_LINK_QUALITY_VALID_PERIOD) {
+         PARAM_RSSI rRssi;
+ 
+-        rRssi = (PARAM_RSSI)prAdapter->rLinkQuality.cRssi; // ranged from (-128 ~ 30) in unit of dBm
+-#if RSSI_ENHANCE
+-	// add by gwl	
+-	rRssi += 10;
+-	if (ORssi == 0) ORssi = rRssi;
+-	else if ((ORssi - rRssi) > 8) {
+-		if (time > 0) {
+-			rRssi = ORssi;
+-			time--;
+-		} else {
+-			time = 2;
+-			ORssi = rRssi;
+-		}
+-	}else {
+-		time = 2;
+-		ORssi = rRssi;
+-	}
+-#endif						
++        rRssi = (PARAM_RSSI)prAdapter->rLinkQuality.cRssi; // ranged from (-128 ~ 30) in unit of dBm						
+         if(rRssi > PARAM_WHQL_RSSI_MAX_DBM)
+             rRssi = PARAM_WHQL_RSSI_MAX_DBM;
+         else if(rRssi < PARAM_WHQL_RSSI_MIN_DBM)
+diff --git a/drivers/net/wireless/mt5931/include/wlan_oid.h b/drivers/net/wireless/mt5931/include/wlan_oid.h
+index f5215298bf85..0f5a6b6e3f25 100755
+--- a/drivers/net/wireless/mt5931/include/wlan_oid.h
++++ b/drivers/net/wireless/mt5931/include/wlan_oid.h
+@@ -478,6 +478,16 @@ typedef struct _PARAM_BSSID_EX_T {
+     UINT_8                          aucIEs[1];
+ } PARAM_BSSID_EX_T, *P_PARAM_BSSID_EX_T;
+ 
++/*! hold a table of mac  and  AvgRssiX8*/
++typedef struct _TABLE_RSSI_ {
++    PARAM_MAC_ADDRESS               arMacAddress;         /*!< BSSID */
++	PARAM_RSSI                      AvgRssiX8;
++	PARAM_RSSI                      AvgRssi;
++} TABLE_RSSI;
++
++#define MAX_SCAN_RSSI_NUM 128
++extern TABLE_RSSI mTABLE_RSSI[MAX_SCAN_RSSI_NUM];
++
+ typedef struct _PARAM_BSSID_LIST_EX {
+     UINT_32                         u4NumberOfItems;      /*!< at least 1 */
+     PARAM_BSSID_EX_T                arBssid[1];
+diff --git a/drivers/net/wireless/mt5931/mgmt/scan.c b/drivers/net/wireless/mt5931/mgmt/scan.c
+index 3eaab2b6834a..0e89b493497a 100755
+--- a/drivers/net/wireless/mt5931/mgmt/scan.c
++++ b/drivers/net/wireless/mt5931/mgmt/scan.c
+@@ -2052,6 +2052,86 @@ scanAddToBssDesc (
+     return prBssDesc;
+ }
+ 
++#if RSSI_ENHANCE
++
++extern int numOfTblRssi;
++extern TABLE_RSSI mTABLE_RSSI[MAX_SCAN_RSSI_NUM];
++extern int mTblRssiStatus[MAX_SCAN_RSSI_NUM];
++
++#define RSSI_DEG(x...)   //printk(x)
++
++PARAM_RSSI processAvgRssi(UINT_8 ucRCPI, PARAM_MAC_ADDRESS rMacAddr)
++{
++	int bFound, i;
++	PARAM_RSSI rRssi = RCPI_TO_dBm(ucRCPI);
++	PARAM_RSSI rRssi2 = rRssi;
++	PARAM_RSSI AvgRssiX8, AvgRssi;
++
++	if(rRssi < -40)
++		rRssi += 8;
++
++	RSSI_DEG("---- processAvgRssi ---- \n");
++	
++	bFound = FALSE;
++	for(i = 0; i < numOfTblRssi; i++) {
++		RSSI_DEG("-%02x:%02x:%02x:%02x:%02x:%02x\n", 
++		 	mTABLE_RSSI[i].arMacAddress[0], mTABLE_RSSI[i].arMacAddress[1], mTABLE_RSSI[i].arMacAddress[2], mTABLE_RSSI[i].arMacAddress[3], mTABLE_RSSI[i].arMacAddress[4], mTABLE_RSSI[i].arMacAddress[5]);
++		if(EQUAL_MAC_ADDR(rMacAddr, mTABLE_RSSI[i].arMacAddress)) {
++			bFound = TRUE;
++			AvgRssiX8 = mTABLE_RSSI[i].AvgRssiX8;
++			AvgRssi = mTABLE_RSSI[i].AvgRssi;
++			mTblRssiStatus[i] = 1;
++			break;
++		}
++	}
++
++    if(!bFound) {
++    	AvgRssiX8 = rRssi << 3;
++        AvgRssi   = rRssi;
++    } else {
++        AvgRssiX8 = (AvgRssiX8 - AvgRssi) + rRssi;  
++    }
++
++    AvgRssi = AvgRssiX8 >> 3;
++
++    if(!bFound) {
++		COPY_MAC_ADDR(mTABLE_RSSI[numOfTblRssi].arMacAddress, rMacAddr);
++		mTABLE_RSSI[numOfTblRssi].AvgRssi = AvgRssi;
++		mTABLE_RSSI[numOfTblRssi].AvgRssiX8 = AvgRssiX8;
++		numOfTblRssi++;
++		mTblRssiStatus[i] = 1;
++    } else {
++        mTABLE_RSSI[i].AvgRssi = AvgRssi;
++		mTABLE_RSSI[i].AvgRssiX8 = AvgRssiX8;
++    }		
++
++	RSSI_DEG("results : %02x:%02x:%02x:%02x:%02x:%02x %d -> %d\n", 
++		 rMacAddr[0], rMacAddr[1], rMacAddr[2], rMacAddr[3], rMacAddr[4], rMacAddr[5], rRssi2, AvgRssi);
++
++	return AvgRssi;
++}
++
++void sortAvgRssi(void)
++{
++	int i, index = 0;
++
++	RSSI_DEG("---- sortAvgRssi numOfTblRssi = %d ---- \n", numOfTblRssi);
++
++	for(i = 0; i < numOfTblRssi; i++) {
++		if(mTblRssiStatus[i] == 1) {
++			memmove(&mTABLE_RSSI[index++], &mTABLE_RSSI[i], sizeof(TABLE_RSSI));
++		}
++	}
++	numOfTblRssi = index;
++
++	RSSI_DEG("--numOfTblRssi = %d.\n", numOfTblRssi);
++
++	for(i = 0; i < numOfTblRssi; i++) {
++		mTblRssiStatus[i] = 0;
++	}
++}
++
++#endif
+ 
+ /*----------------------------------------------------------------------------*/
+ /*!
+@@ -2080,6 +2160,7 @@ scanAddScanResult (
+     ENUM_PARAM_OP_MODE_T eOpMode;
+     UINT_8 ucRateLen = 0;
+     UINT_32 i;
++	PARAM_RSSI AvgRssi;
+ 
+     ASSERT(prAdapter);
+     ASSERT(prSwRfb);
+@@ -2143,11 +2224,19 @@ scanAddScanResult (
+         break;
+     }
+ 
++#if RSSI_ENHANCE
++	AvgRssi = processAvgRssi(prBssDesc->ucRCPI, rMacAddr);
++#endif	
++
+     kalIndicateBssInfo(prAdapter->prGlueInfo,
+             (PUINT_8)prSwRfb->pvHeader,
+             prSwRfb->u2PacketLen,
+             prBssDesc->ucChannelNum,
++#if RSSI_ENHANCE     
++			AvgRssi);
++#else
+             RCPI_TO_dBm(prBssDesc->ucRCPI));
++#endif
+ 
+     nicAddScanResult(prAdapter,
+             rMacAddr,
+@@ -2159,7 +2248,7 @@ scanAddScanResult (
+             eOpMode,
+             aucRatesEx,
+             prSwRfb->u2PacketLen - prSwRfb->u2HeaderLen,
+-            (PUINT_8)((UINT_32)(prSwRfb->pvHeader) + WLAN_MAC_MGMT_HEADER_LEN));
++            (PUINT_8)((UINT_32)(prSwRfb->pvHeader) + WLAN_MAC_MGMT_HEADER_LEN));	
+ 
+     return WLAN_STATUS_SUCCESS;
+ 
+diff --git a/drivers/net/wireless/mt5931/mgmt/scan_fsm.c b/drivers/net/wireless/mt5931/mgmt/scan_fsm.c
+index 2fc9b8bac204..98a97aaac135 100755
+--- a/drivers/net/wireless/mt5931/mgmt/scan_fsm.c
++++ b/drivers/net/wireless/mt5931/mgmt/scan_fsm.c
+@@ -440,7 +440,11 @@ scnSendScanReq (
+         rCmdScanReq.u2ChannelDwellTime = prScanParam->u2PassiveListenInterval;
+     }
+ #endif
+-
++#if RSSI_ENHANCE
++    //add by gwl
++    rCmdScanReq.u2ChannelDwellTime = 200;
++	rCmdScanReq.u2ChannelMinDwellTime = 200;
++#endif
+     if(prScanParam->u2IELen <= MAX_IE_LENGTH) {
+         rCmdScanReq.u2IELen = prScanParam->u2IELen;
+     }
+diff --git a/drivers/net/wireless/mt5931/os/linux/gl_cfg80211.c b/drivers/net/wireless/mt5931/os/linux/gl_cfg80211.c
+index 1c45a7bc1729..8c8649b45443 100755
+--- a/drivers/net/wireless/mt5931/os/linux/gl_cfg80211.c
++++ b/drivers/net/wireless/mt5931/os/linux/gl_cfg80211.c
+@@ -117,6 +117,69 @@
+ ********************************************************************************
+ */
+ 
++#if RSSI_ENHANCE
++
++#define RSSI_DEG(x...)   //printk(x)
++
++#define RSSI_ENHANCE_VALUE        (10)
++#define MAX_COUNT_OF_RSSI_HISTORY (8)
++typedef struct _RSSI_HISTORY_T
++{
++	int counts;
++	int history[MAX_COUNT_OF_RSSI_HISTORY];
++} RSSI_HISTORY_T, *P_RSSI_HISTORY_T;
++
++RSSI_HISTORY_T gRssiHistory;
++
++extern void initScanRssiHistory(void);
++void initRssiHistory(void)
++{
++	printk("initRssiHistory.\n");
++	memset(&gRssiHistory, 0, sizeof(RSSI_HISTORY_T));
++}
++
++int processRssiHistory(int newRssi)
++{
++	int rstRssi, i, total = 0;
++	int index = gRssiHistory.counts;
++	int *history = &gRssiHistory.history[0];
++
++	RSSI_DEG("---- newRssi = %d\n", newRssi);
++
++	if(index != 0) {
++		if(abs(newRssi-history[index-1]) >= 10) { // rssi change too much, discard history rssi
++			index = 0;
++		}
++	}
++	
++	// save new rssi
++	if(index >= MAX_COUNT_OF_RSSI_HISTORY) {
++		memmove(&history[0], &history[1], (MAX_COUNT_OF_RSSI_HISTORY-1)*sizeof(int));
++		history[MAX_COUNT_OF_RSSI_HISTORY-1] = newRssi;
++	} else {
++		history[index++] = newRssi;
++	}
++	gRssiHistory.counts = index;
++
++	// calc result rssi
++	for(i = 0; i < index; i++) {
++		RSSI_DEG("%d, ", history[i]);
++		total += history[i];
++	}
++	RSSI_DEG("\n");
++
++	rstRssi = total/gRssiHistory.counts;
++	rstRssi += RSSI_ENHANCE_VALUE;
++	RSSI_DEG("---- rstRssi = %d\n", rstRssi);
++
++	if(rstRssi > -10)
++		rstRssi = -10;
++	
++	return rstRssi;
++}
++
++#endif
++
+ /*----------------------------------------------------------------------------*/
+ /*!
+  * @brief This routine is responsible for change STA type between
+@@ -486,6 +549,9 @@ mtk_cfg80211_get_station (
+             DBGLOG(REQ, WARN, ("unable to retrieve link speed\n"));
+         }
+         else {
++		#if RSSI_ENHANCE
++			i4Rssi = processRssiHistory(i4Rssi);
++		#endif
+             sinfo->filled |= STATION_INFO_SIGNAL;
+             sinfo->signal = i4Rssi; /* dBm */
+         }
+@@ -595,6 +661,10 @@ mtk_cfg80211_connect (
+     prGlueInfo = (P_GLUE_INFO_T) wiphy_priv(wiphy);
+     ASSERT(prGlueInfo);
+ 
++#if RSSI_ENHANCE
++	initRssiHistory();
++#endif
++
+     if (prGlueInfo->prAdapter->rWifiVar.rConnSettings.eOPMode > NET_TYPE_AUTO_SWITCH)
+ 		eOpMode = NET_TYPE_AUTO_SWITCH;
+ 	else 
+@@ -934,6 +1004,11 @@ mtk_cfg80211_disconnect (
+     prGlueInfo = (P_GLUE_INFO_T) wiphy_priv(wiphy);
+     ASSERT(prGlueInfo);
+ 
++#if RSSI_ENHANCE
++	initRssiHistory();
++	initScanRssiHistory();
++#endif
++
+     rStatus = kalIoctl(prGlueInfo,
+         wlanoidSetDisassociate,
+         NULL,
+diff --git a/drivers/net/wireless/mt5931/os/linux/gl_init.c b/drivers/net/wireless/mt5931/os/linux/gl_init.c
+index 6371a42d67d0..13d90ecaa4d0 100755
+--- a/drivers/net/wireless/mt5931/os/linux/gl_init.c
++++ b/drivers/net/wireless/mt5931/os/linux/gl_init.c
+@@ -3138,6 +3138,8 @@ wlanRemove(
+ 
+ #include "wifi_version.h"
+ 
++extern void initRssiHistory(void);
++extern void initScanRssiHistory(void);
+ extern VOID exitWlan(void);
+ /*static */int initWlan(void)
+ {
+@@ -3145,6 +3147,10 @@ extern VOID exitWlan(void);
+ 	int count = 3;
+ 	driver_start_ok = 0;
+ 
++#if RSSI_ENHANCE
++	initRssiHistory();
++	initScanRssiHistory();
++#endif
+ retry_initwlan:
+ 	
+     //printk("=======================================================\n");
+diff --git a/drivers/net/wireless/mt5931/os/linux/hif/sdio/sdio.c b/drivers/net/wireless/mt5931/os/linux/hif/sdio/sdio.c
+index b367c80e2320..ebfedf3c4a47 100755
+--- a/drivers/net/wireless/mt5931/os/linux/hif/sdio/sdio.c
++++ b/drivers/net/wireless/mt5931/os/linux/hif/sdio/sdio.c
+@@ -978,6 +978,7 @@ kalDevRegRead (
+     )
+ {
+     int ret = 0;
++	int a = 0;
+ 
+     ASSERT(prGlueInfo);
+     ASSERT(pu4Value);
+@@ -989,7 +990,14 @@ kalDevRegRead (
+         sdio_claim_host(prGlueInfo->rHifInfo.func);
+     }
+ 
++retry:
+     *pu4Value = sdio_readl(prGlueInfo->rHifInfo.func, u4Register, &ret);
++	if (ret && a < 10) {
++		a++;
++		printk("gwl =-==============> sdio_readl retry %d!\n", a);
++		msleep(1);
++		goto retry;
++	}	
+ 
+     if (!in_interrupt) {
+         sdio_release_host(prGlueInfo->rHifInfo.func);
+diff --git a/drivers/net/wireless/mt5931/os/linux/include/gl_kal.h b/drivers/net/wireless/mt5931/os/linux/include/gl_kal.h
+index 91dfe905e9bc..6df16d4ef1dd 100755
+--- a/drivers/net/wireless/mt5931/os/linux/include/gl_kal.h
++++ b/drivers/net/wireless/mt5931/os/linux/include/gl_kal.h
+@@ -1507,7 +1507,7 @@ typedef UINT_32             KAL_WAKE_LOCK_T, *P_KAL_WAKE_LOCK_T;
+ 
+ #define CNM_ERROR_LOGFUNC(_Fmt...) kalPrint(_Fmt)
+ #define CNM_WARN_LOGFUNC(_Fmt...) kalPrint(_Fmt)
+-#define CNM_INFO_LOGFUNC(_Fmt...) kalPrint(_Fmt)
++#define CNM_INFO_LOGFUNC(_Fmt...) //kalPrint(_Fmt)
+ #define CNM_STATE_LOGFUNC(_Fmt...)
+ #define CNM_EVENT_LOGFUNC(_Fmt...)
+ #define CNM_TRACE_LOGFUNC(_Fmt...)
+@@ -1561,7 +1561,7 @@ typedef UINT_32             KAL_WAKE_LOCK_T, *P_KAL_WAKE_LOCK_T;
+ 
+ #define QM_ERROR_LOGFUNC(_Fmt...) kalPrint(_Fmt)
+ #define QM_WARN_LOGFUNC(_Fmt...) kalPrint(_Fmt)
+-#define QM_INFO_LOGFUNC(_Fmt...) kalPrint(_Fmt)
++#define QM_INFO_LOGFUNC(_Fmt...) //kalPrint(_Fmt)
+ #define QM_STATE_LOGFUNC(_Fmt...)
+ #define QM_EVENT_LOGFUNC(_Fmt...)
+ #define QM_TRACE_LOGFUNC(_Fmt...) //kalPrint(_Fmt)
+diff --git a/drivers/net/wireless/mt5931/os/wifi_version.h b/drivers/net/wireless/mt5931/os/wifi_version.h
+index 0a68907af426..2ae10663fa5c 100755
+--- a/drivers/net/wireless/mt5931/os/wifi_version.h
++++ b/drivers/net/wireless/mt5931/os/wifi_version.h
+@@ -7,7 +7,7 @@
+ /*
+  * Marvell MV8686 driver version.
+  */
+-#define MT5931_DRV_VERSION "2.09"
++#define MT5931_DRV_VERSION "2.12"
+ 
+ #endif /* WIFI_VERSION_H */
+ 
+-- 
+2.35.3
+

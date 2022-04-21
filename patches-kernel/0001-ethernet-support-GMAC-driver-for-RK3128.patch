@@ -1,0 +1,1011 @@
+From 686e3a9bc816a6fe64ce09f6fb6eeb8a29d80169 Mon Sep 17 00:00:00 2001
+From: roger <cz@rock-chips.com>
+Date: Fri, 8 Aug 2014 20:57:19 +0800
+Subject: [PATCH] ethernet: support GMAC driver for RK3128
+
+---
+ arch/arm/boot/dts/rk3128-box.dts              |   7 +-
+ arch/arm/boot/dts/rk312x-clocks.dtsi          |   4 +-
+ arch/arm/boot/dts/rk312x-pinctrl.dtsi         |   7 +-
+ arch/arm/boot/dts/rk312x.dtsi                 |  21 +-
+ drivers/net/ethernet/rockchip/gmac/stmmac.h   |  25 +-
+ .../net/ethernet/rockchip/gmac/stmmac_main.c  | 282 +++++++--------
+ .../ethernet/rockchip/gmac/stmmac_platform.c  | 342 +++++++++++++++---
+ 7 files changed, 480 insertions(+), 208 deletions(-)
+
+diff --git a/arch/arm/boot/dts/rk3128-box.dts b/arch/arm/boot/dts/rk3128-box.dts
+index 5b997bbed008..65d03c406780 100755
+--- a/arch/arm/boot/dts/rk3128-box.dts
++++ b/arch/arm/boot/dts/rk3128-box.dts
+@@ -133,4 +133,9 @@
+ 	status = "disabled";
+ };
+ 
+-
++&gmac {
++	//pmu_regulator = "act_ldo5";
++	//pmu_enable_level = <1>; //1->HIGH, 0->LOW
++	//power-gpio = <&gpio0 GPIO_A6 GPIO_ACTIVE_HIGH>;
++	reset-gpio = <&gpio2 GPIO_D0 GPIO_ACTIVE_LOW>;
++};
+diff --git a/arch/arm/boot/dts/rk312x-clocks.dtsi b/arch/arm/boot/dts/rk312x-clocks.dtsi
+index e7b95493a732..97f15d4f0ccf 100755
+--- a/arch/arm/boot/dts/rk312x-clocks.dtsi
++++ b/arch/arm/boot/dts/rk312x-clocks.dtsi
+@@ -39,10 +39,10 @@
+ 				#clock-cells = <0>;
+ 			};
+ 
+-			gmac_clkin: rmii_clkin {
++			gmac_clkin: gmac_clkin {
+ 				compatible = "rockchip,rk-fixed-clock";
+ 				clock-output-names = "gmac_clkin";
+-				clock-frequency = <0>;
++				clock-frequency = <125000000>;
+ 				#clock-cells = <0>;
+ 			};
+ 
+diff --git a/arch/arm/boot/dts/rk312x-pinctrl.dtsi b/arch/arm/boot/dts/rk312x-pinctrl.dtsi
+index 8dec9bc2cc67..61e0628b6661 100755
+--- a/arch/arm/boot/dts/rk312x-pinctrl.dtsi
++++ b/arch/arm/boot/dts/rk312x-pinctrl.dtsi
+@@ -788,7 +788,12 @@
+ 				rockchip,pins = <GMAC_COL>;
+ 				rockchip,pull = <VALUE_PULL_DEFAULT>;
+ 			};
+-			
++
++			gmac_col_gpio:gmac-col-gpio {
++				rockchip,pins = <GPIO2_D0>;
++				rockchip,pull = <VALUE_PULL_DEFAULT>;
++			};
++		
+ 			gmac_mdc:gmac-mdc {
+ 				rockchip,pins = <GMAC_MDC>;
+ 				rockchip,pull = <VALUE_PULL_DEFAULT>;
+diff --git a/arch/arm/boot/dts/rk312x.dtsi b/arch/arm/boot/dts/rk312x.dtsi
+index ecdc3dc45908..99501b2e488c 100755
+--- a/arch/arm/boot/dts/rk312x.dtsi
++++ b/arch/arm/boot/dts/rk312x.dtsi
+@@ -187,6 +187,25 @@
+ 		status = "disabled";
+ 	};
+ 
++	gmac: eth@2008c000 {
++		compatible = "rockchip,gmac";
++		reg = <0x2008c000 0x4000>;
++		interrupts = <GIC_SPI 56 IRQ_TYPE_LEVEL_HIGH>;  /*irq=88*/
++		interrupt-names = "macirq";
++		clocks = <&clk_mac_ref>, <&clk_gates2 6>,
++			<&clk_gates2 7>, <&clk_gates2 4>,
++			<&clk_gates2 5>,
++			<&clk_gates10 11>;
++		clock-names = "clk_mac", "mac_clk_rx",
++			"mac_clk_tx", "clk_mac_ref",
++			"clk_mac_refout",
++			"pclk_mac";
++		//phy-mode = "rmii";
++		phy-mode = "rgmii";
++		pinctrl-names = "default";
++		pinctrl-0 = <&gmac_rxdv &gmac_txclk &gmac_crs &gmac_rxclk &gmac_mdio &gmac_txen &gmac_clk &gmac_rxer &gmac_rxd1 &gmac_rxd0 &gmac_txd1 &gmac_txd0 &gmac_rxd3 &gmac_rxd2 &gmac_txd2 &gmac_txd3 &gmac_col_gpio &gmac_mdc>;
++	};
++
+ 	fiq-debugger {
+ 		compatible = "rockchip,fiq-debugger";
+ 		rockchip,serial-id = <2>;
+@@ -220,7 +239,7 @@
+ 			<&aclk_vio0_pre 300000000>, <&hclk_vio_pre 150000000>,
+ 			<&aclk_vio1_pre 300000000>, <&clk_vepu 300000000>,
+ 			<&clk_vdpu 300000000>, <&clk_hevc_core 200000000>,
+-			<&clk_mac_ref 50000000>;
++			<&clk_mac_ref 125000000>;
+ 	/*	rockchip,clocks-uboot-has-init =
+ 			<&aclk_vio1>;*/
+ 	};
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac.h b/drivers/net/ethernet/rockchip/gmac/stmmac.h
+index d736777358ca..66b4410bd4f1 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac.h
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac.h
+@@ -91,17 +91,7 @@ struct stmmac_priv {
+ 	u32 msg_enable;
+ 	int wolopts;
+ 	int wol_irq;
+-	struct clk *clk_mac;
+ 	struct clk *stmmac_clk;
+-	struct clk *clk_mac_pll;
+-	struct clk *gmac_clkin;
+-	struct clk *mac_clk_rx;
+-	struct clk *mac_clk_tx;
+-	struct clk *clk_mac_ref;
+-	struct clk *clk_mac_refout;
+-	struct clk *aclk_mac;
+-	struct clk *pclk_mac;
+-	bool clk_enable;
+ 	int clk_csr;
+ 	struct timer_list eee_ctrl_timer;
+ 	int lpi_irq;
+@@ -129,7 +119,20 @@ struct bsp_priv {
+ 	int reset_io;
+ 	int reset_io_level;
+ 	int phy_iface;
+-	int (*phy_power_on)(struct plat_stmmacenet_data *plat, int enable);
++
++	struct clk *clk_mac;
++	struct clk *clk_mac_pll;
++	struct clk *gmac_clkin;
++	struct clk *mac_clk_rx;
++	struct clk *mac_clk_tx;
++	struct clk *clk_mac_ref;
++	struct clk *clk_mac_refout;
++	struct clk *aclk_mac;
++	struct clk *pclk_mac;
++	bool clk_enable;
++
++	int (*phy_power_on)(bool enable);
++	int (*gmac_clk_enable)(bool enable);
+ };
+ 
+ extern int phyaddr;
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac_main.c b/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
+index 04e71c29ce06..98a14b3c924e 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
+@@ -148,61 +148,6 @@ static void stmmac_exit_fs(void);
+ 
+ #define STMMAC_COAL_TIMER(x) (jiffies + usecs_to_jiffies(x))
+ 
+-static int gmac_clk_enable(struct stmmac_priv *priv) {
+-	int phy_iface = -1;
+-
+-	if ((priv->plat) && (priv->plat->bsp_priv)) {
+-		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
+-		phy_iface = bsp_priv->phy_iface;
+-	} else {
+-		pr_err("%s:get PHY interface type failed!", __func__);
+-	}
+-
+-	if (!priv->clk_enable) {
+-		if (phy_iface == PHY_INTERFACE_MODE_RMII) {
+-			clk_set_rate(priv->stmmac_clk, 50000000);
+-			clk_prepare_enable(priv->mac_clk_rx);
+-			clk_prepare_enable(priv->clk_mac_ref);
+-			clk_prepare_enable(priv->clk_mac_refout);
+-		}
+-
+-		clk_prepare_enable(priv->aclk_mac);
+-		clk_prepare_enable(priv->pclk_mac);
+-		clk_prepare_enable(priv->mac_clk_tx);
+-
+-		priv->clk_enable = true;
+-	}
+-	
+-	return 0;
+-}
+-
+-static int gmac_clk_disable(struct stmmac_priv *priv) {
+-	int phy_iface = -1;
+-
+-	if ((priv->plat) && (priv->plat->bsp_priv)) {
+-		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
+-		phy_iface = bsp_priv->phy_iface;
+-	} else {
+-		pr_err("%s:get PHY interface type failed!", __func__);
+-	}
+-
+-	if (priv->clk_enable) {
+-		if (phy_iface == PHY_INTERFACE_MODE_RMII) {
+-			clk_disable_unprepare(priv->mac_clk_rx);
+-			clk_disable_unprepare(priv->clk_mac_ref);
+-			clk_disable_unprepare(priv->clk_mac_refout);
+-		}
+-
+-		clk_disable_unprepare(priv->aclk_mac);
+-		clk_disable_unprepare(priv->pclk_mac);
+-		clk_disable_unprepare(priv->mac_clk_tx);
+-
+-		priv->clk_enable = false;
+-	}
+-	
+-	return 0;
+-}
+-
+ /**
+  * stmmac_verify_args - verify the driver parameters.
+  * Description: it verifies if some wrong parameter is passed to the driver.
+@@ -858,6 +803,79 @@ static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
+ 	}
+ }
+ 
++static int gPhyReg;
++
++static ssize_t show_phy_reg(struct device *dev,
++				struct device_attribute *attr, char *buf) {
++	int ret = snprintf(buf, PAGE_SIZE, "current phy reg = 0x%x\n", gPhyReg);
++	return ret;
++}
++
++static ssize_t set_phy_reg(struct device *dev,struct device_attribute *attr,
++				const char *buf, size_t count) {
++	int ovl;
++	int r = kstrtoint(buf, 0, &ovl);
++	if (r) printk("kstrtoint failed\n");
++	gPhyReg = ovl;
++	printk("%s----ovl=0x%x\n", __FUNCTION__, ovl);
++	return count;
++}
++
++static ssize_t show_phy_regValue(struct device *dev,
++					struct device_attribute *attr, char *buf) {
++	struct phy_device *phy_dev = dev_get_drvdata(dev);
++	int ret = 0;
++	int val;
++#if 0
++	val = phy_read(phy_dev, gPhyReg);
++	ret = snprintf(buf, PAGE_SIZE, "phy reg 0x%x = 0x%x\n", gPhyReg, val);
++#else
++	int i=0;
++
++	for (i=0; i<32; i++) {
++		printk("%d: 0x%x\n", i, phy_read(phy_dev, i));
++	}
++
++	val = phy_read(phy_dev, gPhyReg);
++	ret = snprintf(buf, PAGE_SIZE, "phy reg 0x%x = 0x%x\n", gPhyReg, val);
++#endif
++	return ret;
++}
++
++static ssize_t set_phy_regValue(struct device *dev,
++					struct device_attribute *attr,
++					const char *buf, size_t count) {
++	int ovl;
++	int ret;
++
++	struct phy_device *phy_dev = dev_get_drvdata(dev);
++	ret = kstrtoint(buf, 0, &ovl);
++	printk("%s----reg 0x%x: ovl=0x%x\n", __FUNCTION__, gPhyReg, ovl);
++	phy_write(phy_dev, gPhyReg, ovl);
++	return count;
++}
++
++static struct device_attribute phy_reg_attrs[] = {
++	__ATTR(phy_reg, S_IRUGO | S_IWUSR, show_phy_reg, set_phy_reg),
++	__ATTR(phy_regValue, S_IRUGO | S_IWUSR, show_phy_regValue, set_phy_regValue)
++};
++
++int gmac_create_sysfs(struct phy_device * phy_dev) {
++	int r;
++	int t;
++
++	dev_set_drvdata(&phy_dev->dev, phy_dev);
++	for (t = 0; t < ARRAY_SIZE(phy_reg_attrs); t++) {
++		r = device_create_file(&phy_dev->dev,&phy_reg_attrs[t]);
++		if (r) {
++			dev_err(&phy_dev->dev, "failed to create sysfs file\n");
++			return r;
++		}
++	}
++
++	return 0;
++}
++
+ /**
+  * stmmac_init_phy - PHY initialization
+  * @dev: net device structure
+@@ -917,6 +935,8 @@ static int stmmac_init_phy(struct net_device *dev)
+ 
+ 	priv->phydev = phydev;
+ 
++	gmac_create_sysfs(phydev);
++
+ 	return 0;
+ }
+ 
+@@ -1625,32 +1645,33 @@ static int stmmac_open(struct net_device *dev)
+ 	struct stmmac_priv *priv = netdev_priv(dev);
+ 	int ret;
+ 
+-	clk_prepare_enable(priv->stmmac_clk);
+-	gmac_clk_enable(priv);
+-
+ 	if ((priv->plat) && (priv->plat->bsp_priv)) {
+ 		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
+-		if ((bsp_priv) && (bsp_priv->phy_power_on)) {
+-			bsp_priv->phy_power_on(priv->plat, 1);
++		if (bsp_priv) { 
++			if (bsp_priv->phy_power_on) {
++				bsp_priv->phy_power_on(true);
++			}
++			if (bsp_priv->gmac_clk_enable) {
++				bsp_priv->gmac_clk_enable(true);
++			}
+ 		}
+ 	}
+ 
+ 	stmmac_check_ether_addr(priv);
+ 
+-	if (priv->pcs != STMMAC_PCS_SGMII && priv->pcs != STMMAC_PCS_TBI &&
+-	    priv->pcs != STMMAC_PCS_RTBI && !priv->mdio_registered) {
+-		/* MDIO bus Registration */
+-		ret = stmmac_mdio_register(priv->dev);
+-		if (ret < 0) {
+-			pr_debug("%s: MDIO bus (id: %d) registration failed",
+-				 __func__, priv->plat->bus_id);
+-			goto open_error;
+-		}
+-		priv->mdio_registered = true;
+-	}	
+ 
+ 	if (priv->pcs != STMMAC_PCS_SGMII && priv->pcs != STMMAC_PCS_TBI &&
+ 	    priv->pcs != STMMAC_PCS_RTBI) {
++		if(!priv->mdio_registered) {
++			/* MDIO bus Registration */
++			ret = stmmac_mdio_register(priv->dev);
++			if (ret < 0) {
++				pr_debug("%s: MDIO bus (id: %d) registration failed",
++				 	__func__, priv->plat->bus_id);
++				goto open_error;
++			}
++			priv->mdio_registered = true;
++		}
+ 		ret = stmmac_init_phy(dev);
+ 		if (ret) {
+ 			pr_err("%s: Cannot attach to PHY (error: %d)\n",
+@@ -1778,8 +1799,12 @@ static int stmmac_open(struct net_device *dev)
+ 	if (priv->phydev)
+ 		phy_disconnect(priv->phydev);
+ 
+-	clk_disable_unprepare(priv->stmmac_clk);
+-	gmac_clk_disable(priv);
++	if ((priv->plat) && (priv->plat->bsp_priv)) {
++		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
++		if ((bsp_priv) && (bsp_priv->gmac_clk_enable)) {
++			bsp_priv->gmac_clk_enable(false);
++		}
++	}
+ 
+ 	return ret;
+ }
+@@ -1832,15 +1857,18 @@ static int stmmac_release(struct net_device *dev)
+ #ifdef CONFIG_GMAC_DEBUG_FS
+ 	stmmac_exit_fs();
+ #endif
+-	clk_disable_unprepare(priv->stmmac_clk);
+-	gmac_clk_disable(priv);
+ 
+ 	stmmac_release_ptp(priv);
+ 
+ 	if ((priv->plat) && (priv->plat->bsp_priv)) {
+ 		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
+-		if ((bsp_priv) && (bsp_priv->phy_power_on)) {
+-			bsp_priv->phy_power_on(priv->plat, 0);
++		if (bsp_priv) { 
++			if (bsp_priv->phy_power_on) {
++				bsp_priv->phy_power_on(false);
++			}
++			if (bsp_priv->gmac_clk_enable) {
++				bsp_priv->gmac_clk_enable(false);
++			}
+ 		}
+ 	}
+ 
+@@ -2789,69 +2817,13 @@ struct stmmac_priv *stmmac_dvr_probe(struct device *device,
+ 	}
+ 
+ 	priv->mdio_registered = false;
+-	priv->clk_enable = false;
+-
+-	priv->mac_clk_rx = clk_get(priv->device,"mac_clk_rx");
+-	if (IS_ERR(priv->mac_clk_rx)) {
+-		pr_warn("%s: warning: cannot get mac_clk_rx clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->mac_clk_tx = clk_get(priv->device,"mac_clk_tx");
+-	if (IS_ERR(priv->mac_clk_tx)) {
+-		pr_warn("%s: warning: cannot get mac_clk_tx clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->clk_mac_ref = clk_get(priv->device,"clk_mac_ref");
+-	if (IS_ERR(priv->clk_mac_ref)) {
+-		pr_warn("%s: warning: cannot get clk_mac_ref clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->clk_mac_refout = clk_get(priv->device,"clk_mac_refout");
+-	if (IS_ERR(priv->clk_mac_refout)) {
+-		pr_warn("%s: warning: cannot get clk_mac_refout clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->aclk_mac = clk_get(priv->device,"aclk_mac");
+-	if (IS_ERR(priv->aclk_mac)) {
+-		pr_warn("%s: warning: cannot get aclk_mac clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->pclk_mac = clk_get(priv->device,"pclk_mac");
+-	if (IS_ERR(priv->pclk_mac)) {
+-		pr_warn("%s: warning: cannot get pclk_mac clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->clk_mac_pll = clk_get(priv->device,"clk_mac_pll");
+-	if (IS_ERR(priv->clk_mac_pll)) {
+-		pr_warn("%s: warning: cannot get clk_mac_pll clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->gmac_clkin = clk_get(priv->device,"gmac_clkin");
+-	if (IS_ERR(priv->gmac_clkin)) {
+-		pr_warn("%s: warning: cannot get gmac_clkin clock\n", __func__);
+-		goto error_clk_get;
+-	}
+-
+-	priv->stmmac_clk = clk_get(priv->device, "clk_mac");
+ 
++	priv->stmmac_clk = ((struct bsp_priv *)(priv->plat->bsp_priv))->clk_mac;
+ 	if (IS_ERR(priv->stmmac_clk)) {
+ 		pr_warn("%s: warning: cannot get CSR clock\n", __func__);
+ 		goto error_clk_get;
+ 	}
+ 
+-#ifdef CONFIG_GMAC_CLK_IN
+-	clk_set_parent(priv->stmmac_clk, priv->gmac_clkin);
+-#else
+-	clk_set_parent(priv->stmmac_clk, priv->clk_mac_pll);
+-#endif
+-
+ 	/* If a specific clk_csr value is passed from the platform
+ 	 * this means that the CSR Clock Range selection cannot be
+ 	 * changed at run-time and it is fixed. Viceversa the driver'll try to
+@@ -2864,18 +2836,23 @@ struct stmmac_priv *stmmac_dvr_probe(struct device *device,
+ 		priv->clk_csr = priv->plat->clk_csr;
+ 
+ 	stmmac_check_pcs_mode(priv);
+-
++#if 0
++	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
++	    priv->pcs != STMMAC_PCS_RTBI) {
++		/* MDIO bus Registration */
++		ret = stmmac_mdio_register(ndev);
++		if (ret < 0) {
++			pr_debug("%s: MDIO bus (id: %d) registration failed",
++				 __func__, priv->plat->bus_id);
++			goto error_mdio_register;
++		}
++	}
++#endif
+ 	return priv;
+-
+-/*error_mdio_register:
++#if 0
++error_mdio_register:
+ 	clk_put(priv->stmmac_clk);
+-	clk_put(priv->clk_mac);
+-	clk_put(priv->mac_clk_rx);
+-	clk_put(priv->mac_clk_tx);
+-	clk_put(priv->clk_mac_ref);
+-	clk_put(priv->clk_mac_refout);
+-	clk_put(priv->aclk_mac);
+-	clk_put(priv->pclk_mac);*/
++#endif
+ error_clk_get:
+ 	unregister_netdev(ndev);
+ error_netdev_register:
+@@ -2943,8 +2920,13 @@ int stmmac_suspend(struct net_device *ndev)
+ 	else {
+ 		stmmac_set_mac(priv->ioaddr, false);
+ 		/* Disable clock in case of PWM is off */
+-		clk_disable_unprepare(priv->stmmac_clk);
+-		gmac_clk_disable(priv);
++	if ((priv->plat) && (priv->plat->bsp_priv)) {
++		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
++		if ((bsp_priv) && (bsp_priv->gmac_clk_enable)) {
++			bsp_priv->gmac_clk_enable(false);
++		}
++	}
++
+ 	}
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ 	return 0;
+@@ -2970,8 +2952,12 @@ int stmmac_resume(struct net_device *ndev)
+ 		priv->hw->mac->pmt(priv->ioaddr, 0);
+ 	else {
+ 		/* enable the clk prevously disabled */
+-		clk_prepare_enable(priv->stmmac_clk);
+-		gmac_clk_enable(priv);
++		if ((priv->plat) && (priv->plat->bsp_priv)) {
++			struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
++			if ((bsp_priv) && (bsp_priv->gmac_clk_enable)) {
++				bsp_priv->gmac_clk_enable(true);
++			}
++		}
+ 	}
+ 
+ 	netif_device_attach(ndev);
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c b/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
+index 471bfe71b70e..23171af80beb 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
+@@ -38,7 +38,8 @@
+ #define grf_readl(offset)	readl_relaxed(RK_GRF_VIRT + offset)
+ #define grf_writel(v, offset)	do { writel_relaxed(v, RK_GRF_VIRT + offset); dsb(); } while (0)
+ 
+-// RK3288_GRF_SOC_CON1
++//RK3288_GRF_SOC_CON1
++//RK3128_GRF_MAC_CON1
+ #define GMAC_PHY_INTF_SEL_RGMII ((0x01C0 << 16) | (0x0040))
+ #define GMAC_PHY_INTF_SEL_RMII  ((0x01C0 << 16) | (0x0100))
+ #define GMAC_FLOW_CTRL          ((0x0200 << 16) | (0x0200))
+@@ -53,47 +54,297 @@
+ #define GMAC_RMII_MODE          ((0x4000 << 16) | (0x4000))
+ #define GMAC_RMII_MODE_CLR      ((0x4000 << 16) | (0x0000))
+ 
+-// RK3288_GRF_SOC_CON3
++//RK3288_GRF_SOC_CON3
++//RK3128_GRF_MAC_CON0
+ #define GMAC_TXCLK_DLY_ENABLE   ((0x4000 << 16) | (0x4000))
+ #define GMAC_TXCLK_DLY_DISABLE  ((0x4000 << 16) | (0x0000))
+ #define GMAC_RXCLK_DLY_ENABLE   ((0x8000 << 16) | (0x8000))
+ #define GMAC_RXCLK_DLY_DISABLE  ((0x8000 << 16) | (0x0000))
+-#if 0
+-#define GMAC_CLK_RX_DL_CFG	((0x3F80 << 16) | (0x0800))
+-#define GMAC_CLK_TX_DL_CFG	((0x007F << 16) | (0x0040))
+-#else
+ #define GMAC_CLK_RX_DL_CFG(val) ((0x3F80 << 16) | (val<<7))        // 7bit
+ #define GMAC_CLK_TX_DL_CFG(val) ((0x007F << 16) | (val))           // 7bit
++
++
++#if 0 //3288
++#define SET_RGMII	{	\
++				grf_writel(GMAC_PHY_INTF_SEL_RGMII, RK3288_GRF_SOC_CON1);	\
++				grf_writel(GMAC_RMII_MODE_CLR, RK3288_GRF_SOC_CON1);	\
++				grf_writel(GMAC_RXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);	\
++				grf_writel(GMAC_TXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);	\
++				grf_writel(GMAC_CLK_RX_DL_CFG(0x10), RK3288_GRF_SOC_CON3);	\
++				grf_writel(GMAC_CLK_TX_DL_CFG(0x30), RK3288_GRF_SOC_CON3);	\
++				grf_writel(0xffffffff,RK3288_GRF_GPIO3D_E);	\
++				grf_writel(grf_readl(RK3288_GRF_GPIO4B_E) | 0x3<<2<<16 | 0x3<<2, RK3288_GRF_GPIO4B_E);	\
++				grf_writel(0xffffffff,RK3288_GRF_GPIO4A_E);	\
++			}
++
++#define SET_RMII	{	\
++				grf_writel(GMAC_PHY_INTF_SEL_RMII, RK3288_GRF_SOC_CON1);	\
++				grf_writel(GMAC_RMII_MODE, RK3288_GRF_SOC_CON1);	\
++			}
++
++#define SET_RGMII_10M	{	\
++				grf_writel(GMAC_CLK_2_5M, RK3288_GRF_SOC_CON1);	\
++			}
++
++#define SET_RGMII_100M	{	\
++				grf_writel(GMAC_CLK_25M, RK3288_GRF_SOC_CON1);	\
++			}
++
++#define SET_RGMII_1000M	{	\
++				grf_writel(GMAC_CLK_125M, RK3288_GRF_SOC_CON1);	\
++			}
++
++#define SET_RMII_10M	{	\
++				grf_writel(GMAC_RMII_CLK_2_5M, RK3288_GRF_SOC_CON1);	\
++				grf_writel(GMAC_SPEED_10M, RK3288_GRF_SOC_CON1);	\
++			}
++
++#define SET_RMII_100M	{	\
++				grf_writel(GMAC_RMII_CLK_25M, RK3288_GRF_SOC_CON1);	\
++				grf_writel(GMAC_SPEED_100M, RK3288_GRF_SOC_CON1);	\
++			}
++#else //3128
++#define SET_RGMII	{	\
++				grf_writel(GMAC_PHY_INTF_SEL_RGMII, RK312X_GRF_MAC_CON1);	\
++				grf_writel(GMAC_RMII_MODE_CLR, RK312X_GRF_MAC_CON1);		\
++				grf_writel(GMAC_RXCLK_DLY_ENABLE, RK312X_GRF_MAC_CON0);		\
++				grf_writel(GMAC_TXCLK_DLY_ENABLE, RK312X_GRF_MAC_CON0);		\
++				grf_writel(GMAC_CLK_RX_DL_CFG(0x10), RK312X_GRF_MAC_CON0);	\
++				grf_writel(GMAC_CLK_TX_DL_CFG(0x30), RK312X_GRF_MAC_CON0);	\
++			}
++
++#define SET_RMII	{	\
++				grf_writel(GMAC_PHY_INTF_SEL_RMII, RK312X_GRF_MAC_CON1);	\
++				grf_writel(GMAC_RMII_MODE, RK312X_GRF_MAC_CON1);	\
++			}
++
++#define SET_RGMII_10M	{	\
++				grf_writel(GMAC_CLK_2_5M, RK312X_GRF_MAC_CON1);	\
++			}
++
++#define SET_RGMII_100M	{	\
++				grf_writel(GMAC_CLK_25M, RK312X_GRF_MAC_CON1);	\
++			}
++
++#define SET_RGMII_1000M	{	\
++				grf_writel(GMAC_CLK_125M, RK312X_GRF_MAC_CON1);	\
++			}
++
++#define SET_RMII_10M	{	\
++				grf_writel(GMAC_RMII_CLK_2_5M, RK312X_GRF_MAC_CON1);	\
++				grf_writel(GMAC_SPEED_10M, RK312X_GRF_MAC_CON1);	\
++			}
++
++#define SET_RMII_100M	{	\
++				grf_writel(GMAC_RMII_CLK_25M, RK312X_GRF_MAC_CON1);	\
++				grf_writel(GMAC_SPEED_100M, RK312X_GRF_MAC_CON1);	\
++			}
++
+ #endif
++
+ struct bsp_priv g_bsp_priv;
+ 
+-static int phy_power_on(struct plat_stmmacenet_data *plat, int enable)
++int gmac_clk_init(struct device *device)
+ {
+-	struct bsp_priv * bsp_priv;
+-	//int ret;
++	struct bsp_priv * bsp_priv = &g_bsp_priv;
+ 
+-	printk("%s: enable = %d \n", __func__, enable);
++	bsp_priv->clk_enable = false;
++
++	bsp_priv->mac_clk_rx = clk_get(device,"mac_clk_rx");
++	if (IS_ERR(bsp_priv->mac_clk_rx)) {
++		pr_warn("%s: warning: cannot get mac_clk_rx clock\n", __func__);
++	}
++
++	bsp_priv->mac_clk_tx = clk_get(device,"mac_clk_tx");
++	if (IS_ERR(bsp_priv->mac_clk_tx)) {
++		pr_warn("%s: warning: cannot get mac_clk_tx clock\n", __func__);
++	}
++
++	bsp_priv->clk_mac_ref = clk_get(device,"clk_mac_ref");
++	if (IS_ERR(bsp_priv->clk_mac_ref)) {
++		pr_warn("%s: warning: cannot get clk_mac_ref clock\n", __func__);
++	}
++
++	bsp_priv->clk_mac_refout = clk_get(device,"clk_mac_refout");
++	if (IS_ERR(bsp_priv->clk_mac_refout)) {
++		pr_warn("%s: warning: cannot get clk_mac_refout clock\n", __func__);
++	}
++
++	bsp_priv->aclk_mac = clk_get(device,"aclk_mac");
++	if (IS_ERR(bsp_priv->aclk_mac)) {
++		pr_warn("%s: warning: cannot get aclk_mac clock\n", __func__);
++	}
++
++	bsp_priv->pclk_mac = clk_get(device,"pclk_mac");
++	if (IS_ERR(bsp_priv->pclk_mac)) {
++		pr_warn("%s: warning: cannot get pclk_mac clock\n", __func__);
++	}
+ 
+-	if ((plat) && (plat->bsp_priv)) {
+-		bsp_priv = plat->bsp_priv;
++	bsp_priv->clk_mac_pll = clk_get(device,"clk_mac_pll");
++	if (IS_ERR(bsp_priv->clk_mac_pll)) {
++		pr_warn("%s: warning: cannot get clk_mac_pll clock\n", __func__);
++	}
++
++	bsp_priv->gmac_clkin = clk_get(device,"gmac_clkin");
++	if (IS_ERR(bsp_priv->gmac_clkin)) {
++		pr_warn("%s: warning: cannot get gmac_clkin clock\n", __func__);
++	}
++
++	bsp_priv->clk_mac = clk_get(device, "clk_mac");
++	if (IS_ERR(bsp_priv->clk_mac)) {
++		pr_warn("%s: warning: cannot get clk_mac clock\n", __func__);
++	}
++
++#ifdef CONFIG_GMAC_CLK_IN
++	clk_set_parent(bsp_priv->clk_mac, bsp_priv->gmac_clkin);
++#else
++	clk_set_parent(bsp_priv->clk_mac, bsp_priv->clk_mac_pll);
++#endif
++	return 0;
++}
++
++static int gmac_clk_enable(bool enable) {
++	int phy_iface = -1;
++	struct bsp_priv * bsp_priv = &g_bsp_priv;
++	phy_iface = bsp_priv->phy_iface;
++
++	if (enable) {
++		if (!bsp_priv->clk_enable) {
++			if (phy_iface == PHY_INTERFACE_MODE_RMII) {
++				if (!IS_ERR(bsp_priv->clk_mac))
++					clk_set_rate(bsp_priv->clk_mac, 50000000);
++
++				if (!IS_ERR(bsp_priv->mac_clk_rx))
++					clk_prepare_enable(bsp_priv->mac_clk_rx);
++
++				if (!IS_ERR(bsp_priv->clk_mac_ref))
++					clk_prepare_enable(bsp_priv->clk_mac_ref);
++
++				if (!IS_ERR(bsp_priv->clk_mac_refout))
++					clk_prepare_enable(bsp_priv->clk_mac_refout);
++			}
++
++			if (!IS_ERR(bsp_priv->aclk_mac))
++				clk_prepare_enable(bsp_priv->aclk_mac);
++
++			if (!IS_ERR(bsp_priv->pclk_mac))
++				clk_prepare_enable(bsp_priv->pclk_mac);
++
++			if (!IS_ERR(bsp_priv->mac_clk_tx))
++				clk_prepare_enable(bsp_priv->mac_clk_tx);
++
++			if (!IS_ERR(bsp_priv->clk_mac))
++				clk_prepare_enable(bsp_priv->clk_mac);
++
++
++			bsp_priv->clk_enable = true;
++		}
+ 	} else {
+-		pr_err("%s: ERROR: platform data or private data is NULL.\n", __FUNCTION__);
++		if (bsp_priv->clk_enable) {
++			if (phy_iface == PHY_INTERFACE_MODE_RMII) {
++				if (!IS_ERR(bsp_priv->mac_clk_rx))
++					clk_disable_unprepare(bsp_priv->mac_clk_rx);
++
++				if (!IS_ERR(bsp_priv->clk_mac_ref))
++					clk_disable_unprepare(bsp_priv->clk_mac_ref);
++
++				if (!IS_ERR(bsp_priv->clk_mac_refout))
++					clk_disable_unprepare(bsp_priv->clk_mac_refout);
++			}
++
++			if (!IS_ERR(bsp_priv->aclk_mac))
++				clk_disable_unprepare(bsp_priv->aclk_mac);
++
++			if (!IS_ERR(bsp_priv->pclk_mac))
++				clk_disable_unprepare(bsp_priv->pclk_mac);
++
++			if (!IS_ERR(bsp_priv->mac_clk_tx))
++				clk_disable_unprepare(bsp_priv->mac_clk_tx);
++
++			if (!IS_ERR(bsp_priv->clk_mac))
++				clk_disable_unprepare(bsp_priv->clk_mac);
++
++			bsp_priv->clk_enable = false;
++		}
++	}
++
++	return 0;
++}
++
++static int power_on_by_pmu(bool enable) {
++	struct bsp_priv * bsp_priv = &g_bsp_priv;
++	struct regulator * ldo;
++	char * ldostr = bsp_priv->pmu_regulator;
++	int ret;
++
++	if (ldostr == NULL) {
++		pr_err("%s: no ldo found\n", __func__);
+ 		return -1;
+ 	}
+ 
++	ldo = regulator_get(NULL, ldostr);
++	if (ldo == NULL) {
++		pr_err("\n%s get ldo %s failed\n", __func__, ldostr);
++	} else {
++		if (enable) {
++			if(!regulator_is_enabled(ldo)) {
++				regulator_set_voltage(ldo, 3300000, 3300000);
++				ret = regulator_enable(ldo);
++				if(ret != 0){
++					pr_err("%s: faild to enable %s\n", __func__, ldostr);
++				} else {
++					pr_info("turn on ldo done.\n");
++				}
++			} else {
++				pr_warn("%s is enabled before enable", ldostr);
++			}
++		} else {
++			if(regulator_is_enabled(ldo)) {
++				ret = regulator_disable(ldo);
++				if(ret != 0){
++					pr_err("%s: faild to disable %s\n", __func__, ldostr);
++				} else {
++					pr_info("turn off ldo done.\n");
++				}
++			} else {
++				pr_warn("%s is disabled before disable", ldostr);
++			}
++		}
++		regulator_put(ldo);
++		msleep(100);
++
++		if (enable) {
++			//reset
++			if (gpio_is_valid(bsp_priv->reset_io)) {
++				gpio_direction_output(bsp_priv->reset_io, bsp_priv->reset_io_level);
++				msleep(10);
++				gpio_direction_output(bsp_priv->reset_io, !bsp_priv->reset_io_level);
++			}
++
++			msleep(100);
++		} else {
++			//pull up reset
++			if (gpio_is_valid(bsp_priv->reset_io)) {
++				gpio_direction_output(bsp_priv->reset_io, !bsp_priv->reset_io_level);
++			}
++		}
++
++	}
++
++	return 0;
++}
++
++static int power_on_by_gpio(bool enable) {
++	struct bsp_priv * bsp_priv = &g_bsp_priv;
+ 	if (enable) {
+ 		//power on
+ 		if (gpio_is_valid(bsp_priv->power_io)) {
+-			gpio_direction_output(bsp_priv->power_io, !bsp_priv->power_io_level);
+-			msleep(10);
+ 			gpio_direction_output(bsp_priv->power_io, bsp_priv->power_io_level);
+-			//gpio_set_value(bsp_priv->power_io, 1);
+ 		}
+ 
+ 		//reset
+ 		if (gpio_is_valid(bsp_priv->reset_io)) {
+ 			gpio_direction_output(bsp_priv->reset_io, bsp_priv->reset_io_level);
+-			//gpio_set_value(bsp_priv->reset_io, 0);
+ 			msleep(10);
+ 			gpio_direction_output(bsp_priv->reset_io, !bsp_priv->reset_io_level);
+ 		}
+@@ -102,13 +353,28 @@ static int phy_power_on(struct plat_stmmacenet_data *plat, int enable)
+ 		//power off
+ 		if (gpio_is_valid(bsp_priv->power_io)) {
+ 			gpio_direction_output(bsp_priv->power_io, !bsp_priv->power_io_level);
+-			//gpio_set_value(bsp_priv->power_io, 0);
++		}
++		//pull down reset
++		if (gpio_is_valid(bsp_priv->reset_io)) {
++			gpio_direction_output(bsp_priv->reset_io, !bsp_priv->reset_io_level);
+ 		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static int phy_power_on(bool enable)
++{
++	struct bsp_priv *bsp_priv = &g_bsp_priv;
++	printk("%s: enable = %d \n", __func__, enable);
++
++	if (bsp_priv->power_ctrl_by_pmu) {
++		return power_on_by_pmu(enable);
++	} else {
++		return power_on_by_gpio(enable);
++	}
++}
++
+ int stmmc_pltfr_init(struct platform_device *pdev) {
+ 	int phy_iface;
+ 	int err;
+@@ -134,42 +400,28 @@ int stmmc_pltfr_init(struct platform_device *pdev) {
+ //power
+ 	if (!gpio_is_valid(bsp_priv->power_io)) {
+ 		pr_err("%s: ERROR: Get power-gpio failed.\n", __func__);
+-		//return -EINVAL;
+ 	} else {
+ 		err = gpio_request(bsp_priv->power_io, "gmac_phy_power");
+ 		if (err) {
+ 			pr_err("%s: ERROR: Request gmac phy power pin failed.\n", __func__);
+-			//return -EINVAL;
+ 		}
+ 	}
+ 
+ 	if (!gpio_is_valid(bsp_priv->reset_io)) {
+ 		pr_err("%s: ERROR: Get reset-gpio failed.\n", __func__);
+-		//return -EINVAL;
+ 	} else {
+ 		err = gpio_request(bsp_priv->reset_io, "gmac_phy_reset");
+ 		if (err) {
+ 			pr_err("%s: ERROR: Request gmac phy reset pin failed.\n", __func__);
+-			//return -EINVAL;
+ 		}
+ 	}
+ //rmii or rgmii
+ 	if (phy_iface == PHY_INTERFACE_MODE_RGMII) {
+ 		pr_info("%s: init for RGMII\n", __func__);
+-		grf_writel(GMAC_PHY_INTF_SEL_RGMII, RK3288_GRF_SOC_CON1);
+-		grf_writel(GMAC_RMII_MODE_CLR, RK3288_GRF_SOC_CON1);
+-		grf_writel(GMAC_RXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);
+-		grf_writel(GMAC_TXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);
+-		grf_writel(GMAC_CLK_RX_DL_CFG(0x10), RK3288_GRF_SOC_CON3);
+-		grf_writel(GMAC_CLK_TX_DL_CFG(0x30), RK3288_GRF_SOC_CON3);
+-		grf_writel(0xffffffff,RK3288_GRF_GPIO3D_E);
+-		grf_writel(grf_readl(RK3288_GRF_GPIO4B_E) | 0x3<<2<<16 | 0x3<<2, RK3288_GRF_GPIO4B_E);
+-		grf_writel(0xffffffff,RK3288_GRF_GPIO4A_E);
+-
++		SET_RGMII
+ 	} else if (phy_iface == PHY_INTERFACE_MODE_RMII) {
+ 		pr_info("%s: init for RMII\n", __func__);
+-		grf_writel(GMAC_PHY_INTF_SEL_RMII, RK3288_GRF_SOC_CON1);
+-		grf_writel(GMAC_RMII_MODE, RK3288_GRF_SOC_CON1);
++		SET_RMII
+ 	} else {
+ 		pr_err("%s: ERROR: NO interface defined!\n", __func__);
+ 	}
+@@ -192,15 +444,15 @@ void stmmc_pltfr_fix_mac_speed(void *priv, unsigned int speed){
+ 
+ 		switch (speed) {
+ 			case 10: {
+-				grf_writel(GMAC_CLK_2_5M, RK3288_GRF_SOC_CON1);
++				SET_RGMII_10M
+ 				break;
+ 			}
+ 			case 100: {
+-				grf_writel(GMAC_CLK_25M, RK3288_GRF_SOC_CON1);
++				SET_RGMII_100M
+ 				break;
+ 			}
+ 			case 1000: {
+-				grf_writel(GMAC_CLK_125M, RK3288_GRF_SOC_CON1);
++				SET_RGMII_1000M
+ 				break;
+ 			}
+ 			default: {
+@@ -212,13 +464,11 @@ void stmmc_pltfr_fix_mac_speed(void *priv, unsigned int speed){
+ 		pr_info("%s: fix speed for RMII\n", __func__);
+ 		switch (speed) {
+ 			case 10: {
+-				grf_writel(GMAC_RMII_CLK_2_5M, RK3288_GRF_SOC_CON1);
+-				grf_writel(GMAC_SPEED_10M, RK3288_GRF_SOC_CON1);
++				SET_RMII_10M
+ 				break;
+ 			}
+ 			case 100: {
+-				grf_writel(GMAC_RMII_CLK_25M, RK3288_GRF_SOC_CON1);
+-				grf_writel(GMAC_SPEED_100M, RK3288_GRF_SOC_CON1);
++				SET_RMII_100M
+ 				break;
+ 			}
+ 			default: {
+@@ -247,7 +497,7 @@ static int stmmac_probe_config_dt(struct platform_device *pdev,
+ 
+ 	*mac = of_get_mac_address(np);
+ 	plat->interface = of_get_phy_mode(np);
+-	//don't care about the return value of of_get_phy_mode(np)
++//don't care about the return value of of_get_phy_mode(np)
+ #ifdef CONFIG_GMAC_PHY_RMII
+ 	plat->interface = PHY_INTERFACE_MODE_RMII;
+ #else
+@@ -289,6 +539,7 @@ static int stmmac_probe_config_dt(struct platform_device *pdev,
+ 
+ 	g_bsp_priv.phy_iface = plat->interface;
+ 	g_bsp_priv.phy_power_on = phy_power_on;
++	g_bsp_priv.gmac_clk_enable = gmac_clk_enable;
+ 
+ 	plat->bsp_priv = &g_bsp_priv;
+ 
+@@ -349,7 +600,7 @@ static int stmmac_pltfr_probe(struct platform_device *pdev)
+ 
+ 		ret = stmmac_probe_config_dt(pdev, plat_dat, &mac);
+ 		if (ret) {
+-			pr_err("%s: ERROR: main dt probe failed", __func__);
++			pr_err("%s: main dt probe failed", __func__);
+ 			return ret;
+ 		}
+ 	} else {
+@@ -363,12 +614,15 @@ static int stmmac_pltfr_probe(struct platform_device *pdev)
+ 			return ret;
+ 	}
+ 
++	gmac_clk_init(&(pdev->dev));
++
+ 	priv = stmmac_dvr_probe(&(pdev->dev), plat_dat, addr);
+ 	if (!priv) {
+-		pr_err("%s: ERROR: main driver probe failed", __func__);
++		pr_err("%s: main driver probe failed", __func__);
+ 		return -ENODEV;
+ 	}
+ 
++
+ 	/* Get MAC address if available (DT) */
+ 	if (mac)
+ 		memcpy(priv->dev->dev_addr, mac, ETH_ALEN);
+-- 
+2.35.3
+

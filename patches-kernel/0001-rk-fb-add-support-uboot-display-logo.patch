@@ -1,0 +1,243 @@
+From 8c7e2fc6ac16f65e4154cc36e6280effc1cbd5de Mon Sep 17 00:00:00 2001
+From: hjc <hjc@rock-chips.com>
+Date: Wed, 16 Apr 2014 11:40:58 +0800
+Subject: [PATCH] rk fb: add support uboot display logo
+
+---
+ drivers/video/rockchip/lcdc/rk3288_lcdc.c | 98 +++++++++++++----------
+ drivers/video/rockchip/rk_fb.c            | 14 +++-
+ include/linux/rk_fb.h                     |  2 +-
+ 3 files changed, 66 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/video/rockchip/lcdc/rk3288_lcdc.c b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+index 1a3aa0f78f41..9dc130775dd5 100755
+--- a/drivers/video/rockchip/lcdc/rk3288_lcdc.c
++++ b/drivers/video/rockchip/lcdc/rk3288_lcdc.c
+@@ -218,13 +218,9 @@ static int rk3288_lcdc_pre_init(struct rk_lcdc_driver *dev_drv)
+ 			lcdc_dev->id);
+ 	}
+ 
+-	/*uboot display has enabled lcdc in boot */
+-	if (!support_uboot_display()) {
+-		rk_disp_pwr_enable(dev_drv);
+-		rk3288_lcdc_clk_enable(lcdc_dev);
+-	} else {
+-		lcdc_dev->clk_on = 1;
+-	}
++	rk_disp_pwr_enable(dev_drv);
++	rk3288_lcdc_clk_enable(lcdc_dev);
++
+ 	/*backup reg config at uboot*/
+ 	for (i = 0; i < 0x1a0;) {
+ 		lcdc_readl(lcdc_dev,i);
+@@ -861,6 +857,47 @@ static int rk3288_lcdc_reg_restore(struct lcdc_device *lcdc_dev)
+ 	memcpy((u8 *) lcdc_dev->regs, (u8 *) lcdc_dev->regsbak, 0x1f8);
+ 	return 0;
+ }
++static int rk3288_lcdc_mmu_en(struct rk_lcdc_driver *dev_drv)
++{
++	u32 mask,val;
++	struct lcdc_device *lcdc_dev =
++	    container_of(dev_drv, struct lcdc_device, driver);
++	spin_lock(&lcdc_dev->reg_lock);
++	if (likely(lcdc_dev->clk_on)) {
++		mask = m_MMU_EN;
++		val = v_MMU_EN(1);
++		lcdc_msk_reg(lcdc_dev, SYS_CTRL, mask, val);
++		mask = m_AXI_MAX_OUTSTANDING_EN | m_AXI_OUTSTANDING_MAX_NUM;
++		val = v_AXI_OUTSTANDING_MAX_NUM(31) | v_AXI_MAX_OUTSTANDING_EN(1);
++		lcdc_msk_reg(lcdc_dev, SYS_CTRL1, mask, val);
++	}
++	spin_unlock(&lcdc_dev->reg_lock);
++}
++
++static int rk3288_lcdc_set_dclk(struct rk_lcdc_driver *dev_drv)
++{
++#ifdef CONFIG_RK_FPGA
++	return 0;
++#endif
++	int ret,fps;
++	struct lcdc_device *lcdc_dev =
++	    container_of(dev_drv, struct lcdc_device, driver);
++	struct rk_screen *screen = dev_drv->cur_screen;
++
++	ret = clk_set_rate(lcdc_dev->dclk, screen->mode.pixclock);
++	if (ret)
++		dev_err(dev_drv->dev, "set lcdc%d dclk failed\n", lcdc_dev->id);
++	lcdc_dev->pixclock =
++		 div_u64(1000000000000llu, clk_get_rate(lcdc_dev->dclk));
++	lcdc_dev->driver.pixclock = lcdc_dev->pixclock;
++	
++	fps = rk_fb_calc_fps(screen, lcdc_dev->pixclock);
++	screen->ft = 1000 / fps;
++	dev_info(lcdc_dev->dev, "%s: dclk:%lu>>fps:%d ",
++		 lcdc_dev->driver.name, clk_get_rate(lcdc_dev->dclk), fps);
++	return 0;
++
++}
+ 
+ static int rk3288_load_screen(struct rk_lcdc_driver *dev_drv, bool initscreen)
+ {
+@@ -881,7 +918,7 @@ static int rk3288_load_screen(struct rk_lcdc_driver *dev_drv, bool initscreen)
+ 	u16 y_res = screen->mode.yres;
+ 	u32 mask, val;
+ 	u16 h_total,v_total;
+-
++	
+ 	h_total = hsync_len + left_margin  + x_res + right_margin;
+ 	v_total = vsync_len + upper_margin + y_res + lower_margin;
+ 	screen->post_dsp_stx=0;
+@@ -966,14 +1003,6 @@ static int rk3288_load_screen(struct rk_lcdc_driver *dev_drv, bool initscreen)
+ 			break;
+ 		}
+ 		lcdc_msk_reg(lcdc_dev, SYS_CTRL, mask, val);
+-#ifdef USE_ION_MMU
+-		mask = m_MMU_EN;
+-		val = v_MMU_EN(1);
+-		lcdc_msk_reg(lcdc_dev, SYS_CTRL, mask, val);
+-		mask = m_AXI_MAX_OUTSTANDING_EN | m_AXI_OUTSTANDING_MAX_NUM;
+-		val = v_AXI_OUTSTANDING_MAX_NUM(31) | v_AXI_MAX_OUTSTANDING_EN(1);
+-		lcdc_msk_reg(lcdc_dev, SYS_CTRL1, mask, val);		
+-#endif	
+ #ifndef CONFIG_RK_FPGA
+ 		writel_relaxed(v, RK_GRF_VIRT + RK3288_GRF_SOC_CON6);
+ #endif		
+@@ -1018,24 +1047,12 @@ static int rk3288_load_screen(struct rk_lcdc_driver *dev_drv, bool initscreen)
+ 		rk3288_lcdc_post_cfg(dev_drv);
+ 	}
+ 	spin_unlock(&lcdc_dev->reg_lock);
+-	
+-#ifndef CONFIG_RK_FPGA
+-	ret = clk_set_rate(lcdc_dev->dclk, screen->mode.pixclock);
+-	if (ret)
+-		dev_err(dev_drv->dev, "set lcdc%d dclk failed\n", lcdc_dev->id);
+-	lcdc_dev->pixclock =
+-	    div_u64(1000000000000llu, clk_get_rate(lcdc_dev->dclk));
+-	lcdc_dev->driver.pixclock = lcdc_dev->pixclock;
+-
+-	fps = rk_fb_calc_fps(screen, lcdc_dev->pixclock);
+-	screen->ft = 1000 / fps;
+-	dev_info(lcdc_dev->dev, "%s: dclk:%lu>>fps:%d ",
+-		 lcdc_dev->driver.name, clk_get_rate(lcdc_dev->dclk), fps);
++	rk3288_lcdc_set_dclk(dev_drv);
+ 	if (dev_drv->trsm_ops && dev_drv->trsm_ops->enable)
+ 		dev_drv->trsm_ops->enable();
+ 	if (screen->init)
+ 		screen->init();
+-#endif
++	
+ 	return 0;
+ }
+ 
+@@ -1154,7 +1171,13 @@ static int rk3288_lcdc_open(struct rk_lcdc_driver *dev_drv, int win_id,
+ 		rk3288_lcdc_pre_init(dev_drv);
+ 		rk3288_lcdc_clk_enable(lcdc_dev);
+ 		rk3288_lcdc_reg_restore(lcdc_dev);
+-		rk3288_load_screen(dev_drv, 1);
++		#ifdef USE_ION_MMU
++			rk3288_lcdc_mmu_en(dev_drv);
++		#endif
++		if ((support_uboot_display()&&(lcdc_dev->prop == PRMRY)))
++			rk3288_lcdc_set_dclk(dev_drv);
++		else
++			rk3288_load_screen(dev_drv, 1);
+ 		spin_lock(&lcdc_dev->reg_lock);
+ 		if (dev_drv->cur_screen->dsp_lut)
+ 			rk3288_lcdc_set_lut(dev_drv);
+@@ -2830,19 +2853,6 @@ static int rk3288_set_dsp_lut(struct rk_lcdc_driver *dev_drv, int *lut)
+ 	return ret;
+ }
+ 
+-static int rk3288_lcdc_mmu_en(struct rk_lcdc_driver *dev_drv, bool en)
+-{
+-	struct lcdc_device *lcdc_dev =
+-	    container_of(dev_drv, struct lcdc_device, driver);
+-	spin_lock(&lcdc_dev->reg_lock);
+-	/*close win*/
+-	lcdc_msk_reg(lcdc_dev, SYS_CTRL, m_MMU_EN,
+-		     v_MMU_EN(en));
+-	lcdc_cfg_done(lcdc_dev);
+-	spin_unlock(&lcdc_dev->reg_lock);
+-	return 0;
+-}
+-
+ static int rk3288_lcdc_config_done(struct rk_lcdc_driver *dev_drv)
+ {
+ 	struct lcdc_device *lcdc_dev =
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index e718ab4a4d7a..9b54022919a7 100755
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -65,9 +65,10 @@ EXPORT_SYMBOL(video_data_to_mirroring);
+ static struct rk_fb_trsm_ops *trsm_lvds_ops;
+ static struct rk_fb_trsm_ops *trsm_edp_ops;
+ static struct rk_fb_trsm_ops *trsm_mipi_ops;
+-__weak int support_uboot_display(void)
++static int uboot_logo_on = 0;
++int support_uboot_display(void)
+ {
+-	return 0;
++	return uboot_logo_on;
+ }
+ 
+ int rk_fb_trsm_ops_register(struct rk_fb_trsm_ops *ops, int type)
+@@ -617,7 +618,6 @@ static int rk_fb_open(struct fb_info *info, int user)
+ {
+ 	struct rk_lcdc_driver *dev_drv = (struct rk_lcdc_driver *)info->par;
+ 	int win_id;
+-
+ 	win_id = dev_drv->ops->fb_get_win_id(dev_drv, info->fix.id);
+ 	if (dev_drv->win[win_id]->state)
+ 		return 0;    /* if this win aready opened ,no need to reopen*/
+@@ -1572,6 +1572,7 @@ static int rk_fb_set_win_config(struct fb_info *info,
+ 	regs->post_cfg.ypos = win_data->post_cfg.ypos;
+ 	regs->post_cfg.xsize = win_data->post_cfg.xsize;
+ 	regs->post_cfg.ysize = win_data->post_cfg.xsize;*/
++
+ 	for (i=0; i<dev_drv->lcdc_win_num; i++) {
+ 		if(win_data->win_par[i].win_id < dev_drv->lcdc_win_num){
+ 			rk_fb_set_win_buffer(info,&win_data->win_par[i],&regs->reg_win_data[j]);
+@@ -2949,6 +2950,8 @@ int rk_fb_register(struct rk_lcdc_driver *dev_drv,
+ if (dev_drv->prop == PRMRY) {
+ 	struct fb_info *main_fbi = rk_fb->fb[0];
+ 	main_fbi->fbops->fb_open(main_fbi, 1);
++	if(support_uboot_display())
++		return 0;
+ 	main_fbi->fbops->fb_set_par(main_fbi);
+ #if  defined(CONFIG_LOGO_LINUX_BMP)
+ 	if (fb_prewine_bmp_logo(main_fbi, FB_ROTATE_UR)) {
+@@ -2964,6 +2967,7 @@ if (dev_drv->prop == PRMRY) {
+ 	main_fbi->fbops->fb_pan_display(&main_fbi->var, main_fbi);
+ }
+ #endif
++
+ 	return 0;
+ 
+ 
+@@ -3024,6 +3028,10 @@ static int rk_fb_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "no disp-mode node found!");
+ 		return -ENODEV;
+ 	}
++
++	if (!of_property_read_u32(np, "rockchip,uboot-logo-on", &uboot_logo_on)) {
++		printk("uboot-logo-on:%d\n", uboot_logo_on);
++	}
+ 	dev_set_name(&pdev->dev, "rockchip-fb");
+ #if defined(CONFIG_ION_ROCKCHIP)
+ 	rk_fb->ion_client = rockchip_ion_client_create("rk_fb");
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index da31a7087ced..417e7e866431 100755
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -383,7 +383,7 @@ struct rk_lcdc_drv_ops {
+ 	int (*set_dsp_hue) (struct rk_lcdc_driver *dev_drv,int hue);
+ 	int (*set_dsp_bcsh_bcs)(struct rk_lcdc_driver *dev_drv,int bri,int con,int sat);
+ 	int (*dump_reg) (struct rk_lcdc_driver * dev_drv);
+-	int (*mmu_en) (struct rk_lcdc_driver * dev_drv,bool en);
++	int (*mmu_en) (struct rk_lcdc_driver * dev_drv);
+ 	int (*cfg_done) (struct rk_lcdc_driver * dev_drv);
+ };
+ 
+-- 
+2.35.3
+

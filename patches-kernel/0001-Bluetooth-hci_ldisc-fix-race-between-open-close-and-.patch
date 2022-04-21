@@ -1,0 +1,117 @@
+From 882829d5bf8c57481a96333b4549a3e8bf9c079b Mon Sep 17 00:00:00 2001
+From: Huibin Hong <huibin.hong@rock-chips.com>
+Date: Wed, 25 Jul 2018 15:47:26 +0800
+Subject: [PATCH] Bluetooth: hci_ldisc: fix race between open, close and send
+ data
+
+Fix the bug below, it may be reproduced after open and close bt about 7000 times:
+
+<1>[73036.938137] Unable to handle kernel NULL pointer dereference at virtual address 0000001c
+<1>[73036.939316] pgd = ffffff800886d000
+<1>[73036.939627] [0000001c] *pgd=000000000fffe003, *pud=000000000fffe003, *pmd=0000000000000000
+<0>[73036.940396] Internal error: Oops: 96000006 [#1] PREEMPT SMP
+<4>[73036.940899] Modules linked in:
+<4>[73036.941193] CPU: 2 PID: 2989 Comm: kworker/2:2 Not tainted 4.4.138 #3
+<4>[73036.942409] Workqueue: events hci_uart_write_work
+<4>[73036.942836] task: ffffffc00d688ac0 task.stack: ffffffc00b184000
+<4>[73036.943365] PC is at _raw_spin_lock_irqsave+0x1c/0x50
+<4>[73036.943815] LR is at skb_dequeue+0x20/0x74
+<4>[73036.944185] pc : [<ffffff8008576398>] lr : [<ffffff800840f9a4>] pstate: 800001c5
+<4>[73036.944832] sp : ffffffc00b187d00
+<4>[73036.945127] x29: ffffffc00b187d00 x28: 0000000000000000
+<4>[73036.945620] x27: 0000000000000000 x26: 0000000000000000
+<4>[73036.946114] x25: ffffffc00e1280e0 x24: ffffffc00038d000
+<4>[73036.946606] x23: ffffffc00e1271f8 x22: ffffffc00e127f00
+<4>[73036.947099] x21: 000000000000001c x20: 0000000000000008
+<4>[73036.947592] x19: 0000000000000000 x18: 0000000000000000
+<4>[73036.948086] x17: 0000007fade08530 x16: ffffff80080e308c
+<4>[73036.948579] x15: 0000000000000000 x14: 65736f6c63207568
+<4>[73036.949073] x13: 205d303537373339 x12: 2e36333033375b0a
+<4>[73036.949566] x11: 3220746e63666572 x10: 00000000000006f0
+<4>[73036.950060] x9 : ffffffc00b187d30 x8 : ffffffc00d689210
+<4>[73036.950553] x7 : 0000000000002d31 x6 : 0000000000000400
+<4>[73036.951046] x5 : 0000000000113d82 x4 : 0000000000002f32
+<4>[73036.951539] x3 : 0000000000000140 x2 : ffffffc00d688ac0
+<4>[73036.952032] x1 : 0000000000000001 x0 : 000000000000001c
+<4>[73037.068289] [<ffffff8008576398>] _raw_spin_lock_irqsave+0x1c/0x50
+<4>[73037.068858] [<ffffff8008377094>] h4_dequeue+0x14/0x1c
+<4>[73037.069335] [<ffffff8008376924>] hci_uart_write_work+0x50/0x12c
+<4>[73037.069893] [<ffffff80080abbc8>] process_one_work+0x1b0/0x294
+<4>[73037.070426] [<ffffff80080ac920>] worker_thread+0x2d8/0x398
+<4>[73037.070935] [<ffffff80080b0f28>] kthread+0xc8/0xd8
+<4>[73037.071388] [<ffffff8008082e80>] ret_from_fork+0x10/0x50
+
+	thread0               		thread1
+	   |				   |
+	hci_uart_tty_close		hci_uart_write_work
+	   |				   |
+	h4_close			h4_dequeue
+	   |				   |
+	free (h4_struct) h4		   |
+	   |             _raw_spin_lock_irqsave access h4 null pointer
+
+Change-Id: I61d8ad5fb4c9349e0a304d2e87332681240f22e2
+Signed-off-by: Huibin Hong <huibin.hong@rock-chips.com>
+---
+ drivers/bluetooth/hci_ldisc.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_ldisc.c b/drivers/bluetooth/hci_ldisc.c
+index 61bb2192a80b..9c4c9d299599 100644
+--- a/drivers/bluetooth/hci_ldisc.c
++++ b/drivers/bluetooth/hci_ldisc.c
+@@ -142,6 +142,11 @@ static void hci_uart_write_work(struct work_struct *work)
+ 	struct hci_dev *hdev = hu->hdev;
+ 	struct sk_buff *skb;
+ 
++	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
++		clear_bit(HCI_UART_SENDING, &hu->tx_state);
++		return;
++	}
++
+ 	/* REVISIT: should we cope with bad skbs or ->write() returning
+ 	 * and error value ?
+ 	 */
+@@ -250,6 +255,9 @@ static int hci_uart_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	BT_DBG("%s: type %d len %d", hdev->name, bt_cb(skb)->pkt_type, skb->len);
+ 
++	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags))
++		return -EUNATCH;
++
+ 	hu->proto->enqueue(hu, skb);
+ 
+ 	hci_uart_tx_wakeup(hu);
+@@ -495,9 +503,9 @@ static void hci_uart_tty_close(struct tty_struct *tty)
+ 	if (hdev)
+ 		hci_uart_close(hdev);
+ 
+-	cancel_work_sync(&hu->write_work);
+-
+ 	if (test_and_clear_bit(HCI_UART_PROTO_READY, &hu->flags)) {
++		cancel_work_sync(&hu->write_work);
++
+ 		if (hdev) {
+ 			if (test_bit(HCI_UART_REGISTERED, &hu->flags))
+ 				hci_unregister_dev(hdev);
+@@ -644,15 +652,15 @@ static int hci_uart_set_proto(struct hci_uart *hu, int id)
+ 		return err;
+ 
+ 	hu->proto = p;
+-	set_bit(HCI_UART_PROTO_READY, &hu->flags);
+ 
+ 	err = hci_uart_register_dev(hu);
+ 	if (err) {
+-		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+ 		p->close(hu);
+ 		return err;
+ 	}
+ 
++	set_bit(HCI_UART_PROTO_READY, &hu->flags);
++
+ 	return 0;
+ }
+ 
+-- 
+2.35.3
+

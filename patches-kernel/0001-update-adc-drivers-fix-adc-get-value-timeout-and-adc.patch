@@ -1,0 +1,391 @@
+From 79409ef39efb770f3d8f50e4b630affaddceec19 Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Tue, 19 Jun 2012 10:07:08 +0800
+Subject: [PATCH] update adc drivers: fix: 'adc get value timeout' and 'adc get
+ zero, but voltage is NOT zero'
+
+---
+ drivers/adc/adc_priv.h      |  16 ++++-
+ drivers/adc/core.c          | 116 +++++++++++++++++++++++++-----------
+ drivers/adc/plat/rk28_adc.c |   2 +-
+ drivers/adc/plat/rk29_adc.c |   2 +-
+ drivers/adc/plat/rk30_adc.c |  50 +++++++++++-----
+ include/linux/adc.h         |   1 +
+ 6 files changed, 132 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/adc/adc_priv.h b/drivers/adc/adc_priv.h
+index 6ac01d5ff538..078bf75dd1b4 100755
+--- a/drivers/adc/adc_priv.h
++++ b/drivers/adc/adc_priv.h
+@@ -19,6 +19,7 @@
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/clk.h>
++#include <linux/workqueue.h>
+ #include <linux/interrupt.h>
+ #include <mach/board.h>
+ 
+@@ -27,8 +28,15 @@
+ #define adc_writel                 writel_relaxed
+ #define adc_readl                  readl_relaxed
+ 
++#if 0
++#define adc_dbg(dev, format, arg...)		\
++	dev_printk(KERN_INFO , dev , format , ## arg)
++#else
++#define adc_dbg(dev, format, arg...)
++#endif
++
+ enum read_type{
+-        ADC_SYNC_READ,
++        ADC_SYNC_READ = 0,
+         ADC_ASYNC_READ,
+ };
+ 
+@@ -40,17 +48,19 @@ struct adc_ops {
+ 	void (*start)(struct adc_host *);
+ 	void (*stop)(struct adc_host *);
+ 	int (*read)(struct adc_host *);
++	void (*dump)(struct adc_host *);
+ };
+ struct adc_host {
+         struct list_head entry;
+-        struct list_head request_head;
++        struct list_head req_head;
+         unsigned int is_suspended;
+         enum host_chn_mask mask;
+         struct device *dev;
+-        struct adc_client *cur;
++        unsigned int chn;
+         spinlock_t lock;
+         unsigned int client_count;
+ 	const struct adc_ops *ops;
++        struct work_struct work;
+         unsigned long priv[0];
+ };
+ 
+diff --git a/drivers/adc/core.c b/drivers/adc/core.c
+index 011dcb0a19d1..f31dc08899f4 100755
+--- a/drivers/adc/core.c
++++ b/drivers/adc/core.c
+@@ -9,6 +9,7 @@
+ 
+ struct list_head adc_host_head;
+ 
++static void adc_host_work(struct work_struct *work);
+ struct adc_host *adc_alloc_host(struct device *dev, int extra, enum host_chn_mask mask)
+ {
+ 	struct adc_host *adc;
+@@ -18,8 +19,10 @@ struct adc_host *adc_alloc_host(struct device *dev, int extra, enum host_chn_mas
+ 		return NULL;
+         adc->mask = mask;
+ 	adc->dev = dev;
++        adc->chn = -1;
+         spin_lock_init(&adc->lock);
+-        INIT_LIST_HEAD(&adc->request_head);
++        INIT_LIST_HEAD(&adc->req_head);
++        INIT_WORK(&adc->work, adc_host_work);
+ 
+         list_add_tail(&adc->entry, &adc_host_head);
+ 
+@@ -77,36 +80,38 @@ static inline void trigger_next_adc_job_if_any(struct adc_host *adc)
+ {
+         struct adc_request *req = NULL;
+ 
+-        if(list_empty(&adc->request_head))
++        if(adc->chn != -1)
+                 return;
++        req = list_first_entry(&adc->req_head, struct adc_request, entry);
++        if(req){
++                adc->chn = req->client->chn;
++        	adc->ops->start(adc);
++        }
+ 
+-        req = list_first_entry(&adc->request_head, struct adc_request, entry);
+-
+-        if(req == NULL)
+-                return;
+-        list_del_init(&req->entry);
+-	adc->cur = req->client;
+-	kfree(req);
+-	adc->ops->start(adc);
+ 	return;
+ }
++static void adc_host_work(struct work_struct *work)
++{
++        unsigned long flags;
++	struct adc_host *adc =
++		container_of(work, struct adc_host, work);
++
++	spin_lock_irqsave(&adc->lock, flags);
++        trigger_next_adc_job_if_any(adc);
++	spin_unlock_irqrestore(&adc->lock, flags);
++}
+ static int adc_request_add(struct adc_host *adc, struct adc_client *client)
+ {
+         struct adc_request *req = NULL;
+ 
+-        list_for_each_entry(req, &adc->request_head, entry) {
+-                if(req->client->index == client->index)
+-                        return 0;
+-        }
+         req = kzalloc(sizeof(struct adc_request), GFP_ATOMIC);
+ 
+         if(!req)
+                 return -ENOMEM;
++        INIT_LIST_HEAD(&req->entry);
+         req->client = client;
+-        list_add_tail(&req->entry, &adc->request_head);
+-
++        list_add_tail(&req->entry, &adc->req_head);
+         trigger_next_adc_job_if_any(adc);
+-
+         return 0;
+ }
+ static void
+@@ -114,18 +119,41 @@ adc_sync_read_callback(struct adc_client *client, void *param, int result)
+ {
+         client->result = result;
+ }
++static void adc_finished(struct adc_host *adc, int result)
++{
++        struct adc_request *req = NULL, *n = NULL;
++
++        adc_dbg(adc->dev, "chn[%d] read value: %d\n", adc->chn, result);
++        adc->ops->stop(adc);
++        list_for_each_entry_safe(req, n, &adc->req_head, entry) {
++                if(req->client->chn == adc->chn){
++                        if(req->client->flags & (1<<ADC_ASYNC_READ)){
++                                req->client->callback(req->client, req->client->callback_param, result);
++                        }
++                        if(req->client->flags & (1<<ADC_SYNC_READ)){
++                                adc_sync_read_callback(req->client, NULL, result);
++                                req->client->is_finished = 1;
++                                wake_up(&req->client->wait);
++                        }
++                        req->client->result = result;
++                        req->client->flags = 0;
++                        list_del_init(&req->entry);
++                        kfree(req);
++                }
++        }
++        adc->chn = -1;
++}
+ void adc_core_irq_handle(struct adc_host *adc)
+ {
+-        int result = adc->ops->read(adc);
++        int result = 0;
+ 
+ 	spin_lock(&adc->lock);
+-        adc->ops->stop(adc);
+-        adc->cur->callback(adc->cur, adc->cur->callback_param, result);
+-        adc_sync_read_callback(adc->cur, NULL, result);
+-        adc->cur->is_finished = 1;
+-        wake_up(&adc->cur->wait);
++        result = adc->ops->read(adc);
+ 
+-        trigger_next_adc_job_if_any(adc);
++        adc_finished(adc, result);
++
++        if(!list_empty(&adc->req_head))
++                schedule_work(&adc->work);
+ 	spin_unlock(&adc->lock);
+ }
+ 
+@@ -141,29 +169,45 @@ int adc_host_read(struct adc_client *client, enum read_type type)
+ 	}
+         adc = client->adc;
+ 	if(adc->is_suspended == 1) {
+-		dev_dbg(adc->dev, "system enter sleep\n");
++		dev_err(adc->dev, "adc is in suspend state\n");
+ 		return -EIO;
+ 	}
+ 
+ 	spin_lock_irqsave(&adc->lock, flags);
+-        ret = adc_request_add(adc, client);
+-        if(ret < 0){
+-                spin_unlock_irqrestore(&adc->lock, flags);
+-                dev_err(adc->dev, "No memory for req\n");
+-                return ret;
++        if(client->flags & (1<<type)){
++	        spin_unlock_irqrestore(&adc->lock, flags);
++                adc_dbg(adc->dev, "req is exist: %s, client->index: %d\n", 
++                                (type == ADC_ASYNC_READ)?"async_read":"sync_read", client->index);
++                return -EEXIST;
++        }else if(client->flags != 0){
++                client->flags |= 1<<type;
++        }else{
++                client->flags = 1<<type;
++                ret = adc_request_add(adc, client);
++                if(ret < 0){
++                        spin_unlock_irqrestore(&adc->lock, flags);
++                        dev_err(adc->dev, "fail to add request\n");
++                        return ret;
++                }
++        }
++        if(type == ADC_ASYNC_READ){
++	        spin_unlock_irqrestore(&adc->lock, flags);
++                return 0;
+         }
+         client->is_finished = 0;
+ 	spin_unlock_irqrestore(&adc->lock, flags);
+ 
+-        if(type == ADC_ASYNC_READ)
+-                return 0;
+-
+         tmo = wait_event_timeout(client->wait, ( client->is_finished == 1 ), msecs_to_jiffies(ADC_READ_TMO));
+-        if(tmo <= 0) {
+-                adc->ops->stop(adc);
+-                dev_dbg(adc->dev, "get adc value timeout\n");
++	spin_lock_irqsave(&adc->lock, flags);
++        if(unlikely((tmo <= 0) && (client->is_finished == 0))) {
++                if(adc->ops->dump)
++                        adc->ops->dump(adc);
++                dev_err(adc->dev, "get adc value timeout.................................\n");
++                adc_finished(adc, -1);
++	        spin_unlock_irqrestore(&adc->lock, flags);
+                 return -ETIMEDOUT;
+         } 
++	spin_unlock_irqrestore(&adc->lock, flags);
+ 
+         return client->result;
+ }
+diff --git a/drivers/adc/plat/rk28_adc.c b/drivers/adc/plat/rk28_adc.c
+index e5ac7a35c1a3..859d56fdb2a3 100755
+--- a/drivers/adc/plat/rk28_adc.c
++++ b/drivers/adc/plat/rk28_adc.c
+@@ -21,7 +21,7 @@ struct rk28_adc_device {
+ static void rk28_adc_start(struct adc_host *adc)
+ {
+ 	struct rk28_adc_device *dev  = adc_priv(adc);
+-	int chn = adc->cur->chn;
++	int chn = adc->chn;
+ 	
+ 	writel(ADC_CTRL_IRQ_ENABLE|ADC_CTRL_POWER_UP|ADC_CTRL_START|ADC_CTRL_CH(chn),
+ 		dev->regs + ADC_CTRL);
+diff --git a/drivers/adc/plat/rk29_adc.c b/drivers/adc/plat/rk29_adc.c
+index db45d1b8d6b4..bf511ca8b425 100755
+--- a/drivers/adc/plat/rk29_adc.c
++++ b/drivers/adc/plat/rk29_adc.c
+@@ -21,7 +21,7 @@ struct rk29_adc_device {
+ static void rk29_adc_start(struct adc_host *adc)
+ {
+ 	struct rk29_adc_device *dev  = adc_priv(adc);
+-	int chn = adc->cur->chn;
++	int chn = adc->chn;
+ 
+ 	writel(0, dev->regs + ADC_CTRL);
+ 	writel(ADC_CTRL_POWER_UP|ADC_CTRL_CH(chn), dev->regs + ADC_CTRL);
+diff --git a/drivers/adc/plat/rk30_adc.c b/drivers/adc/plat/rk30_adc.c
+index 90a49d8de0af..fbfb26a940b5 100755
+--- a/drivers/adc/plat/rk30_adc.c
++++ b/drivers/adc/plat/rk30_adc.c
+@@ -19,12 +19,22 @@ struct rk30_adc_device {
+ 	struct resource		*ioarea;
+ 	struct adc_host		*adc;
+ };
++static void rk30_adc_dump(struct adc_host *adc)
++{
++	struct rk30_adc_device *dev  = adc_priv(adc);
++
++        dev_info(adc->dev, "[0x00-0x0c]: 0x%08x 0x%08x 0x%08x 0x%08x\n",
++                        adc_readl(dev->regs + 0x00),
++                        adc_readl(dev->regs + 0x04),
++                        adc_readl(dev->regs + 0x08),
++                        adc_readl(dev->regs + 0x0c));
++}
+ static void rk30_adc_start(struct adc_host *adc)
+ {
+ 	struct rk30_adc_device *dev  = adc_priv(adc);
+-	int chn = adc->cur->chn;
++	int chn = adc->chn;
+ 
+-	adc_writel(0, dev->regs + ADC_CTRL);
++	//adc_writel(0, dev->regs + ADC_CTRL);
+         adc_writel(0x08, dev->regs + ADC_DELAY_PU_SOC);
+ 	adc_writel(ADC_CTRL_POWER_UP|ADC_CTRL_CH(chn)|ADC_CTRL_IRQ_ENABLE, dev->regs + ADC_CTRL);
+ 
+@@ -53,8 +63,11 @@ static const struct adc_ops rk30_adc_ops = {
+ 	.start		= rk30_adc_start,
+ 	.stop		= rk30_adc_stop,
+ 	.read		= rk30_adc_read,
++	.dump		= rk30_adc_dump,
+ };
+ #ifdef ADC_TEST
++#define CHN_NR  3
++struct workqueue_struct *adc_wq;
+ struct adc_test_data {
+ 	struct adc_client *client;
+ 	struct timer_list timer;
+@@ -62,14 +75,17 @@ struct adc_test_data {
+ };
+ static void callback(struct adc_client *client, void *param, int result)
+ {
+-	dev_info(client->adc->dev, "[chn%d] async_read = %d\n", client->chn, result);
++        if(result < 70)
++	        dev_info(client->adc->dev, "[chn%d] async_read = %d\n", client->chn, result);
++        else
++	        dev_dbg(client->adc->dev, "[chn%d] async_read = %d\n", client->chn, result);
+ 	return;
+ }
+ static void adc_timer(unsigned long data)
+ {
+ 	 struct adc_test_data *test=(struct adc_test_data *)data;
+ 	
+-	schedule_work(&test->timer_work);
++	queue_work(adc_wq, &test->timer_work);
+ 	add_timer(&test->timer);
+ }
+ static void adc_timer_work(struct work_struct *work)
+@@ -79,20 +95,26 @@ static void adc_timer_work(struct work_struct *work)
+ 						timer_work);
+ 	adc_async_read(test->client);
+ 	sync_read = adc_sync_read(test->client);
+-	dev_info(test->client->adc->dev, "[chn%d] sync_read = %d\n", test->client->chn, sync_read);
++        if(sync_read < 70)
++	        dev_info(test->client->adc->dev, "[chn%d] sync_read = %d\n", test->client->chn, sync_read);
++        else
++	        dev_dbg(test->client->adc->dev, "[chn%d] sync_read = %d\n", test->client->chn, sync_read);
+ }
+ 
+ static int rk30_adc_test(void)
+ {
+-	struct adc_test_data *test = NULL;
+-
+-	test = kzalloc(sizeof(struct adc_test_data), GFP_KERNEL);
+-	
+-	test->client = adc_register(1, callback, NULL);
+-	INIT_WORK(&test->timer_work, adc_timer_work);
+-	setup_timer(&test->timer, adc_timer, (unsigned long)test);
+-	test->timer.expires  = jiffies + 1;
+-	add_timer(&test->timer);
++        int i;
++	struct adc_test_data *test[CHN_NR];
++
++        adc_wq = create_singlethread_workqueue("adc_test");
++	for(i = 0; i < CHN_NR; i++){
++	        test[i] = kzalloc(sizeof(struct adc_test_data), GFP_KERNEL);
++	        test[i]->client = adc_register(i, callback, NULL);
++	        INIT_WORK(&test[i]->timer_work, adc_timer_work);
++	        setup_timer(&test[i]->timer, adc_timer, (unsigned long)test[i]);
++	        test[i]->timer.expires  = jiffies + 1;
++	        add_timer(&test[i]->timer);
++        }
+ 	
+ 	return 0;
+ 
+diff --git a/include/linux/adc.h b/include/linux/adc.h
+index 1b61b47106ab..90e44913dae7 100755
+--- a/include/linux/adc.h
++++ b/include/linux/adc.h
+@@ -27,6 +27,7 @@ struct adc_client {
+         unsigned int index;
+         unsigned int chn;
+         unsigned int is_finished;
++        unsigned int flags;
+         int result;
+ 	struct adc_host *adc;
+         struct list_head list;
+-- 
+2.35.3
+

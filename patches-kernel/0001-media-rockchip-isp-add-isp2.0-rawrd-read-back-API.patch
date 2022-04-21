@@ -1,0 +1,205 @@
+From a1473fa729a99d487b6fa13f30d8ad35f0509784 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Fri, 27 Dec 2019 16:41:41 +0800
+Subject: [PATCH] media: rockchip: isp: add isp2.0 rawrd read back API
+
+Change-Id: I0ffab0e90b3eaebfad949826eee8601f80e01caf
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/csi.c   | 15 ++++++
+ drivers/media/platform/rockchip/isp/csi.h   | 16 ++++++-
+ drivers/media/platform/rockchip/isp/dmarx.c |  5 ++
+ drivers/media/platform/rockchip/isp/rkisp.c | 53 ++++++++++++++++++++-
+ include/uapi/linux/rkisp2-config.h          |  3 ++
+ 5 files changed, 90 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index 33096f4f4740..caaa26c9a65c 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -422,6 +422,21 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	struct rkisp_device *dev = csi->ispdev;
+ 	void __iomem *addr = dev->base_addr + CSI2RX_CTRL0;
+ 
++	if (dma2frm > 2)
++		dma2frm = 2;
++	memset(csi->filt_state, 0, sizeof(csi->filt_state));
++	switch (dev->hdr.op_mode) {
++	case HDR_DBG_FRAME3://is rawrd1 rawrd0 rawrd2
++		csi->filt_state[CSI_F_RD1] = dma2frm;
++	case HDR_DBG_FRAME2://is rawrd0 and rawrd2
++		csi->filt_state[CSI_F_RD0] = dma2frm;
++	case HDR_DBG_FRAME1://only rawrd2
++		csi->filt_state[CSI_F_RD2] = dma2frm;
++		break;
++	default://other no support readback
++		return;
++	}
++	csi->filt_state[CSI_F_VS] = dma2frm;
+ 	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 3f82234e8aac..5a4aa70088ab 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -45,19 +45,33 @@ enum rkisp_csi_pad {
+ 	CSI_PAD_MAX
+ };
+ 
++enum rkisp_csi_filt {
++	CSI_F_VS,
++	CSI_F_RD0,
++	CSI_F_RD1,
++	CSI_F_RD2,
++	CSI_F_MAX
++};
++
+ struct sink_info {
+ 	u8 index;
+ 	u8 linked;
+ };
+ 
++/*
++ * struct rkisp_csi_device
++ * sink: csi link enable flags
++ * mipi_di: Data Identifier (vc[7:6],dt[5:0])
++ * filt_state: multiframe read back mode to filt irq event
++ */
+ struct rkisp_csi_device {
+ 	struct rkisp_device *ispdev;
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pads[CSI_PAD_MAX];
+ 	int max_pad;
+ 	struct sink_info sink[CSI_PAD_MAX - 1];
+-	/* Data Identifier */
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
++	u8 filt_state[CSI_F_MAX];
+ };
+ 
+ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 02f7824ecbd4..8b111e7b3427 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -763,6 +763,11 @@ void rkisp2_rawrd_isr(u32 mis_val, struct rkisp_device *dev)
+ 		stream = &dev->dmarx_dev.stream[i];
+ 		if (!(mis_val & CIF_MI_FRAME(stream)))
+ 			continue;
++		/* filt rawrd frame end when frame read back mode */
++		if (dev->csi_dev.filt_state[stream->id]) {
++			dev->csi_dev.filt_state[stream->id]--;
++			continue;
++		}
+ 		stream->frame_end = true;
+ 		if (stream->stopping) {
+ 			stream->stopping = false;
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 708fc87514ea..344519f566d9 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -41,6 +41,7 @@
+ #include <linux/kfifo.h>
+ #include <linux/interrupt.h>
+ #include <linux/rk-preisp.h>
++#include <linux/rkisp2-config.h>
+ #include <linux/iommu.h>
+ #include <media/v4l2-event.h>
+ #include <media/media-entity.h>
+@@ -1575,6 +1576,47 @@ static int rkisp_isp_sd_subs_evt(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+ 	return v4l2_event_subscribe(fh, sub, 0, NULL);
+ }
+ 
++static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
++{
++	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
++	long ret = 0;
++
++	switch (cmd) {
++	case RKISP_CMD_TRIGGER_READ_BACK:
++		if (!IS_HDR_DBG(isp_dev->hdr.op_mode))
++			break;
++		rkisp_trigger_read_back(&isp_dev->csi_dev, *((int *)arg));
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++	}
++
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
++				 unsigned int cmd, unsigned long arg)
++{
++	void __user *up = compat_ptr(arg);
++	long ret = 0;
++
++	switch (cmd) {
++	case RKISP_CMD_TRIGGER_READ_BACK:
++		int mode;
++
++		ret = copy_from_user(&mode, up, sizeof(int));
++		if (!ret)
++			ret = rkisp_ioctl(sd, cmd, &mode);
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++	}
++
++	return ret;
++}
++#endif
++
+ static const struct v4l2_subdev_pad_ops rkisp_isp_sd_pad_ops = {
+ 	.enum_mbus_code = rkisp_isp_sd_enum_mbus_code,
+ 	.get_selection = rkisp_isp_sd_get_selection,
+@@ -1599,6 +1641,10 @@ static const struct v4l2_subdev_core_ops rkisp_isp_core_ops = {
+ 	.subscribe_event = rkisp_isp_sd_subs_evt,
+ 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+ 	.s_power = rkisp_isp_sd_s_power,
++	.ioctl = rkisp_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl32 = rkisp_compat_ioctl32,
++#endif
+ };
+ 
+ static struct v4l2_subdev_ops rkisp_isp_sd_ops = {
+@@ -1802,6 +1848,11 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 
+ 	/* start edge of v_sync */
+ 	if (isp_mis & CIF_ISP_V_START) {
++		/* filt v_sync when frame read back mode */
++		if (dev->csi_dev.filt_state[CSI_F_VS]) {
++			dev->csi_dev.filt_state[CSI_F_VS]--;
++			goto vs_skip;
++		}
+ 		if (dev->cap_dev.stream[RKISP_STREAM_SP].interlaced) {
+ 			/* 0 = ODD 1 = EVEN */
+ 			if (dev->active_sensor->mbus.type == V4L2_MBUS_CSI2) {
+@@ -1825,7 +1876,7 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 
+ 		if (dev->vs_irq < 0)
+ 			rkisp_isp_queue_event_sof(&dev->isp_sdev);
+-
++vs_skip:
+ 		writel(CIF_ISP_V_START, base + CIF_ISP_ICR);
+ 		isp_mis_tmp = readl(base + CIF_ISP_MIS);
+ 		if (isp_mis_tmp & CIF_ISP_V_START)
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index 425aa08d16a6..558fb8a1d8f0 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -10,6 +10,9 @@
+ #include <linux/types.h>
+ #include <linux/v4l2-controls.h>
+ 
++#define RKISP_CMD_TRIGGER_READ_BACK \
++	_IOW('V', BASE_VIDIOC_PRIVATE + 0, int)
++
+ #define ISP2X_MODULE_DPCC		BIT_ULL(0)
+ #define ISP2X_MODULE_BLS		BIT_ULL(1)
+ #define ISP2X_MODULE_SDG		BIT_ULL(2)
+-- 
+2.35.3
+

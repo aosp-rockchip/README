@@ -1,0 +1,547 @@
+From 7dfb03af682651b15119ecdca837a3ac58395493 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Fri, 2 Oct 2020 14:54:17 +0800
+Subject: [PATCH] media: rockchip: isp: use ldch share buffer to reduce buffer
+ size
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: I243023a4d689f9f9a878095d8edaf8576bb26102
+---
+ drivers/media/platform/rockchip/isp/common.c  |  13 +-
+ drivers/media/platform/rockchip/isp/common.h  |   2 +
+ .../media/platform/rockchip/isp/isp_params.c  |  12 ++
+ .../media/platform/rockchip/isp/isp_params.h  |   8 +
+ .../platform/rockchip/isp/isp_params_v1x.c    |  14 ++
+ .../platform/rockchip/isp/isp_params_v2x.c    | 176 ++++++++++++++----
+ .../platform/rockchip/isp/isp_params_v2x.h    |   4 +-
+ drivers/media/platform/rockchip/isp/rkisp.c   |  22 +++
+ include/uapi/linux/rkisp2-config.h            |  30 ++-
+ 9 files changed, 242 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/common.c b/drivers/media/platform/rockchip/isp/common.c
+index e3fb05399821..bed788573cd6 100644
+--- a/drivers/media/platform/rockchip/isp/common.c
++++ b/drivers/media/platform/rockchip/isp/common.c
+@@ -88,8 +88,18 @@ int rkisp_alloc_buffer(struct rkisp_device *dev,
+ 	buf->dma_addr = *((dma_addr_t *)g_ops->cookie(mem_priv));
+ 	if (!attrs)
+ 		buf->vaddr = g_ops->vaddr(mem_priv);
+-	if (buf->is_need_dbuf)
++	if (buf->is_need_dbuf) {
+ 		buf->dbuf = g_ops->get_dmabuf(mem_priv, O_RDWR);
++		if (buf->is_need_dmafd) {
++			buf->dma_fd = dma_buf_fd(buf->dbuf, O_CLOEXEC);
++			if (buf->dma_fd < 0) {
++				dma_buf_put(buf->dbuf);
++				ret = buf->dma_fd;
++				goto err;
++			}
++			get_dma_buf(buf->dbuf);
++		}
++	}
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+ 		 "%s buf:0x%x~0x%x size:%d\n", __func__,
+ 		 (u32)buf->dma_addr, (u32)buf->dma_addr + buf->size, buf->size);
+@@ -115,6 +125,7 @@ void rkisp_free_buffer(struct rkisp_device *dev,
+ 		buf->mem_priv = NULL;
+ 		buf->is_need_dbuf = false;
+ 		buf->is_need_vaddr = false;
++		buf->is_need_dmafd = false;
+ 	}
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/common.h b/drivers/media/platform/rockchip/isp/common.h
+index 08bad85a69a2..f4c89af67f21 100644
+--- a/drivers/media/platform/rockchip/isp/common.h
++++ b/drivers/media/platform/rockchip/isp/common.h
+@@ -121,8 +121,10 @@ struct rkisp_dummy_buffer {
+ 	void *mem_priv;
+ 	void *vaddr;
+ 	u32 size;
++	int dma_fd;
+ 	bool is_need_vaddr;
+ 	bool is_need_dbuf;
++	bool is_need_dmafd;
+ };
+ 
+ extern int rkisp_debug;
+diff --git a/drivers/media/platform/rockchip/isp/isp_params.c b/drivers/media/platform/rockchip/isp/isp_params.c
+index d022000945c5..6c307bdff647 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params.c
++++ b/drivers/media/platform/rockchip/isp/isp_params.c
+@@ -326,6 +326,18 @@ void rkisp_params_disable_isp(struct rkisp_isp_params_vdev *params_vdev)
+ 	params_vdev->ops->disable_isp(params_vdev);
+ }
+ 
++void rkisp_params_get_ldchbuf_inf(struct rkisp_isp_params_vdev *params_vdev,
++				  struct rkisp_ldchbuf_info *ldchbuf)
++{
++	params_vdev->ops->get_ldchbuf_inf(params_vdev, ldchbuf);
++}
++
++void rkisp_params_set_ldchbuf_size(struct rkisp_isp_params_vdev *params_vdev,
++				   struct rkisp_ldchbuf_size *ldchsize)
++{
++	params_vdev->ops->set_ldchbuf_size(params_vdev, ldchsize);
++}
++
+ int rkisp_register_params_vdev(struct rkisp_isp_params_vdev *params_vdev,
+ 				struct v4l2_device *v4l2_dev,
+ 				struct rkisp_device *dev)
+diff --git a/drivers/media/platform/rockchip/isp/isp_params.h b/drivers/media/platform/rockchip/isp/isp_params.h
+index 67978c23cfe0..7bf19c0aa65e 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params.h
++++ b/drivers/media/platform/rockchip/isp/isp_params.h
+@@ -25,6 +25,10 @@ struct rkisp_isp_params_ops {
+ 	void (*param_cfg)(struct rkisp_isp_params_vdev *params_vdev, u32 frame_id,
+ 			  u32 rdbk_times, enum rkisp_params_type type);
+ 	void (*param_cfgsram)(struct rkisp_isp_params_vdev *params_vdev);
++	void (*get_ldchbuf_inf)(struct rkisp_isp_params_vdev *params_vdev,
++				struct rkisp_ldchbuf_info *ldchbuf);
++	void (*set_ldchbuf_size)(struct rkisp_isp_params_vdev *params_vdev,
++				 struct rkisp_ldchbuf_size *ldchsize);
+ };
+ 
+ /*
+@@ -87,5 +91,9 @@ void rkisp_params_cfg(struct rkisp_isp_params_vdev *params_vdev,
+ 		      u32 frame_id, u32 rdbk_times);
+ 
+ void rkisp_params_cfgsram(struct rkisp_isp_params_vdev *params_vdev);
++void rkisp_params_get_ldchbuf_inf(struct rkisp_isp_params_vdev *params_vdev,
++				  struct rkisp_ldchbuf_info *ldchbuf);
++void rkisp_params_set_ldchbuf_size(struct rkisp_isp_params_vdev *params_vdev,
++				   struct rkisp_ldchbuf_size *ldchsize);
+ 
+ #endif /* _RKISP_ISP_PARAM_H */
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v1x.c b/drivers/media/platform/rockchip/isp/isp_params_v1x.c
+index de868da9d089..a38f1b2dfcfa 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v1x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v1x.c
+@@ -2272,6 +2272,18 @@ rkisp1_get_param_size_v1x(struct rkisp_isp_params_vdev *params_vdev, unsigned in
+ 	sizes[0] = sizeof(struct rkisp1_isp_params_cfg);
+ }
+ 
++static void
++rkisp_params_get_ldchbuf_inf_v1x(struct rkisp_isp_params_vdev *params_vdev,
++				 struct rkisp_ldchbuf_info *ldchbuf)
++{
++}
++
++static void
++rkisp_params_set_ldchbuf_size_v1x(struct rkisp_isp_params_vdev *params_vdev,
++				  struct rkisp_ldchbuf_size *ldchsize)
++{
++}
++
+ /* Not called when the camera active, thus not isr protection. */
+ static void rkisp1_params_disable_isp_v1x(struct rkisp_isp_params_vdev *params_vdev)
+ {
+@@ -2353,6 +2365,8 @@ static struct rkisp_isp_params_ops rkisp_isp_params_ops_tbl = {
+ 	.first_cfg = rkisp1_params_first_cfg_v1x,
+ 	.disable_isp = rkisp1_params_disable_isp_v1x,
+ 	.isr_hdl = rkisp1_params_isr_v1x,
++	.get_ldchbuf_inf = rkisp_params_get_ldchbuf_inf_v1x,
++	.set_ldchbuf_size = rkisp_params_set_ldchbuf_size_v1x,
+ };
+ 
+ int rkisp_init_params_vdev_v1x(struct rkisp_isp_params_vdev *params_vdev)
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index a3eac911ad94..017111b68bef 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -3539,15 +3539,37 @@ static void
+ isp_ldch_config(struct rkisp_isp_params_vdev *params_vdev,
+ 		const struct isp2x_ldch_cfg *arg)
+ {
++	struct rkisp_device *dev = params_vdev->dev;
+ 	struct rkisp_isp_params_val_v2x *priv_val;
+-	u32 value, buf_idx;
++	struct isp2x_ldch_head *ldch_head;
++	int buf_idx, i;
++	u32 value;
+ 
+ 	priv_val = (struct rkisp_isp_params_val_v2x *)params_vdev->priv_val;
+-	buf_idx = (priv_val->buf_ldch_idx++) % RKISP_PARAM_LDCH_BUF_NUM;
+-	memcpy(priv_val->buf_ldch[buf_idx].vaddr, &arg->data[0],
+-		arg->hsize * arg->vsize * 4);
++	for (i = 0; i < ISP2X_LDCH_BUF_NUM; i++) {
++		if (arg->buf_fd == priv_val->buf_ldch[i].dma_fd)
++			break;
++	}
++	if (i == ISP2X_LDCH_BUF_NUM) {
++		dev_err(dev->dev, "cannot find ldch buf fd(%d)\n", arg->buf_fd);
++		return;
++	}
+ 
+-	value = priv_val->buf_ldch[buf_idx].dma_addr;
++	if (!priv_val->buf_ldch[i].vaddr) {
++		dev_err(dev->dev, "no ldch buffer allocated\n");
++		return;
++	}
++
++	buf_idx = priv_val->buf_ldch_idx;
++	ldch_head = (struct isp2x_ldch_head *)priv_val->buf_ldch[buf_idx].vaddr;
++	ldch_head->stat = LDCH_BUF_INIT;
++
++	buf_idx = i;
++	ldch_head = (struct isp2x_ldch_head *)priv_val->buf_ldch[buf_idx].vaddr;
++	ldch_head->stat = LDCH_BUF_CHIPINUSE;
++	priv_val->buf_ldch_idx = buf_idx;
++
++	value = priv_val->buf_ldch[buf_idx].dma_addr + ldch_head->data_oft;
+ 	rkisp_iowrite32(params_vdev, value, MI_LUT_LDCH_RD_BASE);
+ 	rkisp_iowrite32(params_vdev, arg->hsize, MI_LUT_LDCH_RD_H_WSIZE);
+ 	rkisp_iowrite32(params_vdev, arg->vsize, MI_LUT_LDCH_RD_V_SIZE);
+@@ -3557,10 +3579,21 @@ static void
+ isp_ldch_enable(struct rkisp_isp_params_vdev *params_vdev,
+ 		bool en)
+ {
+-	if (en)
++	struct rkisp_device *dev = params_vdev->dev;
++	struct rkisp_isp_params_val_v2x *priv_val;
++	u32 buf_idx;
++
++	priv_val = (struct rkisp_isp_params_val_v2x *)params_vdev->priv_val;
++	if (en) {
++		buf_idx = priv_val->buf_ldch_idx;
++		if (!priv_val->buf_ldch[buf_idx].vaddr) {
++			dev_err(dev->dev, "no ldch buffer allocated\n");
++			return;
++		}
+ 		isp_param_set_bits(params_vdev, ISP_LDCH_STS, 0x01);
+-	else
++	} else {
+ 		isp_param_clear_bits(params_vdev, ISP_LDCH_STS, 0x01);
++	}
+ }
+ 
+ static void
+@@ -4190,6 +4223,74 @@ static void rkisp_clear_first_param_v2x(struct rkisp_isp_params_vdev *params_vde
+ 	params_vdev->isp2x_params->module_en_update = 0;
+ }
+ 
++static u32 rkisp_get_ldch_meshsize(struct rkisp_isp_params_vdev *params_vdev,
++				   struct rkisp_ldchbuf_size *ldchsize)
++{
++	int mesh_w, mesh_h, map_align;
++
++	mesh_w = ((ldchsize->meas_width + (1 << 4) - 1) >> 4) + 1;
++	mesh_h = ((ldchsize->meas_height + (1 << 3) - 1) >> 3) + 1;
++
++	map_align = ((mesh_w + 1) >> 1) << 1;
++	return map_align * mesh_h;
++}
++
++static void rkisp_deinit_ldch_buf(struct rkisp_isp_params_vdev *params_vdev)
++{
++	struct rkisp_isp_params_val_v2x *priv_val;
++	int i;
++
++	priv_val = params_vdev->priv_val;
++	if (!priv_val)
++		return;
++
++	for (i = 0; i < ISP2X_LDCH_BUF_NUM; i++)
++		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_ldch[i]);
++}
++
++static int rkisp_init_ldch_buf(struct rkisp_isp_params_vdev *params_vdev,
++			       struct rkisp_ldchbuf_size *ldchsize)
++{
++	struct device *dev = params_vdev->dev->dev;
++	struct rkisp_isp_params_val_v2x *priv_val;
++	struct isp2x_ldch_head *ldch_head;
++	u32 mesh_size;
++	int i, ret;
++
++	priv_val = params_vdev->priv_val;
++	if (!priv_val) {
++		dev_err(dev, "priv_val is NULL\n");
++		return -EINVAL;
++	}
++
++	priv_val->buf_ldch_idx = 0;
++	mesh_size = rkisp_get_ldch_meshsize(params_vdev, ldchsize);
++	for (i = 0; i < ISP2X_LDCH_BUF_NUM; i++) {
++		priv_val->buf_ldch[i].is_need_vaddr = true;
++		priv_val->buf_ldch[i].is_need_dbuf = true;
++		priv_val->buf_ldch[i].is_need_dmafd = true;
++		priv_val->buf_ldch[i].size =
++			PAGE_ALIGN(mesh_size * sizeof(u16) + ALIGN(sizeof(struct isp2x_ldch_head), 16));
++		ret = rkisp_alloc_buffer(params_vdev->dev, &priv_val->buf_ldch[i]);
++		if (ret) {
++			dev_err(dev, "can not alloc buffer\n");
++			goto err;
++		}
++
++		ldch_head = (struct isp2x_ldch_head *)priv_val->buf_ldch[i].vaddr;
++		ldch_head->stat = LDCH_BUF_INIT;
++		ldch_head->data_oft = ALIGN(sizeof(struct isp2x_ldch_head), 16);
++	}
++
++	return 0;
++
++err:
++	rkisp_deinit_ldch_buf(params_vdev);
++
++	return -ENOMEM;
++
++}
++
+ static void
+ rkisp_get_param_size_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 			 unsigned int sizes[])
+@@ -4197,6 +4298,28 @@ rkisp_get_param_size_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 	sizes[0] = sizeof(struct isp2x_isp_params_cfg);
+ }
+ 
++static void
++rkisp_params_get_ldchbuf_inf_v2x(struct rkisp_isp_params_vdev *params_vdev,
++				 struct rkisp_ldchbuf_info *ldchbuf)
++{
++	struct rkisp_isp_params_val_v2x *priv_val;
++	int i;
++
++	priv_val = params_vdev->priv_val;
++	for (i = 0; i < ISP2X_LDCH_BUF_NUM; i++) {
++		ldchbuf->buf_fd[i] = priv_val->buf_ldch[i].dma_fd;
++		ldchbuf->buf_size[i] = priv_val->buf_ldch[i].size;
++	}
++}
++
++static void
++rkisp_params_set_ldchbuf_size_v2x(struct rkisp_isp_params_vdev *params_vdev,
++				 struct rkisp_ldchbuf_size *ldchsize)
++{
++	rkisp_deinit_ldch_buf(params_vdev);
++	rkisp_init_ldch_buf(params_vdev, ldchsize);
++}
++
+ /* Not called when the camera active, thus not isr protection. */
+ static void
+ rkisp_params_disable_isp_v2x(struct rkisp_isp_params_vdev *params_vdev)
+@@ -4332,12 +4455,14 @@ static struct rkisp_isp_params_ops rkisp_isp_params_ops_tbl = {
+ 	.isr_hdl = rkisp_params_isr_v2x,
+ 	.param_cfg = rkisp_params_cfg_v2x,
+ 	.param_cfgsram = rkisp_params_cfgsram_v2x,
++	.get_ldchbuf_inf = rkisp_params_get_ldchbuf_inf_v2x,
++	.set_ldchbuf_size = rkisp_params_set_ldchbuf_size_v2x,
+ };
+ 
+ int rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ {
+-	struct rkisp_isp_params_val_v2x *priv_val;
+ 	struct device *dev = params_vdev->dev->dev;
++	struct rkisp_isp_params_val_v2x *priv_val;
+ 	int i, ret;
+ 
+ 	priv_val = kzalloc(sizeof(*priv_val), GFP_KERNEL);
+@@ -4346,6 +4471,13 @@ int rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 		return -ENOMEM;
+ 	}
+ 
++	params_vdev->isp2x_params = vmalloc(sizeof(*params_vdev->isp2x_params));
++	if (!params_vdev->isp2x_params) {
++		dev_err(dev, "call vmalloc failure\n");
++		kfree(priv_val);
++		return -ENOMEM;
++	}
++
+ 	priv_val->buf_3dlut_idx = 0;
+ 	for (i = 0; i < RKISP_PARAM_3DLUT_BUF_NUM; i++) {
+ 		priv_val->buf_3dlut[i].is_need_vaddr = true;
+@@ -4368,23 +4500,7 @@ int rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 		}
+ 	}
+ 
+-	priv_val->buf_ldch_idx = 0;
+-	for (i = 0; i < RKISP_PARAM_LDCH_BUF_NUM; i++) {
+-		priv_val->buf_ldch[i].is_need_vaddr = true;
+-		priv_val->buf_ldch[i].size = ISP2X_LDCH_MESH_XY_NUM * sizeof(u16);
+-		ret = rkisp_alloc_buffer(params_vdev->dev, &priv_val->buf_ldch[i]);
+-		if (ret) {
+-			dev_err(dev, "can not alloc buffer\n");
+-			goto err;
+-		}
+-	}
+-
+-	params_vdev->isp2x_params = vmalloc(sizeof(*params_vdev->isp2x_params));
+-	if (!params_vdev->isp2x_params)
+-		goto err;
+-
+ 	rkisp_clear_first_param_v2x(params_vdev);
+-
+ 	params_vdev->priv_val = (void *)priv_val;
+ 	params_vdev->ops = &rkisp_isp_params_ops_tbl;
+ 	params_vdev->priv_ops = &rkisp_v2x_isp_params_ops;
+@@ -4396,13 +4512,9 @@ int rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 
+ 	for (i = 0; i < RKISP_PARAM_LSC_LUT_BUF_NUM; i++)
+ 		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_lsclut[i]);
+-
+-	for (i = 0; i < RKISP_PARAM_LDCH_BUF_NUM; i++)
+-		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_ldch[i]);
+-
+ 	vfree(params_vdev->isp2x_params);
+ 
+-	return -ENOMEM;
++	return ret;
+ }
+ 
+ void rkisp_uninit_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+@@ -4414,17 +4526,13 @@ void rkisp_uninit_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 	if (!priv_val)
+ 		return;
+ 
++	rkisp_deinit_ldch_buf(params_vdev);
+ 	for (i = 0; i < RKISP_PARAM_3DLUT_BUF_NUM; i++)
+ 		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_3dlut[i]);
+ 
+ 	for (i = 0; i < RKISP_PARAM_LSC_LUT_BUF_NUM; i++)
+ 		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_lsclut[i]);
+-
+-	for (i = 0; i < RKISP_PARAM_LDCH_BUF_NUM; i++)
+-		rkisp_free_buffer(params_vdev->dev, &priv_val->buf_ldch[i]);
+-
+ 	vfree(params_vdev->isp2x_params);
+-
+ 	kfree(priv_val);
+ 	params_vdev->priv_val = NULL;
+ }
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.h b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+index 32393c059822..ad86bc505b46 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.h
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+@@ -173,8 +173,6 @@
+ #define RKISP_PARAM_3DLUT_BUF_NUM		2
+ #define RKISP_PARAM_3DLUT_BUF_SIZE		(9 * 9 * 9 * 4)
+ 
+-#define RKISP_PARAM_LDCH_BUF_NUM		2
+-
+ #define RKISP_PARAM_LSC_LUT_BUF_NUM		2
+ #define RKISP_PARAM_LSC_LUT_TBL_SIZE		(9 * 17 * 4)
+ #define RKISP_PARAM_LSC_LUT_BUF_SIZE		(RKISP_PARAM_LSC_LUT_TBL_SIZE * 4)
+@@ -325,7 +323,7 @@ struct rkisp_isp_params_val_v2x {
+ 	struct rkisp_dummy_buffer buf_3dlut[RKISP_PARAM_3DLUT_BUF_NUM];
+ 	u32 buf_3dlut_idx;
+ 
+-	struct rkisp_dummy_buffer buf_ldch[RKISP_PARAM_LDCH_BUF_NUM];
++	struct rkisp_dummy_buffer buf_ldch[ISP2X_LDCH_BUF_NUM];
+ 	u32 buf_ldch_idx;
+ 
+ 	struct rkisp_dummy_buffer buf_lsclut[RKISP_PARAM_LSC_LUT_BUF_NUM];
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index d76e19d8c01d..3e9861a0752c 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1806,6 +1806,8 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
+ 	struct rkisp_thunderboot_resmem *resmem;
+ 	struct rkisp_thunderboot_resmem_head *head;
++	struct rkisp_ldchbuf_info *ldchbuf;
++	struct rkisp_ldchbuf_size *ldchsize;
+ 	void *resmem_va;
+ 	long ret = 0;
+ 
+@@ -1856,6 +1858,14 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 		isp_dev->resmem_pa = 0;
+ 		isp_dev->resmem_size = 0;
+ 		break;
++	case RKISP_CMD_GET_LDCHBUF_INFO:
++		ldchbuf = (struct rkisp_ldchbuf_info *)arg;
++		rkisp_params_get_ldchbuf_inf(&isp_dev->params_vdev, ldchbuf);
++		break;
++	case RKISP_CMD_SET_LDCHBUF_SIZE:
++		ldchsize = (struct rkisp_ldchbuf_size *)arg;
++		rkisp_params_set_ldchbuf_size(&isp_dev->params_vdev, ldchsize);
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+@@ -1870,6 +1880,8 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 	void __user *up = compat_ptr(arg);
+ 	struct isp2x_csi_trigger trigger;
+ 	struct rkisp_thunderboot_resmem resmem;
++	struct rkisp_ldchbuf_info ldchbuf;
++	struct rkisp_ldchbuf_size ldchsize;
+ 	long ret = 0;
+ 	int mode;
+ 
+@@ -1895,6 +1907,16 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 	case RKISP_CMD_FREE_SHARED_BUF:
+ 		ret = rkisp_ioctl(sd, cmd, NULL);
+ 		break;
++	case RKISP_CMD_GET_LDCHBUF_INFO:
++		ret = rkisp_ioctl(sd, cmd, &ldchbuf);
++		if (!ret)
++			ret = copy_to_user(up, &ldchbuf, sizeof(ldchbuf));
++		break;
++	case RKISP_CMD_SET_LDCHBUF_SIZE:
++		ret = copy_from_user(&ldchsize, up, sizeof(ldchsize));
++		if (!ret)
++			ret = rkisp_ioctl(sd, cmd, &ldchsize);
++		break;
+ 	default:
+ 		ret = -ENOIOCTLCMD;
+ 	}
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index 2ba92af71faa..70b11abcdaa4 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -24,6 +24,12 @@
+ #define RKISP_CMD_FREE_SHARED_BUF \
+ 	_IO('V', BASE_VIDIOC_PRIVATE + 3)
+ 
++#define RKISP_CMD_GET_LDCHBUF_INFO \
++	_IOR('V', BASE_VIDIOC_PRIVATE + 4, struct rkisp_ldchbuf_info)
++
++#define RKISP_CMD_SET_LDCHBUF_SIZE \
++	_IOW('V', BASE_VIDIOC_PRIVATE + 5, struct rkisp_ldchbuf_size)
++
+ #define ISP2X_MODULE_DPCC		BIT_ULL(0)
+ #define ISP2X_MODULE_BLS		BIT_ULL(1)
+ #define ISP2X_MODULE_SDG		BIT_ULL(2)
+@@ -148,6 +154,7 @@
+ #define ISP2X_3DLUT_DATA_NUM		729
+ 
+ #define ISP2X_LDCH_MESH_XY_NUM		0x80000
++#define ISP2X_LDCH_BUF_NUM		2
+ 
+ #define ISP2X_THUNDERBOOT_VIDEO_BUF_NUM	30
+ 
+@@ -874,10 +881,31 @@ struct isp2x_3dlut_cfg {
+ 	u16 lut_b[ISP2X_3DLUT_DATA_NUM];
+ } __attribute__ ((packed));
+ 
++enum isp2x_ldch_buf_stat {
++	LDCH_BUF_INIT = 0,
++	LDCH_BUF_WAIT2CHIP,
++	LDCH_BUF_CHIPINUSE,
++};
++
++struct rkisp_ldchbuf_info {
++	s32 buf_fd[ISP2X_LDCH_BUF_NUM];
++	u32 buf_size[ISP2X_LDCH_BUF_NUM];
++} __attribute__ ((packed));
++
++struct rkisp_ldchbuf_size {
++	u32 meas_width;
++	u32 meas_height;
++} __attribute__ ((packed));
++
++struct isp2x_ldch_head {
++	enum isp2x_ldch_buf_stat stat;
++	u32 data_oft;
++} __attribute__ ((packed));
++
+ struct isp2x_ldch_cfg {
+ 	u32 hsize;
+ 	u32 vsize;
+-	u16 data[ISP2X_LDCH_MESH_XY_NUM];
++	s32 buf_fd;
+ } __attribute__ ((packed));
+ 
+ struct isp2x_awb_gain_cfg {
+-- 
+2.35.3
+

@@ -1,0 +1,1057 @@
+From bef7d0902a3cdcf03eda8a0d6bc603f594151208 Mon Sep 17 00:00:00 2001
+From: chenzhen <chenzhen@rock-chips.com>
+Date: Mon, 15 Feb 2016 17:13:10 +0800
+Subject: [PATCH] MALI: rockchip: upgrade utgard DDK to r6p0-01rel1
+
+Change-Id: I0c88698a29855905da05b45c54f37beddcb6fcd6
+Signed-off-by: chenzhen <chenzhen@rock-chips.com>
+---
+ .../arm/mali400/mali/common/mali_executor.c   | 79 +++++--------------
+ .../arm/mali400/mali/common/mali_executor.h   |  2 -
+ .../gpu/arm/mali400/mali/common/mali_gp_job.c | 29 +++----
+ .../gpu/arm/mali400/mali/common/mali_gp_job.h |  3 +-
+ .../gpu/arm/mali400/mali/common/mali_group.c  | 69 +++++++++-------
+ .../gpu/arm/mali400/mali/common/mali_group.h  |  7 --
+ .../arm/mali400/mali/common/mali_session.h    |  1 +
+ .../arm/mali400/mali/common/mali_timeline.c   | 10 +--
+ .../include/linux/mali/mali_utgard_uk_types.h |  4 +-
+ .../mali400/mali/linux/mali_kernel_linux.h    |  6 ++
+ .../gpu/arm/mali400/mali/linux/mali_memory.c  | 31 +++++---
+ .../arm/mali400/mali/linux/mali_memory_cow.c  | 34 ++++++--
+ .../mali/linux/mali_memory_defer_bind.c       | 30 +++++--
+ .../mali/linux/mali_memory_defer_bind.h       |  5 +-
+ .../mali400/mali/linux/mali_memory_manager.c  | 13 +--
+ .../mali400/mali/linux/mali_memory_os_alloc.c |  7 ++
+ .../gpu/arm/mali400/mali/linux/mali_osk_pm.c  |  2 +-
+ .../mali400/mali/linux/mali_osk_profiling.c   | 14 +++-
+ .../mali400/mali/linux/mali_ukk_profiling.c   | 10 ++-
+ .../gpu/arm/mali400/mali/platform/arm/arm.c   |  1 +
+ drivers/gpu/arm/mali400/ump/linux/ump_ioctl.h |  2 +-
+ 21 files changed, 197 insertions(+), 162 deletions(-)
+
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_executor.c b/drivers/gpu/arm/mali400/mali/common/mali_executor.c
+index d16a47b695e1..2a6d2d5d8e63 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_executor.c
++++ b/drivers/gpu/arm/mali400/mali/common/mali_executor.c
+@@ -129,7 +129,7 @@ static mali_bool mali_executor_has_virtual_group(void);
+ static mali_bool mali_executor_virtual_group_is_usable(void);
+ static void mali_executor_schedule(void);
+ static void mali_executor_wq_schedule(void *arg);
+-static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job, u32 added_size);
++static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job);
+ static void mali_executor_complete_group(struct mali_group *group,
+ 		mali_bool success,
+ 		struct mali_gp_job **gp_job_done,
+@@ -574,10 +574,23 @@ _mali_osk_errcode_t mali_executor_interrupt_gp(struct mali_group *group,
+ 			return _MALI_OSK_ERR_OK;
+ 		}
+ 	} else if (MALI_INTERRUPT_RESULT_OOM == int_result) {
++		struct mali_gp_job *job = mali_group_get_running_gp_job(group);
+ 
+-		mali_executor_unlock();
++		/* PLBU out of mem */
++		MALI_DEBUG_PRINT(3, ("Executor: PLBU needs more heap memory\n"));
++
++#if defined(CONFIG_MALI400_PROFILING)
++		/* Give group a chance to generate a SUSPEND event */
++		mali_group_oom(group);
++#endif
+ 
+-		mali_group_schedule_oom_work_handler(group);
++		/*
++		 * no need to hold interrupt raised while
++		 * waiting for more memory.
++		 */
++		mali_executor_send_gp_oom_to_user(job);
++
++		mali_executor_unlock();
+ 
+ 		return _MALI_OSK_ERR_OK;
+ 	}
+@@ -825,59 +838,6 @@ _mali_osk_errcode_t mali_executor_interrupt_mmu(struct mali_group *group,
+ 	return _MALI_OSK_ERR_OK;
+ }
+ 
+-void mali_executor_group_oom(struct mali_group *group)
+-{
+-	struct mali_gp_job *job = NULL;
+-	MALI_DEBUG_ASSERT_POINTER(group);
+-	MALI_DEBUG_ASSERT_POINTER(group->gp_core);
+-	MALI_DEBUG_ASSERT_POINTER(group->mmu);
+-
+-	mali_executor_lock();
+-
+-	job = mali_group_get_running_gp_job(group);
+-
+-	MALI_DEBUG_ASSERT_POINTER(job);
+-
+-#if defined(CONFIG_MALI400_PROFILING)
+-	/* Give group a chance to generate a SUSPEND event */
+-	mali_group_oom(group);
+-#endif
+-
+-	mali_gp_job_set_current_heap_addr(job, mali_gp_read_plbu_alloc_start_addr(group->gp_core));
+-
+-	mali_executor_unlock();
+-
+-	if (_MALI_OSK_ERR_OK  == mali_mem_add_mem_size(job->session, job->heap_base_addr, job->heap_grow_size)) {
+-		_mali_osk_notification_t *new_notification = NULL;
+-
+-		new_notification = _mali_osk_notification_create(
+-					   _MALI_NOTIFICATION_GP_STALLED,
+-					   sizeof(_mali_uk_gp_job_suspended_s));
+-
+-		/* resume job with new heap,
+-		* This will also re-enable interrupts
+-		*/
+-		mali_executor_lock();
+-
+-		mali_executor_send_gp_oom_to_user(job, job->heap_grow_size);
+-
+-		if (NULL != new_notification) {
+-
+-			mali_gp_job_set_oom_notification(job, new_notification);
+-
+-			mali_group_resume_gp_with_new_heap(group, mali_gp_job_get_id(job),
+-							   job->heap_current_addr,
+-							   job->heap_current_addr + job->heap_grow_size);
+-		}
+-		mali_executor_unlock();
+-	} else {
+-		mali_executor_lock();
+-		mali_executor_send_gp_oom_to_user(job, 0);
+-		mali_executor_unlock();
+-	}
+-
+-}
+-
+ void mali_executor_group_power_up(struct mali_group *groups[], u32 num_groups)
+ {
+ 	u32 i;
+@@ -1346,9 +1306,6 @@ _mali_osk_errcode_t _mali_ukk_gp_suspend_response(_mali_uk_gp_suspend_response_s
+ 								   args->arguments[0],
+ 								   args->arguments[1]);
+ 
+-				job->heap_base_addr =  args->arguments[0];
+-				job->heap_current_addr = args->arguments[0];
+-
+ 				mali_executor_unlock();
+ 				return _MALI_OSK_ERR_OK;
+ 			} else {
+@@ -1844,7 +1801,7 @@ static void mali_executor_wq_schedule(void *arg)
+ 	mali_executor_unlock();
+ }
+ 
+-static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job, u32 added_size)
++static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job)
+ {
+ 	_mali_uk_gp_job_suspended_s *jobres;
+ 	_mali_osk_notification_t *notification;
+@@ -1860,7 +1817,7 @@ static void mali_executor_send_gp_oom_to_user(struct mali_gp_job *job, u32 added
+ 	jobres = (_mali_uk_gp_job_suspended_s *)notification->result_buffer;
+ 	jobres->user_job_ptr = mali_gp_job_get_user_id(job);
+ 	jobres->cookie = gp_returned_cookie;
+-	jobres->heap_added_size = added_size;
++
+ 	mali_session_send_notification(mali_gp_job_get_session(job),
+ 				       notification);
+ }
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_executor.h b/drivers/gpu/arm/mali400/mali/common/mali_executor.h
+index a756d3f40c2a..927a38458322 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_executor.h
++++ b/drivers/gpu/arm/mali400/mali/common/mali_executor.h
+@@ -58,8 +58,6 @@ void mali_executor_schedule_from_mask(mali_scheduler_mask mask, mali_bool deferr
+ _mali_osk_errcode_t mali_executor_interrupt_gp(struct mali_group *group, mali_bool in_upper_half);
+ _mali_osk_errcode_t mali_executor_interrupt_pp(struct mali_group *group, mali_bool in_upper_half);
+ _mali_osk_errcode_t mali_executor_interrupt_mmu(struct mali_group *group, mali_bool in_upper_half);
+-
+-void mali_executor_group_oom(struct mali_group *group);
+ void mali_executor_group_power_up(struct mali_group *groups[], u32 num_groups);
+ void mali_executor_group_power_down(struct mali_group *groups[], u32 num_groups);
+ 
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_gp_job.c b/drivers/gpu/arm/mali400/mali/common/mali_gp_job.c
+index adc30a3408a8..2a05f3f7d089 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_gp_job.c
++++ b/drivers/gpu/arm/mali400/mali/common/mali_gp_job.c
+@@ -43,7 +43,8 @@ static int _mali_gp_add_varying_allocations(struct mali_session_data *session,
+ 				MALI_DEBUG_ASSERT(alloc[i] == mali_vma_node->vm_node.start);
+ 			} else {
+ 				MALI_DEBUG_PRINT(1, ("ERROE!_mali_gp_add_varying_allocations,can't find allocation %d by address =0x%x, num=%d\n", i, alloc[i], num));
+-				MALI_DEBUG_ASSERT(0);
++				_mali_osk_free(alloc_node);
++				goto fail;
+ 			}
+ 			alloc_node->alloc = mali_alloc;
+ 			/* add to gp job varying alloc list*/
+@@ -107,9 +108,7 @@ struct mali_gp_job *mali_gp_job_create(struct mali_session_data *session, _mali_
+ 		_mali_osk_list_init(&job->list);
+ 		job->session = session;
+ 		job->id = id;
+-		job->heap_base_addr = job->uargs.frame_registers[4];
+ 		job->heap_current_addr = job->uargs.frame_registers[4];
+-		job->heap_grow_size = job->uargs.heap_grow_size;
+ 		job->perf_counter_value0 = 0;
+ 		job->perf_counter_value1 = 0;
+ 		job->pid = _mali_osk_get_pid();
+@@ -119,31 +118,37 @@ struct mali_gp_job *mali_gp_job_create(struct mali_session_data *session, _mali_
+ 		INIT_LIST_HEAD(&job->varying_alloc);
+ 		INIT_LIST_HEAD(&job->vary_todo);
+ 		job->dmem = NULL;
++
++		if (job->uargs.varying_alloc_num > session->allocation_mgr.mali_allocation_num) {
++			MALI_PRINT_ERROR(("Mali GP job: The number of  varying buffer to defer bind  is invalid !\n"));
++			goto fail1;
++		}
++
+ 		/* add varying allocation list*/
+-		if (uargs->varying_alloc_num) {
++		if (job->uargs.varying_alloc_num > 0) {
+ 			/* copy varying list from user space*/
+-			job->varying_list = _mali_osk_calloc(1, sizeof(u32) * uargs->varying_alloc_num);
++			job->varying_list = _mali_osk_calloc(1, sizeof(u32) * job->uargs.varying_alloc_num);
+ 			if (!job->varying_list) {
+-				MALI_PRINT_ERROR(("Mali GP job: allocate varying_list failed varying_alloc_num = %d !\n", uargs->varying_alloc_num));
++				MALI_PRINT_ERROR(("Mali GP job: allocate varying_list failed varying_alloc_num = %d !\n", job->uargs.varying_alloc_num));
+ 				goto fail1;
+ 			}
+ 
+ 			memory_list = (u32 __user *)(uintptr_t)uargs->varying_alloc_list;
+ 
+-			if (0 != _mali_osk_copy_from_user(job->varying_list, memory_list, sizeof(u32)*uargs->varying_alloc_num)) {
++			if (0 != _mali_osk_copy_from_user(job->varying_list, memory_list, sizeof(u32) * job->uargs.varying_alloc_num)) {
+ 				MALI_PRINT_ERROR(("Mali GP job: Failed to copy varying list from user space!\n"));
+ 				goto fail;
+ 			}
+ 
+ 			if (unlikely(_mali_gp_add_varying_allocations(session, job, job->varying_list,
+-					uargs->varying_alloc_num))) {
++					job->uargs.varying_alloc_num))) {
+ 				MALI_PRINT_ERROR(("Mali GP job: _mali_gp_add_varying_allocations failed!\n"));
+ 				goto fail;
+ 			}
+ 
+ 			/* do preparetion for each allocation */
+ 			list_for_each_entry_safe(alloc_node, tmp_node, &job->varying_alloc, node) {
+-				if (unlikely(_MALI_OSK_ERR_OK != mali_mem_defer_bind_allocation_prepare(alloc_node->alloc, &job->vary_todo))) {
++				if (unlikely(_MALI_OSK_ERR_OK != mali_mem_defer_bind_allocation_prepare(alloc_node->alloc, &job->vary_todo, &job->required_varying_memsize))) {
+ 					MALI_PRINT_ERROR(("Mali GP job: mali_mem_defer_bind_allocation_prepare failed!\n"));
+ 					goto fail;
+ 				}
+@@ -162,7 +167,7 @@ struct mali_gp_job *mali_gp_job_create(struct mali_session_data *session, _mali_
+ 					MALI_PRINT_ERROR(("Mali GP job: mali_mem_prepare_mem_for_job failed!\n"));
+ 					goto fail;
+ 				}
+-				if (_MALI_OSK_ERR_OK != mali_mem_defer_bind(job->uargs.varying_memsize / _MALI_OSK_MALI_PAGE_SIZE, job, &dmem_block)) {
++				if (_MALI_OSK_ERR_OK != mali_mem_defer_bind(job, &dmem_block)) {
+ 					MALI_PRINT_ERROR(("gp job create, mali_mem_defer_bind failed! GP %x fail!", job));
+ 					goto fail;
+ 				}
+@@ -222,10 +227,6 @@ void mali_gp_job_delete(struct mali_gp_job *job)
+ 		_mali_osk_free(bkn);
+ 	}
+ 
+-	if (!list_empty(&job->vary_todo)) {
+-		MALI_DEBUG_ASSERT(0);
+-	}
+-
+ 	mali_mem_defer_dmem_free(job);
+ 
+ 	/* de-allocate the pre-allocated oom notifications */
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_gp_job.h b/drivers/gpu/arm/mali400/mali/common/mali_gp_job.h
+index f249439c7155..5dd534155249 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_gp_job.h
++++ b/drivers/gpu/arm/mali400/mali/common/mali_gp_job.h
+@@ -65,9 +65,7 @@ struct mali_gp_job {
+ 	 * returning job to user. Hold executor lock when setting,
+ 	 * no lock needed when reading
+ 	 */
+-	u32 heap_base_addr;                                /** < Holds the base mali addr of mem handle which is used for new heap*/
+ 	u32 heap_current_addr;                             /**< Holds the current HEAP address when the job has completed */
+-	u32 heap_grow_size;                                /** < Holds the HEAP grow size when HEAP oom */
+ 	u32 perf_counter_value0;                           /**< Value of performance counter 0 (to be returned to user space) */
+ 	u32 perf_counter_value1;                           /**< Value of performance counter 1 (to be returned to user space) */
+ 	struct mali_defer_mem *dmem;                                          /** < used for defer bind to store dmem info */
+@@ -75,6 +73,7 @@ struct mali_gp_job {
+ 	u32 bind_flag;                                     /** < flag for deferbind*/
+ 	u32 *varying_list;                                 /**< varying memory list need to to defer bind*/
+ 	struct list_head vary_todo;                        /**< list of backend list need to do defer bind*/
++	u32 required_varying_memsize;			   /** < size of varying memory to reallocate*/
+ 	u32 big_job;                                       /** < if the gp job have large varying output and may take long time*/
+ };
+ 
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_group.c b/drivers/gpu/arm/mali400/mali/common/mali_group.c
+index b4cd3a1fcd8c..f0ed5223cc2a 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_group.c
++++ b/drivers/gpu/arm/mali400/mali/common/mali_group.c
+@@ -44,8 +44,6 @@ static void mali_group_bottom_half_mmu(void *data);
+ static void mali_group_bottom_half_gp(void *data);
+ static void mali_group_bottom_half_pp(void *data);
+ static void mali_group_timeout(void *data);
+-static void mali_group_out_of_memory(void *data);
+-
+ static void mali_group_reset_pp(struct mali_group *group);
+ static void mali_group_reset_mmu(struct mali_group *group);
+ 
+@@ -197,10 +195,6 @@ _mali_osk_errcode_t mali_group_add_gp_core(struct mali_group *group, struct mali
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 
+-	group->oom_work_handler = _mali_osk_wq_create_work(mali_group_out_of_memory, group);
+-	if (NULL == group->oom_work_handler) {
+-		_mali_osk_wq_delete_work(group->bottom_half_work_gp);
+-	}
+ 	return _MALI_OSK_ERR_OK;
+ }
+ 
+@@ -211,10 +205,6 @@ void mali_group_remove_gp_core(struct mali_group *group)
+ 	if (NULL != group->bottom_half_work_gp) {
+ 		_mali_osk_wq_delete_work(group->bottom_half_work_gp);
+ 	}
+-
+-	if (NULL != group->oom_work_handler) {
+-		_mali_osk_wq_delete_work(group->oom_work_handler);
+-	}
+ }
+ 
+ _mali_osk_errcode_t mali_group_add_pp_core(struct mali_group *group, struct mali_pp_core *pp_core)
+@@ -1464,10 +1454,27 @@ _mali_osk_errcode_t mali_group_upper_half_mmu(void *data)
+ #if defined(CONFIG_MALI400_PROFILING) && defined (CONFIG_TRACEPOINTS)
+ #if defined(CONFIG_MALI_SHARED_INTERRUPTS)
+ 	mali_executor_lock();
+-	if (!mali_group_is_working(group)) {
+-		/* Not working, so nothing to do */
++	if (!mali_group_is_working(group) && (!mali_group_power_is_on(group))) {
++		/* group complete and on job shedule on it, it already power off */
++		if (NULL != group->gp_core) {
++			_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
++					MALI_PROFILING_EVENT_CHANNEL_SOFTWARE |
++					MALI_PROFILING_EVENT_REASON_START_STOP_SW_UPPER_HALF,
++					0, 0, /* No pid and tid for interrupt handler */
++					MALI_PROFILING_MAKE_EVENT_DATA_CORE_GP_MMU(0),
++					0xFFFFFFFF, 0);
++		} else {
++			_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
++					MALI_PROFILING_EVENT_CHANNEL_SOFTWARE |
++					MALI_PROFILING_EVENT_REASON_START_STOP_SW_UPPER_HALF,
++					0, 0, /* No pid and tid for interrupt handler */
++					MALI_PROFILING_MAKE_EVENT_DATA_CORE_PP_MMU(
++						mali_pp_core_get_id(group->pp_core)),
++					0xFFFFFFFF, 0);
++		}
++
+ 		mali_executor_unlock();
+-		return _MALI_OSK_ERR_FAULT;
++		return ret;
+ 	}
+ #endif
+ 
+@@ -1577,10 +1584,16 @@ _mali_osk_errcode_t mali_group_upper_half_gp(void *data)
+ #if defined(CONFIG_MALI400_PROFILING) && defined (CONFIG_TRACEPOINTS)
+ #if defined(CONFIG_MALI_SHARED_INTERRUPTS)
+ 	mali_executor_lock();
+-	if (!mali_group_is_working(group)) {
+-		/* Not working, so nothing to do */
++	if (!mali_group_is_working(group) && (!mali_group_power_is_on(group))) {
++		/* group complete and on job shedule on it, it already power off */
++		_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
++				      MALI_PROFILING_EVENT_CHANNEL_SOFTWARE |
++				      MALI_PROFILING_EVENT_REASON_START_STOP_SW_UPPER_HALF,
++				      0, 0, /* No pid and tid for interrupt handler */
++				      MALI_PROFILING_MAKE_EVENT_DATA_CORE_GP(0),
++				      0xFFFFFFFF, 0);
+ 		mali_executor_unlock();
+-		return _MALI_OSK_ERR_FAULT;
++		return ret;
+ 	}
+ #endif
+ 	_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
+@@ -1661,10 +1674,17 @@ _mali_osk_errcode_t mali_group_upper_half_pp(void *data)
+ #if defined(CONFIG_MALI400_PROFILING) && defined (CONFIG_TRACEPOINTS)
+ #if defined(CONFIG_MALI_SHARED_INTERRUPTS)
+ 	mali_executor_lock();
+-	if (!mali_group_is_working(group)) {
+-		/* Not working, so nothing to do */
++	if (!mali_group_is_working(group) && (!mali_group_power_is_on(group))) {
++		/* group complete and on job shedule on it, it already power off */
++		_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
++				      MALI_PROFILING_EVENT_CHANNEL_SOFTWARE |
++				      MALI_PROFILING_EVENT_REASON_START_STOP_SW_UPPER_HALF,
++				      0, 0, /* No pid and tid for interrupt handler */
++				      MALI_PROFILING_MAKE_EVENT_DATA_CORE_PP(
++					      mali_pp_core_get_id(group->pp_core)),
++				      0xFFFFFFFF, 0);
+ 		mali_executor_unlock();
+-		return _MALI_OSK_ERR_FAULT;
++		return ret;
+ 	}
+ #endif
+ 	_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_STOP |
+@@ -1725,17 +1745,6 @@ static void mali_group_timeout(void *data)
+ 	}
+ }
+ 
+-static void mali_group_out_of_memory(void *data)
+-{
+-	struct mali_group *group = (struct mali_group *)data;
+-
+-	MALI_DEBUG_ASSERT_POINTER(group);
+-	MALI_DEBUG_ASSERT_POINTER(group->gp_core);
+-	MALI_DEBUG_ASSERT_POINTER(group->mmu);
+-
+-	mali_executor_group_oom(group);
+-}
+-
+ mali_bool mali_group_zap_session(struct mali_group *group,
+ 				 struct mali_session_data *session)
+ {
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_group.h b/drivers/gpu/arm/mali400/mali/common/mali_group.h
+index 705605ec1d9f..f2c031381048 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_group.h
++++ b/drivers/gpu/arm/mali400/mali/common/mali_group.h
+@@ -84,7 +84,6 @@ struct mali_group {
+ 	_mali_osk_wq_work_t         *bottom_half_work_gp;
+ 	_mali_osk_wq_work_t         *bottom_half_work_pp;
+ 
+-	_mali_osk_wq_work_t         *oom_work_handler;
+ 	_mali_osk_timer_t           *timeout_timer;
+ };
+ 
+@@ -412,12 +411,6 @@ MALI_STATIC_INLINE void mali_group_schedule_bottom_half_gp(struct mali_group *gr
+ 	_mali_osk_wq_schedule_work(group->bottom_half_work_gp);
+ }
+ 
+-MALI_STATIC_INLINE void mali_group_schedule_oom_work_handler(struct mali_group *group)
+-{
+-	MALI_DEBUG_ASSERT_POINTER(group);
+-	MALI_DEBUG_ASSERT_POINTER(group->gp_core);
+-	_mali_osk_wq_schedule_work(group->oom_work_handler);
+-}
+ 
+ MALI_STATIC_INLINE void mali_group_schedule_bottom_half_pp(struct mali_group *group)
+ {
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_session.h b/drivers/gpu/arm/mali400/mali/common/mali_session.h
+index 6791b2b5f110..66d95c30073f 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_session.h
++++ b/drivers/gpu/arm/mali400/mali/common/mali_session.h
+@@ -30,6 +30,7 @@ struct mali_session_data {
+ 	_mali_osk_notification_queue_t *ioctl_queue;
+ 
+ 	_mali_osk_mutex_t *memory_lock; /**< Lock protecting the vm manipulation */
++	_mali_osk_mutex_t *cow_lock; /** < Lock protecting the cow memory free manipulation */
+ #if 0
+ 	_mali_osk_list_t memory_head; /**< Track all the memory allocated in this session, for freeing on abnormal termination */
+ #endif
+diff --git a/drivers/gpu/arm/mali400/mali/common/mali_timeline.c b/drivers/gpu/arm/mali400/mali/common/mali_timeline.c
+index 5a767b39d56e..dccc30348002 100755
+--- a/drivers/gpu/arm/mali400/mali/common/mali_timeline.c
++++ b/drivers/gpu/arm/mali400/mali/common/mali_timeline.c
+@@ -237,17 +237,17 @@ static void mali_timeline_destroy(struct mali_timeline *timeline)
+ 		MALI_DEBUG_ASSERT(NULL != timeline->system);
+ 		MALI_DEBUG_ASSERT(MALI_TIMELINE_MAX > timeline->id);
+ 
++		if (NULL != timeline->delayed_work) {
++			_mali_osk_wq_delayed_cancel_work_sync(timeline->delayed_work);
++			_mali_osk_wq_delayed_delete_work_nonflush(timeline->delayed_work);
++		}
++
+ #if defined(CONFIG_SYNC)
+ 		if (NULL != timeline->sync_tl) {
+ 			sync_timeline_destroy(timeline->sync_tl);
+ 		}
+ #endif /* defined(CONFIG_SYNC) */
+ 
+-		if (NULL != timeline->delayed_work) {
+-			_mali_osk_wq_delayed_cancel_work_sync(timeline->delayed_work);
+-			_mali_osk_wq_delayed_delete_work_nonflush(timeline->delayed_work);
+-		}
+-
+ #ifndef CONFIG_SYNC
+ 		_mali_osk_free(timeline);
+ #endif
+diff --git a/drivers/gpu/arm/mali400/mali/include/linux/mali/mali_utgard_uk_types.h b/drivers/gpu/arm/mali400/mali/include/linux/mali/mali_utgard_uk_types.h
+index b1be0f0b4d48..071585b34c95 100755
+--- a/drivers/gpu/arm/mali400/mali/include/linux/mali/mali_utgard_uk_types.h
++++ b/drivers/gpu/arm/mali400/mali/include/linux/mali/mali_utgard_uk_types.h
+@@ -275,7 +275,6 @@ typedef struct {
+ 	u64 user_job_ptr;                   /**< [in] identifier for the job in user space, a @c mali_gp_job_info* */
+ 	u32 priority;                       /**< [in] job priority. A lower number means higher priority */
+ 	u32 frame_registers[MALIGP2_NUM_REGS_FRAME]; /**< [in] core specific registers associated with this job */
+-	u32 heap_grow_size;     /** <[in] the grow size of the plbu heap when out of memory */
+ 	u32 perf_counter_flag;              /**< [in] bitmask indicating which performance counters to enable, see \ref _MALI_PERFORMANCE_COUNTER_FLAG_SRC0_ENABLE and related macro definitions */
+ 	u32 perf_counter_src0;              /**< [in] source id for performance counter 0 (see ARM DDI0415A, Table 3-60) */
+ 	u32 perf_counter_src1;              /**< [in] source id for performance counter 1 (see ARM DDI0415A, Table 3-60) */
+@@ -306,7 +305,6 @@ typedef struct {
+ typedef struct {
+ 	u64 user_job_ptr;                    /**< [out] identifier for the job in user space */
+ 	u32 cookie;                          /**< [out] identifier for the core in kernel space on which the job stalled */
+-	u32 heap_added_size;
+ } _mali_uk_gp_job_suspended_s;
+ 
+ /** @} */ /* end group _mali_uk_gp */
+@@ -666,7 +664,7 @@ typedef struct {
+  * The 16bit integer is stored twice in a 32bit integer
+  * For example, for version 1 the value would be 0x00010001
+  */
+-#define _MALI_API_VERSION 800
++#define _MALI_API_VERSION 850
+ #define _MALI_UK_API_VERSION _MAKE_VERSION_ID(_MALI_API_VERSION)
+ 
+ /**
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_kernel_linux.h b/drivers/gpu/arm/mali400/mali/linux/mali_kernel_linux.h
+index f6042712d1e3..e87879a8b804 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_kernel_linux.h
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_kernel_linux.h
+@@ -20,9 +20,15 @@ extern "C" {
+ #include <linux/rbtree.h>
+ #include "mali_kernel_license.h"
+ #include "mali_osk_types.h"
++#include <linux/version.h>
+ 
+ extern struct platform_device *mali_platform_device;
+ 
++/* After 3.19.0 kenrel droped CONFIG_PM_RUNTIME define,define by ourself */
++#if defined(CONFIG_PM) && LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
++#define CONFIG_PM_RUNTIME 1
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory.c b/drivers/gpu/arm/mali400/mali/linux/mali_memory.c
+index c45f6ee25887..1e57bd674042 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory.c
+@@ -120,8 +120,7 @@ static int mali_mem_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 			return VM_FAULT_LOCKED;
+ 		}
+ 	} else {
+-		MALI_DEBUG_ASSERT(0);
+-		/*NOT support yet*/
++		MALI_PRINT_ERROR(("Mali vma fault! It never happen, indicating some logic errors in caller.\n"));
+ 	}
+ 	return VM_FAULT_NOPAGE;
+ }
+@@ -247,7 +246,8 @@ int mali_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		ret = 0;
+ 	} else {
+ 		/* Not support yet*/
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of backend memory! \n"));
++		return -EFAULT;
+ 	}
+ 
+ 	if (ret != 0) {
+@@ -346,6 +346,13 @@ _mali_osk_errcode_t mali_memory_session_begin(struct mali_session_data *session_
+ 		MALI_ERROR(_MALI_OSK_ERR_FAULT);
+ 	}
+ 
++	session_data->cow_lock = _mali_osk_mutex_init(_MALI_OSK_LOCKFLAG_UNORDERED, 0);
++	if (NULL == session_data->cow_lock) {
++		_mali_osk_mutex_term(session_data->memory_lock);
++		_mali_osk_free(session_data);
++		MALI_ERROR(_MALI_OSK_ERR_FAULT);
++	}
++
+ 	mali_memory_manager_init(&session_data->allocation_mgr);
+ 
+ 	MALI_DEBUG_PRINT(5, ("MMU session begin: success\n"));
+@@ -367,7 +374,7 @@ void mali_memory_session_end(struct mali_session_data *session)
+ 
+ 	/* Free the lock */
+ 	_mali_osk_mutex_term(session->memory_lock);
+-
++	_mali_osk_mutex_term(session->cow_lock);
+ 	return;
+ }
+ 
+@@ -425,8 +432,9 @@ void _mali_page_node_ref(struct mali_page_node *node)
+ 		mali_mem_block_add_ref(node);
+ 	} else if (node->type == MALI_PAGE_NODE_SWAP) {
+ 		atomic_inc(&node->swap_it->ref_count);
+-	} else
+-		MALI_DEBUG_ASSERT(0);
++	} else {
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of mali page node! \n"));
++	}
+ }
+ 
+ void _mali_page_node_unref(struct mali_page_node *node)
+@@ -436,8 +444,9 @@ void _mali_page_node_unref(struct mali_page_node *node)
+ 		put_page(node->page);
+ 	} else if (node->type == MALI_PAGE_NODE_BLOCK) {
+ 		mali_mem_block_dec_ref(node);
+-	} else
+-		MALI_DEBUG_ASSERT(0);
++	} else {
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of mali page node! \n"));
++	}
+ }
+ 
+ 
+@@ -471,7 +480,7 @@ int _mali_page_node_get_ref_count(struct mali_page_node *node)
+ 	} else if (node->type == MALI_PAGE_NODE_SWAP) {
+ 		return atomic_read(&node->swap_it->ref_count);
+ 	} else {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of mali page node! \n"));
+ 	}
+ 	return -1;
+ }
+@@ -486,7 +495,7 @@ dma_addr_t _mali_page_node_get_dma_addr(struct mali_page_node *node)
+ 	} else if (node->type == MALI_PAGE_NODE_SWAP) {
+ 		return node->swap_it->dma_addr;
+ 	} else {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of mali page node! \n"));
+ 	}
+ 	return 0;
+ }
+@@ -502,7 +511,7 @@ unsigned long _mali_page_node_get_pfn(struct mali_page_node *node)
+ 	} else if (node->type == MALI_PAGE_NODE_SWAP) {
+ 		return page_to_pfn(node->swap_it->page);
+ 	} else {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid type of mali page node! \n"));
+ 	}
+ 	return 0;
+ }
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory_cow.c b/drivers/gpu/arm/mali400/mali/linux/mali_memory_cow.c
+index bcd0f8713771..65fb38b327b8 100644
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory_cow.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory_cow.c
+@@ -117,7 +117,7 @@ _mali_osk_errcode_t mali_memory_cow_os_memory(mali_mem_backend *target_bk,
+ 	pages = _mali_memory_cow_get_node_list(target_bk, target_offset, target_size);
+ 
+ 	if (NULL == pages) {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("No memory page  need to cow ! \n"));
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 
+@@ -195,7 +195,7 @@ _mali_osk_errcode_t mali_memory_cow_swap_memory(mali_mem_backend *target_bk,
+ 
+ 	pages = _mali_memory_cow_get_node_list(target_bk, target_offset, target_size);
+ 	if (NULL == pages) {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("No swap memory page need to cow ! \n"));
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 
+@@ -290,6 +290,7 @@ _mali_osk_errcode_t mali_memory_cow_modify_range(mali_mem_backend *backend,
+ 		u32 range_size)
+ {
+ 	mali_mem_allocation *alloc = NULL;
++	struct mali_session_data *session;
+ 	mali_mem_cow *cow = &backend->cow_mem;
+ 	struct mali_page_node *m_page, *m_tmp;
+ 	LIST_HEAD(pages);
+@@ -304,6 +305,9 @@ _mali_osk_errcode_t mali_memory_cow_modify_range(mali_mem_backend *backend,
+ 	alloc = backend->mali_allocation;
+ 	MALI_DEBUG_ASSERT_POINTER(alloc);
+ 
++	session = alloc->session;
++	MALI_DEBUG_ASSERT_POINTER(session);
++
+ 	MALI_DEBUG_ASSERT(MALI_MEM_COW == backend->type);
+ 	MALI_DEBUG_ASSERT(((range_start + range_size) / _MALI_OSK_MALI_PAGE_SIZE) <= cow->count);
+ 
+@@ -324,10 +328,13 @@ _mali_osk_errcode_t mali_memory_cow_modify_range(mali_mem_backend *backend,
+ 				if (1 != _mali_page_node_get_ref_count(m_page))
+ 					change_pages_nr++;
+ 				/* unref old page*/
++				_mali_osk_mutex_wait(session->cow_lock);
+ 				if (_mali_mem_put_page_node(m_page)) {
+ 					__free_page(new_page);
++					_mali_osk_mutex_signal(session->cow_lock);
+ 					goto error;
+ 				}
++				_mali_osk_mutex_signal(session->cow_lock);
+ 				/* add new page*/
+ 				/* always use OS for COW*/
+ 				m_page->type = MALI_PAGE_NODE_OS;
+@@ -448,19 +455,23 @@ _mali_osk_errcode_t mali_memory_do_cow(mali_mem_backend *target_bk,
+ 		break;
+ 	case MALI_MEM_EXTERNAL:
+ 		/*NOT support yet*/
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("External physical memory not supported ! \n"));
++		return _MALI_OSK_ERR_UNSUPPORTED;
+ 		break;
+ 	case MALI_MEM_DMA_BUF:
+ 		/*NOT support yet*/
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("DMA buffer not supported ! \n"));
++		return _MALI_OSK_ERR_UNSUPPORTED;
+ 		break;
+ 	case MALI_MEM_UMP:
+ 		/*NOT support yet*/
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("UMP buffer not supported ! \n"));
++		return _MALI_OSK_ERR_UNSUPPORTED;
+ 		break;
+ 	default:
+ 		/*Not support yet*/
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid memory type not supported ! \n"));
++		return _MALI_OSK_ERR_UNSUPPORTED;
+ 		break;
+ 	}
+ 	return _MALI_OSK_ERR_OK;
+@@ -582,18 +593,25 @@ _mali_osk_errcode_t mali_mem_cow_cpu_map_pages_locked(mali_mem_backend *mem_bken
+ u32 mali_mem_cow_release(mali_mem_backend *mem_bkend, mali_bool is_mali_mapped)
+ {
+ 	mali_mem_allocation *alloc;
++	struct mali_session_data *session;
+ 	u32 free_pages_nr = 0;
+ 	MALI_DEBUG_ASSERT_POINTER(mem_bkend);
+ 	MALI_DEBUG_ASSERT(MALI_MEM_COW == mem_bkend->type);
+ 	alloc = mem_bkend->mali_allocation;
+ 	MALI_DEBUG_ASSERT_POINTER(alloc);
+ 
++	 session = alloc->session;
++	 MALI_DEBUG_ASSERT_POINTER(session);
++
+ 	if (MALI_MEM_BACKEND_FLAG_SWAP_COWED != (MALI_MEM_BACKEND_FLAG_SWAP_COWED & mem_bkend->flags)) {
+ 		/* Unmap the memory from the mali virtual address space. */
+ 		if (MALI_TRUE == is_mali_mapped)
+ 			mali_mem_os_mali_unmap(alloc);
+ 		/* free cow backend list*/
++		_mali_osk_mutex_wait(session->cow_lock);
+ 		free_pages_nr = mali_mem_os_free(&mem_bkend->cow_mem.pages, mem_bkend->cow_mem.count, MALI_TRUE);
++		_mali_osk_mutex_signal(session->cow_lock);
++
+ 		free_pages_nr += mali_mem_block_free_list(&mem_bkend->cow_mem.pages);
+ 
+ 		MALI_DEBUG_ASSERT(list_empty(&mem_bkend->cow_mem.pages));
+@@ -736,11 +754,15 @@ _mali_osk_errcode_t mali_mem_cow_allocate_on_demand(mali_mem_backend *mem_bkend,
+ 		}
+ 		mem_bkend->cow_mem.change_pages_nr++;
+ 	}
++
++	_mali_osk_mutex_wait(session->cow_lock);
+ 	if (_mali_mem_put_page_node(found_node)) {
+ 		__free_page(new_page);
+ 		kfree(new_node);
++		_mali_osk_mutex_signal(session->cow_lock);
+ 		return _MALI_OSK_ERR_NOMEM;
+ 	}
++	_mali_osk_mutex_signal(session->cow_lock);
+ 
+ 	list_replace(&found_node->list, &new_node->list);
+ 
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.c b/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.c
+index e51902f1bf65..6d84558d0fac 100644
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.c
+@@ -35,7 +35,7 @@ mali_defer_bind_manager *mali_dmem_man = NULL;
+ 
+ static u32 mali_dmem_get_gp_varying_size(struct mali_gp_job *gp_job)
+ {
+-	return gp_job->uargs.varying_memsize / _MALI_OSK_MALI_PAGE_SIZE;
++	return gp_job->required_varying_memsize / _MALI_OSK_MALI_PAGE_SIZE;
+ }
+ 
+ _mali_osk_errcode_t mali_mem_defer_bind_manager_init(void)
+@@ -108,7 +108,7 @@ _mali_osk_errcode_t mali_mem_prepare_mem_for_job(struct mali_gp_job *next_gp_job
+ 
+ 
+ /* do preparetion for allocation before defer bind */
+-_mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *alloc, struct list_head *list)
++_mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *alloc, struct list_head *list, u32 *required_varying_memsize)
+ {
+ 	mali_mem_backend *mem_bkend = NULL;
+ 	struct mali_backend_bind_list *bk_list = _mali_osk_calloc(1, sizeof(struct mali_backend_bind_list));
+@@ -121,10 +121,17 @@ _mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *
+ 	if (!(mem_bkend = idr_find(&mali_backend_idr, alloc->backend_handle))) {
+ 		MALI_DEBUG_PRINT(1, ("Can't find memory backend in defer bind!\n"));
+ 		mutex_unlock(&mali_idr_mutex);
+-		kfree(bk_list);
++		_mali_osk_free(bk_list);
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 	mutex_unlock(&mali_idr_mutex);
++
++	/* If the mem backend has already been bound, no need to bind again.*/
++	if (mem_bkend->os_mem.count > 0) {
++		_mali_osk_free(bk_list);
++		return _MALI_OSK_ERR_OK;
++	}
++
+ 	MALI_DEBUG_PRINT(4, ("bind_allocation_prepare:: allocation =%x vaddr=0x%x!\n", alloc, alloc->mali_vma_node.vm_node.start));
+ 
+ 	INIT_LIST_HEAD(&mem_bkend->os_mem.pages);
+@@ -133,6 +140,7 @@ _mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *
+ 	bk_list->vaddr = alloc->mali_vma_node.vm_node.start;
+ 	bk_list->session = alloc->session;
+ 	bk_list->page_num = mem_bkend->size / _MALI_OSK_MALI_PAGE_SIZE;
++	*required_varying_memsize +=  mem_bkend->size;
+ 	MALI_DEBUG_ASSERT(mem_bkend->type == MALI_MEM_OS);
+ 
+ 	/* add to job to do list */
+@@ -196,13 +204,18 @@ static struct list_head *mali_mem_defer_get_free_page_list(u32 count, struct lis
+ @ pages page list to do this bind
+ @ count number of pages
+ */
+-_mali_osk_errcode_t mali_mem_defer_bind(u32 count, struct mali_gp_job *gp,
++_mali_osk_errcode_t mali_mem_defer_bind(struct mali_gp_job *gp,
+ 					struct mali_defer_mem_block *dmem_block)
+ {
+ 	struct mali_defer_mem *dmem = NULL;
+ 	struct mali_backend_bind_list *bkn, *bkn_tmp;
+ 	LIST_HEAD(pages);
+ 
++	if (gp->required_varying_memsize != (atomic_read(&dmem_block->num_free_pages) * _MALI_OSK_MALI_PAGE_SIZE)) {
++		MALI_DEBUG_PRINT_ERROR(("#BIND:  The memsize of varying buffer not match to the pagesize of the dmem_block!!## \n"));
++		return _MALI_OSK_ERR_FAULT;
++	}
++
+ 	MALI_DEBUG_PRINT(4, ("#BIND: GP job=%x## \n", gp));
+ 	dmem = (mali_defer_mem *)_mali_osk_calloc(1, sizeof(struct mali_defer_mem));
+ 	if (dmem) {
+@@ -222,13 +235,16 @@ _mali_osk_errcode_t mali_mem_defer_bind(u32 count, struct mali_gp_job *gp,
+ 			_mali_osk_free(bkn);
+ 		} else {
+ 			/* not enough memory will not happen */
+-			MALI_DEBUG_PRINT(1, ("#BIND: NOT enough memory when binded !!## \n"));
+-			MALI_DEBUG_ASSERT(0);
++			MALI_DEBUG_PRINT_ERROR(("#BIND: NOT enough memory when binded !!## \n"));
++			_mali_osk_free(gp->dmem);
++			return _MALI_OSK_ERR_NOMEM;
+ 		}
+ 	}
+ 
+ 	if (!list_empty(&gp->vary_todo)) {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("#BIND:  The deferbind backend list isn't empty !!## \n"));
++		_mali_osk_free(gp->dmem);
++		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 
+ 	dmem->flag = MALI_DEFER_BIND_MEMORY_BINDED;
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.h b/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.h
+index ef67540434f5..98f6bebde995 100644
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.h
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory_defer_bind.h
+@@ -56,9 +56,8 @@ typedef struct mali_defer_bind_manager {
+ 
+ _mali_osk_errcode_t mali_mem_defer_bind_manager_init(void);
+ void mali_mem_defer_bind_manager_destory(void);
+-_mali_osk_errcode_t mali_mem_defer_bind(u32 count, struct mali_gp_job *gp,
+-					struct mali_defer_mem_block *dmem_block);
+-_mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *alloc, struct list_head *list);
++_mali_osk_errcode_t mali_mem_defer_bind(struct mali_gp_job *gp, struct mali_defer_mem_block *dmem_block);
++_mali_osk_errcode_t mali_mem_defer_bind_allocation_prepare(mali_mem_allocation *alloc, struct list_head *list,  u32 *required_varying_memsize);
+ _mali_osk_errcode_t mali_mem_prepare_mem_for_job(struct mali_gp_job *next_gp_job, mali_defer_mem_block *dblock);
+ void mali_mem_defer_dmem_free(struct mali_gp_job *gp);
+ 
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory_manager.c b/drivers/gpu/arm/mali400/mali/linux/mali_memory_manager.c
+index 55e2c092d597..b7479940f461 100644
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory_manager.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory_manager.c
+@@ -413,7 +413,7 @@ _mali_osk_errcode_t _mali_ukk_mem_allocate(_mali_uk_alloc_mem_s *args)
+ 	mali_vma_node = mali_vma_offset_search(&session->allocation_mgr, args->gpu_vaddr, 0);
+ 
+ 	if (unlikely(mali_vma_node)) {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("The mali virtual address has already been used ! \n"));
+ 		return _MALI_OSK_ERR_FAULT;
+ 	}
+ 	/**
+@@ -680,7 +680,8 @@ _mali_osk_errcode_t _mali_ukk_mem_bind(_mali_uk_bind_mem_s *args)
+ 		break;
+ 	case _MALI_MEMORY_BIND_BACKEND_MALI_MEMORY:
+ 		/* not allowed */
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Mali internal memory type not supported !\n"));
++		goto Failed_bind_backend;
+ 		break;
+ 
+ 	case _MALI_MEMORY_BIND_BACKEND_EXTERNAL_MEMORY:
+@@ -696,11 +697,13 @@ _mali_osk_errcode_t _mali_ukk_mem_bind(_mali_uk_bind_mem_s *args)
+ 
+ 	case _MALI_MEMORY_BIND_BACKEND_EXT_COW:
+ 		/* not allowed */
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("External cow memory  type not supported !\n"));
++		goto Failed_bind_backend;
+ 		break;
+ 
+ 	default:
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("Invalid memory type  not supported !\n"));
++		goto Failed_bind_backend;
+ 		break;
+ 	}
+ 	MALI_DEBUG_ASSERT(0 == mem_backend->size % MALI_MMU_PAGE_SIZE);
+@@ -779,7 +782,7 @@ _mali_osk_errcode_t _mali_ukk_mem_cow(_mali_uk_cow_mem_s *args)
+ 	mali_vma_node = mali_vma_offset_search(&session->allocation_mgr, args->vaddr, 0);
+ 
+ 	if (unlikely(mali_vma_node)) {
+-		MALI_DEBUG_ASSERT(0);
++		MALI_DEBUG_PRINT_ERROR(("The mali virtual address has already been used ! \n"));
+ 		return ret;
+ 	}
+ 
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_memory_os_alloc.c b/drivers/gpu/arm/mali400/mali/linux/mali_memory_os_alloc.c
+index 1a6cc0649421..90bc2f6d83f5 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_memory_os_alloc.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_memory_os_alloc.c
+@@ -449,6 +449,7 @@ u32 mali_mem_os_release(mali_mem_backend *mem_bkend)
+ {
+ 
+ 	mali_mem_allocation *alloc;
++	struct mali_session_data *session;
+ 	u32 free_pages_nr = 0;
+ 	MALI_DEBUG_ASSERT_POINTER(mem_bkend);
+ 	MALI_DEBUG_ASSERT(MALI_MEM_OS == mem_bkend->type);
+@@ -456,12 +457,18 @@ u32 mali_mem_os_release(mali_mem_backend *mem_bkend)
+ 	alloc = mem_bkend->mali_allocation;
+ 	MALI_DEBUG_ASSERT_POINTER(alloc);
+ 
++	session = alloc->session;
++	MALI_DEBUG_ASSERT_POINTER(session);
++
+ 	/* Unmap the memory from the mali virtual address space. */
+ 	mali_mem_os_mali_unmap(alloc);
+ 	mutex_lock(&mem_bkend->mutex);
+ 	/* Free pages */
+ 	if (MALI_MEM_BACKEND_FLAG_COWED & mem_bkend->flags) {
++		/* Lock to avoid the free race condition for the cow shared memory page node. */
++		_mali_osk_mutex_wait(session->cow_lock);
+ 		free_pages_nr = mali_mem_os_free(&mem_bkend->os_mem.pages, mem_bkend->os_mem.count, MALI_TRUE);
++		_mali_osk_mutex_signal(session->cow_lock);
+ 	} else {
+ 		free_pages_nr = mali_mem_os_free(&mem_bkend->os_mem.pages, mem_bkend->os_mem.count, MALI_FALSE);
+ 	}
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_osk_pm.c b/drivers/gpu/arm/mali400/mali/linux/mali_osk_pm.c
+index 21180d33fe75..860ce925e77f 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_osk_pm.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_osk_pm.c
+@@ -15,6 +15,7 @@
+ 
+ #include <linux/sched.h>
+ 
++#include "mali_kernel_linux.h"
+ #ifdef CONFIG_PM_RUNTIME
+ #include <linux/pm_runtime.h>
+ #endif /* CONFIG_PM_RUNTIME */
+@@ -22,7 +23,6 @@
+ #include <linux/version.h>
+ #include "mali_osk.h"
+ #include "mali_kernel_common.h"
+-#include "mali_kernel_linux.h"
+ 
+ /* Can NOT run in atomic context */
+ _mali_osk_errcode_t _mali_osk_pm_dev_ref_get_sync(void)
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_osk_profiling.c b/drivers/gpu/arm/mali400/mali/linux/mali_osk_profiling.c
+index cc09748e7316..0201e1ab56c2 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_osk_profiling.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_osk_profiling.c
+@@ -254,7 +254,8 @@ static u32 _mali_profiling_read_packet_int(unsigned char *const buf, u32 *const
+ 	u8 byte_value = ~0;
+ 
+ 	while ((byte_value & 0x80) != 0) {
+-		MALI_DEBUG_ASSERT((*pos) < packet_size);
++		if ((*pos) >= packet_size);
++		return -1;
+ 		byte_value = buf[*pos];
+ 		*pos += 1;
+ 		int_value |= (u32)(byte_value & 0x7f) << shift;
+@@ -283,7 +284,8 @@ static u32 _mali_profiling_pack_int(u8 *const buf, u32 const buf_size, u32 const
+ 			byte_value |= 0x80;
+ 		}
+ 
+-		MALI_DEBUG_ASSERT((pos + add_bytes) < buf_size);
++		if ((pos + add_bytes) >= buf_size)
++			return 0;
+ 		buf[pos + add_bytes] = byte_value;
+ 		add_bytes++;
+ 	}
+@@ -914,6 +916,9 @@ _mali_osk_errcode_t _mali_ukk_profiling_control_set(_mali_uk_profiling_control_s
+ 			}
+ 
+ 			/* Send supported counters */
++			if (PACKET_HEADER_SIZE > output_buffer_size)
++				return _MALI_OSK_ERR_FAULT;
++
+ 			*response_packet_data = PACKET_HEADER_COUNTERS_ACK;
+ 			args->response_packet_size = PACKET_HEADER_SIZE;
+ 
+@@ -983,16 +988,21 @@ _mali_osk_errcode_t _mali_ukk_profiling_control_set(_mali_uk_profiling_control_s
+ 				u32 event;
+ 				u32 key;
+ 
++				/* Check the counter name which should be ended with null */
+ 				while (request_pos < control_packet_size && control_packet_data[request_pos] != '\0') {
+ 					++request_pos;
+ 				}
+ 
++				if (request_pos >= control_packet_size)
++					return _MALI_OSK_ERR_FAULT;
++
+ 				++request_pos;
+ 				event = _mali_profiling_read_packet_int(control_packet_data, &request_pos, control_packet_size);
+ 				key = _mali_profiling_read_packet_int(control_packet_data, &request_pos, control_packet_size);
+ 
+ 				for (i = 0; i < num_global_mali_profiling_counters; ++i) {
+ 					u32 name_size = strlen((char *)(control_packet_data + begin));
++
+ 					if (strncmp(global_mali_profiling_counters[i].counter_name, (char *)(control_packet_data + begin), name_size) == 0) {
+ 						if (!sw_counter_if_enabled && (FIRST_SW_COUNTER <= global_mali_profiling_counters[i].counter_id
+ 									       && global_mali_profiling_counters[i].counter_id <= LAST_SW_COUNTER)) {
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_ukk_profiling.c b/drivers/gpu/arm/mali400/mali/linux/mali_ukk_profiling.c
+index e84544dee07d..4f8bc92a2e02 100755
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_ukk_profiling.c
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_ukk_profiling.c
+@@ -120,15 +120,21 @@ int profiling_control_set_wrapper(struct mali_session_data *session_data, _mali_
+ 
+ 	kargs.ctx = (uintptr_t)session_data;
+ 
++	
++	/* Sanity check about the size */
++	if (kargs.control_packet_size > PAGE_SIZE || kargs.response_packet_size > PAGE_SIZE)
++		return -EINVAL;
++
+ 	if (0 !=  kargs.control_packet_size) {
+ 
++		if (0 == kargs.response_packet_size)
++			return -EINVAL;
++
+ 		kernel_control_data = _mali_osk_calloc(1, kargs.control_packet_size);
+ 		if (NULL == kernel_control_data) {
+ 			return -ENOMEM;
+ 		}
+ 
+-		MALI_DEBUG_ASSERT(0 != kargs.response_packet_size);
+-
+ 		kernel_response_data = _mali_osk_calloc(1, kargs.response_packet_size);
+ 		if (NULL == kernel_response_data) {
+ 			_mali_osk_free(kernel_control_data);
+diff --git a/drivers/gpu/arm/mali400/mali/platform/arm/arm.c b/drivers/gpu/arm/mali400/mali/platform/arm/arm.c
+index 41ad63c0793b..011f242071d2 100755
+--- a/drivers/gpu/arm/mali400/mali/platform/arm/arm.c
++++ b/drivers/gpu/arm/mali400/mali/platform/arm/arm.c
+@@ -17,6 +17,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/version.h>
+ #include <linux/pm.h>
++#include "mali_kernel_linux.h"
+ #ifdef CONFIG_PM_RUNTIME
+ #include <linux/pm_runtime.h>
+ #endif
+diff --git a/drivers/gpu/arm/mali400/ump/linux/ump_ioctl.h b/drivers/gpu/arm/mali400/ump/linux/ump_ioctl.h
+index 2a640e35c384..70db873c3d3b 100755
+--- a/drivers/gpu/arm/mali400/ump/linux/ump_ioctl.h
++++ b/drivers/gpu/arm/mali400/ump/linux/ump_ioctl.h
+@@ -6,7 +6,7 @@
+  * 
+  * A copy of the licence is included with the program, and can also be obtained from Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+-
++ 
+  * Class Path Exception
+  * Linking this library statically or dynamically with other modules is making a combined work based on this library. 
+  * Thus, the terms and conditions of the GNU General Public License cover the whole combination.
+-- 
+2.35.3
+

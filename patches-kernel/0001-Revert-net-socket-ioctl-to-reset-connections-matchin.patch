@@ -1,0 +1,155 @@
+From 701364a426862939963d129caf7f2a9d2a37b25a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Sat, 30 Jul 2011 22:57:37 +0800
+Subject: [PATCH] Revert "net: socket ioctl to reset connections matching local
+ address"
+
+This reverts commit e97bf10949b28a6815f149fb06167409bd86a297.
+---
+ include/linux/sockios.h |  1 -
+ include/net/tcp.h       |  2 --
+ net/ipv4/af_inet.c      |  1 -
+ net/ipv4/devinet.c      |  9 +--------
+ net/ipv4/tcp_ipv4.c     | 44 +----------------------------------------
+ 5 files changed, 2 insertions(+), 55 deletions(-)
+
+diff --git a/include/linux/sockios.h b/include/linux/sockios.h
+index f4fa1a164c74..241f179347d9 100644
+--- a/include/linux/sockios.h
++++ b/include/linux/sockios.h
+@@ -65,7 +65,6 @@
+ #define SIOCDIFADDR	0x8936		/* delete PA address		*/
+ #define	SIOCSIFHWBROADCAST	0x8937	/* set hardware broadcast addr	*/
+ #define SIOCGIFCOUNT	0x8938		/* get number of devices */
+-#define SIOCKILLADDR	0x8939		/* kill sockets with this local addr */
+ 
+ #define SIOCGIFBR	0x8940		/* Bridging support		*/
+ #define SIOCSIFBR	0x8941		/* Set bridging options 	*/
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 5b0761e2b565..03a49c703377 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1443,8 +1443,6 @@ extern struct sk_buff **tcp4_gro_receive(struct sk_buff **head,
+ extern int tcp_gro_complete(struct sk_buff *skb);
+ extern int tcp4_gro_complete(struct sk_buff *skb);
+ 
+-extern void tcp_v4_nuke_addr(__u32 saddr);
+-
+ #ifdef CONFIG_PROC_FS
+ extern int  tcp4_proc_init(void);
+ extern void tcp4_proc_exit(void);
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 941d9752a3c1..b395f7d34bd3 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -865,7 +865,6 @@ int inet_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
+ 	case SIOCSIFPFLAGS:
+ 	case SIOCGIFPFLAGS:
+ 	case SIOCSIFFLAGS:
+-	case SIOCKILLADDR:
+ 		err = devinet_ioctl(net, cmd, (void __user *)arg);
+ 		break;
+ 	default:
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index d32da9ad500d..5df2f6a0b0f0 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -57,7 +57,6 @@
+ 
+ #include <net/arp.h>
+ #include <net/ip.h>
+-#include <net/tcp.h>
+ #include <net/route.h>
+ #include <net/ip_fib.h>
+ #include <net/rtnetlink.h>
+@@ -632,7 +631,6 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 	case SIOCSIFBRDADDR:	/* Set the broadcast address */
+ 	case SIOCSIFDSTADDR:	/* Set the destination address */
+ 	case SIOCSIFNETMASK: 	/* Set the netmask for the interface */
+-	case SIOCKILLADDR:	/* Nuke all sockets on this address */
+ 		ret = -EACCES;
+ 		if (!capable(CAP_NET_ADMIN))
+ 			goto out;
+@@ -682,8 +680,7 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 	}
+ 
+ 	ret = -EADDRNOTAVAIL;
+-	if (!ifa && cmd != SIOCSIFADDR && cmd != SIOCSIFFLAGS
+-	    && cmd != SIOCKILLADDR)
++	if (!ifa && cmd != SIOCSIFADDR && cmd != SIOCSIFFLAGS)
+ 		goto done;
+ 
+ 	switch (cmd) {
+@@ -807,10 +804,6 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 			inet_insert_ifa(ifa);
+ 		}
+ 		break;
+-	case SIOCKILLADDR:	/* Nuke all connections on this address */
+-		ret = 0;
+-		tcp_v4_nuke_addr(sin->sin_addr.s_addr);
+-		break;
+ 	}
+ done:
+ 	rtnl_unlock();
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 315805d1cedc..7cda24b53f61 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1884,49 +1884,6 @@ void tcp_v4_destroy_sock(struct sock *sk)
+ 
+ EXPORT_SYMBOL(tcp_v4_destroy_sock);
+ 
+-/*
+- * tcp_v4_nuke_addr - destroy all sockets on the given local address
+- */
+-void tcp_v4_nuke_addr(__u32 saddr)
+-{
+-	unsigned int bucket;
+-
+-	for (bucket = 0; bucket < tcp_hashinfo.ehash_size; bucket++) {
+-		struct hlist_nulls_node *node;
+-		struct sock *sk;
+-		spinlock_t *lock = inet_ehash_lockp(&tcp_hashinfo, bucket);
+-
+-restart:
+-		spin_lock_bh(lock);
+-		sk_nulls_for_each(sk, node, &tcp_hashinfo.ehash[bucket].chain) {
+-			struct inet_sock *inet = inet_sk(sk);
+-
+-			if (inet->rcv_saddr != saddr)
+-				continue;
+-			if (sysctl_ip_dynaddr && sk->sk_state == TCP_SYN_SENT)
+-				continue;
+-			if (sock_flag(sk, SOCK_DEAD))
+-				continue;
+-
+-			sock_hold(sk);
+-			spin_unlock_bh(lock);
+-
+-			local_bh_disable();
+-			bh_lock_sock(sk);
+-			sk->sk_err = ETIMEDOUT;
+-			sk->sk_error_report(sk);
+-
+-			tcp_done(sk);
+-			bh_unlock_sock(sk);
+-			local_bh_enable();
+-			sock_put(sk);
+-
+-			goto restart;
+-		}
+-		spin_unlock_bh(lock);
+-	}
+-}
+-
+ #ifdef CONFIG_PROC_FS
+ /* Proc filesystem TCP sock list dumping. */
+ 
+@@ -2536,3 +2493,4 @@ EXPORT_SYMBOL(tcp_proc_register);
+ EXPORT_SYMBOL(tcp_proc_unregister);
+ #endif
+ EXPORT_SYMBOL(sysctl_tcp_low_latency);
++
+-- 
+2.35.3
+

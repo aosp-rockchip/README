@@ -1,0 +1,573 @@
+From 8295095b48937dd682891e0193f96194750bca74 Mon Sep 17 00:00:00 2001
+From: "Huang, Tao" <huangtao@rock-chips.com>
+Date: Wed, 11 Nov 2015 14:26:59 +0800
+Subject: [PATCH] Revert "regulator: core: Split devres code out into a
+ separate file"
+
+This reverts commit 85815b087b38caefb0d8e2fdc33d19db05f52a9f.
+---
+ drivers/regulator/Makefile         |   2 +-
+ drivers/regulator/core.c           | 153 ++++++++++++++----
+ drivers/regulator/devres.c         | 252 -----------------------------
+ drivers/regulator/internal.h       |  38 -----
+ include/linux/regulator/consumer.h |   9 --
+ 5 files changed, 124 insertions(+), 330 deletions(-)
+ delete mode 100644 drivers/regulator/devres.c
+ delete mode 100644 drivers/regulator/internal.h
+
+diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index b51e806218ca..16b342805211 100644
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -3,7 +3,7 @@
+ #
+ 
+ 
+-obj-$(CONFIG_REGULATOR) += core.o dummy.o fixed-helper.o  devres.o
++obj-$(CONFIG_REGULATOR) += core.o dummy.o fixed-helper.o
+ obj-$(CONFIG_OF) += of_regulator.o
+ obj-$(CONFIG_REGULATOR_FIXED_VOLTAGE) += fixed.o
+ obj-$(CONFIG_REGULATOR_VIRTUAL_CONSUMER) += virtual.o
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 9d2873e9963c..82fa39969a37 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -36,7 +36,6 @@
+ #include <trace/events/regulator.h>
+ 
+ #include "dummy.h"
+-#include "internal.h"
+ 
+ #define rdev_crit(rdev, fmt, ...)					\
+ 	pr_crit("%s: " fmt, rdev_get_name(rdev), ##__VA_ARGS__)
+@@ -83,6 +82,25 @@ struct regulator_enable_gpio {
+ 	unsigned int ena_gpio_invert:1;
+ };
+ 
++/*
++ * struct regulator
++ *
++ * One for each consumer device.
++ */
++struct regulator {
++	struct device *dev;
++	struct list_head list;
++	unsigned int always_on:1;
++	unsigned int bypass:1;
++	int uA_load;
++	int min_uV;
++	int max_uV;
++	char *supply_name;
++	struct device_attribute dev_attr;
++	struct regulator_dev *rdev;
++	struct dentry *debugfs;
++};
++
+ static int _regulator_is_enabled(struct regulator_dev *rdev);
+ static int _regulator_disable(struct regulator_dev *rdev);
+ static int _regulator_get_voltage(struct regulator_dev *rdev);
+@@ -1337,34 +1355,36 @@ static void devm_regulator_release(struct device *dev, void *res)
+ }
+ 
+ /**
+- * regulator_get_exclusive - obtain exclusive access to a regulator.
++ * devm_regulator_get - Resource managed regulator_get()
+  * @dev: device for regulator "consumer"
+  * @id: Supply name or regulator ID.
+  *
+- * Returns a struct regulator corresponding to the regulator producer,
+- * or IS_ERR() condition containing errno.  Other consumers will be
+- * unable to obtain this reference is held and the use count for the
+- * regulator will be initialised to reflect the current state of the
+- * regulator.
+- *
+- * This is intended for use by consumers which cannot tolerate shared
+- * use of the regulator such as those which need to force the
+- * regulator off for correct operation of the hardware they are
+- * controlling.
+- *
+- * Use of supply names configured via regulator_set_device_supply() is
+- * strongly encouraged.  It is recommended that the supply name used
+- * should match the name used for the supply and/or the relevant
+- * device pins in the datasheet.
++ * Managed regulator_get(). Regulators returned from this function are
++ * automatically regulator_put() on driver detach. See regulator_get() for more
++ * information.
+  */
+-struct regulator *regulator_get_exclusive(struct device *dev, const char *id)
++struct regulator *devm_regulator_get(struct device *dev, const char *id)
+ {
+-	return _regulator_get(dev, id, 1);
++	struct regulator **ptr, *regulator;
++
++	ptr = devres_alloc(devm_regulator_release, sizeof(*ptr), GFP_KERNEL);
++	if (!ptr)
++		return ERR_PTR(-ENOMEM);
++
++	regulator = regulator_get(dev, id);
++	if (!IS_ERR(regulator)) {
++		*ptr = regulator;
++		devres_add(dev, ptr);
++	} else {
++		devres_free(ptr);
++	}
++
++	return regulator;
+ }
+-EXPORT_SYMBOL_GPL(regulator_get_exclusive);
++EXPORT_SYMBOL_GPL(devm_regulator_get);
+ 
+ /**
+- * regulator_get_optional - obtain optional access to a regulator.
++ * regulator_get_exclusive - obtain exclusive access to a regulator.
+  * @dev: device for regulator "consumer"
+  * @id: Supply name or regulator ID.
+  *
+@@ -1374,23 +1394,21 @@ EXPORT_SYMBOL_GPL(regulator_get_exclusive);
+  * regulator will be initialised to reflect the current state of the
+  * regulator.
+  *
+- * This is intended for use by consumers for devices which can have
+- * some supplies unconnected in normal use, such as some MMC devices.
+- * It can allow the regulator core to provide stub supplies for other
+- * supplies requested using normal regulator_get() calls without
+- * disrupting the operation of drivers that can handle absent
+- * supplies.
++ * This is intended for use by consumers which cannot tolerate shared
++ * use of the regulator such as those which need to force the
++ * regulator off for correct operation of the hardware they are
++ * controlling.
+  *
+  * Use of supply names configured via regulator_set_device_supply() is
+  * strongly encouraged.  It is recommended that the supply name used
+  * should match the name used for the supply and/or the relevant
+  * device pins in the datasheet.
+  */
+-struct regulator *regulator_get_optional(struct device *dev, const char *id)
++struct regulator *regulator_get_exclusive(struct device *dev, const char *id)
+ {
+-	return _regulator_get(dev, id, 0);
++	return _regulator_get(dev, id, 1);
+ }
+-EXPORT_SYMBOL_GPL(regulator_get_optional);
++EXPORT_SYMBOL_GPL(regulator_get_exclusive);
+ 
+ /* regulator_list_mutex lock held by regulator_put() */
+ static void _regulator_put(struct regulator *regulator)
+@@ -1435,6 +1453,35 @@ void regulator_put(struct regulator *regulator)
+ }
+ EXPORT_SYMBOL_GPL(regulator_put);
+ 
++static int devm_regulator_match(struct device *dev, void *res, void *data)
++{
++	struct regulator **r = res;
++	if (!r || !*r) {
++		WARN_ON(!r || !*r);
++		return 0;
++	}
++	return *r == data;
++}
++
++/**
++ * devm_regulator_put - Resource managed regulator_put()
++ * @regulator: regulator to free
++ *
++ * Deallocate a regulator allocated with devm_regulator_get(). Normally
++ * this function will not need to be called and the resource management
++ * code will ensure that the resource is freed.
++ */
++void devm_regulator_put(struct regulator *regulator)
++{
++	int rc;
++
++	rc = devres_release(regulator->dev, devm_regulator_release,
++			    devm_regulator_match, regulator);
++	if (rc != 0)
++		WARN_ON(rc);
++}
++EXPORT_SYMBOL_GPL(devm_regulator_put);
++
+ /* Manage enable GPIO list. Same GPIO pin can be shared among regulators */
+ static int regulator_ena_gpio_request(struct regulator_dev *rdev,
+ 				const struct regulator_config *config)
+@@ -3154,6 +3201,52 @@ int regulator_bulk_get(struct device *dev, int num_consumers,
+ }
+ EXPORT_SYMBOL_GPL(regulator_bulk_get);
+ 
++/**
++ * devm_regulator_bulk_get - managed get multiple regulator consumers
++ *
++ * @dev:           Device to supply
++ * @num_consumers: Number of consumers to register
++ * @consumers:     Configuration of consumers; clients are stored here.
++ *
++ * @return 0 on success, an errno on failure.
++ *
++ * This helper function allows drivers to get several regulator
++ * consumers in one operation with management, the regulators will
++ * automatically be freed when the device is unbound.  If any of the
++ * regulators cannot be acquired then any regulators that were
++ * allocated will be freed before returning to the caller.
++ */
++int devm_regulator_bulk_get(struct device *dev, int num_consumers,
++			    struct regulator_bulk_data *consumers)
++{
++	int i;
++	int ret;
++
++	for (i = 0; i < num_consumers; i++)
++		consumers[i].consumer = NULL;
++
++	for (i = 0; i < num_consumers; i++) {
++		consumers[i].consumer = devm_regulator_get(dev,
++							   consumers[i].supply);
++		if (IS_ERR(consumers[i].consumer)) {
++			ret = PTR_ERR(consumers[i].consumer);
++			dev_err(dev, "Failed to get supply '%s': %d\n",
++				consumers[i].supply, ret);
++			consumers[i].consumer = NULL;
++			goto err;
++		}
++	}
++
++	return 0;
++
++err:
++	for (i = 0; i < num_consumers && consumers[i].consumer; i++)
++		devm_regulator_put(consumers[i].consumer);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(devm_regulator_bulk_get);
++
+ static void regulator_bulk_enable_async(void *data, async_cookie_t cookie)
+ {
+ 	struct regulator_bulk_data *bulk = data;
+diff --git a/drivers/regulator/devres.c b/drivers/regulator/devres.c
+deleted file mode 100644
+index 2672a029fa25..000000000000
+--- a/drivers/regulator/devres.c
++++ /dev/null
+@@ -1,252 +0,0 @@
+-/*
+- * devres.c  --  Voltage/Current Regulator framework devres implementation.
+- *
+- * Copyright 2013 Linaro Ltd
+- *
+- *  This program is free software; you can redistribute  it and/or modify it
+- *  under  the terms of  the GNU General  Public License as published by the
+- *  Free Software Foundation;  either version 2 of the  License, or (at your
+- *  option) any later version.
+- *
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/err.h>
+-#include <linux/regmap.h>
+-#include <linux/regulator/consumer.h>
+-#include <linux/regulator/driver.h>
+-#include <linux/module.h>
+-
+-#include "internal.h"
+-
+-enum {
+-	NORMAL_GET,
+-	EXCLUSIVE_GET,
+-	OPTIONAL_GET,
+-};
+-
+-static void devm_regulator_release(struct device *dev, void *res)
+-{
+-	regulator_put(*(struct regulator **)res);
+-}
+-
+-static struct regulator *_devm_regulator_get(struct device *dev, const char *id,
+-					     int get_type)
+-{
+-	struct regulator **ptr, *regulator;
+-
+-	ptr = devres_alloc(devm_regulator_release, sizeof(*ptr), GFP_KERNEL);
+-	if (!ptr)
+-		return ERR_PTR(-ENOMEM);
+-
+-	switch (get_type) {
+-	case NORMAL_GET:
+-		regulator = regulator_get(dev, id);
+-		break;
+-	case EXCLUSIVE_GET:
+-		regulator = regulator_get_exclusive(dev, id);
+-		break;
+-	case OPTIONAL_GET:
+-		regulator = regulator_get_optional(dev, id);
+-		break;
+-	default:
+-		regulator = ERR_PTR(-EINVAL);
+-	}
+-
+-	if (!IS_ERR(regulator)) {
+-		*ptr = regulator;
+-		devres_add(dev, ptr);
+-	} else {
+-		devres_free(ptr);
+-	}
+-
+-	return regulator;
+-}
+-
+-/**
+- * devm_regulator_get - Resource managed regulator_get()
+- * @dev: device for regulator "consumer"
+- * @id: Supply name or regulator ID.
+- *
+- * Managed regulator_get(). Regulators returned from this function are
+- * automatically regulator_put() on driver detach. See regulator_get() for more
+- * information.
+- */
+-struct regulator *devm_regulator_get(struct device *dev, const char *id)
+-{
+-	return _devm_regulator_get(dev, id, NORMAL_GET);
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_get);
+-
+-/**
+- * devm_regulator_get_exclusive - Resource managed regulator_get_exclusive()
+- * @dev: device for regulator "consumer"
+- * @id: Supply name or regulator ID.
+- *
+- * Managed regulator_get_exclusive(). Regulators returned from this function
+- * are automatically regulator_put() on driver detach. See regulator_get() for
+- * more information.
+- */
+-struct regulator *devm_regulator_get_exclusive(struct device *dev,
+-					       const char *id)
+-{
+-	return _devm_regulator_get(dev, id, EXCLUSIVE_GET);
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_get_exclusive);
+-
+-/**
+- * devm_regulator_get_optional - Resource managed regulator_get_optional()
+- * @dev: device for regulator "consumer"
+- * @id: Supply name or regulator ID.
+- *
+- * Managed regulator_get_optional(). Regulators returned from this
+- * function are automatically regulator_put() on driver detach. See
+- * regulator_get_optional() for more information.
+- */
+-struct regulator *devm_regulator_get_optional(struct device *dev,
+-					      const char *id)
+-{
+-	return _devm_regulator_get(dev, id, OPTIONAL_GET);
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_get_optional);
+-
+-static int devm_regulator_match(struct device *dev, void *res, void *data)
+-{
+-	struct regulator **r = res;
+-	if (!r || !*r) {
+-		WARN_ON(!r || !*r);
+-		return 0;
+-	}
+-	return *r == data;
+-}
+-
+-/**
+- * devm_regulator_put - Resource managed regulator_put()
+- * @regulator: regulator to free
+- *
+- * Deallocate a regulator allocated with devm_regulator_get(). Normally
+- * this function will not need to be called and the resource management
+- * code will ensure that the resource is freed.
+- */
+-void devm_regulator_put(struct regulator *regulator)
+-{
+-	int rc;
+-
+-	rc = devres_release(regulator->dev, devm_regulator_release,
+-			    devm_regulator_match, regulator);
+-	if (rc != 0)
+-		WARN_ON(rc);
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_put);
+-
+-/**
+- * devm_regulator_bulk_get - managed get multiple regulator consumers
+- *
+- * @dev:           Device to supply
+- * @num_consumers: Number of consumers to register
+- * @consumers:     Configuration of consumers; clients are stored here.
+- *
+- * @return 0 on success, an errno on failure.
+- *
+- * This helper function allows drivers to get several regulator
+- * consumers in one operation with management, the regulators will
+- * automatically be freed when the device is unbound.  If any of the
+- * regulators cannot be acquired then any regulators that were
+- * allocated will be freed before returning to the caller.
+- */
+-int devm_regulator_bulk_get(struct device *dev, int num_consumers,
+-			    struct regulator_bulk_data *consumers)
+-{
+-	int i;
+-	int ret;
+-
+-	for (i = 0; i < num_consumers; i++)
+-		consumers[i].consumer = NULL;
+-
+-	for (i = 0; i < num_consumers; i++) {
+-		consumers[i].consumer = devm_regulator_get(dev,
+-							   consumers[i].supply);
+-		if (IS_ERR(consumers[i].consumer)) {
+-			ret = PTR_ERR(consumers[i].consumer);
+-			dev_err(dev, "Failed to get supply '%s': %d\n",
+-				consumers[i].supply, ret);
+-			consumers[i].consumer = NULL;
+-			goto err;
+-		}
+-	}
+-
+-	return 0;
+-
+-err:
+-	for (i = 0; i < num_consumers && consumers[i].consumer; i++)
+-		devm_regulator_put(consumers[i].consumer);
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_bulk_get);
+-
+-static void devm_rdev_release(struct device *dev, void *res)
+-{
+-	regulator_unregister(*(struct regulator_dev **)res);
+-}
+-
+-/**
+- * devm_regulator_register - Resource managed regulator_register()
+- * @regulator_desc: regulator to register
+- * @config: runtime configuration for regulator
+- *
+- * Called by regulator drivers to register a regulator.  Returns a
+- * valid pointer to struct regulator_dev on success or an ERR_PTR() on
+- * error.  The regulator will automatically be released when the device
+- * is unbound.
+- */
+-struct regulator_dev *devm_regulator_register(struct device *dev,
+-				  const struct regulator_desc *regulator_desc,
+-				  const struct regulator_config *config)
+-{
+-	struct regulator_dev **ptr, *rdev;
+-
+-	ptr = devres_alloc(devm_rdev_release, sizeof(*ptr),
+-			   GFP_KERNEL);
+-	if (!ptr)
+-		return ERR_PTR(-ENOMEM);
+-
+-	rdev = regulator_register(regulator_desc, config);
+-	if (!IS_ERR(rdev)) {
+-		*ptr = rdev;
+-		devres_add(dev, ptr);
+-	} else {
+-		devres_free(ptr);
+-	}
+-
+-	return rdev;
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_register);
+-
+-static int devm_rdev_match(struct device *dev, void *res, void *data)
+-{
+-	struct regulator_dev **r = res;
+-	if (!r || !*r) {
+-		WARN_ON(!r || !*r);
+-		return 0;
+-	}
+-	return *r == data;
+-}
+-
+-/**
+- * devm_regulator_unregister - Resource managed regulator_unregister()
+- * @regulator: regulator to free
+- *
+- * Unregister a regulator registered with devm_regulator_register().
+- * Normally this function will not need to be called and the resource
+- * management code will ensure that the resource is freed.
+- */
+-void devm_regulator_unregister(struct device *dev, struct regulator_dev *rdev)
+-{
+-	int rc;
+-
+-	rc = devres_release(dev, devm_rdev_release, devm_rdev_match, rdev);
+-	if (rc != 0)
+-		WARN_ON(rc);
+-}
+-EXPORT_SYMBOL_GPL(devm_regulator_unregister);
+diff --git a/drivers/regulator/internal.h b/drivers/regulator/internal.h
+deleted file mode 100644
+index 84bbda10c396..000000000000
+--- a/drivers/regulator/internal.h
++++ /dev/null
+@@ -1,38 +0,0 @@
+-/*
+- * internal.h  --  Voltage/Current Regulator framework internal code
+- *
+- * Copyright 2007, 2008 Wolfson Microelectronics PLC.
+- * Copyright 2008 SlimLogic Ltd.
+- *
+- * Author: Liam Girdwood <lrg@slimlogic.co.uk>
+- *
+- *  This program is free software; you can redistribute  it and/or modify it
+- *  under  the terms of  the GNU General  Public License as published by the
+- *  Free Software Foundation;  either version 2 of the  License, or (at your
+- *  option) any later version.
+- *
+- */
+-
+-#ifndef __REGULATOR_INTERNAL_H
+-#define __REGULATOR_INTERNAL_H
+-
+-/*
+- * struct regulator
+- *
+- * One for each consumer device.
+- */
+-struct regulator {
+-	struct device *dev;
+-	struct list_head list;
+-	unsigned int always_on:1;
+-	unsigned int bypass:1;
+-	int uA_load;
+-	int min_uV;
+-	int max_uV;
+-	char *supply_name;
+-	struct device_attribute dev_attr;
+-	struct regulator_dev *rdev;
+-	struct dentry *debugfs;
+-};
+-
+-#endif
+diff --git a/include/linux/regulator/consumer.h b/include/linux/regulator/consumer.h
+index c726653fec4e..4d7953b4c241 100644
+--- a/include/linux/regulator/consumer.h
++++ b/include/linux/regulator/consumer.h
+@@ -157,18 +157,9 @@ struct regulator *__must_check devm_regulator_get(struct device *dev,
+ 					     const char *id);
+ struct regulator *__must_check regulator_get_exclusive(struct device *dev,
+ 						       const char *id);
+-struct regulator *__must_check devm_regulator_get_exclusive(struct device *dev,
+-                            const char *id);
+-struct regulator *__must_check regulator_get_optional(struct device *dev,
+-                              const char *id);
+-struct regulator *__must_check devm_regulator_get_optional(struct device *dev,
+-                               const char *id);
+-
+ void regulator_put(struct regulator *regulator);
+ void devm_regulator_put(struct regulator *regulator);
+ 
+-
+-
+ /* regulator output control and status */
+ int __must_check regulator_enable(struct regulator *regulator);
+ int regulator_disable(struct regulator *regulator);
+-- 
+2.35.3
+

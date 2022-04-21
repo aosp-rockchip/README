@@ -1,0 +1,244 @@
+From 5c977f1c64cbde2c13beab36e12ef5f96d221cbe Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Fri, 19 Sep 2014 15:37:09 +0800
+Subject: [PATCH] usb: rk312x support usb charger detect
+
+---
+ arch/arm/boot/dts/rk312x.dtsi       |  11 +++
+ drivers/usb/dwc_otg_310/usbdev_bc.c | 113 ++++++++++++++++++++++++++--
+ drivers/usb/dwc_otg_310/usbdev_bc.h |  28 +++++--
+ 3 files changed, 140 insertions(+), 12 deletions(-)
+ mode change 100644 => 100755 drivers/usb/dwc_otg_310/usbdev_bc.h
+
+diff --git a/arch/arm/boot/dts/rk312x.dtsi b/arch/arm/boot/dts/rk312x.dtsi
+index 05ac265b1e5d..a7d7b4ab70e2 100755
+--- a/arch/arm/boot/dts/rk312x.dtsi
++++ b/arch/arm/boot/dts/rk312x.dtsi
+@@ -678,6 +678,17 @@
+ 		usb_bc{
+ 			compatible = "inno,phy";
+ 			regbase = &dwc_control_usb;
++			rk_usb,bvalid     = <0x14c  5 1>;
++			rk_usb,iddig      = <0x14c  8 1>;
++			rk_usb,vdmsrcen   = <0x184 12 1>;
++			rk_usb,vdpsrcen   = <0x184 11 1>;
++			rk_usb,rdmpden    = <0x184 10 1>;
++			rk_usb,idpsrcen   = <0x184  9 1>;
++			rk_usb,idmsinken  = <0x184  8 1>;
++			rk_usb,idpsinken  = <0x184  7 1>;
++			rk_usb,dpattach   = <0x2c0  7 1>;
++			rk_usb,cpdet      = <0x2c0  6 1>;
++			rk_usb,dcpattach  = <0x2c0  5 1>;
+ 		};
+ 	};
+ 
+diff --git a/drivers/usb/dwc_otg_310/usbdev_bc.c b/drivers/usb/dwc_otg_310/usbdev_bc.c
+index 5a2330907105..51c1d45c029c 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_bc.c
++++ b/drivers/usb/dwc_otg_310/usbdev_bc.c
+@@ -16,8 +16,13 @@
+ 
+ #include "usbdev_rk.h"
+ 
+-/****** GET and SET REGISTER FIELDS IN GRF UOC ******/
++char *bc_string[USB_BC_TYPE_MAX] = {"DISCONNECT",
++				    "Starder Downstream Port",
++				    "Dedicated Charging Port",
++				    "Charging Downstream Port",
++				    "UNKNOW"};
+ 
++/****** GET and SET REGISTER FIELDS IN GRF UOC ******/
+ #define BC_GET(x) grf_uoc_get_field(&pBC_UOC_FIELDS[x])
+ #define BC_SET(x, v) grf_uoc_set_field(&pBC_UOC_FIELDS[x], v)
+ 
+@@ -99,7 +104,31 @@ static inline void uoc_init_rk(struct device_node *np)
+ 
+ static inline void uoc_init_inno(struct device_node *np)
+ {
+-	;
++	pBC_UOC_FIELDS = (uoc_field_t *)
++			 kzalloc(INNO_BC_MAX * sizeof(uoc_field_t), GFP_ATOMIC);
++
++	uoc_init_field(np, "rk_usb,bvalid",
++			   &pBC_UOC_FIELDS[INNO_BC_BVALID]);
++	uoc_init_field(np, "rk_usb,iddig",
++			   &pBC_UOC_FIELDS[INNO_BC_IDDIG]);
++	uoc_init_field(np, "rk_usb,vdmsrcen",
++			   &pBC_UOC_FIELDS[INNO_BC_VDMSRCEN]);
++	uoc_init_field(np, "rk_usb,vdpsrcen",
++			   &pBC_UOC_FIELDS[INNO_BC_VDPSRCEN]);
++	uoc_init_field(np, "rk_usb,rdmpden",
++			   &pBC_UOC_FIELDS[INNO_BC_RDMPDEN]);
++	uoc_init_field(np, "rk_usb,idpsrcen",
++			   &pBC_UOC_FIELDS[INNO_BC_IDPSRCEN]);
++	uoc_init_field(np, "rk_usb,idmsinken",
++			   &pBC_UOC_FIELDS[INNO_BC_IDMSINKEN]);
++	uoc_init_field(np, "rk_usb,idpsinken",
++			   &pBC_UOC_FIELDS[INNO_BC_IDPSINKEN]);
++	uoc_init_field(np, "rk_usb,dpattach",
++			   &pBC_UOC_FIELDS[INNO_BC_DPATTACH]);
++	uoc_init_field(np, "rk_usb,cpdet",
++			   &pBC_UOC_FIELDS[INNO_BC_CPDET]);
++	uoc_init_field(np, "rk_usb,dcpattach",
++			   &pBC_UOC_FIELDS[INNO_BC_DCPATTACH]);
+ }
+ 
+ /****** BATTERY CHARGER DETECT FUNCTIONS ******/
+@@ -107,7 +136,7 @@ static inline void uoc_init_inno(struct device_node *np)
+ int usb_battery_charger_detect_rk(bool wait)
+ {
+ 
+-	int port_type = USB_BC_TYPE_DISCNT;
++	enum bc_port_type port_type = USB_BC_TYPE_DISCNT;
+ 
+ 	if (BC_GET(RK_BC_BVALID) &&
+ 	    BC_GET(RK_BC_IDDIG)) {
+@@ -143,14 +172,84 @@ int usb_battery_charger_detect_rk(bool wait)
+ 
+ int usb_battery_charger_detect_inno(bool wait)
+ {
+-	return readl(RK_GRF_VIRT + RK312X_GRF_SOC_STATUS0) & (1 << 8);
++	enum bc_port_type port_type = USB_BC_TYPE_DISCNT;
++	int dcd_state = DCD_POSITIVE;
++	int timeout = 0, i = 0;
++
++	/* VBUS Valid detect */
++	if (BC_GET(SYNOP_BC_BVALID) &&
++		BC_GET(SYNOP_BC_IDDIG)) {
++		if (wait) {
++			/* Do DCD */
++			dcd_state = DCD_TIMEOUT;
++			BC_SET(INNO_BC_RDMPDEN, 1);
++			BC_SET(INNO_BC_IDPSRCEN, 1);
++			timeout = T_DCD_TIMEOUT;
++			while (timeout--) {
++				if (BC_GET(INNO_BC_DPATTACH))
++					i++;
++				if (i >= 3) {
++					/* It is a filter here to assure data
++					 * lines contacted for at least 3ms */
++					dcd_state = DCD_POSITIVE;
++					break;
++				}
++				mdelay(1);
++			}
++			BC_SET(INNO_BC_RDMPDEN, 0);
++			BC_SET(INNO_BC_IDPSRCEN, 0);
++		} else {
++			dcd_state = DCD_PASSED;
++		}
++		if (dcd_state == DCD_TIMEOUT) {
++			port_type = USB_BC_TYPE_UNKNOW;
++			goto out;
++		}
++
++		/* Turn on VDPSRC */
++		/* Primary Detection */
++		BC_SET(INNO_BC_VDPSRCEN, 1);
++		BC_SET(INNO_BC_IDMSINKEN, 1);
++		udelay(T_BC_CHGDET_VALID);
++
++		/* SDP and CDP/DCP distinguish */
++		if (BC_GET(INNO_BC_CPDET)) {
++			/* Turn off VDPSRC */
++			BC_SET(INNO_BC_VDPSRCEN, 0);
++			BC_SET(INNO_BC_IDMSINKEN, 0);
++
++			udelay(T_BC_CHGDET_VALID);
++
++			/* Turn on VDMSRC */
++			BC_SET(INNO_BC_VDMSRCEN, 1);
++			BC_SET(INNO_BC_IDPSINKEN, 1);
++			udelay(T_BC_CHGDET_VALID);
++			if (BC_GET(INNO_BC_DCPATTACH))
++				port_type = USB_BC_TYPE_DCP;
++			else
++				port_type = USB_BC_TYPE_CDP;
++		} else {
++			port_type = USB_BC_TYPE_SDP;
++		}
++
++		BC_SET(INNO_BC_VDPSRCEN, 0);
++		BC_SET(INNO_BC_IDMSINKEN, 0);
++		BC_SET(INNO_BC_VDMSRCEN, 0);
++		BC_SET(INNO_BC_IDPSINKEN, 0);
++
++	}
++out:
++	printk("%s, Charger type %s, %s DCD, dcd_state = %d\n", __func__,
++	       bc_string[port_type], wait ? "wait" : "pass", dcd_state);
++	return port_type;
++
+ }
+ 
+ /* When do BC detect PCD pull-up register should be disabled  */
+ /* wait wait for dcd timeout 900ms */
+ int usb_battery_charger_detect_synop(bool wait)
+ {
+-	int port_type = USB_BC_TYPE_DISCNT;
++	enum bc_port_type port_type = USB_BC_TYPE_DISCNT;
+ 	int dcd_state = DCD_POSITIVE;
+ 	int timeout = 0, i = 0;
+ 
+@@ -217,8 +316,8 @@ int usb_battery_charger_detect_synop(bool wait)
+ 
+ 	}
+ out:
+-	printk("%s , battery_charger_detect %d, %s DCD, dcd_state = %d\n",
+-	       __func__, port_type, wait ? "wait" : "pass", dcd_state);
++	printk("%s, Charger type %s, %s DCD, dcd_state = %d\n", __func__,
++	       bc_string[port_type], wait ? "wait" : "pass", dcd_state);
+ 	return port_type;
+ }
+ 
+diff --git a/drivers/usb/dwc_otg_310/usbdev_bc.h b/drivers/usb/dwc_otg_310/usbdev_bc.h
+old mode 100644
+new mode 100755
+index dff942c2c70e..52898230b510
+--- a/drivers/usb/dwc_otg_310/usbdev_bc.h
++++ b/drivers/usb/dwc_otg_310/usbdev_bc.h
+@@ -2,11 +2,14 @@
+ #define _USBDEV_BC_H
+ 
+ /* USB Charger Types */
+-#define USB_BC_TYPE_DISCNT  (0)
+-#define USB_BC_TYPE_SDP     (1)
+-#define USB_BC_TYPE_DCP     (2)
+-#define USB_BC_TYPE_CDP     (3)
+-#define USB_BC_TYPE_UNKNOW  (4)
++enum bc_port_type{
++	USB_BC_TYPE_DISCNT = 0,
++	USB_BC_TYPE_SDP,
++	USB_BC_TYPE_DCP,
++	USB_BC_TYPE_CDP,
++	USB_BC_TYPE_UNKNOW,
++	USB_BC_TYPE_MAX,
++};
+ 
+ enum {
+ 	SYNOP_BC_BVALID = 0,
+@@ -21,6 +24,21 @@ enum {
+ 	SYNOP_BC_MAX,
+ };
+ 
++enum {
++	INNO_BC_BVALID = 0,
++	INNO_BC_IDDIG,
++	INNO_BC_VDMSRCEN,
++	INNO_BC_VDPSRCEN,
++	INNO_BC_RDMPDEN,
++	INNO_BC_IDPSRCEN,
++	INNO_BC_IDMSINKEN,
++	INNO_BC_IDPSINKEN,
++	INNO_BC_DPATTACH,
++	INNO_BC_CPDET,
++	INNO_BC_DCPATTACH,
++	INNO_BC_MAX,
++};
++
+ enum {
+ 	RK_BC_BVALID = 0,
+ 	RK_BC_IDDIG,
+-- 
+2.35.3
+

@@ -1,0 +1,221 @@
+From cc7b5cb97c5c519b921ca6c210176afd8e30a277 Mon Sep 17 00:00:00 2001
+From: chenxing <chenxing@rock-chips.com>
+Date: Tue, 24 Sep 2013 18:00:09 +0800
+Subject: [PATCH] rk: pm_test: add reset dvfs table ko library support
+
+---
+ arch/arm/plat-rk/rk_pm_tests/Kconfig          |   7 +-
+ arch/arm/plat-rk/rk_pm_tests/Makefile         |  23 ++--
+ .../plat-rk/rk_pm_tests/dvfs_table_reset.c    | 130 ++++++++++++++++++
+ .../plat-rk/rk_pm_tests/dvfs_table_reset.h    |   8 ++
+ 4 files changed, 157 insertions(+), 11 deletions(-)
+ create mode 100644 arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.c
+ create mode 100644 arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.h
+
+diff --git a/arch/arm/plat-rk/rk_pm_tests/Kconfig b/arch/arm/plat-rk/rk_pm_tests/Kconfig
+index 77e7e19851c8..40e5afba070b 100755
+--- a/arch/arm/plat-rk/rk_pm_tests/Kconfig
++++ b/arch/arm/plat-rk/rk_pm_tests/Kconfig
+@@ -1,5 +1,5 @@
+ menuconfig RK_PM_TESTS
+-	bool "/sys/pm_tests/ support"
++	tristate "/sys/pm_tests/ support"
+ 	help
+ 	  PM tests tools
+ 
+@@ -48,6 +48,11 @@ config PM_TEST_DVFS_TABLE_SCAN
+ 	help
+ 	  Use to scan dvfs table
+ 
++config PM_TEST_DVFS_TABLE_RESET
++	bool "dvfs table reset"
++	help
++	  Use to reset dvfs table
++
+ config PM_TEST_DELAYLINE
+ 	bool "Get delayline value"
+ 	help
+diff --git a/arch/arm/plat-rk/rk_pm_tests/Makefile b/arch/arm/plat-rk/rk_pm_tests/Makefile
+index bd12a872fa35..86a18bbfb96a 100755
+--- a/arch/arm/plat-rk/rk_pm_tests/Makefile
++++ b/arch/arm/plat-rk/rk_pm_tests/Makefile
+@@ -1,13 +1,16 @@
+-obj-$(CONFIG_RK_PM_TESTS) += rk_pm_tests.o
++obj-$(CONFIG_RK_PM_TESTS) += rk_pm_test.o
++rk_pm_test-y += rk_pm_tests.o
+ 
+ # Optional functions
+-obj-$(CONFIG_PM_TEST_CLK_RATE) += clk_rate.o
+-obj-$(CONFIG_PM_TEST_CLK_VOLT) += clk_volt.o
+-obj-$(CONFIG_PM_TEST_MAXFREQ) += maxfreq.o
+-obj-$(CONFIG_PM_TEST_FREQ_LIMIT) += freq_limit.o
+-obj-$(CONFIG_PM_TEST_CPU_USAGE) += cpu_usage.o
+-obj-$(CONFIG_PM_TEST_SUSPEND_DBG) += rk_suspend_test.o
+-obj-$(CONFIG_PM_TEST_CLK_AUTO_VOLT) += clk_auto_volt.o
+-obj-$(CONFIG_PM_TEST_DELAYLINE) += delayline.o
+-obj-$(CONFIG_PM_TEST_DVFS_TABLE_SCAN) += dvfs_table_scan.o
++# set_volt: change dvfs_table to change voltage
++rk_pm_test-$(CONFIG_PM_TEST_CLK_RATE) += clk_rate.o
++rk_pm_test-$(CONFIG_PM_TEST_CLK_VOLT) += clk_volt.o
++rk_pm_test-$(CONFIG_PM_TEST_MAXFREQ) += maxfreq.o
++rk_pm_test-$(CONFIG_PM_TEST_FREQ_LIMIT) += freq_limit.o
++rk_pm_test-$(CONFIG_PM_TEST_CPU_USAGE) += cpu_usage.o
++rk_pm_test-$(CONFIG_PM_TEST_SUSPEND_DBG) += rk_suspend_test.o
++rk_pm_test-$(CONFIG_PM_TEST_CLK_AUTO_VOLT) += clk_auto_volt.o
++rk_pm_test-$(CONFIG_PM_TEST_DELAYLINE) += delayline.o
++rk_pm_test-$(CONFIG_PM_TEST_DVFS_TABLE_SCAN) += dvfs_table_scan.o
++rk_pm_test-$(CONFIG_PM_TEST_DVFS_TABLE_RESET) += dvfs_table_reset.o
+ obj-$(CONFIG_PM_TEST_FT) += ft/
+diff --git a/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.c b/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.c
+new file mode 100644
+index 000000000000..abb383d0bb0e
+--- /dev/null
++++ b/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.c
+@@ -0,0 +1,130 @@
++#include <linux/clk.h>
++#include <linux/kobject.h>
++#include <linux/string.h>
++#include <linux/resume-trace.h>
++#include <linux/workqueue.h>
++#include <linux/mutex.h>
++#include <linux/module.h>
++#include <linux/syscalls.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/cpu.h>
++#include <linux/slab.h>
++#include <linux/dma-mapping.h>
++#include <linux/regulator/machine.h>
++#include <plat/dma-pl330.h>
++#include <linux/mfd/wm831x/core.h>
++#include <linux/sysfs.h>
++#include <linux/err.h>
++#include <mach/ddr.h>
++#include <mach/dvfs.h>
++#include <linux/cpufreq.h>
++
++#include "rk_pm_tests.h"
++#include "dvfs_table_reset.h"
++/***************************************************************************/
++#define ARM_TABLE_CHANGE	1
++#define GPU_TABLE_CHANGE	0
++#define DDR_TABLE_CHANGE	0
++#define VOLT_MODIFY_FREQ_L		37500
++#define VOLT_MODIFY_FREQ_H		25000
++#if ARM_TABLE_CHANGE
++static struct cpufreq_frequency_table *arm_table;
++#endif
++#if GPU_TABLE_CHANGE
++static struct cpufreq_frequency_table *gpu_table;
++#endif
++#if DDR_TABLE_CHANGE
++static struct cpufreq_frequency_table *ddr_table;
++#endif
++struct clk *clk_arm, *clk_gpu, *clk_ddr;
++static int __init dvfs_table_reset_init(void)
++{
++	int i = 0;
++	printk("get arm clk OK\n");
++#if ARM_TABLE_CHANGE
++	clk_arm = clk_get(NULL, "cpu");
++	if (IS_ERR(clk_arm))
++		return PTR_ERR(clk_arm);
++	PM_DBG("get arm clk OK\n");
++	arm_table = dvfs_get_freq_volt_table(clk_arm);
++
++	for (i = 0; arm_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		if (arm_table[i].frequency <= 1008 * 1000) {
++			printk("%s: set freq(%d), volt(%d), modify(%d)\n", __func__,
++					arm_table[i].frequency, arm_table[i].index, VOLT_MODIFY_FREQ_L);
++			arm_table[i].index -= VOLT_MODIFY_FREQ_L;
++			printk("%s: set freq(%d), volt(%d), modify(%d)\n", __func__,
++					arm_table[i].frequency, arm_table[i].index, VOLT_MODIFY_FREQ_L);
++		} else {
++			printk("%s: set freq(%d), volt(%d), modify(%d)\n", __func__,
++					arm_table[i].frequency, arm_table[i].index, VOLT_MODIFY_FREQ_H);
++			arm_table[i].index -= VOLT_MODIFY_FREQ_H;
++			printk("%s: set freq(%d), volt(%d), modify(%d)\n", __func__,
++					arm_table[i].frequency, arm_table[i].index, VOLT_MODIFY_FREQ_H);
++		}
++	}
++	dvfs_set_freq_volt_table(clk_arm, arm_table);
++#endif
++
++#if GPU_TABLE_CHANGE
++	clk_gpu = clk_get(NULL, "gpu");
++	if (IS_ERR(clk_gpu))
++		return PTR_ERR(clk_gpu);
++	PM_DBG("get gpu clk OK\n");
++	gpu_table = dvfs_get_freq_volt_table(clk_gpu);
++
++	for (i = 0; gpu_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		gpu_table[i].index -= VOLT_MODIFY_FREQ_H;
++	}
++	dvfs_set_freq_volt_table(clk_gpu, gpu_table);
++#endif
++
++#if DDR_TABLE_CHANGE
++	clk_ddr = clk_get(NULL, "ddr");
++	if (IS_ERR(clk_ddr))
++		return PTR_ERR(clk_ddr);
++	PM_DBG("get ddr clk OK\n");
++	ddr_table = dvfs_get_freq_volt_table(clk_ddr);
++
++	for (i = 0; gpu_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		ddr_table[i] -= VOLT_MODIFY_FREQ_H;
++	}
++	dvfs_set_freq_volt_table(clk_ddr, ddr_table);
++#endif
++
++	return 0;
++}
++
++static void __exit dvfs_table_reset_exit(void)
++{
++	int i = 0;
++#if ARM_TABLE_CHANGE
++	for (i = 0; arm_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		if (arm_table[i].frequency <= 1008 * 1000)
++			arm_table[i].index += VOLT_MODIFY_FREQ_L;
++		else
++			arm_table[i].index += VOLT_MODIFY_FREQ_H;
++	}
++	dvfs_set_freq_volt_table(clk_arm, arm_table);
++#endif
++
++#if GPU_TABLE_CHANGE
++	for (i = 0; gpu_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		gpu_table[i].index += VOLT_MODIFY_FREQ_H;
++	}
++	dvfs_set_freq_volt_table(clk_gpu, gpu_table);
++#endif
++
++#if DDR_TABLE_CHANGE
++	for (i = 0; ddr_table[i].frequency != CPUFREQ_TABLE_END; i++) {
++		ddr_table[i].index += VOLT_MODIFY_FREQ_H;
++	}
++	dvfs_set_freq_volt_table(clk_ddr, ddr_table);
++#endif
++
++}
++
++module_init(dvfs_table_reset_init);
++module_exit(dvfs_table_reset_exit);
+diff --git a/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.h b/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.h
+new file mode 100644
+index 000000000000..f72648701584
+--- /dev/null
++++ b/arch/arm/plat-rk/rk_pm_tests/dvfs_table_reset.h
+@@ -0,0 +1,8 @@
++#ifndef _DVFS_TABLE_RESET_H_
++#define _DVFS_TABLE_RESET_H_
++ssize_t dvfs_table_reset_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf);
++ssize_t dvfs_table_reset_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t n);
++
++#endif
+-- 
+2.35.3
+

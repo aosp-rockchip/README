@@ -1,0 +1,111 @@
+From b638988d9fb9a438897f19940edb6f656b57eeb7 Mon Sep 17 00:00:00 2001
+From: yangkai <yk@rock-chips.com>
+Date: Sat, 2 Jun 2012 16:16:38 +0800
+Subject: [PATCH] fix hcd panic when xacterr happen
+
+---
+ drivers/usb/dwc_otg/dwc_otg_hcd.c      |  7 +++--
+ drivers/usb/dwc_otg/dwc_otg_hcd_intr.c | 38 ++++++++++++++++++--------
+ 2 files changed, 32 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg/dwc_otg_hcd.c b/drivers/usb/dwc_otg/dwc_otg_hcd.c
+index ddf44bac2dab..378f395f35f6 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_hcd.c
++++ b/drivers/usb/dwc_otg/dwc_otg_hcd.c
+@@ -1595,7 +1595,6 @@ int dwc_otg_hcd_urb_dequeue(struct usb_hcd *_hcd, struct urb *_urb, int _status)
+     if (urb_qtd == qh->qtd_in_process) {
+ 	    /* The QTD is in process (it has been assigned to a channel). */
+ 	    if (dwc_otg_hcd->flags.b.port_connect_status) {
+-            DWC_PRINT("%s urb %p in process\n", __func__, _urb);
+ 
+ 		    /*
+ 		     * If still connected (i.e. in host mode), halt the
+@@ -2290,7 +2289,9 @@ int dwc_otg_hcd_hub_control(struct usb_hcd *_hcd,
+ 			hprt0.b.prtres = 1;
+ 			dwc_write_reg32(core_if->host_if->hprt0, hprt0.d32);
+ 			/* Clear Resume bit */
++            spin_unlock_irqrestore(&dwc_otg_hcd->global_lock, flags);
+ 			mdelay (100);
++            spin_lock_irqsave(&dwc_otg_hcd->global_lock, flags);
+ 			hprt0.b.prtres = 0;
+ 			dwc_write_reg32(core_if->host_if->hprt0, hprt0.d32);
+ 			break;
+@@ -2477,7 +2478,7 @@ int dwc_otg_hcd_hub_control(struct usb_hcd *_hcd,
+                         }
+                         hprt0.d32 = dwc_otg_read_hprt0 (core_if);
+                         hprt0.b.prtsusp = 1;
+-			dwc_write_reg32(core_if->host_if->hprt0, hprt0.d32);
++			            dwc_write_reg32(core_if->host_if->hprt0, hprt0.d32);
+                         //DWC_PRINT( "SUSPEND: HPRT0=%0x\n", hprt0.d32);       
+                         /* Suspend the Phy Clock */
+                         {
+@@ -2488,7 +2489,9 @@ int dwc_otg_hcd_hub_control(struct usb_hcd *_hcd,
+                         
+                         /* For HNP the bus must be suspended for at least 200ms.*/
+                         if (_hcd->self.b_hnp_enable) {
++                                spin_unlock_irqrestore(&dwc_otg_hcd->global_lock, flags);
+                                 mdelay(200);
++                                spin_lock_irqsave(&dwc_otg_hcd->global_lock, flags);
+                                 //DWC_PRINT( "SUSPEND: wait complete! (%d)\n", _hcd->state);
+                         }
+ 			break;
+diff --git a/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c b/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
+index 255e4172bc51..ea4e1581188f 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
++++ b/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
+@@ -821,14 +821,19 @@ static void release_channel(dwc_otg_hcd_t *_hcd,
+ 	dwc_otg_transaction_type_e tr_type;
+ 	int free_qtd;
+ 	int continue_trans = 1;
+-
+-    if(((uint32_t) _qtd & 0xf0000000)==0){
+-        DWC_PRINT("%s qtd %p, status %d\n", __func__, _qtd, _halt_status);
+-        goto cleanup;
+-    }
+-    if(((uint32_t) _qtd->urb & 0xf0000000)==0){
+-        DWC_PRINT("%s urb %p, status %d\n", __func__, _qtd->urb, _halt_status);
+-        goto cleanup;
++    if(_halt_status != DWC_OTG_HC_XFER_URB_DEQUEUE){
++        if(((uint32_t) _qtd & 0xf0000000)==0){
++            DWC_PRINT("%s qtd %p, status %d\n", __func__, _qtd, _halt_status);
++            goto cleanup;
++        }
++        if(((uint32_t) _qtd & 0x80000000)==0){
++            DWC_PRINT("%s qtd %p, status %d 1\n", __func__, _qtd, _halt_status);
++            goto cleanup;
++        }
++        if(((uint32_t) _qtd->urb & 0xf0000000)==0){
++            DWC_PRINT("%s qtd %p urb %p, status %d\n", __func__, _qtd, _qtd->urb, _halt_status);
++            goto cleanup;
++        }
+     }
+         
+ 	DWC_DEBUGPL(DBG_HCDV, "  %s: channel %d, halt_status %d\n",
+@@ -1566,10 +1571,21 @@ static int32_t handle_hc_xacterr_intr(dwc_otg_hcd_t *_hcd,
+     dwc_otg_halt_status_e halt_status = DWC_OTG_HC_XFER_NO_HALT_STATUS;
+ 	DWC_DEBUGPL(DBG_HCD, "--Host Channel %d Interrupt: "
+ 		    "Transaction Error--\n", _hc->hc_num);
++    if (list_empty(&_hc->qh->qh_list_entry)){
++        DWC_PRINT("%s qh empty\n", __func__);
++        goto out;
++    }
+     
+-    if((_qtd==NULL)||(_qtd->urb == NULL))
+-    {
+-		DWC_PRINT("%s qtd->urb %p NULL\n", __func__, _qtd);
++    if(((uint32_t) _qtd & 0xf0000000)==0){
++        DWC_PRINT("%s qtd %p\n", __func__, _qtd);
++        goto out;
++    }
++    if(((uint32_t) _qtd & 0x80000000)==0){
++        DWC_PRINT("%s qtd %p 1\n", __func__, _qtd);
++        goto out;
++    }
++    if(((uint32_t) _qtd->urb & 0xf0000000)==0){
++        DWC_PRINT("%s qtd %p urb %p\n", __func__,_qtd, _qtd->urb);
+         goto out;
+     }
+ 	switch (usb_pipetype(_qtd->urb->pipe)) {
+-- 
+2.35.3
+

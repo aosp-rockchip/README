@@ -1,0 +1,488 @@
+From 3bf91b51f17988b82269111b0f6c4ab5d05783bc Mon Sep 17 00:00:00 2001
+From: lbt <lbt@rock-chips.com>
+Date: Thu, 9 Dec 2010 14:06:38 +0800
+Subject: [PATCH] wifi: add broadcom 4329 wireless lan driver support
+
+---
+ arch/arm/configs/rk29_sdk_defconfig           |  24 +++-
+ arch/arm/mach-rk29/Kconfig                    |   5 +
+ arch/arm/mach-rk29/board-rk29sdk.c            | 133 +++++++++++++++++-
+ arch/arm/mach-rk29/include/mach/board.h       |   8 ++
+ drivers/mmc/host/rk29_sdmmc.c                 |  60 +++++++-
+ drivers/net/wireless/Makefile                 |   2 +-
+ .../net/wireless/bcm4329/dhd_custom_gpio.c    |   6 +
+ drivers/net/wireless/bcm4329/dhd_linux.c      |  21 +--
+ 8 files changed, 233 insertions(+), 26 deletions(-)
+ mode change 100644 => 100755 drivers/mmc/host/rk29_sdmmc.c
+
+diff --git a/arch/arm/configs/rk29_sdk_defconfig b/arch/arm/configs/rk29_sdk_defconfig
+index 7e24eec06a4e..87d7ff9d535a 100755
+--- a/arch/arm/configs/rk29_sdk_defconfig
++++ b/arch/arm/configs/rk29_sdk_defconfig
+@@ -1,7 +1,7 @@
+ #
+ # Automatically generated make config: don't edit
+ # Linux kernel version: 2.6.32.9
+-# Wed Dec  8 09:41:39 2010
++# Thu Dec  9 14:06:05 2010
+ #
+ CONFIG_ARM=y
+ CONFIG_SYS_SUPPORTS_APM_EMULATION=y
+@@ -194,6 +194,7 @@ CONFIG_MMU=y
+ # CONFIG_ARCH_BCMRING is not set
+ # CONFIG_ARCH_RK2818 is not set
+ CONFIG_ARCH_RK29=y
++CONFIG_WIFI_CONTROL_FUNC=y
+ CONFIG_MACH_RK29SDK=y
+ 
+ #
+@@ -412,7 +413,17 @@ CONFIG_ANDROID_PARANOID_NETWORK=y
+ # CONFIG_IRDA is not set
+ # CONFIG_BT is not set
+ # CONFIG_AF_RXRPC is not set
+-# CONFIG_WIRELESS is not set
++CONFIG_WIRELESS=y
++# CONFIG_CFG80211 is not set
++CONFIG_CFG80211_DEFAULT_PS_VALUE=0
++# CONFIG_WIRELESS_OLD_REGULATORY is not set
++CONFIG_WIRELESS_EXT=y
++CONFIG_WIRELESS_EXT_SYSFS=y
++# CONFIG_LIB80211 is not set
++
++#
++# CFG80211 needs to be enabled for MAC80211
++#
+ # CONFIG_WIMAX is not set
+ # CONFIG_RFKILL is not set
+ # CONFIG_NET_9P is not set
+@@ -565,7 +576,14 @@ CONFIG_NETDEVICES=y
+ # CONFIG_NET_ETHERNET is not set
+ # CONFIG_NETDEV_1000 is not set
+ # CONFIG_NETDEV_10000 is not set
+-# CONFIG_WLAN is not set
++CONFIG_WLAN=y
++# CONFIG_WLAN_PRE80211 is not set
++CONFIG_WLAN_80211=y
++# CONFIG_LIBERTAS is not set
++# CONFIG_HOSTAP is not set
++CONFIG_BCM4329=m
++CONFIG_BCM4329_FW_PATH="/etc/firmware/fw_bcm4329.bin"
++CONFIG_BCM4329_NVRAM_PATH="/etc/firmware/nvram_bcm4329_B23.txt"
+ 
+ #
+ # Enable WiMAX (Networking options) to see the WiMAX drivers
+diff --git a/arch/arm/mach-rk29/Kconfig b/arch/arm/mach-rk29/Kconfig
+index d2c7dd516f53..97ca0b7e0078 100644
+--- a/arch/arm/mach-rk29/Kconfig
++++ b/arch/arm/mach-rk29/Kconfig
+@@ -6,6 +6,11 @@ config MACH_RK29SDK
+         help
+ 	  Support for the ROCKCHIP Board For Rk29 Sdk.
+ 
++config WIFI_CONTROL_FUNC
++        bool "Enable WiFi control function abstraction"
++        help
++          Enables Power/Reset/Carddetect function abstraction
++
+ menu "RK29 VPU (Video Processing Unit) support"
+ 
+ config RK29_VPU
+diff --git a/arch/arm/mach-rk29/board-rk29sdk.c b/arch/arm/mach-rk29/board-rk29sdk.c
+index f498c4c9be37..842ebed25f71 100755
+--- a/arch/arm/mach-rk29/board-rk29sdk.c
++++ b/arch/arm/mach-rk29/board-rk29sdk.c
+@@ -770,10 +770,15 @@ static int rk29_sdmmc1_cfg_gpio(void)
+ 	rk29_mux_api_set(GPIO1C4_SDMMC1DATA1_NAME, GPIO1H_SDMMC1_DATA1);
+ 	rk29_mux_api_set(GPIO1C5_SDMMC1DATA2_NAME, GPIO1H_SDMMC1_DATA2);
+ 	rk29_mux_api_set(GPIO1C6_SDMMC1DATA3_NAME, GPIO1H_SDMMC1_DATA3);
+-	rk29_mux_api_set(GPIO1C0_UART0CTSN_SDMMC1DETECTN_NAME, GPIO1H_SDMMC1_DETECT_N);
++	//rk29_mux_api_set(GPIO1C0_UART0CTSN_SDMMC1DETECTN_NAME, GPIO1H_SDMMC1_DETECT_N);
+ 	return 0;
+ }
+-
++
++static int rk29sdk_wifi_status(struct device *dev);
++static int rk29sdk_wifi_status_register(void (*callback)(int card_presend, void *dev_id), void *dev_id);
++
++#define RK29SDK_WIFI_SDIO_CARD_DETECT_N    RK29_PIN1_PD6
++
+ struct rk29_sdmmc_platform_data default_sdmmc1_data = {
+ 	.host_ocr_avail = (MMC_VDD_25_26|MMC_VDD_26_27|MMC_VDD_27_28|MMC_VDD_28_29|
+ 					   MMC_VDD_29_30|MMC_VDD_30_31|MMC_VDD_31_32|
+@@ -787,9 +792,126 @@ struct rk29_sdmmc_platform_data default_sdmmc1_data = {
+ #else
+ 	.use_dma = 0,
+ #endif
++#ifdef CONFIG_WIFI_CONTROL_FUNC
++        .status = rk29sdk_wifi_status,
++        .register_status_notify = rk29sdk_wifi_status_register,
++#endif
++        .detect_irq = RK29SDK_WIFI_SDIO_CARD_DETECT_N,
+ };
+ #endif
+-
++
++#ifdef CONFIG_WIFI_CONTROL_FUNC
++#define RK29SDK_WIFI_BT_GPIO_POWER_N       RK29_PIN5_PD6
++#define RK29SDK_WIFI_GPIO_RESET_N          RK29_PIN6_PC0
++#define RK29SDK_BT_GPIO_RESET_N            RK29_PIN6_PC4
++
++static int rk29sdk_wifi_cd = 0;   /* wifi virtual 'card detect' status */
++static void (*wifi_status_cb)(int card_present, void *dev_id);
++static void *wifi_status_cb_devid;
++int rk29sdk_wifi_power_state = 0;
++int rk29sdk_bt_power_state = 0;
++
++static int rk29sdk_wifi_status(struct device *dev)
++{
++        return rk29sdk_wifi_cd;
++}
++
++static int rk29sdk_wifi_status_register(void (*callback)(int card_present, void *dev_id), void *dev_id)
++{
++        if(wifi_status_cb)
++                return -EAGAIN;
++        wifi_status_cb = callback;
++        wifi_status_cb_devid = dev_id;
++        return 0;
++}
++
++static int rk29sdk_wifi_bt_gpio_control_init(void)
++{
++    if (gpio_request(RK29SDK_WIFI_BT_GPIO_POWER_N, "wifi_bt_power")) {
++           pr_info("%s: request wifi_bt power gpio failed\n", __func__);
++           return -1; 
++    }
++   
++    if (gpio_request(RK29SDK_WIFI_GPIO_RESET_N, "wifi reset")) {
++           pr_info("%s: request wifi reset gpio failed\n", __func__);
++           gpio_free(RK29SDK_WIFI_BT_GPIO_POWER_N);
++           return -1;
++    }
++   
++    if (gpio_request(RK29SDK_BT_GPIO_RESET_N, "bt reset")) {
++          pr_info("%s: request bt reset gpio failed\n", __func__);
++          gpio_free(RK29SDK_WIFI_GPIO_RESET_N);
++          return -1;
++    }
++   
++    gpio_direction_output(RK29SDK_WIFI_BT_GPIO_POWER_N, GPIO_LOW);
++    gpio_direction_output(RK29SDK_WIFI_GPIO_RESET_N,    GPIO_LOW);
++    gpio_direction_output(RK29SDK_BT_GPIO_RESET_N,      GPIO_LOW); 
++    
++    pr_info("%s: init finished\n",__func__);
++   
++    return 0;
++}
++
++static int rk29sdk_wifi_power(int on)
++{
++        pr_info("%s: %d\n", __func__, on);
++        if (on){
++                gpio_set_value(RK29SDK_WIFI_BT_GPIO_POWER_N, on);
++                mdelay(100);
++                pr_info("wifi turn on power\n");
++        }else{
++                if (!rk29sdk_bt_power_state){
++                        gpio_set_value(RK29SDK_WIFI_BT_GPIO_POWER_N, on);
++                        mdelay(100);
++                        pr_info("wifi shut off power\n");
++                }else
++                {
++                        pr_info("wifi shouldn't shut off power, bt is using it!\n");
++                }
++
++        }
++
++        rk29sdk_wifi_power_state = on;
++        return 0;
++}
++
++static int rk29sdk_wifi_reset_state;
++static int rk29sdk_wifi_reset(int on)
++{
++        pr_info("%s: %d\n", __func__, on);
++        gpio_set_value(RK29SDK_WIFI_GPIO_RESET_N, on);
++        mdelay(100);
++        rk29sdk_wifi_reset_state = on;
++        return 0;
++}
++
++static int rk29sdk_wifi_set_carddetect(int val)
++{
++        pr_info("%s:%d\n", __func__, val);
++        rk29sdk_wifi_cd = val;
++        if (wifi_status_cb){
++                wifi_status_cb(val, wifi_status_cb_devid);
++        }else {
++                pr_warning("%s, nobody to notify\n", __func__);
++        }
++        return 0;
++}
++
++static struct wifi_platform_data rk29sdk_wifi_control = {
++        .set_power = rk29sdk_wifi_power,
++        .set_reset = rk29sdk_wifi_reset,
++        .set_carddetect = rk29sdk_wifi_set_carddetect,
++};
++static struct platform_device rk29sdk_wifi_device = {
++        .name = "bcm4329_wlan",
++        .id = 1,
++        .dev = {
++                .platform_data = &rk29sdk_wifi_control,
++         },
++};
++#endif
++
+ #ifdef CONFIG_VIVANTE
+ static struct resource resources_gpu[] = {
+     [0] = {
+@@ -920,6 +1042,9 @@ static struct platform_device *devices[] __initdata = {
+ 	&rk29xx_device_nand,
+ #endif
+ 
++#ifdef CONFIG_WIFI_CONTROL_FUNC
++        &rk29sdk_wifi_device,
++#endif
+ #ifdef CONFIG_MTD_NAND_RK29
+ 	&rk29_device_nand,
+ #endif
+@@ -1155,6 +1280,8 @@ static void __init machine_rk29_board_init(void)
+ 
+ 		gpio_set_value(POWER_ON_PIN, 1);
+ 		gpio_direction_output(POWER_ON_PIN, 1);
++
++                rk29sdk_wifi_bt_gpio_control_init();
+ 
+ 		platform_add_devices(devices, ARRAY_SIZE(devices));
+ #ifdef CONFIG_I2C0_RK29
+diff --git a/arch/arm/mach-rk29/include/mach/board.h b/arch/arm/mach-rk29/include/mach/board.h
+index 905d218fd9de..b627bc0a9056 100755
+--- a/arch/arm/mach-rk29/include/mach/board.h
++++ b/arch/arm/mach-rk29/include/mach/board.h
+@@ -77,6 +77,13 @@ struct rk29_bl_info{
+     struct notifier_block freq_transition;
+ };
+ 
++struct wifi_platform_data {
++        int (*set_power)(int val);
++        int (*set_reset)(int val);
++        int (*set_carddetect)(int val);
++        void *(*mem_prealloc)(int section, unsigned long size);
++};
++
+ struct rk29_sdmmc_platform_data {
+ 	unsigned int host_caps;
+ 	unsigned int host_ocr_avail;
+@@ -86,6 +93,7 @@ struct rk29_sdmmc_platform_data {
+ 	int (*io_deinit)(void);
+ 	int (*status)(struct device *);
+ 	int (*register_status_notify)(void (*callback)(int card_present, void *dev_id), void *dev_id);
++        int detect_irq;
+ };
+ struct rk29_i2c_platform_data {
+ 	int     bus_num;        
+diff --git a/drivers/mmc/host/rk29_sdmmc.c b/drivers/mmc/host/rk29_sdmmc.c
+old mode 100644
+new mode 100755
+index 28360d3016bd..abce25f2adf9
+--- a/drivers/mmc/host/rk29_sdmmc.c
++++ b/drivers/mmc/host/rk29_sdmmc.c
+@@ -1021,6 +1021,42 @@ static void rk29_sdmmc_cmd_interrupt(struct rk29_sdmmc *host, u32 status)
+ 	tasklet_schedule(&host->tasklet);
+ }
+ 
++static int rk29_sdmmc1_card_get_cd(struct mmc_host *mmc)
++{
++        struct rk29_sdmmc *host = mmc_priv(mmc);
++        struct rk29_sdmmc_platform_data *pdata = host->pdev->dev.platform_data;
++        return gpio_get_value(pdata->detect_irq);
++}
++
++static int rk29_sdmmc1_card_change_cd_trigger_type(struct mmc_host *mmc, unsigned int type)
++{
++       struct rk29_sdmmc *host = mmc_priv(mmc);
++       struct rk29_sdmmc_platform_data *pdata = host->pdev->dev.platform_data;
++       return set_irq_type(gpio_to_irq(pdata->detect_irq), type);
++}
++
++
++static irqreturn_t rk29_sdmmc1_card_detect_interrupt(int irq, void *dev_id)
++{
++       struct rk29_sdmmc *host = dev_id;
++       bool present, present_old; 
++       
++       present = rk29_sdmmc1_card_get_cd(host->mmc);
++       present_old = test_bit(RK29_SDMMC_CARD_PRESENT, &host->flags);
++       if (present != present_old) {
++             if (present != 0) {
++                  set_bit(RK29_SDMMC_CARD_PRESENT, &host->flags);
++             } else {
++                  clear_bit(RK29_SDMMC_CARD_PRESENT, &host->flags);
++             }
++             mod_timer(&host->detect_timer, jiffies + msecs_to_jiffies(200));
++       }
++       rk29_sdmmc1_card_change_cd_trigger_type(host->mmc, (present ? IRQF_TRIGGER_FALLING: IRQF_TRIGGER_RISING)); 
++   
++       return IRQ_HANDLED;
++
++}
++
+ static irqreturn_t rk29_sdmmc_interrupt(int irq, void *dev_id)
+ {
+ 	struct rk29_sdmmc	*host = dev_id;
+@@ -1096,6 +1132,10 @@ static irqreturn_t rk29_sdmmc_interrupt(int irq, void *dev_id)
+ 		    rk29_sdmmc_write(host->regs, SDMMC_RINTSTS,SDMMC_INT_CMD_DONE);  //  clear interrupt
+ 		    rk29_sdmmc_cmd_interrupt(host, status);
+ 		}
++		if(pending & SDMMC_INT_SDIO) {
++				rk29_sdmmc_write(host->regs, SDMMC_RINTSTS,SDMMC_INT_SDIO);
++				mmc_signal_sdio_irq(host->mmc);
++		}
+ 	} while (pass_count++ < 5);
+ 	
+ 	spin_unlock(&host->lock);
+@@ -1112,7 +1152,7 @@ static void rk29_sdmmc_detect_change(unsigned long data)
+ {
+ 	struct mmc_request *mrq;
+ 	struct rk29_sdmmc *host = (struct rk29_sdmmc *)data;;
+-
++   
+ 	smp_rmb();
+ 	if (test_bit(RK29_SDMMC_SHUTDOWN, &host->flags))
+ 		return;		
+@@ -1229,7 +1269,6 @@ static int rk29_sdmmc_probe(struct platform_device *pdev)
+ 	clk_enable(host->clk);
+ 	clk_enable(clk_get(&pdev->dev, "sdmmc_ahb"));
+ 	host->bus_hz = clk_get_rate(host->clk);  ///40000000;  ////cgu_get_clk_freq(CGU_SB_SD_MMC_CCLK_IN_ID); 
+-	printk("Enter:%s %d host->bus_hz =%d\n",__FUNCTION__,__LINE__,host->bus_hz);
+ 
+   	/* reset all blocks */
+   	rk29_sdmmc_write(host->regs, SDMMC_CTRL,(SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET | SDMMC_CTRL_DMA_RESET));
+@@ -1251,6 +1290,22 @@ static int rk29_sdmmc_probe(struct platform_device *pdev)
+ 	ret = request_irq(irq, rk29_sdmmc_interrupt, 0, dev_name(&pdev->dev), host);
+ 	if (ret)
+ 	    goto err_dmaunmap;
++        
++        /* register sdmmc1 card detect interrupt route */ 
++        if ((pdev->id == 1) && (pdata->detect_irq != 0)) {
++            irq = gpio_to_irq(pdata->detect_irq);
++            if (irq < 0)  {
++               printk("%s: request gpio irq failed\n", __FUNCTION__);
++               goto err_dmaunmap;
++            }
++            
++            ret = request_irq(irq, rk29_sdmmc1_card_detect_interrupt, IRQF_TRIGGER_RISING, dev_name(&pdev->dev), host);
++            if (ret) {
++               printk("%s: sdmmc1 request detect interrupt failed\n", __FUNCTION__);
++               goto err_dmaunmap;
++            }
++             
++        }
+ 	platform_set_drvdata(pdev, host); 	
+ 	mmc->ops = &rk29_sdmmc_ops[pdev->id];
+ 	mmc->f_min = host->bus_hz/510;
+@@ -1268,6 +1323,7 @@ static int rk29_sdmmc_probe(struct platform_device *pdev)
+ 		set_bit(RK29_SDMMC_CARD_PRESENT, &host->flags);
+ 	else
+ 		clear_bit(RK29_SDMMC_CARD_PRESENT, &host->flags);
++        
+ 
+ 	mmc_add_host(mmc);
+ #if defined (CONFIG_DEBUG_FS)
+diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
+index 63665859a029..81e81f7b5250 100644
+--- a/drivers/net/wireless/Makefile
++++ b/drivers/net/wireless/Makefile
+@@ -63,4 +63,4 @@ obj-$(CONFIG_WL12XX)	+= wl12xx/
+ 
+ obj-$(CONFIG_IWM)	+= iwmc3200wifi/
+ obj-$(CONFIG_BCM4329)   += bcm4329/
+-obj-m	+= wlan/
++#obj-m	+= wlan/
+diff --git a/drivers/net/wireless/bcm4329/dhd_custom_gpio.c b/drivers/net/wireless/bcm4329/dhd_custom_gpio.c
+index 35d0b97fb4df..f2b7adbed0d3 100644
+--- a/drivers/net/wireless/bcm4329/dhd_custom_gpio.c
++++ b/drivers/net/wireless/bcm4329/dhd_custom_gpio.c
+@@ -48,8 +48,10 @@ int wifi_set_power(int on, unsigned long msec);
+ int wifi_get_irq_number(unsigned long *irq_flags_ptr);
+ #endif
+ 
++#if defined(CONFIG_WIFI_CONTROL_FUNC)
+ int wifi_set_power(int on, unsigned long msec);
+ int wifi_set_reset(int on, unsigned long msec);
++#endif
+ 
+ #if defined(OOB_INTR_ONLY)
+ 
+@@ -117,8 +119,10 @@ dhd_customer_gpio_wlan_ctrl(int onoff)
+ #ifdef CUSTOMER_HW2
+ 			wifi_set_power(0, 0);
+ #endif
++#if defined(CONFIG_WIFI_CONTROL_FUNC)
+ 			wifi_set_power(0, 0);
+                         wifi_set_reset(0, 0);
++#endif
+ 			WL_ERROR(("=========== WLAN placed in RESET ========\n"));
+ 		break;
+ 
+@@ -131,8 +135,10 @@ dhd_customer_gpio_wlan_ctrl(int onoff)
+ #ifdef CUSTOMER_HW2
+ 			wifi_set_power(1, 0);
+ #endif
++#if defined(CONFIG_WIFI_CONTROL_FUNC)
+ 			wifi_set_power(1, 0);
+                         wifi_set_reset(1, 0);
++#endif
+ 			WL_ERROR(("=========== WLAN going back to live  ========\n"));
+ 		break;
+ 
+diff --git a/drivers/net/wireless/bcm4329/dhd_linux.c b/drivers/net/wireless/bcm4329/dhd_linux.c
+index 164b170abc14..e610b4b0d7ea 100644
+--- a/drivers/net/wireless/bcm4329/dhd_linux.c
++++ b/drivers/net/wireless/bcm4329/dhd_linux.c
+@@ -2387,7 +2387,7 @@ dhd_detach(dhd_pub_t *dhdp)
+ 	}
+ }
+ }
+-static void 
++static void __exit
+ dhd_module_cleanup(void)
+ {
+ 	DHD_TRACE(("%s: Enter\n", __FUNCTION__));
+@@ -2401,7 +2401,7 @@ dhd_module_cleanup(void)
+ }
+ 
+ 
+-static int 
++static int __init
+ dhd_module_init(void)
+ {
+ 	int error;
+@@ -2474,21 +2474,8 @@ dhd_module_init(void)
+ 	return -EINVAL;
+ }
+ 
+-//module_init(dhd_module_init);
+-//module_exit(dhd_module_cleanup);
+-
+-int if_sdio_init_module2(void)
+-{
+-    return dhd_module_init();
+-}
+-
+-void if_sdio_exit_module(void)
+-{
+-   dhd_module_cleanup();
+-}
+-
+-EXPORT_SYMBOL(if_sdio_init_module2);
+-EXPORT_SYMBOL(if_sdio_exit_module);
++module_init(dhd_module_init);
++module_exit(dhd_module_cleanup);
+ 
+ /*
+  * OS specific functions required to implement DHD driver in OS independent way
+-- 
+2.35.3
+

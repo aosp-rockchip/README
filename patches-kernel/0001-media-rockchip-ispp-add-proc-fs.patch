@@ -1,0 +1,487 @@
+From 01ffbdf4200f9ea70c6f6dc2e3857755c82698e7 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 2 Sep 2020 10:17:20 +0800
+Subject: [PATCH] media: rockchip: ispp: add proc fs
+
+Change-Id: I0f68b978e39be3f8fded38fbcb2e02b4c9995376
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ .../media/platform/rockchip/isp/isp_ispp.h    |   1 +
+ drivers/media/platform/rockchip/ispp/Makefile |   3 +-
+ drivers/media/platform/rockchip/ispp/dev.c    |   2 +
+ drivers/media/platform/rockchip/ispp/dev.h    |   4 +
+ drivers/media/platform/rockchip/ispp/hw.c     |  15 +--
+ drivers/media/platform/rockchip/ispp/hw.h     |  11 ++
+ drivers/media/platform/rockchip/ispp/ispp.c   |  11 +-
+ drivers/media/platform/rockchip/ispp/procfs.c | 122 ++++++++++++++++++
+ drivers/media/platform/rockchip/ispp/procfs.h |  21 +++
+ drivers/media/platform/rockchip/ispp/stream.c |  34 ++++-
+ drivers/media/platform/rockchip/ispp/stream.h |   6 +
+ 11 files changed, 214 insertions(+), 16 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/ispp/procfs.c
+ create mode 100644 drivers/media/platform/rockchip/ispp/procfs.h
+
+diff --git a/drivers/media/platform/rockchip/isp/isp_ispp.h b/drivers/media/platform/rockchip/isp/isp_ispp.h
+index 0bb44edd923b..883d5294b364 100644
+--- a/drivers/media/platform/rockchip/isp/isp_ispp.h
++++ b/drivers/media/platform/rockchip/isp/isp_ispp.h
+@@ -44,6 +44,7 @@ enum rkisp_ispp_work_mode {
+ struct frame_debug_info {
+ 	u64 timestamp;
+ 	u32 interval;
++	u32 delay;
+ 	u32 id;
+ };
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/Makefile b/drivers/media/platform/rockchip/ispp/Makefile
+index b8ed6800e43a..0ecde61d9cc5 100644
+--- a/drivers/media/platform/rockchip/ispp/Makefile
++++ b/drivers/media/platform/rockchip/ispp/Makefile
+@@ -7,4 +7,5 @@ video_rkispp-objs += dev.o \
+ 		stream.o \
+ 		params.o \
+ 		stats.o \
+-		hw.o
++		hw.o \
++		procfs.o
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 7af2a55204c8..0fb8a3f93186 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -264,6 +264,7 @@ static int rkispp_plat_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_unreg_media_dev;
+ 
++	rkispp_proc_init(ispp_dev);
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	return 0;
+@@ -281,6 +282,7 @@ static int rkispp_plat_remove(struct platform_device *pdev)
+ 
+ 	pm_runtime_disable(&pdev->dev);
+ 
++	rkispp_proc_cleanup(ispp_dev);
+ 	rkispp_unregister_subdev(ispp_dev);
+ 	rkispp_unregister_stats_vdev(ispp_dev);
+ 	rkispp_unregister_params_vdev(ispp_dev);
+diff --git a/drivers/media/platform/rockchip/ispp/dev.h b/drivers/media/platform/rockchip/ispp/dev.h
+index c35b08ee939a..99757ee69df2 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.h
++++ b/drivers/media/platform/rockchip/ispp/dev.h
+@@ -9,6 +9,7 @@
+ #include "stream.h"
+ #include "stats.h"
+ #include "hw.h"
++#include "procfs.h"
+ 
+ #define DRIVER_NAME			"rkispp"
+ #define II_VDEV_NAME DRIVER_NAME	"_input_image"
+@@ -36,6 +37,7 @@ struct rkispp_device {
+ 	struct rkispp_stream_vdev stream_vdev;
+ 	struct rkispp_params_vdev params_vdev;
+ 	struct rkispp_stats_vdev stats_vdev;
++	struct proc_dir_entry *procfs;
+ 
+ 	enum rkispp_ver	ispp_ver;
+ 	/* mutex to serialize the calls from user */
+@@ -45,6 +47,8 @@ struct rkispp_device {
+ 	enum rkispp_input inp;
+ 	u32 dev_id;
+ 	u32 isp_mode;
++	u32 isr_cnt;
++	u32 isr_err_cnt;
+ 	wait_queue_head_t sync_onoff;
+ 	bool stream_sync;
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+index 19480c34517e..601c2c193d35 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.c
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -33,16 +33,6 @@ struct irqs_data {
+ 	irqreturn_t (*irq_hdl)(int irq, void *ctx);
+ };
+ 
+-struct match_data {
+-	int clks_num;
+-	const char * const *clks;
+-	int clk_rate_tbl_num;
+-	const struct ispp_clk_info *clk_rate_tbl;
+-	enum rkispp_ver ispp_ver;
+-	struct irqs_data *irqs;
+-	int num_irqs;
+-};
+-
+ /* using default value if reg no write for multi device */
+ static void default_sw_reg_flag(struct rkispp_device *dev)
+ {
+@@ -170,7 +160,7 @@ static struct irqs_data rv1126_ispp_irqs[] = {
+ 	{"fec_irq", irq_hdl},
+ };
+ 
+-static const struct match_data rv1126_ispp_match_data = {
++static const struct ispp_match_data rv1126_ispp_match_data = {
+ 	.clks = rv1126_ispp_clks,
+ 	.clks_num = ARRAY_SIZE(rv1126_ispp_clks),
+ 	.clk_rate_tbl = rv1126_ispp_clk_rate,
+@@ -191,7 +181,7 @@ static const struct of_device_id rkispp_hw_of_match[] = {
+ static int rkispp_hw_probe(struct platform_device *pdev)
+ {
+ 	const struct of_device_id *match;
+-	const struct match_data *match_data;
++	const struct ispp_match_data *match_data;
+ 	struct device_node *node = pdev->dev.of_node;
+ 	struct device *dev = &pdev->dev;
+ 	struct rkispp_hw_dev *hw_dev;
+@@ -209,6 +199,7 @@ static int rkispp_hw_probe(struct platform_device *pdev)
+ 	dev_set_drvdata(dev, hw_dev);
+ 	hw_dev->dev = dev;
+ 	match_data = match->data;
++	hw_dev->match_data = match->data;
+ 	hw_dev->max_in.w = 0;
+ 	hw_dev->max_in.h = 0;
+ 	hw_dev->max_in.fps = 0;
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+index 75222cd020dd..b7e319944cd5 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.h
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -13,9 +13,20 @@ struct ispp_clk_info {
+ 	u32 refer_data;
+ };
+ 
++struct ispp_match_data {
++	int clks_num;
++	const char * const *clks;
++	int clk_rate_tbl_num;
++	const struct ispp_clk_info *clk_rate_tbl;
++	enum rkispp_ver ispp_ver;
++	struct irqs_data *irqs;
++	int num_irqs;
++};
++
+ struct rkispp_hw_dev {
+ 	struct device *dev;
+ 	void __iomem *base_addr;
++	const struct ispp_match_data *match_data;
+ 	const struct ispp_clk_info *clk_rate_tbl;
+ 	struct clk *clks[ISPP_MAX_BUS_CLK];
+ 	struct rkispp_device *ispp[DEV_MAX];
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index d9cc35c98ef1..f4e2ef041163 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -275,8 +275,17 @@ static int rkispp_sd_s_rx_buffer(struct v4l2_subdev *sd,
+ 	if (!buf)
+ 		return -EINVAL;
+ 
+-	if (ispp_sdev->state == ISPP_START)
++	if (ispp_sdev->state == ISPP_START) {
++		struct rkisp_ispp_buf *dbufs = buf;
++		struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
++		u64 ns = ktime_get_ns();
++
++		vdev->dbg.interval = ns - vdev->dbg.timestamp;
++		vdev->dbg.timestamp = ns;
++		vdev->dbg.delay = ns - dbufs->frame_timestamp;
++		vdev->dbg.id = dbufs->frame_id;
+ 		cmd = CMD_QUEUE_DMABUF;
++	}
+ 
+ 	return rkispp_event_handle(dev, cmd, buf);
+ }
+diff --git a/drivers/media/platform/rockchip/ispp/procfs.c b/drivers/media/platform/rockchip/ispp/procfs.c
+new file mode 100644
+index 000000000000..4bfb91898168
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/procfs.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) Rockchip Electronics Co., Ltd. */
++#include <linux/clk.h>
++#include <linux/proc_fs.h>
++#include <linux/sem.h>
++#include <linux/seq_file.h>
++#include <media/v4l2-common.h>
++
++#include "dev.h"
++#include "procfs.h"
++#include "regs.h"
++#include "version.h"
++
++#ifdef CONFIG_PROC_FS
++static int ispp_show(struct seq_file *p, void *v)
++{
++	struct rkispp_device *dev = p->private;
++	struct rkispp_stream *stream;
++	u32 val;
++
++	seq_printf(p, "%-10s Version:v%02x.%02x.%02x\n",
++		   dev->name,
++		   RKISPP_DRIVER_VERSION >> 16,
++		   (RKISPP_DRIVER_VERSION & 0xff00) >> 8,
++		   RKISPP_DRIVER_VERSION & 0x00ff);
++	seq_printf(p, "%-10s rkisp%d Format:%s%s Size:%dx%d (frame:%d rate:%dms delay:%dms)\n",
++		   "Input",
++		   dev->dev_id,
++		   (dev->isp_mode & FMT_FBC) ? "FBC" : "YUV",
++		   (dev->isp_mode & FMT_YUV422) ? "422" : "420",
++		   dev->ispp_sdev.out_fmt.width,
++		   dev->ispp_sdev.out_fmt.height,
++		   dev->stream_vdev.dbg.id,
++		   dev->stream_vdev.dbg.interval / 1000 / 1000,
++		   dev->stream_vdev.dbg.delay / 1000 / 1000);
++	for (val = STREAM_MB; val < STREAM_MAX; val++) {
++		stream = &dev->stream_vdev.stream[val];
++		if (!stream->streaming)
++			continue;
++		seq_printf(p, "%-10s %s Format:%c%c%c%c Size:%dx%d (frame:%d rate:%dms delay:%dms)\n",
++			   "Output",
++			   stream->vnode.vdev.name,
++			   stream->out_fmt.pixelformat,
++			   stream->out_fmt.pixelformat >> 8,
++			   stream->out_fmt.pixelformat >> 16,
++			   stream->out_fmt.pixelformat >> 24,
++			   stream->out_fmt.width,
++			   stream->out_fmt.height,
++			   stream->dbg.id,
++			   stream->dbg.interval / 1000 / 1000,
++			   stream->dbg.delay / 1000 / 1000);
++	}
++	val = rkispp_read(dev, RKISPP_TNR_CORE_CTRL);
++	seq_printf(p, "%-10s %s(0x%x) (frame:%d time:%dms) CNT:0x%x STATE:0x%x\n",
++		   "TNR",
++		   (val & 1) ? "ON" : "OFF", val,
++		   dev->stream_vdev.tnr.dbg.id,
++		   dev->stream_vdev.tnr.dbg.interval / 1000 / 1000,
++		   rkispp_read(dev, RKISPP_TNR_TILE_CNT),
++		   rkispp_read(dev, RKISPP_TNR_STATE));
++	val = rkispp_read(dev, RKISPP_NR_UVNR_CTRL_PARA);
++	seq_printf(p, "%-10s %s(0x%x) (frame:%d time:%dms) 0x%x:0x%x 0x%x:0x%x\n",
++		   "NR",
++		   (val & 1) ? "ON" : "OFF", val,
++		   dev->stream_vdev.nr.dbg.id,
++		   dev->stream_vdev.nr.dbg.interval / 1000 / 1000,
++		   RKISPP_NR_BLOCK_CNT, rkispp_read(dev, RKISPP_NR_BLOCK_CNT),
++		   RKISPP_NR_BUFFER_READY, rkispp_read(dev, RKISPP_NR_BUFFER_READY));
++	val = rkispp_read(dev, RKISPP_SHARP_CORE_CTRL);
++	seq_printf(p, "%-10s %s(0x%x) 0x%x:0x%x\n",
++		   "SHARP",
++		   (val & 1) ? "ON" : "OFF", val,
++		   RKISPP_SHARP_TILE_IDX, rkispp_read(dev, RKISPP_SHARP_TILE_IDX));
++	val = rkispp_read(dev, RKISPP_FEC_CORE_CTRL);
++	seq_printf(p, "%-10s %s(0x%x) (frame:%d time:%dms) 0x%x:0x%x\n",
++		   "FEC",
++		   (val & 1) ? "ON" : "OFF", val,
++		   dev->stream_vdev.fec.dbg.id,
++		   dev->stream_vdev.fec.dbg.interval / 1000 / 1000,
++		   RKISPP_FEC_DMA_STATUS, rkispp_read(dev, RKISPP_FEC_DMA_STATUS));
++	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
++		   "Interrupt",
++		   dev->isr_cnt,
++		   dev->isr_err_cnt);
++	for (val = 0; val < dev->hw_dev->clks_num; val++) {
++		seq_printf(p, "%-10s %ld\n",
++			   dev->hw_dev->match_data->clks[val],
++			   clk_get_rate(dev->hw_dev->clks[val]));
++	}
++	return 0;
++}
++
++static int ispp_open(struct inode *inode, struct file *file)
++{
++	struct rkispp_device *data = PDE_DATA(inode);
++
++	return single_open(file, ispp_show, data);
++}
++
++static const struct file_operations ops = {
++	.owner		= THIS_MODULE,
++	.open		= ispp_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++int rkispp_proc_init(struct rkispp_device *dev)
++{
++	dev->procfs = proc_create_data(dev->name, 0, NULL, &ops, dev);
++	if (!dev->procfs)
++		return -EINVAL;
++	return 0;
++}
++
++void rkispp_proc_cleanup(struct rkispp_device *dev)
++{
++	if (dev->procfs)
++		remove_proc_entry(dev->name, NULL);
++	dev->procfs = NULL;
++}
++#endif /* CONFIG_PROC_FS */
+diff --git a/drivers/media/platform/rockchip/ispp/procfs.h b/drivers/media/platform/rockchip/ispp/procfs.h
+new file mode 100644
+index 000000000000..21ea0c471b58
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/procfs.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2020 Rockchip Electronics Co., Ltd. */
++
++#ifndef _RKISPP_PROCFS_H
++#define _RKISPP_PROCFS_H
++
++#ifdef CONFIG_PROC_FS
++int rkispp_proc_init(struct rkispp_device *dev);
++void rkispp_proc_cleanup(struct rkispp_device *dev);
++#else
++static inline int rkispp_proc_init(struct rkispp_device *dev)
++{
++	return 0;
++}
++static inline void rkispp_proc_cleanup(struct rkispp_device *dev)
++{
++
++}
++#endif
++
++#endif
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 52ca90128acc..b7db567e0535 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -335,6 +335,13 @@ static int rkispp_frame_end(struct rkispp_stream *stream)
+ 		stream->curr_buf->vb.vb2_buf.timestamp = ns;
+ 		vb2_buffer_done(&stream->curr_buf->vb.vb2_buf,
+ 				VB2_BUF_STATE_DONE);
++
++		ns = ktime_get_ns();
++		stream->dbg.interval = ns - stream->dbg.timestamp;
++		stream->dbg.timestamp = ns;
++		stream->dbg.delay = ns - stream->curr_buf->vb.vb2_buf.timestamp;
++		stream->dbg.id = stream->curr_buf->vb.sequence;
++
+ 		stream->curr_buf = NULL;
+ 	}
+ 
+@@ -1523,6 +1530,8 @@ static int start_isp(struct rkispp_device *dev)
+ 	if (dev->isp_mode & ISP_ISPP_QUICK)
+ 		rkispp_set_bits(dev, RKISPP_CTRL_QUICK, 0, GLB_QUICK_EN);
+ 
++	dev->isr_cnt = 0;
++	dev->isr_err_cnt = 0;
+ 	ret = v4l2_subdev_call(&ispp_sdev->sd, video, s_stream, true);
+ err:
+ 	mutex_unlock(&dev->hw_dev->dev_lock);
+@@ -1708,7 +1717,7 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 		    sdev->out_fmt.width < RKISPP_MIN_WIDTH ||
+ 		    sdev->out_fmt.height < RKISPP_MIN_HEIGHT) {
+ 			v4l2_err(&dev->v4l2_dev,
+-				 "ispp input max:%dx%d min:%dx%d\n",
++				 "ispp input min:%dx%d max:%dx%d\n",
+ 				 RKISPP_MIN_WIDTH, RKISPP_MIN_HEIGHT,
+ 				 RKISPP_MAX_WIDTH, RKISPP_MAX_HEIGHT);
+ 			stream->out_fmt.width = 0;
+@@ -1996,6 +2005,10 @@ static void fec_work_event(struct rkispp_device *dev,
+ 		v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+ 			 "FEC start seq:%d | Y_SHD rd:0x%x\n",
+ 			 seq, readl(base + RKISPP_FEC_RD_Y_BASE_SHD));
++
++		vdev->fec.dbg.id = seq;
++		vdev->fec.dbg.timestamp = ktime_get_ns();
++
+ 		writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->fec.is_end = false;
+ 	}
+@@ -2172,6 +2185,8 @@ static void nr_work_event(struct rkispp_device *dev,
+ 				stream->ops->stop(stream);
+ 		}
+ 
++		vdev->nr.dbg.id = seq;
++		vdev->nr.dbg.timestamp = ktime_get_ns();
+ 		if (!is_quick)
+ 			writel(NR_SHP_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->nr.is_end = false;
+@@ -2357,6 +2372,10 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			     rkispp_read(dev, RKISPP_TNR_WR_Y_BASE));
+ 		rkispp_write(dev, RKISPP_TNR_IIR_UV_BASE,
+ 			     rkispp_read(dev, RKISPP_TNR_WR_UV_BASE));
++
++		vdev->tnr.dbg.id = seq;
++		vdev->tnr.dbg.timestamp = ktime_get_ns();
++
+ 		writel(TNR_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->tnr.is_end = false;
+ 	}
+@@ -2400,14 +2419,25 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 	u32 i, err_mask = NR_LOST_ERR | TNR_LOST_ERR |
+ 		FBCH_EMPTY_NR | FBCH_EMPTY_TNR | FBCD_DEC_ERR_NR |
+ 		FBCD_DEC_ERR_TNR | BUS_ERR_NR | BUS_ERR_TNR;
++	u64 ns = ktime_get_ns();
+ 
+ 	v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+ 		 "isr:0x%x\n", mis_val);
+ 
+ 	vdev = &dev->stream_vdev;
+-	if (mis_val & err_mask)
++	dev->isr_cnt++;
++	if (mis_val & err_mask) {
++		dev->isr_err_cnt++;
+ 		v4l2_err(&dev->v4l2_dev,
+ 			 "ispp err:0x%x\n", mis_val);
++	}
++
++	if (mis_val & TNR_INT)
++		vdev->tnr.dbg.interval = ns - vdev->tnr.dbg.timestamp;
++	if (mis_val & NR_INT)
++		vdev->nr.dbg.interval = ns - vdev->nr.dbg.timestamp;
++	if (mis_val & FEC_INT)
++		vdev->fec.dbg.interval = ns - vdev->fec.dbg.timestamp;
+ 
+ 	if (mis_val & (CMD_TNR_ST_DONE | CMD_NR_SHP_ST_DONE) &&
+ 	    (dev->isp_mode & ISP_ISPP_QUICK || dev->inp == INP_DDR))
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 61a4a898dc02..a79c8c38cbc5 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -94,6 +94,7 @@ struct tnr_module {
+ 	struct rkisp_ispp_buf *cur_rd;
+ 	struct rkisp_ispp_buf *nxt_rd;
+ 	struct rkisp_ispp_buf *cur_wr;
++	struct frame_debug_info dbg;
+ 	u32 uv_offset;
+ 	bool is_end;
+ 	bool is_3to1;
+@@ -106,6 +107,7 @@ struct nr_module {
+ 	spinlock_t buf_lock;
+ 	struct rkisp_ispp_buf *cur_rd;
+ 	struct rkispp_dummy_buffer *cur_wr;
++	struct frame_debug_info dbg;
+ 	u32 uv_offset;
+ 	bool is_end;
+ };
+@@ -113,6 +115,7 @@ struct nr_module {
+ struct fec_module {
+ 	struct list_head list_rd;
+ 	struct rkispp_dummy_buffer *cur_rd;
++	struct frame_debug_info dbg;
+ 	spinlock_t buf_lock;
+ 	u32 uv_offset;
+ 	bool is_end;
+@@ -158,6 +161,8 @@ struct rkispp_stream {
+ 	struct stream_config *config;
+ 	struct capture_fmt out_cap_fmt;
+ 	struct v4l2_pix_format_mplane out_fmt;
++	struct frame_debug_info dbg;
++
+ 	u8 last_module;
+ 	bool streaming;
+ 	bool stopping;
+@@ -174,6 +179,7 @@ struct rkispp_stream_vdev {
+ 	struct nr_module nr;
+ 	struct fec_module fec;
+ 	struct in_fec_buf fec_buf;
++	struct frame_debug_info dbg;
+ 	atomic_t refcnt;
+ 	u32 module_ens;
+ 	u32 irq_ends;
+-- 
+2.35.3
+

@@ -1,0 +1,123 @@
+From 0ae90e7e63347769253a3df5c0ce3215c22c336a Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Wed, 8 Jul 2015 17:36:16 +0800
+Subject: [PATCH] mmc: rk_sdmmc: add MMC_DW_SKIP_CACHE_OP for data manipulation
+
+Direct IO of filesystem  had recursive searched and map the addr
+itself, so mmc drivers can avoid to do the same ops in order to
+improve throughput. We got 30% improvement for 4KB bs packet test.
+
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/card/block.c    |  3 +++
+ drivers/mmc/host/Kconfig    |  6 ++++++
+ drivers/mmc/host/rk_sdmmc.c | 17 +++++++++++++++++
+ include/linux/mmc/core.h    |  1 +
+ 4 files changed, 27 insertions(+)
+
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 3fcceae9742d..f1e6e8586901 100755
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -1405,6 +1405,9 @@ static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
+ 		brq->data.flags |= MMC_DATA_WRITE;
+ 	}
+ 
++	if (req->cmd_flags & REQ_KERNEL)
++		brq->data.flags |= MMC_DATA_DIRECT;
++
+ 	if (do_rel_wr)
+ 		mmc_apply_rel_rw(brq, card, req);
+ 
+diff --git a/drivers/mmc/host/Kconfig b/drivers/mmc/host/Kconfig
+index 7c3b9bb3ddcd..2fe1cb18160b 100755
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -576,6 +576,12 @@ config MMC_DW_ROCKCHIP_SWITCH_VOLTAGE
+           This selects support for Rockchip RK32XX Soc specific extensions to voltage
+ 	  switch squence
+ 
++config MMC_DW_SKIP_CACHE_OP
++	bool "Skip operations for cache coherency"
++	depends on MMC_DW
++	help
++	  This selects support for skipping operations for cache coherency
++	  to reduce I/O overhead if file system layer do same thing.
+ 
+ config MMC_DW_EXYNOS
+ 	tristate "Exynos specific extensions for Synopsys DW Memory Card Interface"
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index f8af868f2075..d9138b6a32eb 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -48,6 +48,7 @@
+ #include <linux/mfd/syscon.h>
+ #include <linux/regmap.h>
+ #include <linux/log2.h>
++#include <asm-generic/dma-mapping-common.h>
+ #include "rk_sdmmc.h"
+ #include "rk_sdmmc_dbg.h"
+ #include <linux/regulator/rockchip_io_vol_domain.h>
+@@ -669,12 +670,17 @@ static const struct dw_mci_dma_ops dw_mci_edmac_ops = {
+ };
+ #endif /* CONFIG_MMC_DW_IDMAC */
+ 
++static struct dma_attrs dw_mci_direct_attrs;
++
+ static int dw_mci_pre_dma_transfer(struct dw_mci *host,
+ 				   struct mmc_data *data,
+ 				   bool next)
+ {
+ 	struct scatterlist *sg;
+ 	unsigned int i, sg_len;
++#ifdef CONFIG_MMC_DW_SKIP_CACHE_OP
++	struct dma_attrs *attrs;
++#endif
+ 
+ 	if (!next && data->host_cookie)
+ 		return data->host_cookie;
+@@ -694,11 +700,19 @@ static int dw_mci_pre_dma_transfer(struct dw_mci *host,
+ 		if (sg->offset & 3 || sg->length & 3)
+ 			return -EINVAL;
+ 	}
++#ifdef CONFIG_MMC_DW_SKIP_CACHE_OP
++	attrs = (data->flags & MMC_DATA_DIRECT) ? &dw_mci_direct_attrs : NULL;
++	sg_len = dma_map_sg_attrs(host->dev,
++				 data->sg,
++				 data->sg_len,
++				 dw_mci_get_dma_dir(data), attrs);
++#else
+ 
+ 	sg_len = dma_map_sg(host->dev,
+ 			    data->sg,
+ 			    data->sg_len,
+ 			    dw_mci_get_dma_dir(data));
++#endif
+ 	if (sg_len == 0)
+ 		return -EINVAL;
+ 
+@@ -4073,6 +4087,9 @@ int dw_mci_probe(struct dw_mci *host)
+ 	if (!dw_mci_ctrl_all_reset(host))
+ 		return -ENODEV;
+ 
++	init_dma_attrs(&dw_mci_direct_attrs);
++	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &dw_mci_direct_attrs);
++
+ 	host->dma_ops = host->pdata->dma_ops;
+ 	dw_mci_init_dma(host);
+ 
+diff --git a/include/linux/mmc/core.h b/include/linux/mmc/core.h
+index 3384809a548d..aac23525caa2 100644
+--- a/include/linux/mmc/core.h
++++ b/include/linux/mmc/core.h
+@@ -114,6 +114,7 @@ struct mmc_data {
+ #define MMC_DATA_WRITE	(1 << 8)
+ #define MMC_DATA_READ	(1 << 9)
+ #define MMC_DATA_STREAM	(1 << 10)
++#define MMC_DATA_DIRECT (1 << 11)
+ 
+ 	unsigned int		bytes_xfered;
+ 
+-- 
+2.35.3
+

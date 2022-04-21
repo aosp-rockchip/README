@@ -1,0 +1,2041 @@
+From bcdfd733fa05f604f1d3deb3d29f5082cb52b01f Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Tue, 23 Jun 2020 17:25:02 +0800
+Subject: [PATCH] video: rockchip: mpp: clock relative code refactoring
+
+1. read clock setting using the common code from dtsi.
+2. clock enable/disable, all devices using the same function.
+3. clock frequency set to two levels: normal and advanced.
+4. according to specific requirements, the frequency is set
+   level instead of the value.
+
+Change-Id: Idcf8e0f49987df20f3eb2574aff316e507f82cfe
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c | 126 +++++++-
+ drivers/video/rockchip/mpp/mpp_common.h |  72 ++++-
+ drivers/video/rockchip/mpp/mpp_iep2.c   |  77 ++---
+ drivers/video/rockchip/mpp/mpp_rkvdec.c | 387 +++++++++++-------------
+ drivers/video/rockchip/mpp/mpp_rkvenc.c | 119 +++-----
+ drivers/video/rockchip/mpp/mpp_vdpu1.c  |  91 ++----
+ drivers/video/rockchip/mpp/mpp_vdpu2.c  |  60 ++--
+ drivers/video/rockchip/mpp/mpp_vepu1.c  |  59 ++--
+ drivers/video/rockchip/mpp/mpp_vepu2.c  |  61 ++--
+ 9 files changed, 514 insertions(+), 538 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 50e09f7cc0e1..a73a36c96358 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -1707,20 +1707,6 @@ irqreturn_t mpp_dev_isr_sched(int irq, void *param)
+ 	return ret;
+ }
+ 
+-int mpp_safe_reset(struct reset_control *rst)
+-{
+-	if (rst)
+-		reset_control_assert(rst);
+-	return 0;
+-}
+-
+-int mpp_safe_unreset(struct reset_control *rst)
+-{
+-	if (rst)
+-		reset_control_deassert(rst);
+-	return 0;
+-}
+-
+ #define MPP_GRF_VAL_MASK	0xFFFF
+ 
+ u32 mpp_get_grf(struct mpp_grf_info *grf_info)
+@@ -1788,6 +1774,118 @@ int mpp_read_req(struct mpp_dev *mpp, u32 *regs,
+ 	return 0;
+ }
+ 
++int mpp_get_clk_info(struct mpp_dev *mpp,
++		     struct mpp_clk_info *clk_info,
++		     const char *name)
++{
++	int index = of_property_match_string(mpp->dev->of_node,
++					     "clock-names", name);
++
++	if (index < 0)
++		return -EINVAL;
++
++	clk_info->clk = devm_clk_get(mpp->dev, name);
++	of_property_read_u32_index(mpp->dev->of_node,
++				   "rockchip,normal-rates",
++				   index,
++				   &clk_info->normal_rate_hz);
++	of_property_read_u32_index(mpp->dev->of_node,
++				   "rockchip,advanced-rates",
++				   index,
++				   &clk_info->advanced_rate_hz);
++
++	return 0;
++}
++
++int mpp_set_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++			     enum MPP_CLOCK_MODE mode,
++			     unsigned long val)
++{
++	if (!clk_info->clk || !val)
++		return 0;
++
++	switch (mode) {
++	case CLK_MODE_DEBUG:
++		clk_info->debug_rate_hz = val;
++	break;
++	case CLK_MODE_REDUCE:
++		clk_info->reduce_rate_hz = val;
++	break;
++	case CLK_MODE_NORMAL:
++		clk_info->normal_rate_hz = val;
++	break;
++	case CLK_MODE_ADVANCED:
++		clk_info->advanced_rate_hz = val;
++	break;
++	case CLK_MODE_DEFAULT:
++		clk_info->default_rate_hz = val;
++	break;
++	default:
++		mpp_err("error mode %d\n", mode);
++	break;
++	}
++
++	return 0;
++}
++
++#define MPP_REDUCE_RATE_HZ (50 * MHZ)
++
++unsigned long mpp_get_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++				       enum MPP_CLOCK_MODE mode)
++{
++	unsigned long clk_rate_hz = 0;
++
++	if (!clk_info->clk)
++		return 0;
++
++	if (clk_info->debug_rate_hz)
++		return clk_info->debug_rate_hz;
++
++	switch (mode) {
++	case CLK_MODE_REDUCE: {
++		if (clk_info->reduce_rate_hz)
++			clk_rate_hz = clk_info->reduce_rate_hz;
++		else
++			clk_rate_hz = MPP_REDUCE_RATE_HZ;
++	} break;
++	case CLK_MODE_NORMAL: {
++		if (clk_info->normal_rate_hz)
++			clk_rate_hz = clk_info->normal_rate_hz;
++		else
++			clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	case CLK_MODE_ADVANCED: {
++		if (clk_info->advanced_rate_hz)
++			clk_rate_hz = clk_info->advanced_rate_hz;
++		else
++			clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	case CLK_MODE_DEFAULT:
++	default: {
++		clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	}
++
++	return clk_rate_hz;
++}
++
++int mpp_clk_set_rate(struct mpp_clk_info *clk_info,
++		     enum MPP_CLOCK_MODE mode)
++{
++	unsigned long clk_rate_hz;
++
++	if (!clk_info->clk)
++		return -EINVAL;
++
++	clk_rate_hz = mpp_get_clk_info_rate_hz(clk_info, mode);
++	if (clk_rate_hz) {
++		clk_info->used_rate_hz = clk_rate_hz;
++		clk_set_rate(clk_info->clk, clk_rate_hz);
++	}
++
++	return 0;
++}
++
+ int px30_workaround_combo_init(struct mpp_dev *mpp)
+ {
+ 	struct mpp_rk_iommu *iommu = NULL, *loop = NULL, *n;
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index b3799c1d70ae..9af08decad9a 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -101,6 +101,16 @@ enum MPP_DEV_COMMAND_TYPE {
+ 	MPP_CMD_BUTT,
+ };
+ 
++enum MPP_CLOCK_MODE {
++	CLK_MODE_BASE		= 0,
++	CLK_MODE_DEFAULT	= CLK_MODE_BASE,
++	CLK_MODE_DEBUG,
++	CLK_MODE_REDUCE,
++	CLK_MODE_NORMAL,
++	CLK_MODE_ADVANCED,
++	CLK_MODE_BUTT,
++};
++
+ /* data common struct for parse out */
+ struct mpp_request {
+ 	__u32 cmd;
+@@ -157,6 +167,22 @@ struct reg_offset_info {
+ 	struct reg_offset_elem elem[MPP_MAX_REG_TRANS_NUM];
+ };
+ 
++struct mpp_clk_info {
++	struct clk *clk;
++
++	/* debug rate, from debugfs */
++	u32 debug_rate_hz;
++	/* normal rate, from dtsi */
++	u32 normal_rate_hz;
++	/* high performance rate, from dtsi */
++	u32 advanced_rate_hz;
++
++	u32 default_rate_hz;
++	u32 reduce_rate_hz;
++	/* record last used rate */
++	u32 used_rate_hz;
++};
++
+ struct mpp_dev_var {
+ 	enum MPP_DEVICE_TYPE device_type;
+ 
+@@ -429,9 +455,6 @@ irqreturn_t mpp_dev_isr_sched(int irq, void *param);
+ struct reset_control *
+ mpp_reset_control_get(struct mpp_dev *mpp, const char *name);
+ 
+-int mpp_safe_reset(struct reset_control *rst);
+-int mpp_safe_unreset(struct reset_control *rst);
+-
+ u32 mpp_get_grf(struct mpp_grf_info *grf_info);
+ int mpp_set_grf(struct mpp_grf_info *grf_info);
+ 
+@@ -443,6 +466,17 @@ int mpp_write_req(struct mpp_dev *mpp, u32 *regs,
+ int mpp_read_req(struct mpp_dev *mpp, u32 *regs,
+ 		 u32 start_idx, u32 end_idx);
+ 
++int mpp_get_clk_info(struct mpp_dev *mpp,
++		     struct mpp_clk_info *clk_info,
++		     const char *name);
++int mpp_set_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++			     enum MPP_CLOCK_MODE mode,
++			     unsigned long val);
++unsigned long mpp_get_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++				       enum MPP_CLOCK_MODE mode);
++int mpp_clk_set_rate(struct mpp_clk_info *clk_info,
++		     enum MPP_CLOCK_MODE mode);
++
+ static inline int mpp_write(struct mpp_dev *mpp, u32 reg, u32 val)
+ {
+ 	int idx = reg / sizeof(u32);
+@@ -489,6 +523,38 @@ static inline u32 mpp_read_relaxed(struct mpp_dev *mpp, u32 reg)
+ 	return val;
+ }
+ 
++static inline int mpp_safe_reset(struct reset_control *rst)
++{
++	if (rst)
++		reset_control_assert(rst);
++
++	return 0;
++}
++
++static inline int mpp_safe_unreset(struct reset_control *rst)
++{
++	if (rst)
++		reset_control_deassert(rst);
++
++	return 0;
++}
++
++static inline int mpp_clk_safe_enable(struct clk *clk)
++{
++	if (clk)
++		clk_prepare_enable(clk);
++
++	return 0;
++}
++
++static inline int mpp_clk_safe_disable(struct clk *clk)
++{
++	if (clk)
++		clk_disable_unprepare(clk);
++
++	return 0;
++}
++
+ /* workaround according hardware */
+ int px30_workaround_combo_init(struct mpp_dev *mpp);
+ int px30_workaround_combo_switch_grf(struct mpp_dev *mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_iep2.c b/drivers/video/rockchip/mpp/mpp_iep2.c
+index 0ec7cc53210c..bc56ae3dd68d 100644
+--- a/drivers/video/rockchip/mpp/mpp_iep2.c
++++ b/drivers/video/rockchip/mpp/mpp_iep2.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ /*
+- * Copyright (c) 2020 Fuzhou Rockchip Electronics Co., Ltd
++ * Copyright (c) 2020 Rockchip Electronics Co., Ltd.
+  *
+  * author:
+  *	Ding Wei, leo.ding@rock-chips.com
+@@ -196,7 +196,8 @@ struct iep2_output {
+ struct iep_task {
+ 	struct mpp_task mpp_task;
+ 	struct mpp_hw_info *hw_info;
+-	unsigned long aclk_freq;
++
++	enum MPP_CLOCK_MODE clk_mode;
+ 	struct iep2_params params;
+ 	struct iep2_output output;
+ 
+@@ -212,13 +213,12 @@ struct iep_task {
+ struct iep2_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
+-	struct clk *sclk;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
++	struct mpp_clk_info sclk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -347,6 +347,7 @@ static void *iep2_alloc_task(struct mpp_session *session,
+ 		if (ret)
+ 			goto fail;
+ 	}
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -772,7 +773,6 @@ static int iep2_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	iep->aclk_debug = 0;
+ 	iep->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(iep->debugfs)) {
+@@ -781,7 +781,7 @@ static int iep2_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   iep->debugfs, &iep->aclk_debug);
++			   iep->debugfs, &iep->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   iep->debugfs, &mpp->session_max_buffers);
+ 
+@@ -804,25 +804,24 @@ static inline int iep2_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int iep2_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_IEP2];
+ 
+-	iep->aclk = devm_clk_get(mpp->dev, "aclk");
+-	if (IS_ERR(iep->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &iep->aclk_info, "aclk");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk\n");
+-		iep->aclk = NULL;
+-	}
+-	iep->hclk = devm_clk_get(mpp->dev, "hclk");
+-	if (IS_ERR(iep->hclk)) {
++	ret = mpp_get_clk_info(mpp, &iep->hclk_info, "hclk");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk\n");
+-		iep->hclk = NULL;
+-	}
+-	iep->sclk = devm_clk_get(mpp->dev, "sclk");
+-	if (IS_ERR(iep->sclk)) {
++	ret = mpp_get_clk_info(mpp, &iep->sclk_info, "sclk");
++	if (ret)
+ 		mpp_err("failed on clk_get sclk\n");
+-		iep->sclk = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&iep->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
++
+ 	iep->rst_a = devm_reset_control_get(mpp->dev, "rst_a");
+ 	if (IS_ERR_OR_NULL(iep->rst_a)) {
+ 		mpp_err("No aclk reset resource define\n");
+@@ -855,12 +854,9 @@ static int iep2_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	if (iep->aclk)
+-		clk_prepare_enable(iep->aclk);
+-	if (iep->hclk)
+-		clk_prepare_enable(iep->hclk);
+-	if (iep->sclk)
+-		clk_prepare_enable(iep->sclk);
++	mpp_clk_safe_enable(iep->aclk_info.clk);
++	mpp_clk_safe_enable(iep->hclk_info.clk);
++	mpp_clk_safe_enable(iep->sclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -869,22 +865,9 @@ static int iep2_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	if (iep->aclk)
+-		clk_disable_unprepare(iep->aclk);
+-	if (iep->hclk)
+-		clk_disable_unprepare(iep->hclk);
+-	if (iep->sclk)
+-		clk_disable_unprepare(iep->sclk);
+-
+-	return 0;
+-}
+-
+-static int iep2_get_freq(struct mpp_dev *mpp,
+-			 struct mpp_task *mpp_task)
+-{
+-	struct iep_task *task = to_iep_task(mpp_task);
+-
+-	task->aclk_freq = 300;
++	mpp_clk_safe_disable(iep->aclk_info.clk);
++	mpp_clk_safe_disable(iep->hclk_info.clk);
++	mpp_clk_safe_disable(iep->sclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -895,11 +878,7 @@ static int iep2_set_freq(struct mpp_dev *mpp,
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 	struct iep_task *task = to_iep_task(mpp_task);
+ 
+-	/* check whether use debug freq */
+-	task->aclk_freq = iep->aclk_debug ?
+-			iep->aclk_debug : task->aclk_freq;
+-
+-	clk_set_rate(iep->aclk, task->aclk_freq * MHZ);
++	mpp_clk_set_rate(&iep->aclk_info, task->clk_mode);
+ 
+ 	return 0;
+ }
+@@ -908,8 +887,7 @@ static int iep2_reduce_freq(struct mpp_dev *mpp)
+ {
+ 	struct iep2_dev *iep = to_iep2_dev(mpp);
+ 
+-	if (iep->aclk)
+-		clk_set_rate(iep->aclk, 50 * MHZ);
++	mpp_clk_set_rate(&iep->aclk_info, CLK_MODE_REDUCE);
+ 
+ 	return 0;
+ }
+@@ -938,7 +916,6 @@ static struct mpp_hw_ops iep_v2_hw_ops = {
+ 	.init = iep2_init,
+ 	.clk_on = iep2_clk_on,
+ 	.clk_off = iep2_clk_off,
+-	.get_freq = iep2_get_freq,
+ 	.set_freq = iep2_set_freq,
+ 	.reduce_freq = iep2_reduce_freq,
+ 	.reset = iep2_reset,
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index 2cd2f41ff978..3f0efb47240d 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -137,11 +137,7 @@ enum RKVDEC_HW_ID {
+ struct rkvdec_task {
+ 	struct mpp_task mpp_task;
+ 
+-	unsigned long aclk_freq;
+-	unsigned long clk_core_freq;
+-	unsigned long clk_cabac_freq;
+-	unsigned long clk_hevc_cabac_freq;
+-
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 reg[RKVDEC_V2_REG_NUM];
+ 	struct reg_offset_info off_inf;
+ 
+@@ -159,18 +155,14 @@ struct rkvdec_dev {
+ 	/* sip smc reset lock */
+ 	struct mutex sip_reset_lock;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
+-	struct clk *clk_core;
+-	struct clk *clk_cabac;
+-	struct clk *clk_hevc_cabac;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
++	struct mpp_clk_info core_clk_info;
++	struct mpp_clk_info cabac_clk_info;
++	struct mpp_clk_info hevc_cabac_clk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+-	u32 clk_core_debug;
+-	u32 clk_cabac_debug;
+-	u32 clk_hevc_cabac_debug;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -183,7 +175,7 @@ struct rkvdec_dev {
+ 	enum RKVDEC_STATE state;
+ 	unsigned long aux_iova;
+ 	struct page *aux_page;
+-	/* regulator and devfreq */
++#ifdef CONFIG_PM_DEVFREQ
+ 	struct regulator *vdd;
+ 	struct devfreq *devfreq;
+ 	struct devfreq *parent_devfreq;
+@@ -192,12 +184,14 @@ struct rkvdec_dev {
+ 	struct thermal_zone_device *thermal_zone;
+ 	u32 static_power_coeff;
+ 	s32 ts[4];
+-	struct mutex set_clk_lock; /* set clk lock */
++	/* set clk lock */
++	struct mutex set_clk_lock;
+ 	unsigned int thermal_div;
+ 	unsigned long volt;
+-	unsigned long aclk_devf;
+-	unsigned long clk_core_devf;
+-	unsigned long clk_cabac_devf;
++	unsigned long devf_aclk_rate_hz;
++	unsigned long devf_core_rate_hz;
++	unsigned long devf_cabac_rate_hz;
++#endif
+ 	/* record last infos */
+ 	u32 last_fmt;
+ 	bool had_reset;
+@@ -261,55 +255,60 @@ static struct mpp_trans_info rkvdec_v1_trans[] = {
+ 	},
+ };
+ 
+-static int rkvdec_set_clk(struct rkvdec_dev *dec,
+-			  unsigned long aclk_freq,
+-			  unsigned long core_freq,
+-			  unsigned long cabac_freq,
+-			  unsigned int event)
++#ifdef CONFIG_PM_DEVFREQ
++static int rkvdec_devf_set_clk(struct rkvdec_dev *dec,
++			       unsigned long aclk_rate_hz,
++			       unsigned long core_rate_hz,
++			       unsigned long cabac_rate_hz,
++			       unsigned int event)
+ {
++	struct clk *aclk = dec->aclk_info.clk;
++	struct clk *clk_core = dec->core_clk_info.clk;
++	struct clk *clk_cabac = dec->cabac_clk_info.clk;
++
+ 	mutex_lock(&dec->set_clk_lock);
+ 
+ 	switch (event) {
+ 	case EVENT_POWER_ON:
+-		clk_set_rate(dec->aclk, dec->aclk_devf);
+-		clk_set_rate(dec->clk_core, dec->clk_core_devf);
+-		clk_set_rate(dec->clk_cabac, dec->clk_cabac_devf);
++		clk_set_rate(aclk, dec->devf_aclk_rate_hz);
++		clk_set_rate(clk_core, dec->devf_core_rate_hz);
++		clk_set_rate(clk_cabac, dec->devf_cabac_rate_hz);
+ 		dec->thermal_div = 0;
+ 		break;
+ 	case EVENT_POWER_OFF:
+-		clk_set_rate(dec->aclk, aclk_freq);
+-		clk_set_rate(dec->clk_core, core_freq);
+-		clk_set_rate(dec->clk_cabac, cabac_freq);
++		clk_set_rate(aclk, aclk_rate_hz);
++		clk_set_rate(clk_core, core_rate_hz);
++		clk_set_rate(clk_cabac, cabac_rate_hz);
+ 		dec->thermal_div = 0;
+ 		break;
+ 	case EVENT_ADJUST:
+ 		if (!dec->thermal_div) {
+-			clk_set_rate(dec->aclk, aclk_freq);
+-			clk_set_rate(dec->clk_core, core_freq);
+-			clk_set_rate(dec->clk_cabac, cabac_freq);
++			clk_set_rate(aclk, aclk_rate_hz);
++			clk_set_rate(clk_core, core_rate_hz);
++			clk_set_rate(clk_cabac, cabac_rate_hz);
+ 		} else {
+-			clk_set_rate(dec->aclk,
+-				     aclk_freq / dec->thermal_div);
+-			clk_set_rate(dec->clk_core,
+-				     core_freq / dec->thermal_div);
+-			clk_set_rate(dec->clk_cabac,
+-				     cabac_freq / dec->thermal_div);
++			clk_set_rate(aclk,
++				     aclk_rate_hz / dec->thermal_div);
++			clk_set_rate(clk_core,
++				     core_rate_hz / dec->thermal_div);
++			clk_set_rate(clk_cabac,
++				     cabac_rate_hz / dec->thermal_div);
+ 		}
+-		dec->aclk_devf = aclk_freq;
+-		dec->clk_core_devf = core_freq;
+-		dec->clk_cabac_devf = cabac_freq;
++		dec->devf_aclk_rate_hz = aclk_rate_hz;
++		dec->devf_core_rate_hz = core_rate_hz;
++		dec->devf_cabac_rate_hz = cabac_rate_hz;
+ 		break;
+ 	case EVENT_THERMAL:
+-		dec->thermal_div = dec->aclk_devf / aclk_freq;
++		dec->thermal_div = dec->devf_aclk_rate_hz / aclk_rate_hz;
+ 		if (dec->thermal_div > 4)
+ 			dec->thermal_div = 4;
+ 		if (dec->thermal_div) {
+-			clk_set_rate(dec->aclk,
+-				     dec->aclk_devf / dec->thermal_div);
+-			clk_set_rate(dec->clk_core,
+-				     dec->clk_core_devf / dec->thermal_div);
+-			clk_set_rate(dec->clk_cabac,
+-				     dec->clk_cabac_devf / dec->thermal_div);
++			clk_set_rate(aclk,
++				     dec->devf_aclk_rate_hz / dec->thermal_div);
++			clk_set_rate(clk_core,
++				     dec->devf_core_rate_hz / dec->thermal_div);
++			clk_set_rate(clk_cabac,
++				     dec->devf_cabac_rate_hz / dec->thermal_div);
+ 		}
+ 		break;
+ 	}
+@@ -326,7 +325,7 @@ static int devfreq_target(struct device *dev,
+ 	unsigned int clk_event;
+ 	struct dev_pm_opp *opp;
+ 	unsigned long target_volt, target_freq;
+-	unsigned long aclk_freq, core_freq, cabac_freq;
++	unsigned long aclk_rate_hz, core_rate_hz, cabac_rate_hz;
+ 
+ 	struct rkvdec_dev *dec = dev_get_drvdata(dev);
+ 	struct devfreq *devfreq = dec->devfreq;
+@@ -344,14 +343,14 @@ static int devfreq_target(struct device *dev,
+ 
+ 	if (target_freq < *freq) {
+ 		clk_event = EVENT_THERMAL;
+-		aclk_freq = target_freq;
+-		core_freq = target_freq;
+-		cabac_freq = target_freq;
++		aclk_rate_hz = target_freq;
++		core_rate_hz = target_freq;
++		cabac_rate_hz = target_freq;
+ 	} else {
+ 		clk_event = stat->busy_time ? EVENT_POWER_ON : EVENT_POWER_OFF;
+-		aclk_freq = dec->aclk_devf;
+-		core_freq = dec->clk_core_devf;
+-		cabac_freq = dec->clk_cabac_devf;
++		aclk_rate_hz = dec->devf_aclk_rate_hz;
++		core_rate_hz = dec->devf_core_rate_hz;
++		cabac_rate_hz = dec->devf_cabac_rate_hz;
+ 	}
+ 
+ 	if (old_clk_rate == target_freq) {
+@@ -376,7 +375,7 @@ static int devfreq_target(struct device *dev,
+ 	}
+ 
+ 	dev_dbg(dev, "%lu-->%lu\n", old_clk_rate, target_freq);
+-	rkvdec_set_clk(dec, aclk_freq, core_freq, cabac_freq, clk_event);
++	rkvdec_devf_set_clk(dec, aclk_rate_hz, core_rate_hz, cabac_rate_hz, clk_event);
+ 	stat->current_frequency = target_freq;
+ 
+ 	if (old_clk_rate > target_freq) {
+@@ -396,7 +395,7 @@ static int devfreq_get_cur_freq(struct device *dev,
+ {
+ 	struct rkvdec_dev *dec = dev_get_drvdata(dev);
+ 
+-	*freq = clk_get_rate(dec->aclk);
++	*freq = clk_get_rate(dec->aclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -534,6 +533,7 @@ static int devfreq_notifier_call(struct notifier_block *nb,
+ 
+ 	return NOTIFY_OK;
+ }
++#endif
+ 
+ /*
+  * NOTE: rkvdec/rkhevc put scaling list address in pps buffer hardware will read
+@@ -841,6 +841,7 @@ static void *rkvdec_alloc_task(struct mpp_session *session,
+ 			goto fail;
+ 	}
+ 	task->strm_addr = task->reg[RKVDEC_REG_RLC_BASE_INDEX];
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -1119,11 +1120,6 @@ static int rkvdec_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+-	dec->aclk_debug = 0;
+-	dec->clk_core_debug = 0;
+-	dec->clk_cabac_debug = 0;
+-	dec->clk_hevc_cabac_debug = 0;
+-
+ 	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(dec->debugfs)) {
+@@ -1132,13 +1128,13 @@ static int rkvdec_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_debug);
++			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("clk_core", 0644,
+-			   dec->debugfs, &dec->clk_core_debug);
++			   dec->debugfs, &dec->core_clk_info.debug_rate_hz);
+ 	debugfs_create_u32("clk_cabac", 0644,
+-			   dec->debugfs, &dec->clk_cabac_debug);
++			   dec->debugfs, &dec->cabac_clk_info.debug_rate_hz);
+ 	debugfs_create_u32("clk_hevc_cabac", 0644,
+-			   dec->debugfs, &dec->clk_hevc_cabac_debug);
++			   dec->debugfs, &dec->hevc_cabac_clk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   dec->debugfs, &mpp->session_max_buffers);
+ 
+@@ -1158,38 +1154,33 @@ static inline int rkvdec_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int rkvdec_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+ 	mutex_init(&dec->sip_reset_lock);
+-	mutex_init(&dec->set_clk_lock);
+-
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_RKVDEC];
+ 
+-	dec->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR_OR_NULL(dec->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &dec->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		dec->aclk = NULL;
+-	}
+-	dec->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR_OR_NULL(dec->hclk)) {
++	ret = mpp_get_clk_info(mpp, &dec->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		dec->hclk = NULL;
+-	}
+-	dec->clk_cabac = devm_clk_get(mpp->dev, "clk_cabac");
+-	if (IS_ERR_OR_NULL(dec->clk_cabac)) {
+-		mpp_err("failed on clk_get clk_cabac\n");
+-		dec->clk_cabac = NULL;
+-	}
+-	dec->clk_core = devm_clk_get(mpp->dev, "clk_core");
+-	if (IS_ERR_OR_NULL(dec->clk_core)) {
++	ret = mpp_get_clk_info(mpp, &dec->core_clk_info, "clk_core");
++	if (ret)
+ 		mpp_err("failed on clk_get clk_core\n");
+-		dec->clk_core = NULL;
+-	}
+-	dec->clk_hevc_cabac = devm_clk_get(mpp->dev, "clk_hevc_cabac");
+-	if (IS_ERR_OR_NULL(dec->clk_hevc_cabac)) {
++	ret = mpp_get_clk_info(mpp, &dec->cabac_clk_info, "clk_cabac");
++	if (ret)
++		mpp_err("failed on clk_get clk_cabac\n");
++	ret = mpp_get_clk_info(mpp, &dec->hevc_cabac_clk_info, "clk_hevc_cabac");
++	if (ret)
+ 		mpp_err("failed on clk_get clk_hevc_cabac\n");
+-		dec->clk_hevc_cabac = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&dec->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
++	mpp_set_clk_info_rate_hz(&dec->core_clk_info, CLK_MODE_DEFAULT, 200 * MHZ);
++	mpp_set_clk_info_rate_hz(&dec->cabac_clk_info, CLK_MODE_DEFAULT, 200 * MHZ);
++	mpp_set_clk_info_rate_hz(&dec->hevc_cabac_clk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+ 	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+@@ -1270,6 +1261,7 @@ static int rkvdec_3328_iommu_hdl(struct iommu_domain *iommu,
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_PM_DEVFREQ
+ static int rkvdec_devfreq_remove(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+@@ -1286,6 +1278,7 @@ static int rkvdec_devfreq_init(struct mpp_dev *mpp)
+ 	struct devfreq_dev_status *stat;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
++	mutex_init(&dec->set_clk_lock);
+ 	dec->parent_devfreq = devfreq_get_devfreq_by_phandle(mpp->dev, 0);
+ 	if (IS_ERR_OR_NULL(dec->parent_devfreq)) {
+ 		if (PTR_ERR(dec->parent_devfreq) == -EPROBE_DEFER) {
+@@ -1327,7 +1320,7 @@ static int rkvdec_devfreq_init(struct mpp_dev *mpp)
+ 	}
+ 
+ 	stat = &dec->devfreq->last_status;
+-	stat->current_frequency = clk_get_rate(dec->aclk);
++	stat->current_frequency = clk_get_rate(dec->aclk_info.clk);
+ 
+ 	ret = devfreq_register_opp_notifier(mpp->dev, dec->devfreq);
+ 	if (ret)
+@@ -1350,6 +1343,17 @@ static int rkvdec_devfreq_init(struct mpp_dev *mpp)
+ done:
+ 	return ret;
+ }
++#else
++static inline int rkvdec_devfreq_remove(struct mpp_dev *mpp)
++{
++	return 0;
++}
++
++static inline int rkvdec_devfreq_init(struct mpp_dev *mpp)
++{
++	return 0;
++}
++#endif
+ 
+ static int rkvdec_3328_init(struct mpp_dev *mpp)
+ {
+@@ -1393,14 +1397,11 @@ static int rkvdec_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_prepare_enable(dec->aclk);
+-	if (dec->hclk)
+-		clk_prepare_enable(dec->hclk);
+-	if (dec->clk_cabac)
+-		clk_prepare_enable(dec->clk_cabac);
+-	if (dec->clk_core)
+-		clk_prepare_enable(dec->clk_core);
++	mpp_clk_safe_enable(dec->aclk_info.clk);
++	mpp_clk_safe_enable(dec->hclk_info.clk);
++	mpp_clk_safe_enable(dec->core_clk_info.clk);
++	mpp_clk_safe_enable(dec->cabac_clk_info.clk);
++	mpp_clk_safe_enable(dec->hevc_cabac_clk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -1409,27 +1410,11 @@ static int rkvdec_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_disable_unprepare(dec->aclk);
+-	if (dec->hclk)
+-		clk_disable_unprepare(dec->hclk);
+-	if (dec->clk_cabac)
+-		clk_disable_unprepare(dec->clk_cabac);
+-	if (dec->clk_core)
+-		clk_disable_unprepare(dec->clk_core);
+-
+-	return 0;
+-}
+-
+-static int rkvdec_get_freq(struct mpp_dev *mpp,
+-			   struct mpp_task *mpp_task)
+-{
+-	struct rkvdec_task *task = to_rkvdec_task(mpp_task);
+-
+-	task->aclk_freq = 300;
+-	task->clk_cabac_freq = 200;
+-	task->clk_core_freq = 200;
+-	task->clk_hevc_cabac_freq = 600;
++	clk_disable_unprepare(dec->aclk_info.clk);
++	clk_disable_unprepare(dec->hclk_info.clk);
++	clk_disable_unprepare(dec->core_clk_info.clk);
++	clk_disable_unprepare(dec->cabac_clk_info.clk);
++	clk_disable_unprepare(dec->hevc_cabac_clk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -1437,71 +1422,27 @@ static int rkvdec_get_freq(struct mpp_dev *mpp,
+ static int rkvdec_3328_get_freq(struct mpp_dev *mpp,
+ 				struct mpp_task *mpp_task)
+ {
++	u32 fmt;
++	u32 ddr_align_en;
+ 	struct rkvdec_task *task =  to_rkvdec_task(mpp_task);
+-	u32 ddr_align_en = task->reg[RKVDEC_REG_INT_EN_INDEX] &
+-					RKVDEC_WR_DDR_ALIGN_EN;
+-	u32 fmt = RKVDEC_GET_FORMAT(task->reg[RKVDEC_REG_SYS_CTRL_INDEX]);
+ 
+-	if (ddr_align_en) {
+-		if (fmt == RKVDEC_FMT_H264D) {
+-			task->aclk_freq = 400;
+-			task->clk_cabac_freq = 400;
+-			task->clk_core_freq = 250;
+-		} else {
+-			task->aclk_freq = 500;
+-			task->clk_cabac_freq = 400;
+-			task->clk_core_freq = 250;
+-		}
+-	} else {
+-		if (fmt == RKVDEC_FMT_H264D) {
+-			task->aclk_freq = 400;
+-			task->clk_cabac_freq = 400;
+-			task->clk_core_freq = 300;
+-		} else {
+-			task->aclk_freq = 500;
+-			task->clk_cabac_freq = 300;
+-			task->clk_core_freq = 400;
+-		}
+-	}
++	fmt = RKVDEC_GET_FORMAT(task->reg[RKVDEC_REG_SYS_CTRL_INDEX]);
++	ddr_align_en = task->reg[RKVDEC_REG_INT_EN_INDEX] & RKVDEC_WR_DDR_ALIGN_EN;
++	if (fmt == RKVDEC_FMT_H264D || ddr_align_en)
++		task->clk_mode = CLK_MODE_ADVANCED;
+ 
+ 	return 0;
+ }
+ 
+-static int rkvdec_probe_width(struct mpp_dev *mpp,
+-			      struct mpp_task *mpp_task)
+-{
+-	u32 width = 0;
+-	struct rkvdec_task *task = to_rkvdec_task(mpp_task);
+-	u32 prod_num = REVDEC_GET_PROD_NUM(mpp->var->hw_info->hw_id);
+-
+-	switch (prod_num) {
+-	case HEVC_DEC_ID_6867:
+-	case RKVDEC_ID_6876:
+-	case RKVDEC_ID_3410:
+-		width = RKVDEC_GET_WIDTH(task->reg[RKVDEC_RGE_WIDTH_INDEX]);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return width;
+-}
+-
+ static int rkvdec_3368_get_freq(struct mpp_dev *mpp,
+ 				struct mpp_task *mpp_task)
+ {
++	u32 width;
+ 	struct rkvdec_task *task = to_rkvdec_task(mpp_task);
+-	u32 width = rkvdec_probe_width(mpp, mpp_task);
+ 
+-	if (width > 2560) {
+-		task->aclk_freq = 600;
+-		task->clk_cabac_freq = 400;
+-		task->clk_core_freq = 400;
+-	} else {
+-		task->aclk_freq = 300;
+-		task->clk_cabac_freq = 200;
+-		task->clk_core_freq = 200;
+-	}
++	width = RKVDEC_GET_WIDTH(task->reg[RKVDEC_RGE_WIDTH_INDEX]);
++	if (width > 2560)
++		task->clk_mode = CLK_MODE_ADVANCED;
+ 
+ 	return 0;
+ }
+@@ -1509,58 +1450,89 @@ static int rkvdec_3368_get_freq(struct mpp_dev *mpp,
+ static int rkvdec_set_freq(struct mpp_dev *mpp,
+ 			   struct mpp_task *mpp_task)
+ {
+-	struct devfreq_dev_status *stat;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 	struct rkvdec_task *task =  to_rkvdec_task(mpp_task);
+ 
+-	task->aclk_freq = dec->aclk_debug ?
+-			dec->aclk_debug : task->aclk_freq;
+-	task->clk_cabac_freq = dec->clk_cabac_debug ?
+-			dec->clk_cabac_debug : task->clk_cabac_freq;
+-	task->clk_core_freq = dec->clk_core_debug ?
+-			dec->clk_core_debug : task->clk_core_freq;
+-	task->clk_hevc_cabac_freq = dec->clk_hevc_cabac_debug ?
+-			dec->clk_hevc_cabac_debug : task->clk_hevc_cabac_freq;
++	mpp_clk_set_rate(&dec->aclk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->core_clk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->cabac_clk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->hevc_cabac_clk_info, task->clk_mode);
++
++	return 0;
++}
++
++static int rkvdec_3328_set_freq(struct mpp_dev *mpp,
++				struct mpp_task *mpp_task)
++{
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++	struct rkvdec_task *task =  to_rkvdec_task(mpp_task);
+ 
++#ifdef CONFIG_PM_DEVFREQ
+ 	if (dec->devfreq) {
++		struct devfreq_dev_status *stat;
++		unsigned long aclk_rate_hz, core_rate_hz, cabac_rate_hz;
++
+ 		stat = &dec->devfreq->last_status;
+ 		stat->busy_time = 1;
+ 		stat->total_time = 1;
+-		rkvdec_set_clk(dec, task->aclk_freq * MHZ,
+-			       task->clk_core_freq * MHZ,
+-			       task->clk_cabac_freq * MHZ,
+-			       EVENT_ADJUST);
+-	} else {
+-		clk_set_rate(dec->aclk, task->aclk_freq * MHZ);
+-		clk_set_rate(dec->clk_cabac, task->clk_cabac_freq * MHZ);
+-		clk_set_rate(dec->clk_core, task->clk_core_freq * MHZ);
+-		clk_set_rate(dec->clk_hevc_cabac,
+-			     task->clk_hevc_cabac_freq * MHZ);
++		aclk_rate_hz = mpp_get_clk_info_rate_hz(&dec->aclk_info,
++							task->clk_mode);
++		core_rate_hz = mpp_get_clk_info_rate_hz(&dec->core_clk_info,
++							task->clk_mode);
++		cabac_rate_hz = mpp_get_clk_info_rate_hz(&dec->cabac_clk_info,
++							 task->clk_mode);
++		rkvdec_devf_set_clk(dec, aclk_rate_hz,
++				    core_rate_hz, cabac_rate_hz,
++				    EVENT_ADJUST);
+ 	}
++#else
++	mpp_clk_set_rate(&dec->aclk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->core_clk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->cabac_clk_info, task->clk_mode);
++#endif
+ 
+ 	return 0;
+ }
+ 
+ static int rkvdec_reduce_freq(struct mpp_dev *mpp)
+ {
+-	struct devfreq_dev_status *stat;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
++	mpp_clk_set_rate(&dec->aclk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&dec->core_clk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&dec->cabac_clk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&dec->hevc_cabac_clk_info, CLK_MODE_REDUCE);
++
++	return 0;
++}
++
++static int rkvdec_3328_reduce_freq(struct mpp_dev *mpp)
++{
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++
++#ifdef CONFIG_PM_DEVFREQ
+ 	if (dec->devfreq) {
++		struct devfreq_dev_status *stat;
++		unsigned long aclk_rate_hz, core_rate_hz, cabac_rate_hz;
++
+ 		stat = &dec->devfreq->last_status;
+ 		stat->busy_time = 0;
+ 		stat->total_time = 1;
+-		rkvdec_set_clk(dec, 50 * MHZ, 50 * MHZ, 50 * MHZ, EVENT_ADJUST);
+-	} else {
+-		if (dec->aclk)
+-			clk_set_rate(dec->aclk, 50 * MHZ);
+-		if (dec->clk_cabac)
+-			clk_set_rate(dec->clk_cabac, 50 * MHZ);
+-		if (dec->clk_core)
+-			clk_set_rate(dec->clk_core, 50 * MHZ);
+-		if (dec->clk_hevc_cabac)
+-			clk_set_rate(dec->clk_hevc_cabac, 50 * MHZ);
++		aclk_rate_hz = mpp_get_clk_info_rate_hz(&dec->aclk_info,
++							CLK_MODE_REDUCE);
++		core_rate_hz = mpp_get_clk_info_rate_hz(&dec->core_clk_info,
++							CLK_MODE_REDUCE);
++		cabac_rate_hz = mpp_get_clk_info_rate_hz(&dec->cabac_clk_info,
++							 CLK_MODE_REDUCE);
++		rkvdec_devf_set_clk(dec, aclk_rate_hz,
++				    core_rate_hz, cabac_rate_hz,
++				    EVENT_ADJUST);
+ 	}
++#else
++	mpp_clk_set_rate(&dec->aclk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&dec->core_clk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&dec->cabac_clk_info, CLK_MODE_REDUCE);
++#endif
+ 
+ 	return 0;
+ }
+@@ -1614,7 +1586,6 @@ static struct mpp_hw_ops rkvdec_v1_hw_ops = {
+ 	.init = rkvdec_init,
+ 	.clk_on = rkvdec_clk_on,
+ 	.clk_off = rkvdec_clk_off,
+-	.get_freq = rkvdec_get_freq,
+ 	.set_freq = rkvdec_set_freq,
+ 	.reduce_freq = rkvdec_reduce_freq,
+ 	.reset = rkvdec_reset,
+@@ -1624,7 +1595,6 @@ static struct mpp_hw_ops rkvdec_px30_hw_ops = {
+ 	.init = rkvdec_px30_init,
+ 	.clk_on = rkvdec_clk_on,
+ 	.clk_off = rkvdec_clk_off,
+-	.get_freq = rkvdec_get_freq,
+ 	.set_freq = rkvdec_set_freq,
+ 	.reduce_freq = rkvdec_reduce_freq,
+ 	.reset = rkvdec_reset,
+@@ -1635,7 +1605,6 @@ static struct mpp_hw_ops rkvdec_3399_hw_ops = {
+ 	.init = rkvdec_init,
+ 	.clk_on = rkvdec_clk_on,
+ 	.clk_off = rkvdec_clk_off,
+-	.get_freq = rkvdec_get_freq,
+ 	.set_freq = rkvdec_set_freq,
+ 	.reduce_freq = rkvdec_reduce_freq,
+ 	.reset = rkvdec_reset,
+@@ -1667,8 +1636,8 @@ static struct mpp_hw_ops rkvdec_3328_hw_ops = {
+ 	.clk_on = rkvdec_clk_on,
+ 	.clk_off = rkvdec_clk_off,
+ 	.get_freq = rkvdec_3328_get_freq,
+-	.set_freq = rkvdec_set_freq,
+-	.reduce_freq = rkvdec_reduce_freq,
++	.set_freq = rkvdec_3328_set_freq,
++	.reduce_freq = rkvdec_3328_reduce_freq,
+ 	.reset = rkvdec_sip_reset,
+ };
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index 674524b17453..7a6116b30d81 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -143,8 +143,7 @@ struct rkvenc_task {
+ 	/* register offset info */
+ 	struct reg_offset_info off_inf;
+ 
+-	unsigned long aclk_freq_mhz;
+-	unsigned long clk_core_freq_mhz;
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 irq_status;
+ 	/* req for current task */
+ 	u32 w_req_cnt;
+@@ -156,14 +155,12 @@ struct rkvenc_task {
+ struct rkvenc_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
+-	struct clk *clk_core;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
++	struct mpp_clk_info core_clk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug_mhz;
+-	u32 clk_core_debug_mhz;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -173,8 +170,8 @@ struct rkvenc_dev {
+ 	struct regulator *vdd;
+ 	struct devfreq *devfreq;
+ 	unsigned long volt;
+-	unsigned long core_freq_mhz;
+-	unsigned long core_last_freq_hz;
++	unsigned long core_rate_hz;
++	unsigned long core_last_rate_hz;
+ 	struct ipa_power_model_data *model_data;
+ 	struct thermal_cooling_device *devfreq_cooling;
+ #endif
+@@ -340,6 +337,7 @@ static void *rkvenc_alloc_task(struct mpp_session *session,
+ 					      &task->off_inf, task->reg);
+ 	}
+ 	task->link_mode = RKVENC_MODE_ONEFRAME;
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -602,8 +600,6 @@ static int rkvenc_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 
+-	enc->aclk_debug_mhz = 0;
+-	enc->clk_core_debug_mhz = 0;
+ 	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(enc->debugfs)) {
+@@ -612,9 +608,9 @@ static int rkvenc_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_debug_mhz);
++			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("clk_core", 0644,
+-			   enc->debugfs, &enc->clk_core_debug_mhz);
++			   enc->debugfs, &enc->core_clk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   enc->debugfs, &mpp->session_max_buffers);
+ 
+@@ -655,7 +651,7 @@ static int rkvenc_devfreq_target(struct device *dev,
+ 	dev_pm_opp_put(opp);
+ 
+ 	if (old_clk_rate == target_freq) {
+-		enc->core_last_freq_hz = target_freq;
++		enc->core_last_rate_hz = target_freq;
+ 		if (enc->volt == target_volt)
+ 			return ret;
+ 		ret = regulator_set_voltage(enc->vdd, target_volt, INT_MAX);
+@@ -677,9 +673,9 @@ static int rkvenc_devfreq_target(struct device *dev,
+ 	}
+ 
+ 	dev_dbg(dev, "%lu-->%lu\n", old_clk_rate, target_freq);
+-	clk_set_rate(enc->clk_core, target_freq);
++	clk_set_rate(enc->core_clk_info.clk, target_freq);
+ 	stat->current_frequency = target_freq;
+-	enc->core_last_freq_hz = target_freq;
++	enc->core_last_rate_hz = target_freq;
+ 
+ 	if (old_clk_rate > target_freq) {
+ 		ret = regulator_set_voltage(enc->vdd, target_volt, INT_MAX);
+@@ -704,7 +700,7 @@ static int rkvenc_devfreq_get_cur_freq(struct device *dev,
+ {
+ 	struct rkvenc_dev *enc = dev_get_drvdata(dev);
+ 
+-	*freq = enc->core_last_freq_hz;
++	*freq = enc->core_last_rate_hz;
+ 
+ 	return 0;
+ }
+@@ -720,7 +716,7 @@ static int devfreq_venc_ondemand_func(struct devfreq *df, unsigned long *freq)
+ 	struct rkvenc_dev *enc = df->data;
+ 
+ 	if (enc)
+-		*freq = enc->core_freq_mhz * MHZ;
++		*freq = enc->core_rate_hz;
+ 	else
+ 		*freq = df->previous_freq;
+ 
+@@ -758,10 +754,11 @@ static struct devfreq_cooling_power venc_cooling_power_data = {
+ static int rkvenc_devfreq_init(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
++	struct clk *clk_core = enc->core_clk_info.clk;
+ 	struct devfreq_cooling_power *venc_dcp = &venc_cooling_power_data;
+ 	int ret = 0;
+ 
+-	if (!enc->clk_core)
++	if (!clk_core)
+ 		return 0;
+ 
+ 	enc->vdd = devm_regulator_get_optional(mpp->dev, "venc");
+@@ -789,7 +786,7 @@ static int rkvenc_devfreq_init(struct mpp_dev *mpp)
+ 		goto governor_err;
+ 	}
+ 
+-	rkvenc_devfreq_profile.initial_freq = clk_get_rate(enc->clk_core);
++	rkvenc_devfreq_profile.initial_freq = clk_get_rate(clk_core);
+ 
+ 	enc->devfreq = devm_devfreq_add_device(mpp->dev,
+ 					       &rkvenc_devfreq_profile,
+@@ -858,21 +855,19 @@ static int rkvenc_init(struct mpp_dev *mpp)
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_RKVENC];
+ 
+-	enc->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR(enc->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &enc->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		enc->aclk = NULL;
+-	}
+-	enc->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR(enc->hclk)) {
++	ret = mpp_get_clk_info(mpp, &enc->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		enc->hclk = NULL;
+-	}
+-	enc->clk_core = devm_clk_get(mpp->dev, "clk_core");
+-	if (IS_ERR_OR_NULL(enc->clk_core)) {
+-		dev_err(mpp->dev, "failed on clk_get core\n");
+-		enc->clk_core = NULL;
+-	}
++	ret = mpp_get_clk_info(mpp, &enc->core_clk_info, "clk_core");
++	if (ret)
++		mpp_err("failed on clk_get clk_core\n");
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
++	mpp_set_clk_info_rate_hz(&enc->core_clk_info, CLK_MODE_DEFAULT, 600 * MHZ);
+ 
+ 	enc->rst_a = devm_reset_control_get_shared(mpp->dev, "video_a");
+ 	if (IS_ERR_OR_NULL(enc->rst_a)) {
+@@ -919,10 +914,8 @@ static int rkvenc_reset(struct mpp_dev *mpp)
+ 	if (enc->devfreq)
+ 		mutex_lock(&enc->devfreq->lock);
+ #endif
+-	if (enc->aclk)
+-		clk_set_rate(enc->aclk, 50 * MHZ);
+-	if (enc->clk_core)
+-		clk_set_rate(enc->clk_core, 50 * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, CLK_MODE_REDUCE);
++	mpp_clk_set_rate(&enc->core_clk_info, CLK_MODE_REDUCE);
+ 
+ 	mpp_write(mpp, RKVENC_INT_EN_BASE, RKVENC_SAFE_CLR_BIT);
+ 	mpp_write(mpp, RKVENC_CLR_BASE, RKVENC_SAFE_CLR_BIT);
+@@ -951,12 +944,9 @@ static int rkvenc_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_prepare_enable(enc->aclk);
+-	if (enc->hclk)
+-		clk_prepare_enable(enc->hclk);
+-	if (enc->clk_core)
+-		clk_prepare_enable(enc->clk_core);
++	mpp_clk_safe_enable(enc->aclk_info.clk);
++	mpp_clk_safe_enable(enc->hclk_info.clk);
++	mpp_clk_safe_enable(enc->core_clk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -965,23 +955,9 @@ static int rkvenc_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_disable_unprepare(enc->aclk);
+-	if (enc->hclk)
+-		clk_disable_unprepare(enc->hclk);
+-	if (enc->clk_core)
+-		clk_disable_unprepare(enc->clk_core);
+-
+-	return 0;
+-}
+-
+-static int rkvenc_get_freq(struct mpp_dev *mpp,
+-			   struct mpp_task *mpp_task)
+-{
+-	struct rkvenc_task *task = to_rkvenc_task(mpp_task);
+-
+-	task->aclk_freq_mhz = 300;
+-	task->clk_core_freq_mhz = 600;
++	clk_disable_unprepare(enc->aclk_info.clk);
++	clk_disable_unprepare(enc->hclk_info.clk);
++	clk_disable_unprepare(enc->core_clk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -992,35 +968,31 @@ static int rkvenc_set_freq(struct mpp_dev *mpp,
+ 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 	struct rkvenc_task *task = to_rkvenc_task(mpp_task);
+ 
+-	task->aclk_freq_mhz = enc->aclk_debug_mhz ?
+-		enc->aclk_debug_mhz : task->aclk_freq_mhz;
+-	task->clk_core_freq_mhz = enc->clk_core_debug_mhz ?
+-		enc->clk_core_debug_mhz : task->clk_core_freq_mhz;
+-
+-	if (enc->aclk)
+-		clk_set_rate(enc->aclk, task->aclk_freq_mhz * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, task->clk_mode);
+ 
+ #ifdef CONFIG_PM_DEVFREQ
+ 	if (enc->devfreq) {
++		unsigned long core_rate_hz;
++
+ 		mutex_lock(&enc->devfreq->lock);
+-		if (enc->core_freq_mhz != task->clk_core_freq_mhz) {
+-			enc->core_freq_mhz = task->clk_core_freq_mhz;
++		core_rate_hz = mpp_get_clk_info_rate_hz(&enc->core_clk_info, task->clk_mode);
++		if (enc->core_rate_hz != core_rate_hz) {
++			enc->core_rate_hz = core_rate_hz;
+ 			update_devfreq(enc->devfreq);
+ 		} else {
+ 			/*
+ 			 * Restore frequency when frequency is changed by
+ 			 * rkvenc_reduce_freq()
+ 			 */
+-			clk_set_rate(enc->clk_core, enc->core_last_freq_hz);
++			clk_set_rate(enc->core_clk_info.clk, enc->core_last_rate_hz);
+ 		}
+ 		mutex_unlock(&enc->devfreq->lock);
+ 		return 0;
+ 	}
+ #else
+-	if (enc->clk_core)
+-		clk_set_rate(enc->clk_core, task->clk_core_freq_mhz * MHZ);
+-
++	mpp_clk_set_rate(&enc->core_clk_info, task->clk_mode);
+ #endif
++
+ 	return 0;
+ }
+ 
+@@ -1029,7 +1001,6 @@ static struct mpp_hw_ops rkvenc_hw_ops = {
+ 	.exit = rkvenc_exit,
+ 	.clk_on = rkvenc_clk_on,
+ 	.clk_off = rkvenc_clk_off,
+-	.get_freq = rkvenc_get_freq,
+ 	.set_freq = rkvenc_set_freq,
+ 	.reset = rkvenc_reset,
+ };
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu1.c b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+index 70cff1d1d6b9..329f038fba73 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+@@ -100,7 +100,7 @@ struct vdpu_task {
+ 	/* enable of post process */
+ 	bool pp_enable;
+ 
+-	unsigned long aclk_freq;
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 reg[VDPU1_REG_PP_NUM];
+ 
+ 	struct reg_offset_info off_inf;
+@@ -116,13 +116,11 @@ struct vdpu_task {
+ struct vdpu_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+-
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ };
+@@ -377,6 +375,7 @@ static void *vdpu_alloc_task(struct mpp_session *session,
+ 			goto fail;
+ 	}
+ 	task->strm_addr = task->reg[VDPU1_REG_STREAM_RLC_BASE_INDEX];
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -503,7 +502,6 @@ static int vdpu_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	dec->aclk_debug = 0;
+ 	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(dec->debugfs)) {
+@@ -512,7 +510,7 @@ static int vdpu_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_debug);
++			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   dec->debugfs, &mpp->session_max_buffers);
+ 
+@@ -532,20 +530,20 @@ static inline int vdpu_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int vdpu_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_VDPU1];
+ 
+-	dec->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR_OR_NULL(dec->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &dec->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		dec->aclk = NULL;
+-	}
+-	dec->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR_OR_NULL(dec->hclk)) {
++	ret = mpp_get_clk_info(mpp, &dec->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		dec->hclk = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&dec->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+ 	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+@@ -565,10 +563,8 @@ static int vdpu_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_prepare_enable(dec->aclk);
+-	if (dec->hclk)
+-		clk_prepare_enable(dec->hclk);
++	mpp_clk_safe_enable(dec->aclk_info.clk);
++	mpp_clk_safe_enable(dec->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -577,51 +573,21 @@ static int vdpu_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_disable_unprepare(dec->aclk);
+-	if (dec->hclk)
+-		clk_disable_unprepare(dec->hclk);
+-
+-	return 0;
+-}
+-
+-static int vdpu_get_freq(struct mpp_dev *mpp,
+-			 struct mpp_task *mpp_task)
+-{
+-	struct vdpu_task *task = to_vdpu_task(mpp_task);
+-
+-	task->aclk_freq = 300;
++	mpp_clk_safe_disable(dec->aclk_info.clk);
++	mpp_clk_safe_disable(dec->hclk_info.clk);
+ 
+ 	return 0;
+ }
+ 
+-static int vdpu_probe_width(struct mpp_dev *mpp,
+-			    struct mpp_task *mpp_task)
+-{
+-	u32 width = 0;
+-	struct vdpu_task *task = to_vdpu_task(mpp_task);
+-	u32 prod_num = VDPU1_GET_PROD_NUM(mpp->var->hw_info->hw_id);
+-
+-	switch (prod_num) {
+-	case VDPU1_ID_0102:
+-	case VDPU1_ID_9190:
+-		width = VDPU1_GET_WIDTH(task->reg[VDPU1_RGE_WIDTH_INDEX]);
+-		break;
+-	}
+-
+-	return width;
+-}
+-
+ static int vdpu_3288_get_freq(struct mpp_dev *mpp,
+ 			      struct mpp_task *mpp_task)
+ {
++	u32 width;
+ 	struct vdpu_task *task = to_vdpu_task(mpp_task);
+-	u32 width = vdpu_probe_width(mpp, mpp_task);
+ 
++	width = VDPU1_GET_WIDTH(task->reg[VDPU1_RGE_WIDTH_INDEX]);
+ 	if (width > 2560)
+-		task->aclk_freq = 600;
+-	else
+-		task->aclk_freq = 300;
++		task->clk_mode = CLK_MODE_ADVANCED;
+ 
+ 	return 0;
+ }
+@@ -629,13 +595,12 @@ static int vdpu_3288_get_freq(struct mpp_dev *mpp,
+ static int vdpu_3368_get_freq(struct mpp_dev *mpp,
+ 			      struct mpp_task *mpp_task)
+ {
++	u32 width;
+ 	struct vdpu_task *task = to_vdpu_task(mpp_task);
+-	u32 width = vdpu_probe_width(mpp, mpp_task);
+ 
++	width = VDPU1_GET_WIDTH(task->reg[VDPU1_RGE_WIDTH_INDEX]);
+ 	if (width > 2560)
+-		task->aclk_freq = 600;
+-	else
+-		task->aclk_freq = 300;
++		task->clk_mode = CLK_MODE_ADVANCED;
+ 
+ 	return 0;
+ }
+@@ -646,11 +611,7 @@ static int vdpu_set_freq(struct mpp_dev *mpp,
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 	struct vdpu_task *task = to_vdpu_task(mpp_task);
+ 
+-	/* check whether use debug freq */
+-	task->aclk_freq = dec->aclk_debug ?
+-			  dec->aclk_debug : task->aclk_freq;
+-
+-	clk_set_rate(dec->aclk, task->aclk_freq * MHZ);
++	mpp_clk_set_rate(&dec->aclk_info, task->clk_mode);
+ 
+ 	return 0;
+ }
+@@ -659,8 +620,7 @@ static int vdpu_reduce_freq(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_set_rate(dec->aclk, 50 * MHZ);
++	mpp_clk_set_rate(&dec->aclk_info, CLK_MODE_REDUCE);
+ 
+ 	return 0;
+ }
+@@ -739,7 +699,6 @@ static struct mpp_hw_ops vdpu_v1_hw_ops = {
+ 	.init = vdpu_init,
+ 	.clk_on = vdpu_clk_on,
+ 	.clk_off = vdpu_clk_off,
+-	.get_freq = vdpu_get_freq,
+ 	.set_freq = vdpu_set_freq,
+ 	.reduce_freq = vdpu_reduce_freq,
+ 	.reset = vdpu_reset,
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu2.c b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+index cebc9af5e481..2783e101fd99 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+@@ -84,7 +84,7 @@
+ struct vdpu_task {
+ 	struct mpp_task mpp_task;
+ 
+-	unsigned long aclk_freq;
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 reg[VDPU2_REG_NUM];
+ 
+ 	struct reg_offset_info off_inf;
+@@ -100,12 +100,11 @@ struct vdpu_task {
+ struct vdpu_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -329,6 +328,7 @@ static void *vdpu_alloc_task(struct mpp_session *session,
+ 			goto fail;
+ 	}
+ 	task->strm_addr = task->reg[VDPU2_REG_STREAM_RLC_BASE_INDEX];
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -455,7 +455,6 @@ static int vdpu_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	dec->aclk_debug = 0;
+ 	dec->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(dec->debugfs)) {
+@@ -464,7 +463,7 @@ static int vdpu_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   dec->debugfs, &dec->aclk_debug);
++			   dec->debugfs, &dec->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   dec->debugfs, &mpp->session_max_buffers);
+ 
+@@ -484,20 +483,20 @@ static inline int vdpu_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int vdpu_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_VDPU2];
+ 
+-	dec->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR(dec->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &dec->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		dec->aclk = NULL;
+-	}
+-	dec->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR(dec->hclk)) {
++	ret = mpp_get_clk_info(mpp, &dec->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		dec->hclk = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&dec->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+ 	dec->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(dec->rst_a)) {
+@@ -523,10 +522,8 @@ static int vdpu_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_prepare_enable(dec->aclk);
+-	if (dec->hclk)
+-		clk_prepare_enable(dec->hclk);
++	mpp_clk_safe_enable(dec->aclk_info.clk);
++	mpp_clk_safe_enable(dec->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -535,20 +532,8 @@ static int vdpu_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_disable_unprepare(dec->aclk);
+-	if (dec->hclk)
+-		clk_disable_unprepare(dec->hclk);
+-
+-	return 0;
+-}
+-
+-static int vdpu_get_freq(struct mpp_dev *mpp,
+-			 struct mpp_task *mpp_task)
+-{
+-	struct vdpu_task *task = to_vdpu_task(mpp_task);
+-
+-	task->aclk_freq = 300;
++	mpp_clk_safe_disable(dec->aclk_info.clk);
++	mpp_clk_safe_disable(dec->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -559,11 +544,7 @@ static int vdpu_set_freq(struct mpp_dev *mpp,
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 	struct vdpu_task *task = to_vdpu_task(mpp_task);
+ 
+-	/* check whether use debug freq */
+-	task->aclk_freq = dec->aclk_debug ?
+-			dec->aclk_debug : task->aclk_freq;
+-
+-	clk_set_rate(dec->aclk, task->aclk_freq * MHZ);
++	mpp_clk_set_rate(&dec->aclk_info, task->clk_mode);
+ 
+ 	return 0;
+ }
+@@ -572,8 +553,7 @@ static int vdpu_reduce_freq(struct mpp_dev *mpp)
+ {
+ 	struct vdpu_dev *dec = to_vdpu_dev(mpp);
+ 
+-	if (dec->aclk)
+-		clk_set_rate(dec->aclk, 50 * MHZ);
++	mpp_clk_set_rate(&dec->aclk_info, CLK_MODE_REDUCE);
+ 
+ 	return 0;
+ }
+@@ -649,7 +629,6 @@ static struct mpp_hw_ops vdpu_v2_hw_ops = {
+ 	.init = vdpu_init,
+ 	.clk_on = vdpu_clk_on,
+ 	.clk_off = vdpu_clk_off,
+-	.get_freq = vdpu_get_freq,
+ 	.set_freq = vdpu_set_freq,
+ 	.reduce_freq = vdpu_reduce_freq,
+ 	.reset = vdpu_reset,
+@@ -659,7 +638,6 @@ static struct mpp_hw_ops vdpu_px30_hw_ops = {
+ 	.init = vdpu_px30_init,
+ 	.clk_on = vdpu_clk_on,
+ 	.clk_off = vdpu_clk_off,
+-	.get_freq = vdpu_get_freq,
+ 	.set_freq = vdpu_set_freq,
+ 	.reduce_freq = vdpu_reduce_freq,
+ 	.reset = vdpu_reset,
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu1.c b/drivers/video/rockchip/mpp/mpp_vepu1.c
+index a078e013f2f8..6c8cc126e41e 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu1.c
+@@ -69,7 +69,7 @@
+ struct vepu_task {
+ 	struct mpp_task mpp_task;
+ 
+-	unsigned long aclk_freq;
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 reg[VEPU1_REG_NUM];
+ 
+ 	struct reg_offset_info off_inf;
+@@ -84,12 +84,11 @@ struct vepu_task {
+ struct vepu_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -246,6 +245,7 @@ static void *vepu_alloc_task(struct mpp_session *session,
+ 		if (ret)
+ 			goto fail;
+ 	}
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -409,7 +409,6 @@ static int vepu_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	enc->aclk_debug = 0;
+ 	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(enc->debugfs)) {
+@@ -418,7 +417,7 @@ static int vepu_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_debug);
++			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   enc->debugfs, &mpp->session_max_buffers);
+ 
+@@ -438,20 +437,20 @@ static inline int vepu_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int vepu_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_VEPU1];
+ 
+-	enc->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR(enc->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &enc->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		enc->aclk = NULL;
+-	}
+-	enc->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR(enc->hclk)) {
++	ret = mpp_get_clk_info(mpp, &enc->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		enc->hclk = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+ 	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(enc->rst_a)) {
+@@ -471,10 +470,8 @@ static int vepu_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_prepare_enable(enc->aclk);
+-	if (enc->hclk)
+-		clk_prepare_enable(enc->hclk);
++	mpp_clk_safe_enable(enc->aclk_info.clk);
++	mpp_clk_safe_enable(enc->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -483,20 +480,8 @@ static int vepu_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_disable_unprepare(enc->aclk);
+-	if (enc->hclk)
+-		clk_disable_unprepare(enc->hclk);
+-
+-	return 0;
+-}
+-
+-static int vepu_get_freq(struct mpp_dev *mpp,
+-			 struct mpp_task *mpp_task)
+-{
+-	struct vepu_task *task = to_vepu_task(mpp_task);
+-
+-	task->aclk_freq = 300;
++	mpp_clk_safe_disable(enc->aclk_info.clk);
++	mpp_clk_safe_disable(enc->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -507,11 +492,7 @@ static int vepu_set_freq(struct mpp_dev *mpp,
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 	struct vepu_task *task = to_vepu_task(mpp_task);
+ 
+-	/* check whether use debug freq */
+-	task->aclk_freq = enc->aclk_debug ?
+-			enc->aclk_debug : task->aclk_freq;
+-
+-	clk_set_rate(enc->aclk, task->aclk_freq * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, task->clk_mode);
+ 
+ 	return 0;
+ }
+@@ -520,8 +501,7 @@ static int vepu_reduce_freq(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_set_rate(enc->aclk, 50 * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, CLK_MODE_REDUCE);
+ 
+ 	return 0;
+ }
+@@ -549,7 +529,6 @@ static struct mpp_hw_ops vepu_v1_hw_ops = {
+ 	.init = vepu_init,
+ 	.clk_on = vepu_clk_on,
+ 	.clk_off = vepu_clk_off,
+-	.get_freq = vepu_get_freq,
+ 	.set_freq = vepu_set_freq,
+ 	.reduce_freq = vepu_reduce_freq,
+ 	.reset = vepu_reset,
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index 770d5075e230..006c32554866 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -77,7 +77,8 @@
+ 
+ struct vepu_task {
+ 	struct mpp_task mpp_task;
+-	unsigned long aclk_freq;
++
++	enum MPP_CLOCK_MODE clk_mode;
+ 	u32 reg[VEPU2_REG_NUM];
+ 
+ 	struct reg_offset_info off_inf;
+@@ -92,12 +93,11 @@ struct vepu_task {
+ struct vepu_dev {
+ 	struct mpp_dev mpp;
+ 
+-	struct clk *aclk;
+-	struct clk *hclk;
++	struct mpp_clk_info aclk_info;
++	struct mpp_clk_info hclk_info;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs;
+ #endif
+-	u32 aclk_debug;
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+@@ -255,6 +255,7 @@ static void *vepu_alloc_task(struct mpp_session *session,
+ 		if (ret)
+ 			goto fail;
+ 	}
++	task->clk_mode = CLK_MODE_NORMAL;
+ 
+ 	mpp_debug_leave();
+ 
+@@ -420,7 +421,6 @@ static int vepu_debugfs_init(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	enc->aclk_debug = 0;
+ 	enc->debugfs = debugfs_create_dir(mpp->dev->of_node->name,
+ 					  mpp->srv->debugfs);
+ 	if (IS_ERR_OR_NULL(enc->debugfs)) {
+@@ -429,7 +429,7 @@ static int vepu_debugfs_init(struct mpp_dev *mpp)
+ 		return -EIO;
+ 	}
+ 	debugfs_create_u32("aclk", 0644,
+-			   enc->debugfs, &enc->aclk_debug);
++			   enc->debugfs, &enc->aclk_info.debug_rate_hz);
+ 	debugfs_create_u32("session_buffers", 0644,
+ 			   enc->debugfs, &mpp->session_max_buffers);
+ 
+@@ -449,20 +449,20 @@ static inline int vepu_debugfs_init(struct mpp_dev *mpp)
+ 
+ static int vepu_init(struct mpp_dev *mpp)
+ {
++	int ret;
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+ 	mpp->grf_info = &mpp->srv->grf_infos[MPP_DRIVER_VEPU2];
+ 
+-	enc->aclk = devm_clk_get(mpp->dev, "aclk_vcodec");
+-	if (IS_ERR(enc->aclk)) {
++	/* Get clock info from dtsi */
++	ret = mpp_get_clk_info(mpp, &enc->aclk_info, "aclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get aclk_vcodec\n");
+-		enc->aclk = NULL;
+-	}
+-	enc->hclk = devm_clk_get(mpp->dev, "hclk_vcodec");
+-	if (IS_ERR(enc->hclk)) {
++	ret = mpp_get_clk_info(mpp, &enc->hclk_info, "hclk_vcodec");
++	if (ret)
+ 		mpp_err("failed on clk_get hclk_vcodec\n");
+-		enc->hclk = NULL;
+-	}
++	/* Set default rates */
++	mpp_set_clk_info_rate_hz(&enc->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
+ 
+ 	enc->rst_a = mpp_reset_control_get(mpp, "video_a");
+ 	if (IS_ERR_OR_NULL(enc->rst_a)) {
+@@ -488,10 +488,8 @@ static int vepu_clk_on(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_prepare_enable(enc->aclk);
+-	if (enc->hclk)
+-		clk_prepare_enable(enc->hclk);
++	mpp_clk_safe_enable(enc->aclk_info.clk);
++	mpp_clk_safe_enable(enc->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -500,20 +498,8 @@ static int vepu_clk_off(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_disable_unprepare(enc->aclk);
+-	if (enc->hclk)
+-		clk_disable_unprepare(enc->hclk);
+-
+-	return 0;
+-}
+-
+-static int vepu_get_freq(struct mpp_dev *mpp,
+-			 struct mpp_task *mpp_task)
+-{
+-	struct vepu_task *task = to_vepu_task(mpp_task);
+-
+-	task->aclk_freq = 300;
++	mpp_clk_safe_disable(enc->aclk_info.clk);
++	mpp_clk_safe_disable(enc->hclk_info.clk);
+ 
+ 	return 0;
+ }
+@@ -524,11 +510,7 @@ static int vepu_set_freq(struct mpp_dev *mpp,
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 	struct vepu_task *task = to_vepu_task(mpp_task);
+ 
+-	/* check whether use debug freq */
+-	task->aclk_freq = enc->aclk_debug ?
+-			enc->aclk_debug : task->aclk_freq;
+-
+-	clk_set_rate(enc->aclk, task->aclk_freq * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, task->clk_mode);
+ 
+ 	return 0;
+ }
+@@ -537,8 +519,7 @@ static int vepu_reduce_freq(struct mpp_dev *mpp)
+ {
+ 	struct vepu_dev *enc = to_vepu_dev(mpp);
+ 
+-	if (enc->aclk)
+-		clk_set_rate(enc->aclk, 50 * MHZ);
++	mpp_clk_set_rate(&enc->aclk_info, CLK_MODE_REDUCE);
+ 
+ 	return 0;
+ }
+@@ -566,7 +547,6 @@ static struct mpp_hw_ops vepu_v2_hw_ops = {
+ 	.init = vepu_init,
+ 	.clk_on = vepu_clk_on,
+ 	.clk_off = vepu_clk_off,
+-	.get_freq = vepu_get_freq,
+ 	.set_freq = vepu_set_freq,
+ 	.reduce_freq = vepu_reduce_freq,
+ 	.reset = vepu_reset,
+@@ -576,7 +556,6 @@ static struct mpp_hw_ops vepu_px30_hw_ops = {
+ 	.init = vepu_px30_init,
+ 	.clk_on = vepu_clk_on,
+ 	.clk_off = vepu_clk_off,
+-	.get_freq = vepu_get_freq,
+ 	.set_freq = vepu_set_freq,
+ 	.reduce_freq = vepu_reduce_freq,
+ 	.reset = vepu_reset,
+-- 
+2.35.3
+

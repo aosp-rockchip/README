@@ -1,0 +1,290 @@
+From 11b7bcf7014c24741c92fb307702eec3714e8749 Mon Sep 17 00:00:00 2001
+From: yangkai <yk@rock-chips.com>
+Date: Wed, 20 Jun 2012 17:12:48 +0800
+Subject: [PATCH] diasble host2.0 if no device connect, fix a pcd disconnect
+ bug
+
+---
+ drivers/usb/dwc_otg/dwc_otg_cil_intr.c |  1 +
+ drivers/usb/dwc_otg/dwc_otg_hcd.c      | 92 +++++++++++++++++++++++++-
+ drivers/usb/dwc_otg/dwc_otg_hcd.h      |  4 ++
+ drivers/usb/dwc_otg/dwc_otg_hcd_intr.c |  2 +-
+ drivers/usb/dwc_otg/dwc_otg_pcd.c      | 11 +--
+ drivers/usb/dwc_otg/dwc_otg_pcd_intr.c |  8 +++
+ 6 files changed, 110 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg/dwc_otg_cil_intr.c b/drivers/usb/dwc_otg/dwc_otg_cil_intr.c
+index 9558706e89e1..ec8b88875ce1 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_cil_intr.c
++++ b/drivers/usb/dwc_otg/dwc_otg_cil_intr.c
+@@ -193,6 +193,7 @@ int32_t dwc_otg_handle_otg_intr(dwc_otg_core_if_t *_core_if)
+ 				        dctl.d32 = dwc_read_reg32( &_core_if->dev_if->dev_global_regs->dctl );
+ 				        dctl.b.sftdiscon = 1;
+ 				        dwc_write_reg32( &_core_if->dev_if->dev_global_regs->dctl, dctl.d32 );
++				        dwc_modify_reg32( &global_regs->gahbcfg, 0, 1); // disable usb global int
+                         DWC_PRINT("********session end intr,soft disconnect************************\n");
+                 }
+                 _core_if->otg_dev->pcd->vbus_status = 0;
+diff --git a/drivers/usb/dwc_otg/dwc_otg_hcd.c b/drivers/usb/dwc_otg/dwc_otg_hcd.c
+index 378f395f35f6..d42eb76e3bbd 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_hcd.c
++++ b/drivers/usb/dwc_otg/dwc_otg_hcd.c
+@@ -69,6 +69,8 @@ static int dwc_otg_hcd_suspend(struct usb_hcd *hcd)
+     	return 0;
+     }
+     hprt0.d32 = dwc_read_reg32(core_if->host_if->hprt0);
++    if((!dwc_otg_hcd->host_enabled)||(!hprt0.b.prtena))
++        return 0;
+     DWC_PRINT("%s suspend, HPRT0:0x%x\n",hcd->self.bus_name,hprt0.d32);
+     if(hprt0.b.prtconnsts)  // usb device connected
+     {
+@@ -126,6 +128,8 @@ static int dwc_otg_hcd_resume(struct usb_hcd *hcd)
+     	DWC_PRINT("%s, usb device mode\n", __func__);
+     	return 0;
+     }
++    if(!dwc_otg_hcd->host_enabled)
++        return 0;
+     #ifndef CONFIG_DWC_REMOTE_WAKEUP
+     clk_enable(core_if->otg_dev->phyclk);
+     clk_enable(core_if->otg_dev->ahbclk);
+@@ -145,6 +149,8 @@ static int dwc_otg_hcd_resume(struct usb_hcd *hcd)
+     dwc_write_reg32(&core_if->core_global_regs->gintmsk, gintmsk.d32);
+         
+     hprt0.d32 = dwc_read_reg32(core_if->host_if->hprt0);
++    if(!hprt0.b.prtena)
++        return 0;
+     DWC_PRINT("%s resume, HPRT0:0x%x\n",hcd->self.bus_name,hprt0.d32);
+     if(hprt0.b.prtconnsts)
+     {
+@@ -638,7 +644,81 @@ static struct tasklet_struct reset_tasklet = {
+ 	.func = reset_tasklet_func,
+ 	.data = 0,
+ };
++#ifdef CONFIG_ARCH_RK30
++static void dwc_otg_hcd_enable(struct work_struct *work)
++{
++    dwc_otg_hcd_t *dwc_otg_hcd;
++    dwc_otg_core_if_t *_core_if;
+ 
++    dwc_otg_hcd = container_of(work, dwc_otg_hcd_t, host_enable_work.work);
++    _core_if = dwc_otg_hcd->core_if;
++    
++	if(dwc_otg_hcd->host_enabled == dwc_otg_hcd->host_setenable){
++//        DWC_PRINT("%s, enable flag %d\n", __func__, dwc_otg_hcd->host_setenable);
++	    return;
++	}
++	    
++	dwc_otg_hcd->host_enabled = dwc_otg_hcd->host_setenable;
++	if(dwc_otg_hcd->host_setenable == 0)    // enable -> disable
++	{
++	    DWC_PRINT("disable host controller\n");
++	    #if 1
++        if (_core_if->hcd_cb && _core_if->hcd_cb->disconnect) {
++                _core_if->hcd_cb->disconnect( _core_if->hcd_cb->p );
++        }
++        #endif
++        if (_core_if->hcd_cb && _core_if->hcd_cb->stop) {
++                _core_if->hcd_cb->stop( _core_if->hcd_cb->p );
++        }
++        if (_core_if->hcd_cb && _core_if->hcd_cb->suspend) {
++                _core_if->hcd_cb->suspend( _core_if->hcd_cb->p, 0);
++        }
++        udelay(3);
++//        clk_disable(otg_dev->phyclk);
++//        clk_disable(otg_dev->ahbclk);
++	}
++	else if(dwc_otg_hcd->host_setenable == 1)
++	{
++	    DWC_PRINT("enable host controller\n");
++//        clk_enable(otg_dev->phyclk);
++//        clk_enable(otg_dev->ahbclk);
++        if (_core_if->hcd_cb && _core_if->hcd_cb->suspend) {
++                _core_if->hcd_cb->suspend( _core_if->hcd_cb->p, 1);
++        }
++        mdelay(5);
++        if (_core_if->hcd_cb && _core_if->hcd_cb->start) {
++                _core_if->hcd_cb->start( _core_if->hcd_cb->p );
++        }
++	}
++    
++}
++static void dwc_otg_hcd_connect_detect(unsigned long pdata)
++{
++    dwc_otg_hcd_t *dwc_otg_hcd = (dwc_otg_hcd_t *)pdata;
++    dwc_otg_core_if_t *core_if = dwc_otg_hcd->core_if;
++    unsigned int usbgrf_status = *(unsigned int*)(USBGRF_SOC_STATUS0);
++	unsigned long flags;
++
++	local_irq_save(flags);
++
++//    DWC_PRINT("%s %p, grfstatus 0x%x\n", __func__, dwc_otg_hcd, usbgrf_status& (7<<22));
++    if(usbgrf_status & (7<<22)){
++    // usb device connected
++        dwc_otg_hcd->host_setenable = 1;
++    }
++    else{
++    // no device, suspend host
++        if((dwc_read_reg32(core_if->host_if->hprt0) & 1) == 0)
++            dwc_otg_hcd->host_setenable = 0;
++    
++    }
++    schedule_delayed_work(&dwc_otg_hcd->host_enable_work, jiffies);
++//    dwc_otg_hcd->connect_detect_timer.expires = jiffies + (HZ<<1); /* 1 s */
++    mod_timer(&dwc_otg_hcd->connect_detect_timer,jiffies + (HZ<<1)); 
++	local_irq_restore(flags);
++	return;
++}
++#endif
+ /**
+  * Initializes the HCD. This function allocates memory for and initializes the
+  * static parts of the usb_hcd and dwc_otg_hcd structures. It also registers the
+@@ -1113,7 +1193,7 @@ int __devinit host20_hcd_init(struct device *dev)
+ 	}
+ 	
+         /* Initialize the Connection timeout timer. */
+-        init_timer( &dwc_otg_hcd->conn_timer );
++        //init_timer( &dwc_otg_hcd->conn_timer );
+ 
+ 	/* Initialize reset tasklet. */
+ 	host20_reset_tasklet.data = (unsigned long) dwc_otg_hcd;
+@@ -1151,7 +1231,14 @@ int __devinit host20_hcd_init(struct device *dev)
+ 		goto error3;
+ 	}
+     
+-        
++#ifdef CONFIG_ARCH_RK30        
++    dwc_otg_hcd->connect_detect_timer.function = dwc_otg_hcd_connect_detect;
++    dwc_otg_hcd->connect_detect_timer.data = (unsigned long)(dwc_otg_hcd);
++    init_timer( &dwc_otg_hcd->connect_detect_timer);
++    mod_timer(&dwc_otg_hcd->connect_detect_timer, jiffies+(HZ<<3)); 
++    
++    INIT_DELAYED_WORK(&dwc_otg_hcd->host_enable_work, dwc_otg_hcd_enable);
++#endif        
+ 	return 0;
+ 
+ 	/* Error conditions */
+@@ -1167,6 +1254,7 @@ int __devinit host20_hcd_init(struct device *dev)
+ }
+ #endif
+ 
++
+ /**
+  * Removes the HCD.
+  * Frees memory and resources associated with the HCD and deregisters the bus.
+diff --git a/drivers/usb/dwc_otg/dwc_otg_hcd.h b/drivers/usb/dwc_otg/dwc_otg_hcd.h
+index 43ed83c227c5..811db624374f 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_hcd.h
++++ b/drivers/usb/dwc_otg/dwc_otg_hcd.h
+@@ -379,6 +379,9 @@ typedef struct dwc_otg_hcd {
+ 	/* Tasket to do a reset */
+ 	struct tasklet_struct   *reset_tasklet;
+ 
++    struct timer_list 	connect_detect_timer;
++    struct delayed_work	host_enable_work;
++    
+ 	spinlock_t global_lock;
+ 
+ #ifdef DEBUG
+@@ -402,6 +405,7 @@ typedef struct dwc_otg_hcd {
+ 
+     /** Flag to indicate whether host controller is enabled. */
+     uint8_t host_enabled;
++    uint8_t host_setenable;
+ 
+ } dwc_otg_hcd_t;
+ 
+diff --git a/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c b/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
+index ea4e1581188f..fe383025c7c3 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
++++ b/drivers/usb/dwc_otg/dwc_otg_hcd_intr.c
+@@ -1830,7 +1830,7 @@ static void handle_hc_chhltd_intr_dma(dwc_otg_hcd_t *_hcd,
+ 		handle_hc_ack_intr(_hcd, _hc, _hc_regs, _qtd);
+ 	} else if(hcint.b.datatglerr){
+ 	     DWC_PRINT("%s, DATA toggle error, Channel %d\n",__func__, _hc->hc_num);
+-             save_data_toggle(_hc, _hc_regs, _qtd);    //hzb,设备的第一个USB数据包的data toggle不符合USB协议
++             save_data_toggle(_hc, _hc_regs, _qtd);
+              halt_channel(_hcd, _hc, _qtd, DWC_OTG_HC_XFER_NO_HALT_STATUS);
+ 				clear_hc_int(_hc_regs,chhltd);
+ 	} else {
+diff --git a/drivers/usb/dwc_otg/dwc_otg_pcd.c b/drivers/usb/dwc_otg/dwc_otg_pcd.c
+index db676878088c..c89715f0e4dc 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_pcd.c
++++ b/drivers/usb/dwc_otg/dwc_otg_pcd.c
+@@ -329,8 +329,8 @@ static int dwc_otg_pcd_ep_enable(struct usb_ep *_ep,
+         /* yk@rk
+          * ep0 -- tx fifo 0
+          * ep1 -- tx fifo 1
+-         * ep3 -- tx fifo 2
+-         * ep5 -- tx fifo 3
++         * ep3 -- tx fifo 3
++         * ep5 -- tx fifo 2
+          */
+         if(ep->dwc_ep.num == 0)
+ 	        ep->dwc_ep.tx_fifo_num = 0;
+@@ -338,6 +338,8 @@ static int dwc_otg_pcd_ep_enable(struct usb_ep *_ep,
+                 ep->dwc_ep.tx_fifo_num = 1;
+         else if(ep->dwc_ep.num == 3)
+                 ep->dwc_ep.tx_fifo_num = 3;
++        else if(ep->dwc_ep.num == 5)
++                ep->dwc_ep.tx_fifo_num = 2;
+         else
+     	    ep->dwc_ep.tx_fifo_num = (ep->dwc_ep.num>>1)+1 ; /* 1,3,5 */
+ #endif
+@@ -576,11 +578,9 @@ static int dwc_otg_pcd_ep_queue(struct usb_ep *_ep,
+ 	}
+ 	
+ 	ep = container_of(_ep, dwc_otg_pcd_ep_t, ep);
+-	SPIN_LOCK_IRQSAVE(&ep->pcd->lock, flags);
+ 	if (!_ep || (!ep->desc && ep->dwc_ep.num != 0)) 
+ 	{
+ 		DWC_WARN("%s, bad ep\n", __func__);
+-				SPIN_UNLOCK_IRQRESTORE(&ep->pcd->lock, flags);
+ 		return -EINVAL;
+ 	}
+ 	pcd = ep->pcd;
+@@ -588,7 +588,6 @@ static int dwc_otg_pcd_ep_queue(struct usb_ep *_ep,
+ 	{
+ 		DWC_DEBUGPL(DBG_PCDV, "gadget.speed=%d\n", pcd->gadget.speed);
+ 		DWC_WARN("%s, bogus device state\n", __func__);
+-				SPIN_UNLOCK_IRQRESTORE(&pcd->lock, flags);
+ 		return -ESHUTDOWN;
+ 	}
+ 
+@@ -625,6 +624,8 @@ static int dwc_otg_pcd_ep_queue(struct usb_ep *_ep,
+ 						: DMA_FROM_DEVICE);
+ 		req->mapped = 0;
+ 	}
++	SPIN_LOCK_IRQSAVE(&pcd->lock, flags);
++	
+ 	_req->status = -EINPROGRESS;
+ 	_req->actual = 0;
+ 
+diff --git a/drivers/usb/dwc_otg/dwc_otg_pcd_intr.c b/drivers/usb/dwc_otg/dwc_otg_pcd_intr.c
+index ce6a44cdfe85..991ff028339f 100755
+--- a/drivers/usb/dwc_otg/dwc_otg_pcd_intr.c
++++ b/drivers/usb/dwc_otg/dwc_otg_pcd_intr.c
+@@ -1053,6 +1053,10 @@ static inline void do_gadget_setup( dwc_otg_pcd_t *_pcd,
+ 	{
+ 		SPIN_UNLOCK(&_pcd->lock);
+ 		ret = _pcd->driver->setup(&_pcd->gadget, _ctrl);
++		if(spin_is_locked(&_pcd->lock)){
++		    DWC_PRINT("%s warning: pcd->lock locked without unlock\n", __func__);
++		    SPIN_UNLOCK(&_pcd->lock);
++		}
+ 		SPIN_LOCK(&_pcd->lock);
+ 		if (ret < 0) 
+ 		{
+@@ -2161,6 +2165,10 @@ do { \
+ 			
+ 			/* Get EP pointer */	   
+ 			ep = get_in_ep(_pcd, epnum);
++			if(ep == NULL){
++                DWC_PRINT("%s epnum %d epintr %x\n", __func__, epnum, ep_intr);
++                break;
++			}
+ 			dwc_ep = &ep->dwc_ep;
+ 
+ 			_diepctl = dwc_read_reg32(&dev_if->in_ep_regs[epnum]->diepctl);
+-- 
+2.35.3
+

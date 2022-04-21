@@ -1,0 +1,1015 @@
+From 9e9a903f9e629e3c2a0121c5926e2fbccfd0ca78 Mon Sep 17 00:00:00 2001
+From: Jacob Chen <jacob2.chen@rock-chips.com>
+Date: Tue, 10 Jan 2017 15:14:32 +0800
+Subject: [PATCH] ARM: rockchip: Convert resume code to C
+
+This CL introduces the concept of "embedded blobs" for Rockchip, which
+allows you to compile some C code into a binary blob that is linked
+into the kernel.  This binary blob is self contained and is intended
+to run in cases where SDRAM (and thus the rest of Linux) isn't
+available.  Resume is a prime candiate for this as is the planned
+DDRFreq code.
+
+We convert the existing assembly resume code into C as proof that this
+works and to prepare for linking in SDRAM reinit code.
+
+Change-Id: I0ff109766cfd4b25bf65de9258631a07d2ebe1d5
+Signed-off-by: Doug Anderson <dianders@chromium.org>
+Signed-off-by: Jacob Chen <jacob2.chen@rock-chips.com>
+---
+ arch/arm/mach-rockchip/Makefile               |   2 +
+ arch/arm/mach-rockchip/embedded/.gitignore    |   1 +
+ arch/arm/mach-rockchip/embedded/Makefile      |  55 ++++
+ arch/arm/mach-rockchip/embedded/rk3288_ddr.h  | 208 ++++++++++++++
+ .../embedded/rk3288_ddr_resume.c              | 261 ++++++++++++++++++
+ .../mach-rockchip/embedded/rk3288_resume.c    | 103 +++++++
+ .../mach-rockchip/embedded/rk3288_resume.h    | 101 +++++++
+ .../embedded/rk3288_resume.lds.S              |  40 +++
+ .../embedded/rk3288_resume_embedded.h         |  20 ++
+ arch/arm/mach-rockchip/embedded/sram_delay.h  |  38 +++
+ arch/arm/mach-rockchip/sleep.S                |  73 -----
+ 11 files changed, 829 insertions(+), 73 deletions(-)
+ create mode 100644 arch/arm/mach-rockchip/embedded/.gitignore
+ create mode 100644 arch/arm/mach-rockchip/embedded/Makefile
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_ddr.h
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_ddr_resume.c
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_resume.c
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_resume.h
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_resume.lds.S
+ create mode 100644 arch/arm/mach-rockchip/embedded/rk3288_resume_embedded.h
+ create mode 100644 arch/arm/mach-rockchip/embedded/sram_delay.h
+ delete mode 100644 arch/arm/mach-rockchip/sleep.S
+
+diff --git a/arch/arm/mach-rockchip/Makefile b/arch/arm/mach-rockchip/Makefile
+index dca48483d6e1..87e541d3e43d 100644
+--- a/arch/arm/mach-rockchip/Makefile
++++ b/arch/arm/mach-rockchip/Makefile
+@@ -3,3 +3,5 @@ CFLAGS_platsmp.o := -march=armv7-a
+ obj-$(CONFIG_ARCH_ROCKCHIP) += rockchip.o
+ obj-$(CONFIG_PM_SLEEP) += pm.o rk3288_ddr_suspend.o
+ obj-$(CONFIG_SMP) += headsmp.o platsmp.o
++
++obj-y += embedded/
+diff --git a/arch/arm/mach-rockchip/embedded/.gitignore b/arch/arm/mach-rockchip/embedded/.gitignore
+new file mode 100644
+index 000000000000..6b8069a1dea8
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/.gitignore
+@@ -0,0 +1 @@
++*.lds
+diff --git a/arch/arm/mach-rockchip/embedded/Makefile b/arch/arm/mach-rockchip/embedded/Makefile
+new file mode 100644
+index 000000000000..a8d8f4700b32
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/Makefile
+@@ -0,0 +1,55 @@
++# Makefile for embedded code blobs for Rockchip SoCs
++#
++# These code blobs are emedded into vmlinux and copied into SRAM
++# at times when SDRAM is not available.  Each blob is self contained.
++#
++# Some blobs may be linked to expect to run at a very specific address.
++# A good example is resume code blobs that always expect to run in a
++# very specific bit of SRAM that keeps power during sleep.  This code
++# is also running with the cache off so it can predict the address it
++# will be at.
++#
++# Other blobs may be linked with -fpic (by adding CFLAGS_file.o := -fpic).
++# These can be located anywhere.  I believe gcc will support this by
++# assuming that the .text and .data sections are relative to each other.
++#
++# That brings up the point that all blobs here:
++# - Are generally very small
++# - Generally have code and data jammed together in one blob.
++# - Generally have "parameters" at the beginning that are filled in by
++#   the kernel.
++
++obj-$(CONFIG_PM_SLEEP) += rk3288_resume.bin.o
++
++targets := rk3288_resume.o rk3288_ddr_resume.o \
++	rk3288_resume.elf rk3288_resume.lds \
++	rk3288_resume.bin rk3288_resume.bin.o
++
++# Reset objcopy flags, ARM puts "-O binary" here.
++OBJCOPYFLAGS :=
++
++# Our embedded code can't handle this flag.
++ifeq ($(CONFIG_FUNCTION_TRACER),y)
++ORIG_CFLAGS := $(KBUILD_CFLAGS)
++KBUILD_CFLAGS = $(subst -pg, , $(ORIG_CFLAGS))
++endif
++
++KBUILD_CFLAGS += -fno-stack-protector -fPIC
++
++# This is the ELF for the embedded binary
++LDFLAGS_rk3288_resume.elf := -Bstatic -nostdlib -T
++$(obj)/rk3288_resume.elf: $(obj)/rk3288_resume.lds \
++			  $(obj)/rk3288_resume.o \
++			  $(obj)/rk3288_ddr_resume.o \
++			  FORCE
++	$(call if_changed,ld)
++
++# Create binary data for the kernel
++OBJCOPYFLAGS_rk3288_resume.bin := -O binary
++$(obj)/rk3288_resume.bin: $(obj)/rk3288_resume.elf FORCE
++	$(call if_changed,objcopy)
++
++# Import the data into the kernel
++OBJCOPYFLAGS_rk3288_resume.bin.o += -B $(ARCH) -I binary -O elf32-littlearm
++$(obj)/rk3288_resume.bin.o: $(obj)/rk3288_resume.bin FORCE
++	$(call if_changed,objcopy)
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_ddr.h b/arch/arm/mach-rockchip/embedded/rk3288_ddr.h
+new file mode 100644
+index 000000000000..8c65aa20de39
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_ddr.h
+@@ -0,0 +1,208 @@
++/*
++ * Copyright (c) 2014, Fuzhou Rockchip Electronics Co., Ltd
++ * Author: Chris Zhong <zyw@rock-chips.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef __MACH_ROCKCHIP_RK3288_DDR_H
++#define __MACH_ROCKCHIP_RK3288_DDR_H
++
++/* DDR pctl register */
++#define DDR_PCTL_SCFG			0x0000
++#define DDR_PCTL_SCTL			0x0004
++#define DDR_PCTL_STAT			0x0008
++#define DDR_PCTL_MCMD			0x0040
++#define DDR_PCTL_POWCTL			0x0044
++#define DDR_PCTL_POWSTAT		0x0048
++#define DDR_PCTL_CMDTSTATEN		0x0050
++#define DDR_PCTL_MRRCFG0		0x0060
++#define DDR_PCTL_MRRSTAT0		0x0064
++#define DDR_PCTL_MRRSTAT1		0x0068
++#define DDR_PCTL_MCFG1			0x007c
++#define DDR_PCTL_MCFG			0x0080
++#define DDR_PCTL_PPCFG			0x0084
++#define DDR_PCTL_TOGCNT1U		0x00c0
++#define DDR_PCTL_TINIT			0x00c4
++#define DDR_PCTL_TRSTH			0x00c8
++#define DDR_PCTL_TOGCNT100N		0x00cc
++#define DDR_PCTL_TREFI			0x00d0
++#define DDR_PCTL_TMRD			0x00d4
++#define DDR_PCTL_TRFC			0x00d8
++#define DDR_PCTL_TRP			0x00dc
++#define DDR_PCTL_TRTW			0x00e0
++#define DDR_PCTL_TAL			0x00e4
++#define DDR_PCTL_TCL			0x00e8
++#define DDR_PCTL_TCWL			0x00ec
++#define DDR_PCTL_TRAS			0x00f0
++#define DDR_PCTL_TRC			0x00f4
++#define DDR_PCTL_TRCD			0x00f8
++#define DDR_PCTL_TRRD			0x00fc
++#define DDR_PCTL_TRTP			0x0100
++#define DDR_PCTL_TWR			0x0104
++#define DDR_PCTL_TWTR			0x0108
++#define DDR_PCTL_TEXSR			0x010c
++#define DDR_PCTL_TXP			0x0110
++#define DDR_PCTL_TXPDLL			0x0114
++#define DDR_PCTL_TZQCS			0x0118
++#define DDR_PCTL_TZQCSI			0x011c
++#define DDR_PCTL_TDQS			0x0120
++#define DDR_PCTL_TCKSRE			0x0124
++#define DDR_PCTL_TCKSRX			0x0128
++#define DDR_PCTL_TCKE			0x012c
++#define DDR_PCTL_TMOD			0x0130
++#define DDR_PCTL_TRSTL			0x0134
++#define DDR_PCTL_TZQCL			0x0138
++#define DDR_PCTL_TMRR			0x013c
++#define DDR_PCTL_TCKESR			0x0140
++#define DDR_PCTL_TDPD			0x0144
++#define DDR_PCTL_DFITCTRLDELAY		0x0240
++#define DDR_PCTL_DFIODTCFG		0x0244
++#define DDR_PCTL_DFIODTCFG1		0x0248
++#define DDR_PCTL_DFIODTRANKMAP		0x024c
++#define DDR_PCTL_DFITPHYWRDATA		0x0250
++#define DDR_PCTL_DFITPHYWRLAT		0x0254
++#define DDR_PCTL_DFITRDDATAEN		0x0260
++#define DDR_PCTL_DFITPHYRDLAT           0x0264
++#define DDR_PCTL_DFITPHYUPDTYPE0        0x0270
++#define DDR_PCTL_DFITPHYUPDTYPE1        0x0274
++#define DDR_PCTL_DFITPHYUPDTYPE2        0x0278
++#define DDR_PCTL_DFITPHYUPDTYPE3        0x027c
++#define DDR_PCTL_DFITCTRLUPDMIN         0x0280
++#define DDR_PCTL_DFITCTRLUPDMAX         0x0284
++#define DDR_PCTL_DFITCTRLUPDDLY         0x0288
++#define DDR_PCTL_DFIUPDCFG		0x0290
++#define DDR_PCTL_DFITREFMSKI            0x0294
++#define DDR_PCTL_DFITCTRLUPDI           0x0298
++#define DDR_PCTL_DFISTCFG0		0x02c4
++#define DDR_PCTL_DFISTCFG1		0x02c8
++#define DDR_PCTL_DFITDRAMCLKEN          0x02d0
++#define DDR_PCTL_DFITDRAMCLKDIS         0x02d4
++#define DDR_PCTL_DFISTCFG2		0x02d8
++#define DDR_PCTL_DFILPCFG0		0x02f0
++
++/* DDR phy register */
++#define DDR_PUBL_RIDR		0x0000
++#define DDR_PUBL_PIR		0x0004
++#define DDR_PUBL_PGCR		0x0008
++#define DDR_PUBL_PGSR		0x000c
++#define DDR_PUBL_DLLGCR		0x0010
++#define DDR_PUBL_ACDLLCR	0x0014
++#define DDR_PUBL_PTR0		0x0018
++#define DDR_PUBL_PTR1		0x001c
++#define DDR_PUBL_PTR2		0x0020
++#define DDR_PUBL_ACIOCR		0x0024
++#define DDR_PUBL_DXCCR		0x0028
++#define DDR_PUBL_DSGCR		0x002c
++#define DDR_PUBL_DCR		0x0030
++#define DDR_PUBL_DTPR0		0x0034
++#define DDR_PUBL_DTPR1		0x0038
++#define DDR_PUBL_DTPR2		0x003c
++#define DDR_PUBL_MR0		0x0040
++#define DDR_PUBL_MR1		0x0044
++#define DDR_PUBL_MR2		0x0048
++#define DDR_PUBL_MR3		0x004c
++#define DDR_PUBL_ODTCR		0x0050
++#define DDR_PUBL_DTAR		0x0054
++#define DDR_PUBL_ZQ0CR0		0x0180
++#define DDR_PUBL_ZQ0CR1		0x0184
++#define DDR_PUBL_ZQ1CR0		0x0190
++#define DDR_PUBL_DX0GCR		0x01c0
++#define DDR_PUBL_DX0GSR0	0x01c4
++#define DDR_PUBL_DX0GSR1	0x01c8
++#define DDR_PUBL_DX0DLLCR	0x01cc
++#define DDR_PUBL_DX0DQTR	0x01d0
++#define DDR_PUBL_DX0DQSTR	0x01d4
++#define DDR_PUBL_DX1GCR		0x0200
++#define DDR_PUBL_DX1GSR0	0x0204
++#define DDR_PUBL_DX1GSR1	0x0208
++#define DDR_PUBL_DX1DLLCR	0x020c
++#define DDR_PUBL_DX1DQTR	0x0210
++#define DDR_PUBL_DX1DQSTR	0x0214
++#define DDR_PUBL_DX2GCR		0x0240
++#define DDR_PUBL_DX2GSR0	0x0244
++#define DDR_PUBL_DX2GSR1	0x0248
++#define DDR_PUBL_DX2DLLCR	0x024c
++#define DDR_PUBL_DX2DQTR	0x0250
++#define DDR_PUBL_DX2DQSTR	0x0254
++#define DDR_PUBL_DX3GCR		0x0280
++#define DDR_PUBL_DX3GSR0	0x0284
++#define DDR_PUBL_DX3GSR1	0x0288
++#define DDR_PUBL_DX3DLLCR	0x028c
++#define DDR_PUBL_DX3DQTR	0x0290
++#define DDR_PUBL_DX3DQSTR	0x0294
++
++/* DDR msch register */
++#define DDR_MSCH_DDRCONF	0x0008
++#define DDR_MSCH_DDRTIMING	0x000c
++#define DDR_MSCH_DDRMODE	0x0010
++#define DDR_MSCH_READLATENCY	0x0014
++#define DDR_MSCH_ACTIVATE	0x0038
++#define DDR_MSCH_DEVTODEV	0x003c
++
++#define DLLSRST			BIT(30)
++#define POWER_UP_START		BIT(0)
++#define POWER_UP_DONE		BIT(0)
++#define DDR0IO_RET_DE_REQ	BIT(21)
++#define DDR0I1_RET_DE_REQ	BIT(22)
++
++#define PCTL_STAT_MSK			(7)
++#define LP_TRIG_VAL(n)			(((n) >> 4) & 7)
++
++/* SCTL */
++#define INIT_STATE			(0)
++#define CFG_STATE			(1)
++#define GO_STATE			(2)
++#define SLEEP_STATE			(3)
++#define WAKEUP_STATE			(4)
++
++/* STAT */
++#define LP_TRIG_VAL(n)			(((n) >> 4) & 7)
++#define PCTL_STAT_MSK			(7)
++#define INIT_MEM			(0)
++#define CONFIG				(1)
++#define CONFIG_REQ			(2)
++#define ACCESS				(3)
++#define ACCESS_REQ			(4)
++#define LOW_POWER			(5)
++#define LOW_POWER_ENTRY_REQ		(6)
++#define LOW_POWER_EXIT_REQ		(7)
++
++/* PGSR */
++#define PGSR_IDONE			(1 << 0)
++#define PGSR_DLDONE			(1 << 1)
++#define PGSR_ZCDONE			(1 << 2)
++#define PGSR_DIDONE			(1 << 3)
++#define PGSR_DTDONE			(1 << 4)
++#define PGSR_DTERR			(1 << 5)
++#define PGSR_DTIERR			(1 << 6)
++#define PGSR_DFTERR			(1 << 7)
++#define PGSR_RVERR			(1 << 8)
++#define PGSR_RVEIRR			(1 << 9)
++
++/* PIR */
++#define PIR_INIT			(1 << 0)
++#define PIR_DLLSRST			(1 << 1)
++#define PIR_DLLLOCK			(1 << 2)
++#define PIR_ZCAL			(1 << 3)
++#define PIR_ITMSRST			(1 << 4)
++#define PIR_DRAMRST			(1 << 5)
++#define PIR_DRAMINIT			(1 << 6)
++#define PIR_QSTRN			(1 << 7)
++#define PIR_RVTRN			(1 << 8)
++#define PIR_ICPC			(1 << 16)
++#define PIR_DLLBYP			(1 << 17)
++#define PIR_CTLDINIT			(1 << 18)
++#define PIR_CLRSR			(1 << 28)
++#define PIR_LOCKBYP			(1 << 29)
++#define PIR_ZCALBYP			(1 << 30)
++#define PIR_INITBYP			(1u << 31)
++
++#endif /* __MACH_ROCKCHIP_RK3288_DDR_H */
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_ddr_resume.c b/arch/arm/mach-rockchip/embedded/rk3288_ddr_resume.c
+new file mode 100644
+index 000000000000..13a4a71a4126
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_ddr_resume.c
+@@ -0,0 +1,261 @@
++/*
++ * Copyright (c) 2014, Fuzhou Rockchip Electronics Co., Ltd
++ * Author: Chris Zhong <zyw@rock-chips.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/bug.h>		/* BUILD_BUG_ON */
++#include <linux/kernel.h>
++
++#include <asm/io.h>
++
++#include "rk3288_ddr.h"
++#include "rk3288_resume.h"
++#include "sram_delay.h"
++
++#include "../pm.h"
++
++#define PMU_ADDR		0xff730000
++#define PMU_PWRMODE_CON_ADDR	((void *)(PMU_ADDR + RK3288_PMU_PWRMODE_CON))
++#define DDR_PCTRL0_ADDR		((void *)0xff610000)
++#define DDR_PUBL0_ADDR		((void *)0xff620000) /* phy */
++#define DDR_PCTRL1_ADDR		((void *)0xff630000)
++#define DDR_PUBL1_ADDR		((void *)0xff640000) /* phy */
++
++#define MSCH0_ADDR		((void *)0xffac0000)
++#define MSCH1_ADDR		((void *)0xffac0080)
++
++static void * const pctrl_addrs[] = { DDR_PCTRL0_ADDR, DDR_PCTRL1_ADDR };
++static void * const phy_addrs[] = { DDR_PUBL0_ADDR, DDR_PUBL1_ADDR };
++static void * const msch_addrs[] = { MSCH0_ADDR, MSCH1_ADDR };
++
++static void reset_dll(void __iomem *phy_addr)
++{
++	static const u32 reg[] = { DDR_PUBL_ACDLLCR, DDR_PUBL_DX0DLLCR,
++				   DDR_PUBL_DX1DLLCR, DDR_PUBL_DX2DLLCR,
++				   DDR_PUBL_DX3DLLCR };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(reg); i++)
++		writel_relaxed(readl_relaxed(phy_addr + reg[i]) & ~DLLSRST,
++			       phy_addr + reg[i]);
++
++	sram_udelay(10);
++
++	for (i = 0; i < ARRAY_SIZE(reg); i++)
++		writel_relaxed(readl_relaxed(phy_addr + reg[i]) | DLLSRST,
++			       phy_addr + reg[i]);
++
++	sram_udelay(10);
++}
++
++static void phy_init(void __iomem *phy_addr)
++{
++	u32 val;
++
++	val = readl_relaxed(phy_addr + DDR_PUBL_PIR);
++
++	val |= PIR_INIT | PIR_DLLSRST | PIR_DLLLOCK |
++	       PIR_ZCAL | PIR_ITMSRST | PIR_CLRSR;
++
++	writel_relaxed(val, phy_addr + DDR_PUBL_PIR);
++
++	sram_udelay(1);
++
++	while ((readl_relaxed(phy_addr + DDR_PUBL_PGSR) &
++		(PGSR_IDONE | PGSR_DLDONE | PGSR_ZCDONE)) !=
++		(PGSR_IDONE | PGSR_DLDONE | PGSR_ZCDONE))
++		;
++}
++
++static void memory_init(void __iomem *phy_addr)
++{
++	u32 val;
++
++	val = readl_relaxed(phy_addr + DDR_PUBL_PIR);
++
++	val |= PIR_INIT | PIR_DRAMINIT | PIR_LOCKBYP |
++	       PIR_ZCALBYP | PIR_CLRSR | PIR_ICPC;
++
++	writel_relaxed(val, phy_addr + DDR_PUBL_PIR);
++
++	sram_udelay(1);
++	while ((readl_relaxed(phy_addr + DDR_PUBL_PGSR) &
++		(PGSR_IDONE | PGSR_DLDONE)) != (PGSR_IDONE | PGSR_DLDONE))
++		;
++}
++
++static void move_to_lowpower_state(void __iomem *pctrl_addr,
++				   void __iomem *phy_addr)
++{
++	u32 state;
++
++	while (1) {
++		state = readl_relaxed(pctrl_addr +
++				      DDR_PCTL_STAT) & PCTL_STAT_MSK;
++
++		switch (state) {
++		case INIT_MEM:
++			writel_relaxed(CFG_STATE, pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) != CONFIG)
++				;
++			/* no break */
++		case CONFIG:
++			writel_relaxed(GO_STATE, pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) != ACCESS)
++				;
++			/* no break */
++		case ACCESS:
++			writel_relaxed(SLEEP_STATE, pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) != LOW_POWER)
++				;
++			/* no break */
++		case LOW_POWER:
++			return;
++		default:
++			break;
++		}
++	}
++}
++
++static void move_to_access_state(void __iomem *pctrl_addr,
++				 void __iomem *phy_addr)
++{
++	u32 state;
++
++	while (1) {
++		state = readl_relaxed(pctrl_addr +
++				      DDR_PCTL_STAT) & PCTL_STAT_MSK;
++
++		switch (state) {
++		case LOW_POWER:
++			if (LP_TRIG_VAL(readl_relaxed(pctrl_addr +
++						      DDR_PCTL_STAT)) == 1)
++				return;
++
++			writel_relaxed(WAKEUP_STATE,
++				       pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) != ACCESS)
++				;
++
++			/* wait DLL lock */
++			while ((readl_relaxed(phy_addr +
++					      DDR_PUBL_PGSR) & PGSR_DLDONE)
++				!= PGSR_DLDONE)
++				;
++
++			break;
++		case INIT_MEM:
++			writel_relaxed(CFG_STATE, pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) != CONFIG)
++				;
++			 /* fallthrough here */
++		case CONFIG:
++			writel_relaxed(GO_STATE,  pctrl_addr + DDR_PCTL_SCTL);
++			while ((readl_relaxed(pctrl_addr + DDR_PCTL_STAT) &
++				PCTL_STAT_MSK) == CONFIG)
++				;
++			break;
++		case ACCESS:
++			return;
++		default:
++			break;
++		}
++	}
++}
++
++static void rk3288_ddr_reg_restore(void __iomem *regbase, const u32 reg_list[],
++				   int num_reg, const u32 *vals)
++{
++	int i;
++
++	for (i = 0; i < num_reg && reg_list[i] != RK3288_BOGUS_OFFSET; i++)
++		writel_relaxed(vals[i], regbase + reg_list[i]);
++}
++
++void rk3288_ddr_resume_early(const struct rk3288_ddr_save_data *ddr_save_data)
++{
++	int ch;
++
++	/* PWM saves full address, so base is NULL */
++	rk3288_ddr_reg_restore(NULL, ddr_save_data->pwm_addrs,
++			       RK3288_MAX_PWM_REGS, ddr_save_data->pwm_vals);
++
++	/*
++	 * PWM never runs higher than 1.2V giving a 2000uV/us ramp delay since
++	 * we start from 1V. This is a very conservative ramp delay for the
++	 * regulator.
++	 */
++	sram_udelay(100);
++
++	for (ch = 0; ch < ARRAY_SIZE(pctrl_addrs); ch++) {
++		/* DLL bypass */
++		rk3288_ddr_reg_restore(phy_addrs[ch],
++				       ddr_save_data->phy_dll_offsets,
++				       RK3288_MAX_DDR_PHY_DLL_REGS,
++				       ddr_save_data->phy_dll_vals[ch]);
++
++		reset_dll(phy_addrs[ch]);
++
++		/* ddr ctrl restore; NOTE: both channels must be the same */
++		rk3288_ddr_reg_restore(pctrl_addrs[ch],
++				       ddr_save_data->ctrl_offsets,
++				       RK3288_MAX_DDR_CTRL_REGS,
++				       ddr_save_data->ctrl_vals);
++
++		/* ddr phy restore */
++		rk3288_ddr_reg_restore(phy_addrs[ch],
++				       ddr_save_data->phy_offsets,
++				       RK3288_MAX_DDR_PHY_REGS,
++				       ddr_save_data->phy_vals[ch]);
++
++		/* msch restore */
++		rk3288_ddr_reg_restore(msch_addrs[ch],
++				       ddr_save_data->msch_offsets,
++				       RK3288_MAX_DDR_MSCH_REGS,
++				       ddr_save_data->msch_vals[ch]);
++
++		phy_init(phy_addrs[ch]);
++
++		/* power up ddr power */
++		writel_relaxed(POWER_UP_START,
++			       pctrl_addrs[ch] + DDR_PCTL_POWCTL);
++		while (!(readl_relaxed(pctrl_addrs[ch] + DDR_PCTL_POWSTAT) &
++			 POWER_UP_DONE))
++			;
++
++		/* zqcr restore; NOTE: both channels must be the same */
++		rk3288_ddr_reg_restore(phy_addrs[ch],
++				       ddr_save_data->phy_zqcr_offsets,
++				       RK3288_MAX_DDR_PHY_ZQCR_REGS,
++				       ddr_save_data->phy_zqcr_vals);
++
++		memory_init(phy_addrs[ch]);
++
++		move_to_lowpower_state(pctrl_addrs[ch], phy_addrs[ch]);
++	}
++
++	/* disable retention */
++	writel_relaxed(readl_relaxed(PMU_PWRMODE_CON_ADDR) |
++	       DDR0IO_RET_DE_REQ | DDR0I1_RET_DE_REQ,
++	       PMU_PWRMODE_CON_ADDR);
++
++	sram_udelay(1);
++
++	/* disable self-refresh */
++	for (ch = 0; ch < ARRAY_SIZE(pctrl_addrs); ch++)
++		move_to_access_state(pctrl_addrs[ch], phy_addrs[ch]);
++}
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_resume.c b/arch/arm/mach-rockchip/embedded/rk3288_resume.c
+new file mode 100644
+index 000000000000..50b44572a849
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_resume.c
+@@ -0,0 +1,103 @@
++/*
++ * Rockchip rk3288 resume code
++ *
++ * This code is intended to be linked into the embedded resume binary
++ * for the rk3288 SoC
++ *
++ * Copyright (c) 2014 Google, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++
++#include "rk3288_resume.h"
++#include "rk3288_resume_embedded.h"
++
++#define INIT_CPSR	(PSR_I_BIT | PSR_F_BIT | SVC_MODE)
++
++static __noreturn void rk3288_resume(void);
++
++/* Parameters of early board initialization in SPL */
++struct rk3288_resume_params rk3288_resume_params
++		__attribute__((section(".resume_params"))) = {
++	.resume_loc	= rk3288_resume,
++};
++
++/**
++ * rk3288_resume_c - Main C entry point for rk3288 at resume time
++ *
++ * This function is called by rk3288_resume() and does the brunt of
++ * any resume processing.  After it's done it will call the kernel's
++ * cpu_resume() function (which it finds through its params structure).
++ *
++ * At the time this function is called:
++ * - We know we're on CPU0.
++ * - Interrupts are disabled.
++ * - We've got a stack.
++ * - The cache is turned off, so all addresses are physical.
++ * - SDRAM hasn't been restored yet (if it was off).
++ *
++ * WARNING: This code, the stack and the params structure are all sitting in
++ * PMU SRAM.  If you try to write to that memory using an 8-bit access (or even
++ * 16-bit) you'll get an imprecise data abort and it will be very hard to debug.
++ * Keep everything in here as 32-bit wide and aligned.  YOU'VE BEEN WARNED.
++ */
++static void __noreturn rk3288_resume_c(void)
++{
++#ifdef CONFIG_ARM_ERRATA_818325
++	u32 val = 0;
++
++	asm("mrc p15, 0, %0, c15, c0, 1" : "=r" (val));
++	val |= BIT(12);
++	asm("mcr p15, 0, %0, c15, c0, 1" : : "r" (val));
++#endif
++
++	if (rk3288_resume_params.l2ctlr_f)
++		asm("mcr p15, 1, %0, c9, c0, 2" : :
++			"r" (rk3288_resume_params.l2ctlr));
++
++	if (rk3288_resume_params.ddr_resume_f)
++		rk3288_ddr_resume_early(&rk3288_resume_params.ddr_save_data);
++
++	rk3288_resume_params.cpu_resume();
++}
++
++/**
++ * rk3288_resume - First entry point for rk3288 at resume time
++ *
++ * A pointer to this function is stored in rk3288_resume_params.  The
++ * kernel uses the pointer in that structure to find this function and
++ * to put its (physical) address in a location that it will get jumped
++ * to at resume time.
++ *
++ * There is no stack at the time this function is called, so this
++ * function is in charge of setting it up.  We get to a function with
++ * a normal stack pointer ASAP.
++ */
++static void __naked __noreturn rk3288_resume(void)
++{
++	/* Make sure we're on CPU0, no IRQs and get a stack setup */
++	asm volatile (
++			"msr	cpsr_cxf, %0\n"
++
++			/* Only cpu0 continues to run, the others halt here */
++			"mrc	p15, 0, r1, c0, c0, 5\n"
++			"and	r1, r1, #0xf\n"
++			"cmp	r1, #0\n"
++			"beq	cpu0run\n"
++		"secondary_loop:\n"
++			"wfe\n"
++			"b	secondary_loop\n"
++
++		"cpu0run:\n"
++			"mov	sp, %1\n"
++		:
++		: "i" (INIT_CPSR), "r" (&__stack_start)
++		: "cc", "r1", "sp");
++
++	/* Now get into a normal function that can use a stack */
++	rk3288_resume_c();
++}
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_resume.h b/arch/arm/mach-rockchip/embedded/rk3288_resume.h
+new file mode 100644
+index 000000000000..2fe25cb929a7
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_resume.h
+@@ -0,0 +1,101 @@
++/*
++ * Rockchip resume header (API from kernel to embedded code)
++ *
++ * Copyright (c) 2014 Google, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __MACH_ROCKCHIP_RK3288_RESUME_H
++#define __MACH_ROCKCHIP_RK3288_RESUME_H
++
++#define RK3288_NUM_DDR_PORTS		2
++
++#define RK3288_MAX_PWM_REGS		3
++#define RK3288_MAX_DDR_PHY_DLL_REGS	7
++#define RK3288_MAX_DDR_CTRL_REGS	64
++#define RK3288_MAX_DDR_PHY_REGS		29
++#define RK3288_MAX_DDR_MSCH_REGS	6
++#define RK3288_MAX_DDR_PHY_ZQCR_REGS	2
++
++#define RK3288_BOGUS_OFFSET		0xffffffff
++
++/**
++ * rk3288_ddr_save - Parameters needed to reinit SDRAM after suspend
++ *
++ * This structure contains data needed to restore SDRAM after suspend.
++ * Generally:
++ * - There are two controllers and we need to save data for both.  We save
++ *   the same registers for both, so you see two sets of values and one sets
++ *   of offsets (the register offset from the base of the controller).
++ *   There are a few registers that are always the same for both controllers
++ *   so we only save one set of values.
++ *
++ * Offsets are saved at init time and vals are saved on each suspend.
++ *
++ * NOTE: offsets are u32 values right now to keep everything 32-bit and avoid
++ * 8-bit and 16-bit access problems in PMU SRAM (see WARNING below).
++ * Technically, though, 8-bit and 16-bit _reads_ seem to work, so as long as
++ * we were careful in setting things up we could possibly save some memory by
++ * storing 16-bit offsets.  We can investigate if we ever get that tight on
++ * space.
++ */
++struct rk3288_ddr_save_data {
++	u32 pwm_addrs[RK3288_MAX_PWM_REGS];
++	u32 pwm_vals[RK3288_MAX_PWM_REGS];
++
++	u32 phy_dll_offsets[RK3288_MAX_DDR_PHY_DLL_REGS];
++	u32 phy_dll_vals[RK3288_NUM_DDR_PORTS][RK3288_MAX_DDR_PHY_DLL_REGS];
++
++	u32 ctrl_offsets[RK3288_MAX_DDR_CTRL_REGS];
++	u32 ctrl_vals[RK3288_MAX_DDR_CTRL_REGS];		/* Both same */
++
++	u32 phy_offsets[RK3288_MAX_DDR_PHY_REGS];
++	u32 phy_vals[RK3288_NUM_DDR_PORTS][RK3288_MAX_DDR_PHY_REGS];
++
++	u32 msch_offsets[RK3288_MAX_DDR_MSCH_REGS];
++	u32 msch_vals[RK3288_NUM_DDR_PORTS][RK3288_MAX_DDR_MSCH_REGS];
++
++	u32 phy_zqcr_offsets[RK3288_MAX_DDR_PHY_ZQCR_REGS];
++	u32 phy_zqcr_vals[RK3288_MAX_DDR_PHY_ZQCR_REGS];	/* Both same */
++};
++
++/**
++ * rk3288_resume_params - Parameter space for the resume code
++ *
++ * This structure is at the start of the resume blob and is used to communicate
++ * between the resume blob and the callers.
++ *
++ * WARNING: This structure is sitting in PMU SRAM.  If you try to write to that
++ * memory using an 8-bit access (or even 16-bit) you'll get an imprecise data
++ * abort and it will be very hard to debug.  Keep everything in here as 32-bit
++ * wide and aligned.  YOU'VE BEEN WARNED.
++ *
++ * @resume_loc:		The value here should be the resume address that the CPU
++ *			is programmed to go to at resume time.
++ *
++ * @l2ctlr_f:		If non-zero we'll set l2ctlr at resume time.
++ * @l2ctlr:		The value to set l2ctlr to at resume time.
++ *
++ * @ddr_resume_f	True if we should resume DDR.
++ * @ddr_save_data:	Data for save / restore of DDR.
++ *
++ * @cpu_resume:		The function to jump to when we're all done.
++ */
++struct rk3288_resume_params {
++	/* This is compiled in and can be read to find the resume location */
++	__noreturn void (*resume_loc)(void);
++
++	/* Filled in by the client of the resume code */
++	u32 l2ctlr_f;		/* u32 not bool to avoid 8-bit SRAM access */
++	u32 l2ctlr;
++
++	u32 ddr_resume_f;	/* u32 not bool to avoid 8-bit SRAM access */
++	struct rk3288_ddr_save_data ddr_save_data;
++
++	__noreturn void (*cpu_resume)(void);
++};
++
++#endif /* __MACH_ROCKCHIP_RK3288_RESUME_H */
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_resume.lds.S b/arch/arm/mach-rockchip/embedded/rk3288_resume.lds.S
+new file mode 100644
+index 000000000000..0643169d496f
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_resume.lds.S
+@@ -0,0 +1,40 @@
++MEMORY {
++	pmu_sram_code  : ORIGIN = 0xff720000, LENGTH = 0xf00
++	pmu_sram_stack : ORIGIN = 0xff720f00, LENGTH = 0x100
++}
++
++OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm", "elf32-littlearm")
++OUTPUT_ARCH(arm)
++
++SECTIONS
++{
++	/* Don't need unwind tables */
++	/DISCARD/ : {
++		*(.ARM.exidx*)
++		*(.ARM.extab*)
++	}
++
++	/* Kernel code finds params because it knows they are first */
++	.params : { *(.resume_params*) } > pmu_sram_code
++	. = ALIGN(4);
++
++	.text : { *(.text*) } > pmu_sram_code
++	. = ALIGN(4);
++
++	.rodata : { *(SORT_BY_ALIGNMENT(.rodata*)) } > pmu_sram_code
++	. = ALIGN(4);
++
++	.data : {
++		*(SORT_BY_ALIGNMENT(.data*))
++		. = ALIGN(4);
++
++		/* We purposely put bss as part of data to avoid initting */
++		*(SORT_BY_ALIGNMENT(.bss*))
++		. = ALIGN(4);
++	} > pmu_sram_code
++
++	.stack : {
++		. += LENGTH(pmu_sram_stack) - 8;
++		__stack_start = .;
++	} > pmu_sram_stack
++}
+diff --git a/arch/arm/mach-rockchip/embedded/rk3288_resume_embedded.h b/arch/arm/mach-rockchip/embedded/rk3288_resume_embedded.h
+new file mode 100644
+index 000000000000..8e87f4665090
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/rk3288_resume_embedded.h
+@@ -0,0 +1,20 @@
++/*
++ * Rockchip resume header (API between files in embedded code)
++ *
++ * Copyright (c) 2014 Google, Inc
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __MACH_ROCKCHIP_RK3288_RESUME_EMBEDDED_H
++#define __MACH_ROCKCHIP_RK3288_RESUME_EMBEDDED_H
++
++/* Defined in the linker script */
++extern u32 *__stack_start;
++
++/* Defined by SDRAM code */
++void rk3288_ddr_resume_early(struct rk3288_ddr_save_data *ddr_save_data);
++
++#endif /* __MACH_ROCKCHIP_RK3288_RESUME_EMBEDDED_H */
+diff --git a/arch/arm/mach-rockchip/embedded/sram_delay.h b/arch/arm/mach-rockchip/embedded/sram_delay.h
+new file mode 100644
+index 000000000000..dd237e6bff1d
+--- /dev/null
++++ b/arch/arm/mach-rockchip/embedded/sram_delay.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __MACH_ROCKCHIP_SRAM_DELAY_H
++#define __MACH_ROCKCHIP_SRAM_DELAY_H
++
++#include <asm/arch_timer.h>
++
++/*
++ * Arch timer freq is present in dts.  We could get it from there but
++ * really nobody is going to put anything but 24MHz here.  If they do then
++ * we'll have to add this to the suspend data.
++ */
++#define ARCH_TIMER_FREQ			24000000
++#define ARCH_TIMER_TICKS_PER_US		(ARCH_TIMER_FREQ / 1000000)
++
++static inline void sram_udelay(u32 us)
++{
++	u32 orig;
++	u32 to_wait = ARCH_TIMER_TICKS_PER_US * us;
++
++	/* Note: u32 math is way more than enough for our small delays */
++	orig = (u32) arch_counter_get_cntpct();
++	while ((u32) arch_counter_get_cntpct() - orig <= to_wait)
++		;
++}
++
++#endif /* MACH_ROCKCHIP_SRAM_DELAY_H */
+diff --git a/arch/arm/mach-rockchip/sleep.S b/arch/arm/mach-rockchip/sleep.S
+deleted file mode 100644
+index 2eec9a341f05..000000000000
+--- a/arch/arm/mach-rockchip/sleep.S
++++ /dev/null
+@@ -1,73 +0,0 @@
+-/*
+- * Copyright (c) 2014, Fuzhou Rockchip Electronics Co., Ltd
+- * Author: Tony Xie <tony.xie@rock-chips.com>
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+- * more details.
+- *
+- */
+-
+-#include <linux/linkage.h>
+-#include <asm/assembler.h>
+-#include <asm/memory.h>
+-
+-.data
+-/*
+- * this code will be copied from
+- * ddr to sram for system resumeing.
+- * so it is ".data section".
+- */
+-.align
+-
+-ENTRY(rockchip_slp_cpu_resume)
+-	setmode	PSR_I_BIT | PSR_F_BIT | SVC_MODE, r1  @ set svc, irqs off
+-	mrc	p15, 0, r1, c0, c0, 5
+-	and	r1, r1, #0xf
+-	cmp	r1, #0
+-	/* olny cpu0 can continue to run, the others is halt here */
+-	beq	cpu0run
+-secondary_loop:
+-	wfe
+-	b	secondary_loop
+-cpu0run:
+-	ldr	r3, rkpm_bootdata_l2ctlr_f
+-	cmp	r3, #0
+-	beq	sp_set
+-	ldr	r3, rkpm_bootdata_l2ctlr
+-	mcr	p15, 1, r3, c9, c0, 2
+-sp_set:
+-	ldr	sp, rkpm_bootdata_cpusp
+-	ldr	r1, rkpm_bootdata_cpu_code
+-	bx	r1
+-ENDPROC(rockchip_slp_cpu_resume)
+-
+-/* Parameters filled in by the kernel */
+-
+-/* Flag for whether to restore L2CTLR on resume */
+-	.global rkpm_bootdata_l2ctlr_f
+-rkpm_bootdata_l2ctlr_f:
+-	.long 0
+-
+-/* Saved L2CTLR to restore on resume */
+-	.global rkpm_bootdata_l2ctlr
+-rkpm_bootdata_l2ctlr:
+-	.long 0
+-
+-/* CPU resume SP addr */
+-	.globl rkpm_bootdata_cpusp
+-rkpm_bootdata_cpusp:
+-	.long 0
+-
+-/* CPU resume function (physical address) */
+-	.globl rkpm_bootdata_cpu_code
+-rkpm_bootdata_cpu_code:
+-	.long 0
+-
+-ENTRY(rk3288_bootram_sz)
+-        .word   . - rockchip_slp_cpu_resume
+-- 
+2.35.3
+

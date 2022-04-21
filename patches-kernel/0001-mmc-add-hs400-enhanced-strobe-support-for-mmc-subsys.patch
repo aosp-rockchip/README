@@ -1,0 +1,380 @@
+From 87145991406facd537f57c9e6bf0809ceddda851 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Wed, 27 Apr 2016 10:53:33 +0800
+Subject: [PATCH] mmc: add hs400 enhanced strobe support for mmc subsystem
+
+HS400 enhanced strobe is a new feature introduced by eMMC
+spec 5.1, let's implement it and enjoy it!
+
+please note that currently I have no much bandwith to split this
+big patch into patchset. So please use, test and applied! Thanks.
+
+Change-Id: I874f18a617a1b69e3ff56f5c134feb817b6985b9
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/core/bus.c             |  3 +-
+ drivers/mmc/core/host.c            |  2 +
+ drivers/mmc/core/mmc.c             | 85 +++++++++++++++++++++++++++---
+ drivers/mmc/host/sdhci-of-arasan.c | 22 ++++++++
+ drivers/mmc/host/sdhci.c           | 11 ++++
+ include/linux/mmc/card.h           |  1 +
+ include/linux/mmc/host.h           | 18 +++++++
+ include/linux/mmc/mmc.h            |  3 ++
+ 8 files changed, 137 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/mmc/core/bus.c b/drivers/mmc/core/bus.c
+index 972ff844cf5a..c40d700d424d 100644
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -332,12 +332,13 @@ int mmc_add_card(struct mmc_card *card)
+ 			mmc_card_ddr52(card) ? "DDR " : "",
+ 			type);
+ 	} else {
+-		pr_info("%s: new %s%s%s%s%s card at address %04x\n",
++		pr_info("%s: new %s%s%s%s%s%s card at address %04x\n",
+ 			mmc_hostname(card->host),
+ 			mmc_card_uhs(card) ? "ultra high speed " :
+ 			(mmc_card_hs(card) ? "high speed " : ""),
+ 			mmc_card_hs400(card) ? "HS400 " :
+ 			(mmc_card_hs200(card) ? "HS200 " : ""),
++			mmc_card_hs400es(card) ? "Enhanced strobe " : "",
+ 			mmc_card_ddr52(card) ? "DDR " : "",
+ 			uhs_bus_speed_mode, type, card->rca);
+ 	}
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index 871989e7c228..71bb2372f71d 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -289,6 +289,8 @@ int mmc_of_parse(struct mmc_host *host)
+ 		host->caps2 |= MMC_CAP2_HS400_1_8V | MMC_CAP2_HS200_1_8V_SDR;
+ 	if (of_property_read_bool(np, "mmc-hs400-1_2v"))
+ 		host->caps2 |= MMC_CAP2_HS400_1_2V | MMC_CAP2_HS200_1_2V_SDR;
++	if (of_property_read_bool(np, "mmc-hs400-enhanced-strobe"))
++		host->caps2 |= MMC_CAP2_HS400_ENHANCED_STROBE;
+ 
+ 	if (of_property_read_bool(np, "supports-sd"))
+ 		host->restrict_caps |= RESTRICT_CARD_TYPE_SD;
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index 3d5087b03999..94bde1d5dae8 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -235,6 +235,12 @@ static void mmc_select_card_type(struct mmc_card *card)
+ 		avail_type |= EXT_CSD_CARD_TYPE_HS400_1_2V;
+ 	}
+ 
++	if ((caps2 & MMC_CAP2_HS400_ENHANCED_STROBE) &&
++		card->ext_csd.strobe_support &&
++		((card_type & EXT_CSD_CARD_TYPE_HS400_1_2V) ||
++		(card_type & EXT_CSD_CARD_TYPE_HS400_1_8V)))
++		avail_type |= EXT_CSD_CARD_TYPE_HS400ES;
++
+ 	card->ext_csd.hs_max_dtr = hs_max_dtr;
+ 	card->ext_csd.hs200_max_dtr = hs200_max_dtr;
+ 	card->mmc_avail_type = avail_type;
+@@ -383,6 +389,13 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
+ 			mmc_card_set_blockaddr(card);
+ 	}
+ 
++	/*
++	 * Enhance Strobe is supported since v5.1 which rev should be
++	 * 8 but some eMMC devices can support it with rev 7. So handle
++	 * Enhance Strobe here.
++	 */
++	card->ext_csd.strobe_support = ext_csd[EXT_CSD_STROBE_SUPPORT];
++
+ 	card->ext_csd.raw_card_type = ext_csd[EXT_CSD_CARD_TYPE];
+ 	mmc_select_card_type(card);
+ 
+@@ -1062,10 +1075,11 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	u8 val;
+ 
+ 	/*
+-	 * HS400 mode requires 8-bit bus width
++	 * HS400(ES) mode requires 8-bit bus width
+ 	 */
+-	if (!(card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400 &&
+-	      host->ios.bus_width == MMC_BUS_WIDTH_8))
++	if (!(((card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400) ||
++		(card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES)) &&
++		host->ios.bus_width == MMC_BUS_WIDTH_8))
+ 		return 0;
+ 
+ 	if (host->caps & MMC_CAP_WAIT_WHILE_BUSY)
+@@ -1097,9 +1111,26 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	}
+ 
+ 	/* Switch card to DDR */
++	val = EXT_CSD_DDR_BUS_WIDTH_8;
++	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES) {
++		val |= EXT_CSD_BUS_WIDTH_STROBE;
++		/*
++		 * Make sure we are in non-enhanced strobe mode before we
++		 * actually enable it in ext_csd.
++		 */
++		if (host->ops->prepare_enhanced_strobe)
++			err = host->ops->prepare_enhanced_strobe(host, false);
++
++		if (err) {
++			pr_err("%s: unprepare_enhanced strobe failed, err:%d\n",
++				mmc_hostname(host), err);
++			return err;
++		}
++	}
++
+ 	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+ 			 EXT_CSD_BUS_WIDTH,
+-			 EXT_CSD_DDR_BUS_WIDTH_8,
++			 val,
+ 			 card->ext_csd.generic_cmd6_time);
+ 	if (err) {
+ 		pr_err("%s: switch to bus width for hs400 failed, err:%d\n",
+@@ -1124,6 +1155,35 @@ static int mmc_select_hs400(struct mmc_card *card)
+ 	mmc_set_timing(host, MMC_TIMING_MMC_HS400);
+ 	mmc_set_bus_speed(card);
+ 
++	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES) {
++		/* Controller enable enhanced strobe function */
++		if (host->ops->prepare_enhanced_strobe)
++			err = host->ops->prepare_enhanced_strobe(host, true);
++
++		if (err) {
++			pr_err("%s: prepare enhanced strobe failed, err:%d\n",
++				mmc_hostname(host), err);
++			return err;
++		}
++
++		/*
++		 * After switching to hs400 enhanced strobe mode, we expect to
++		 * verify whether it works or not. If controller can't handle
++		 * bus width test, compare ext_csd previously read in 1 bit mode
++		 * against ext_csd at new bus width
++		 */
++		if (!(host->caps & MMC_CAP_BUS_WIDTH_TEST))
++			err = mmc_compare_ext_csds(card, MMC_BUS_WIDTH_8);
++		else
++			err = mmc_bus_test(card, MMC_BUS_WIDTH_8);
++
++		if (err) {
++			pr_warn("%s: switch to enhanced strobe failed\n",
++				mmc_hostname(host));
++			return err;
++		}
++	}
++
+ 	if (!send_status) {
+ 		err = mmc_switch_status(card);
+ 		if (err)
+@@ -1297,7 +1357,8 @@ static int mmc_select_hs200(struct mmc_card *card)
+ }
+ 
+ /*
+- * Activate High Speed or HS200 mode if supported.
++ * Activate High Speed or HS200 mode if supported. For HS400
++ * with enhanced strobe mode, we should activate High Speed.
+  */
+ static int mmc_select_timing(struct mmc_card *card)
+ {
+@@ -1306,7 +1367,9 @@ static int mmc_select_timing(struct mmc_card *card)
+ 	if (!mmc_can_ext_csd(card))
+ 		goto bus_speed;
+ 
+-	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
++	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES)
++		err = mmc_select_hs(card);
++	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200)
+ 		err = mmc_select_hs200(card);
+ 	else if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS)
+ 		err = mmc_select_hs(card);
+@@ -1577,7 +1640,15 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 	} else if (mmc_card_hs(card)) {
+ 		/* Select the desired bus width optionally */
+ 		err = mmc_select_bus_width(card);
+-		if (!IS_ERR_VALUE(err)) {
++		if (IS_ERR_VALUE(err))
++			goto free_card;
++
++		if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES) {
++			/* Directly from HS to HS400-ES */
++			err = mmc_select_hs400(card);
++			if (err)
++				goto free_card;
++		} else {
+ 			err = mmc_select_hs_ddr(card);
+ 			if (err)
+ 				goto free_card;
+diff --git a/drivers/mmc/host/sdhci-of-arasan.c b/drivers/mmc/host/sdhci-of-arasan.c
+index 4cdb97c300ff..426750bed6fa 100644
+--- a/drivers/mmc/host/sdhci-of-arasan.c
++++ b/drivers/mmc/host/sdhci-of-arasan.c
+@@ -25,7 +25,9 @@
+ #include "sdhci-pltfm.h"
+ 
+ #define SDHCI_ARASAN_CLK_CTRL_OFFSET	0x2c
++#define SDHCI_ARASAN_VENDOR_REGISTER	0x78
+ 
++#define VENDOR_ENHANCED_STROBE		BIT(0)
+ #define CLK_CTRL_TIMEOUT_SHIFT		16
+ #define CLK_CTRL_TIMEOUT_MASK		(0xf << CLK_CTRL_TIMEOUT_SHIFT)
+ #define CLK_CTRL_TIMEOUT_MIN_EXP	13
+@@ -55,6 +57,23 @@ static unsigned int sdhci_arasan_get_timeout_clock(struct sdhci_host *host)
+ 	return freq;
+ }
+ 
++static int sdhci_arasan_enhanced_strobe(struct mmc_host *mmc,
++					bool enable)
++{
++	u32 vendor;
++	struct sdhci_host *host = mmc_priv(mmc);
++
++	vendor = readl(host->ioaddr + SDHCI_ARASAN_VENDOR_REGISTER);
++	if (enable)
++		vendor |= VENDOR_ENHANCED_STROBE;
++	else
++		vendor &= (~VENDOR_ENHANCED_STROBE);
++
++	writel(vendor, host->ioaddr + SDHCI_ARASAN_VENDOR_REGISTER);
++
++	return 0;
++}
++
+ static void sdhci_arasan_set_clock(struct sdhci_host *host, unsigned int clock)
+ {
+ 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+@@ -249,6 +268,9 @@ static int sdhci_arasan_probe(struct platform_device *pdev)
+ 			dev_err(&pdev->dev, "phy_power_on err.\n");
+ 			goto err_phy_power;
+ 		}
++
++		host->mmc_host_ops.prepare_enhanced_strobe =
++					sdhci_arasan_enhanced_strobe;
+ 	}
+ 
+ 	ret = sdhci_add_host(host);
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 51245f45bc6d..6e13fa8471bf 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -2078,6 +2078,16 @@ static int sdhci_execute_tuning(struct mmc_host *mmc, u32 opcode)
+ 	return err;
+ }
+ 
++static int sdhci_prepare_enhanced_strobe(struct mmc_host *mmc, bool enable)
++{
++	/*
++	* Currently we can't find a register to enable enhanced strobe
++	* function for standard sdhci, so we expect variant drivers to
++	* overwrite it.
++	*/
++	return -EINVAL;
++}
++
+ static int sdhci_select_drive_strength(struct mmc_card *card,
+ 				       unsigned int max_dtr, int host_drv,
+ 				       int card_drv, int *drv_type)
+@@ -2214,6 +2224,7 @@ static const struct mmc_host_ops sdhci_ops = {
+ 	.enable_sdio_irq = sdhci_enable_sdio_irq,
+ 	.start_signal_voltage_switch	= sdhci_start_signal_voltage_switch,
+ 	.prepare_hs400_tuning		= sdhci_prepare_hs400_tuning,
++	.prepare_enhanced_strobe	= sdhci_prepare_enhanced_strobe,
+ 	.execute_tuning			= sdhci_execute_tuning,
+ 	.select_drive_strength		= sdhci_select_drive_strength,
+ 	.card_event			= sdhci_card_event,
+diff --git a/include/linux/mmc/card.h b/include/linux/mmc/card.h
+index eb0151bac50c..22defc2a83b7 100644
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@ -95,6 +95,7 @@ struct mmc_ext_csd {
+ 	u8			raw_partition_support;	/* 160 */
+ 	u8			raw_rpmb_size_mult;	/* 168 */
+ 	u8			raw_erased_mem_count;	/* 181 */
++	u8			strobe_support;		/* 184 */
+ 	u8			raw_ext_csd_structure;	/* 194 */
+ 	u8			raw_card_type;		/* 196 */
+ 	u8			raw_driver_strength;	/* 197 */
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 5c479e778170..ec55e25115d1 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -19,6 +19,7 @@
+ 
+ #include <linux/mmc/core.h>
+ #include <linux/mmc/card.h>
++#include <linux/mmc/mmc.h>
+ #include <linux/mmc/pm.h>
+ 
+ struct mmc_ios {
+@@ -133,6 +134,8 @@ struct mmc_host_ops {
+ 
+ 	/* Prepare HS400 target operating frequency depending host driver */
+ 	int	(*prepare_hs400_tuning)(struct mmc_host *host, struct mmc_ios *ios);
++	/* Prepare enhanced strobe depending host driver */
++	int	(*prepare_enhanced_strobe)(struct mmc_host *host, bool enable);
+ 	int	(*select_drive_strength)(struct mmc_card *card,
+ 					 unsigned int max_dtr, int host_drv,
+ 					 int card_drv, int *drv_type);
+@@ -290,6 +293,7 @@ struct mmc_host {
+ #define MMC_CAP2_HSX00_1_2V	(MMC_CAP2_HS200_1_2V_SDR | MMC_CAP2_HS400_1_2V)
+ #define MMC_CAP2_SDIO_IRQ_NOTHREAD (1 << 17)
+ #define MMC_CAP2_NO_WRITE_PROTECT (1 << 18)	/* No physical write protect pin, assume that card is always read-write */
++#define MMC_CAP2_HS400_ENHANCED_STROBE (1 << 20) /* Host supports enhanced strobe */
+ 
+ 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
+ 
+@@ -492,6 +496,11 @@ static inline int mmc_host_uhs(struct mmc_host *host)
+ 		 MMC_CAP_UHS_DDR50);
+ }
+ 
++static inline int mmc_host_hs400_enhanced_strobe(struct mmc_host *host)
++{
++	return host->caps2 & MMC_CAP2_HS400_ENHANCED_STROBE;
++}
++
+ static inline int mmc_host_packed_wr(struct mmc_host *host)
+ {
+ 	return host->caps2 & MMC_CAP2_PACKED_WR;
+@@ -524,6 +533,15 @@ static inline bool mmc_card_hs400(struct mmc_card *card)
+ 	return card->host->ios.timing == MMC_TIMING_MMC_HS400;
+ }
+ 
++static inline bool mmc_card_hs400es(struct mmc_card *card)
++{
++	if (mmc_card_hs400(card) &&
++	    (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400ES))
++		return 1;
++
++	return 0;
++}
++
+ void mmc_retune_timer_stop(struct mmc_host *host);
+ 
+ static inline void mmc_retune_needed(struct mmc_host *host)
+diff --git a/include/linux/mmc/mmc.h b/include/linux/mmc/mmc.h
+index 15f2c4a0a62c..c376209c70ef 100644
+--- a/include/linux/mmc/mmc.h
++++ b/include/linux/mmc/mmc.h
+@@ -297,6 +297,7 @@ struct _mmc_csd {
+ #define EXT_CSD_PART_CONFIG		179	/* R/W */
+ #define EXT_CSD_ERASED_MEM_CONT		181	/* RO */
+ #define EXT_CSD_BUS_WIDTH		183	/* R/W */
++#define EXT_CSD_STROBE_SUPPORT		184	/* RO */
+ #define EXT_CSD_HS_TIMING		185	/* R/W */
+ #define EXT_CSD_POWER_CLASS		187	/* R/W */
+ #define EXT_CSD_REV			192	/* RO */
+@@ -380,12 +381,14 @@ struct _mmc_csd {
+ #define EXT_CSD_CARD_TYPE_HS400_1_2V	(1<<7)	/* Card can run at 200MHz DDR, 1.2V */
+ #define EXT_CSD_CARD_TYPE_HS400		(EXT_CSD_CARD_TYPE_HS400_1_8V | \
+ 					 EXT_CSD_CARD_TYPE_HS400_1_2V)
++#define EXT_CSD_CARD_TYPE_HS400ES	(1<<8)	/* Card can run at HS400ES */
+ 
+ #define EXT_CSD_BUS_WIDTH_1	0	/* Card is in 1 bit mode */
+ #define EXT_CSD_BUS_WIDTH_4	1	/* Card is in 4 bit mode */
+ #define EXT_CSD_BUS_WIDTH_8	2	/* Card is in 8 bit mode */
+ #define EXT_CSD_DDR_BUS_WIDTH_4	5	/* Card is in 4 bit DDR mode */
+ #define EXT_CSD_DDR_BUS_WIDTH_8	6	/* Card is in 8 bit DDR mode */
++#define EXT_CSD_BUS_WIDTH_STROBE BIT(7)	/* Enhanced strobe mode */
+ 
+ #define EXT_CSD_TIMING_BC	0	/* Backwards compatility */
+ #define EXT_CSD_TIMING_HS	1	/* High speed */
+-- 
+2.35.3
+

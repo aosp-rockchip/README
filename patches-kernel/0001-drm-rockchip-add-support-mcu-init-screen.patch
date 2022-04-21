@@ -1,0 +1,363 @@
+From 8304527e6751dfe41f8baf4a62cb4c8c5c94266e Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Mon, 2 Jul 2018 17:12:25 +0800
+Subject: [PATCH] drm/rockchip: add support mcu init screen
+
+the mcu init cmd should be sent from crtc mcu interface,
+so we add the rockchip_drm_crtc_send_mcu_cmd to do this.
+
+Change-Id: I7fedfb90c6074e8837a825d10e0dcd9c16bfc1d0
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/panel/panel-simple.c        | 64 ++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c | 26 +++++++
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 84 +++++++++++++++++++++
+ include/drm/drm_panel.h                     |  3 +
+ 5 files changed, 178 insertions(+)
+
+diff --git a/drivers/gpu/drm/panel/panel-simple.c b/drivers/gpu/drm/panel/panel-simple.c
+index 9a2be6f20e46..ce93af189b05 100644
+--- a/drivers/gpu/drm/panel/panel-simple.c
++++ b/drivers/gpu/drm/panel/panel-simple.c
+@@ -37,6 +37,7 @@
+ #include <video/mipi_display.h>
+ #include <linux/of_device.h>
+ #include <video/of_display_timing.h>
++#include <linux/of_graph.h>
+ #include <video/videomode.h>
+ 
+ struct cmd_ctrl_hdr {
+@@ -121,6 +122,7 @@ struct panel_simple {
+ 
+ 	struct panel_cmds *on_cmds;
+ 	struct panel_cmds *off_cmds;
++	struct device_node *np_crtc;
+ };
+ 
+ enum rockchip_cmd_type {
+@@ -129,6 +131,12 @@ enum rockchip_cmd_type {
+ 	CMD_TYPE_MCU
+ };
+ 
++enum MCU_IOCTL {
++	MCU_WRCMD = 0,
++	MCU_WRDATA,
++	MCU_SETBYPASS,
++};
++
+ static inline int get_panel_cmd_type(const char *s)
+ {
+ 	if (!s)
+@@ -256,6 +264,32 @@ static void panel_simple_spi_write_cmd(struct panel_simple *panel,
+ 	gpiod_direction_output(panel->spi_cs_gpio, 1);
+ }
+ 
++static int panel_simple_mcu_send_cmds(struct panel_simple *panel,
++				      struct panel_cmds *cmds)
++{
++	int i;
++
++	if (!cmds)
++		return -EINVAL;
++
++	rockchip_drm_crtc_send_mcu_cmd(panel->base.drm,
++				       panel->np_crtc, MCU_SETBYPASS, 1);
++	for (i = 0; i < cmds->cmd_cnt; i++) {
++		struct cmd_desc *cmd = &cmds->cmds[i];
++		u32 value = 0;
++
++		value = cmd->payload[0];
++		rockchip_drm_crtc_send_mcu_cmd(panel->base.drm, panel->np_crtc,
++					       cmd->dchdr.dtype, value);
++		if (cmd->dchdr.wait)
++			msleep(cmd->dchdr.wait);
++	}
++	rockchip_drm_crtc_send_mcu_cmd(panel->base.drm,
++				       panel->np_crtc, MCU_SETBYPASS, 0);
++
++	return 0;
++}
++
+ static int panel_simple_spi_send_cmds(struct panel_simple *panel,
+ 				      struct panel_cmds *cmds)
+ {
+@@ -524,6 +558,7 @@ static int panel_simple_loader_protect(struct drm_panel *panel, bool on)
+ static int panel_simple_disable(struct drm_panel *panel)
+ {
+ 	struct panel_simple *p = to_panel_simple(panel);
++	int err = 0;
+ 
+ 	if (!p->enabled)
+ 		return 0;
+@@ -536,6 +571,11 @@ static int panel_simple_disable(struct drm_panel *panel)
+ 	if (p->desc && p->desc->delay.disable)
+ 		msleep(p->desc->delay.disable);
+ 
++	if (p->cmd_type == CMD_TYPE_MCU) {
++		err = panel_simple_mcu_send_cmds(p, p->off_cmds);
++		if (err)
++			dev_err(p->dev, "failed to send mcu off cmds\n");
++	}
+ 	p->enabled = false;
+ 
+ 	return 0;
+@@ -623,10 +663,16 @@ static int panel_simple_prepare(struct drm_panel *panel)
+ static int panel_simple_enable(struct drm_panel *panel)
+ {
+ 	struct panel_simple *p = to_panel_simple(panel);
++	int err = 0;
+ 
+ 	if (p->enabled)
+ 		return 0;
+ 
++	if (p->cmd_type == CMD_TYPE_MCU) {
++		err = panel_simple_mcu_send_cmds(p, p->on_cmds);
++		if (err)
++			dev_err(p->dev, "failed to send mcu on cmds\n");
++	}
+ 	if (p->desc && p->desc->delay.enable)
+ 		msleep(p->desc->delay.enable);
+ 
+@@ -793,6 +839,24 @@ static int panel_simple_probe(struct device *dev, const struct panel_desc *desc)
+ 		gpiod_direction_output(panel->spi_cs_gpio, 1);
+ 		gpiod_direction_output(panel->spi_sdi_gpio, 1);
+ 		gpiod_direction_output(panel->spi_scl_gpio, 1);
++	} else if (panel->cmd_type == CMD_TYPE_MCU) {
++		struct device_node *port, *endpoint;
++		struct device_node *np;
++
++		port = of_graph_get_port_by_id(dev->of_node, 0);
++		if (port) {
++			endpoint = of_get_next_child(port, NULL);
++			/* get connect device node */
++			np = of_graph_get_remote_port_parent(endpoint);
++
++			port = of_graph_get_port_by_id(np, 0);
++			if (port) {
++				endpoint = of_get_next_child(port, NULL);
++				/* get crtc device node */
++				np = of_graph_get_remote_port_parent(endpoint);
++				panel->np_crtc = np;
++			}
++		}
+ 	}
+ 	panel->power_invert =
+ 			of_property_read_bool(dev->of_node, "power-invert");
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 3b52320bcfa2..4519d7250719 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -895,6 +895,32 @@ static int __init rockchip_clocks_loader_unprotect(void)
+ late_initcall_sync(rockchip_clocks_loader_unprotect);
+ #endif
+ 
++int rockchip_drm_crtc_send_mcu_cmd(struct drm_device *drm_dev,
++				   struct device_node *np_crtc,
++				   u32 type, u32 value)
++{
++	struct drm_crtc *crtc;
++	int pipe = 0;
++	struct rockchip_drm_private *priv;
++
++	if (!np_crtc || !of_device_is_available(np_crtc))
++		return -EINVAL;
++
++	drm_for_each_crtc(crtc, drm_dev) {
++		if (of_get_parent(crtc->port) == np_crtc)
++			break;
++	}
++
++	pipe = drm_crtc_index(crtc);
++	if (pipe >= ROCKCHIP_MAX_CRTC)
++		return -EINVAL;
++	priv = crtc->dev->dev_private;
++	if (priv->crtc_funcs[pipe]->crtc_send_mcu_cmd)
++		priv->crtc_funcs[pipe]->crtc_send_mcu_cmd(crtc, type, value);
++
++	return 0;
++}
++
+ /*
+  * Attach a (component) device to the shared drm dma mapping from master drm
+  * device.  This is used by the VOPs to map GEM buffers to a common DMA
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 4b2b7888626e..0a6b9cd580f9 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -53,6 +53,7 @@ struct rockchip_crtc_funcs {
+ 					   const struct drm_display_mode *mode,
+ 					   int output_type);
+ 	void (*crtc_close)(struct drm_crtc *crtc);
++	void (*crtc_send_mcu_cmd)(struct drm_crtc *crtc, u32 type, u32 value);
+ };
+ 
+ struct drm_rockchip_subdrv {
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 71cd1a6ea907..a2c1d85bba95 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -181,6 +181,15 @@ struct vop_plane_state {
+ 	unsigned long offset;
+ };
+ 
++struct rockchip_mcu_timing {
++	int mcu_pix_total;
++	int mcu_cs_pst;
++	int mcu_cs_pend;
++	int mcu_rw_pst;
++	int mcu_rw_pend;
++	int mcu_hold_mode;
++};
++
+ struct vop_win {
+ 	struct vop_win *parent;
+ 	struct drm_plane base;
+@@ -273,6 +282,8 @@ struct vop {
+ 
+ 	struct rockchip_dclk_pll *pll;
+ 
++	struct rockchip_mcu_timing mcu_timing;
++
+ 	struct vop_win win[];
+ };
+ 
+@@ -2411,6 +2422,36 @@ static void vop_crtc_close(struct drm_crtc *crtc)
+ 	mutex_unlock(&vop->vop_lock);
+ }
+ 
++static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc,  u32 type, u32 value)
++{
++	struct vop *vop = NULL;
++
++	if (!crtc)
++		return;
++
++	vop = to_vop(crtc);
++	mutex_lock(&vop->vop_lock);
++	if (vop && vop->is_enabled) {
++		switch (type) {
++		case MCU_WRCMD:
++			VOP_CTRL_SET(vop, mcu_rs, 0);
++			VOP_CTRL_SET(vop, mcu_rw_bypass_port, value);
++			VOP_CTRL_SET(vop, mcu_rs, 1);
++			break;
++		case MCU_WRDATA:
++			VOP_CTRL_SET(vop, mcu_rs, 1);
++			VOP_CTRL_SET(vop, mcu_rw_bypass_port, value);
++			break;
++		case MCU_SETBYPASS:
++			VOP_CTRL_SET(vop, mcu_bypass, value ? 1 : 0);
++			break;
++		default:
++			break;
++		}
++	}
++	mutex_unlock(&vop->vop_lock);
++}
++
+ static const struct rockchip_crtc_funcs private_crtc_funcs = {
+ 	.loader_protect = vop_crtc_loader_protect,
+ 	.enable_vblank = vop_crtc_enable_vblank,
+@@ -2422,6 +2463,7 @@ static const struct rockchip_crtc_funcs private_crtc_funcs = {
+ 	.mode_valid = vop_crtc_mode_valid,
+ 	.bandwidth = vop_crtc_bandwidth,
+ 	.crtc_close = vop_crtc_close,
++	.crtc_send_mcu_cmd = vop_crtc_send_mcu_cmd,
+ };
+ 
+ static bool vop_crtc_mode_fixup(struct drm_crtc *crtc,
+@@ -2555,6 +2597,21 @@ static bool vop_crtc_mode_update(struct drm_crtc *crtc)
+ 	return false;
+ }
+ 
++static void vop_mcu_mode(struct drm_crtc *crtc)
++{
++	struct vop *vop = to_vop(crtc);
++
++	VOP_CTRL_SET(vop, mcu_clk_sel, 1);
++	VOP_CTRL_SET(vop, mcu_type, 1);
++
++	VOP_CTRL_SET(vop, mcu_hold_mode, 1);
++	VOP_CTRL_SET(vop, mcu_pix_total, vop->mcu_timing.mcu_pix_total);
++	VOP_CTRL_SET(vop, mcu_cs_pst, vop->mcu_timing.mcu_cs_pst);
++	VOP_CTRL_SET(vop, mcu_cs_pend, vop->mcu_timing.mcu_cs_pend);
++	VOP_CTRL_SET(vop, mcu_rw_pst, vop->mcu_timing.mcu_rw_pst);
++	VOP_CTRL_SET(vop, mcu_rw_pend, vop->mcu_timing.mcu_rw_pend);
++}
++
+ static void vop_crtc_enable(struct drm_crtc *crtc)
+ {
+ 	struct vop *vop = to_vop(crtc);
+@@ -2717,6 +2774,9 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 
+ 	clk_set_rate(vop->dclk, adjusted_mode->crtc_clock * 1000);
+ 
++	if (vop->mcu_timing.mcu_pix_total)
++		vop_mcu_mode(crtc);
++
+ 	vop_cfg_done(vop);
+ 
+ 	enable_irq(vop->irq);
+@@ -3403,6 +3463,8 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	} else {
+ 		VOP_CTRL_SET(vop, reg_done_frm, 0);
+ 	}
++	if (vop->mcu_timing.mcu_pix_total)
++		VOP_CTRL_SET(vop, mcu_hold_mode, 0);
+ 
+ 	vop->mode_update = false;
+ 	spin_unlock_irqrestore(&vop->irq_lock, flags);
+@@ -4271,6 +4333,7 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
+ 	size_t alloc_size;
+ 	int ret, irq, i;
+ 	int num_wins = 0;
++	struct device_node *mcu = NULL;
+ 
+ 	vop_data = of_device_get_match_data(dev);
+ 	if (!vop_data)
+@@ -4405,6 +4468,27 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
+ 	of_rockchip_drm_sub_backlight_register(dev, &vop->crtc,
+ 					       &rockchip_sub_backlight_ops);
+ 
++	mcu = of_get_child_by_name(dev->of_node, "mcu-timing");
++	if (!mcu) {
++		DRM_INFO("no mcu-timing node found in %s\n",
++			 dev->of_node->full_name);
++	} else {
++		u32 val;
++
++		if (!of_property_read_u32(mcu, "mcu-pix-total", &val))
++			vop->mcu_timing.mcu_pix_total = val;
++		if (!of_property_read_u32(mcu, "mcu-cs-pst", &val))
++			vop->mcu_timing.mcu_cs_pst = val;
++		if (!of_property_read_u32(mcu, "mcu-cs-pend", &val))
++			vop->mcu_timing.mcu_cs_pend = val;
++		if (!of_property_read_u32(mcu, "mcu-rw-pst", &val))
++			vop->mcu_timing.mcu_rw_pst = val;
++		if (!of_property_read_u32(mcu, "mcu-rw-pend", &val))
++			vop->mcu_timing.mcu_rw_pend = val;
++		if (!of_property_read_u32(mcu, "mcu-hold-mode", &val))
++			vop->mcu_timing.mcu_hold_mode = val;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/include/drm/drm_panel.h b/include/drm/drm_panel.h
+index 0e1da22da939..bc4d0091979a 100644
+--- a/include/drm/drm_panel.h
++++ b/include/drm/drm_panel.h
+@@ -143,6 +143,9 @@ void drm_panel_remove(struct drm_panel *panel);
+ int drm_panel_attach(struct drm_panel *panel, struct drm_connector *connector);
+ int drm_panel_detach(struct drm_panel *panel);
+ 
++int rockchip_drm_crtc_send_mcu_cmd(struct drm_device *drm_dev,
++				   struct device_node *np_crtc,
++				   u32 type, u32 value);
+ struct drm_panel *drm_find_panel_by_connector(struct drm_connector *connector);
+ #ifdef CONFIG_OF
+ struct drm_panel *of_drm_find_panel(struct device_node *np);
+-- 
+2.35.3
+

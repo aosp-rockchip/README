@@ -1,0 +1,987 @@
+From f9cbc2829b33da1f203eba2147782d495a5976e0 Mon Sep 17 00:00:00 2001
+From: Sugar Zhang <sugar.zhang@rock-chips.com>
+Date: Fri, 27 Apr 2018 11:18:36 +0800
+Subject: [PATCH] ASoC: rockchip: add support for vad
+
+This patch add support for rockchip voice activity detection.
+The vad is used to detect the amplitude of voice which is
+received by analog mic, i2s digital mic or pdm digital mic
+when soc is in low power mode. if the amplitude of voice is
+over threshold, the vad will assert interrupt to wake up soc,
+then soc will exit low power mode.
+
+Change-Id: Idb7a3adb87ec4c07274eefd82da4672d493c7627
+Signed-off-by: Sugar Zhang <sugar.zhang@rock-chips.com>
+---
+ .../bindings/sound/rockchip,vad.txt           |  31 +
+ include/sound/pcm.h                           |  19 +
+ sound/soc/rockchip/Kconfig                    |   7 +
+ sound/soc/rockchip/Makefile                   |   2 +
+ sound/soc/rockchip/rockchip_vad.c             | 661 ++++++++++++++++++
+ sound/soc/rockchip/rockchip_vad.h             | 182 +++++
+ 6 files changed, 902 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/sound/rockchip,vad.txt
+ create mode 100644 sound/soc/rockchip/rockchip_vad.c
+ create mode 100644 sound/soc/rockchip/rockchip_vad.h
+
+diff --git a/Documentation/devicetree/bindings/sound/rockchip,vad.txt b/Documentation/devicetree/bindings/sound/rockchip,vad.txt
+new file mode 100644
+index 000000000000..3ebe3c0218ad
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/rockchip,vad.txt
+@@ -0,0 +1,31 @@
++* Rockchip VAD controller
++
++Required properties:
++
++- compatible: "rockchip,vad"
++- reg: physical base address of the controller and length of memory mapped
++  region.
++- clocks: a list of phandle + clock-specifer pairs, one for each entry in clock-names.
++- clock-names: should contain following:
++- interrupts: should contain the vad interrupt.
++- rockchip,audio-src: the audio src for vad.
++- rockchip,det-channel: the channel(0~7) is used for detection.
++- rockchip,mode: vad work mode.
++  - 0: begin to store the data after voice detected.
++  - 1: begin to store the data after vad is enabled.
++  - 2: don't store the data.
++
++Example for rk3308 VAD controller:
++
++vad: vad@ff3c0000 {
++	compatible = "rockchip,rk3308-vad", "rockchip,vad";
++	reg = <0x0 0xff3c0000 0x0 0x10000>, <0x0 0xfff88000 0x0 0x38000>;
++	reg-names = "vad", "vad-memory";
++	clocks = <&cru HCLK_VAD>;
++	clock-names = "hclk";
++	interrupts = <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>;
++	rockchip,audio-src = <0>;
++	rockchip,det-channel = <0>;
++	rockchip,mode = <0>;
++	status = "disabled";
++};
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index b0be09279943..e6dc30362a03 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -1399,6 +1399,25 @@ static inline u64 pcm_format_to_bits(snd_pcm_format_t pcm_format)
+ 	return 1ULL << (__force int) pcm_format;
+ }
+ 
++#ifdef CONFIG_SND_SOC_ROCKCHIP_VAD
++snd_pcm_sframes_t snd_pcm_vad_read(struct snd_pcm_substream *substream,
++				   void __user *buf, snd_pcm_uframes_t frames);
++/**
++ * snd_pcm_vad_avail - Get the available (readable) space for vad
++ * @runtime: PCM substream instance
++ *
++ * Result is between 0 ... (boundary - 1)
++ */
++snd_pcm_uframes_t snd_pcm_vad_avail(struct snd_pcm_substream *substream);
++/**
++ * snd_pcm_vad_attached - Check whether vad is attached to substream or not
++ * @substream: PCM substream instance
++ *
++ * Result is true for attached or false for detached
++ */
++bool snd_pcm_vad_attached(struct snd_pcm_substream *substream);
++#endif
++
+ /* printk helpers */
+ #define pcm_err(pcm, fmt, args...) \
+ 	dev_err((pcm)->card->dev, fmt, ##args)
+diff --git a/sound/soc/rockchip/Kconfig b/sound/soc/rockchip/Kconfig
+index bbeb8ff009b5..3d4ba424734a 100644
+--- a/sound/soc/rockchip/Kconfig
++++ b/sound/soc/rockchip/Kconfig
+@@ -48,6 +48,13 @@ config SND_SOC_ROCKCHIP_SPDIF
+ 	  Say Y or M if you want to add support for SPDIF driver for
+ 	  Rockchip SPDIF transceiver device.
+ 
++config SND_SOC_ROCKCHIP_VAD
++	tristate "Rockchip Voice Activity Detection Driver"
++	depends on CLKDEV_LOOKUP && SND_SOC_ROCKCHIP
++	help
++	  Say Y or M if you want to add support for VAD driver for
++	  Rockchip VAD device.
++
+ config SND_SOC_ROCKCHIP_DA7219
+ 	tristate "ASoC support for Rockchip boards using a DA7219 codec"
+ 	depends on SND_SOC_ROCKCHIP && I2C && GPIOLIB
+diff --git a/sound/soc/rockchip/Makefile b/sound/soc/rockchip/Makefile
+index dddff3eae374..d7e5a59b6dd8 100644
+--- a/sound/soc/rockchip/Makefile
++++ b/sound/soc/rockchip/Makefile
+@@ -3,11 +3,13 @@ snd-soc-rockchip-i2s-objs := rockchip_i2s.o
+ snd-soc-rockchip-i2s-tdm-objs := rockchip_i2s_tdm.o
+ snd-soc-rockchip-pdm-objs := rockchip_pdm.o
+ snd-soc-rockchip-spdif-objs := rockchip_spdif.o
++snd-soc-rockchip-vad-objs := rockchip_vad.o
+ 
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_I2S) += snd-soc-rockchip-i2s.o
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_I2S_TDM) += snd-soc-rockchip-i2s-tdm.o
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_PDM) += snd-soc-rockchip-pdm.o
+ obj-$(CONFIG_SND_SOC_ROCKCHIP_SPDIF) += snd-soc-rockchip-spdif.o
++obj-$(CONFIG_SND_SOC_ROCKCHIP_VAD) += snd-soc-rockchip-vad.o
+ 
+ snd-soc-rockchip-da7219-objs := rockchip_da7219.o
+ snd-soc-rockchip-hdmi-analog-objs := rockchip_hdmi_analog.o
+diff --git a/sound/soc/rockchip/rockchip_vad.c b/sound/soc/rockchip/rockchip_vad.c
+new file mode 100644
+index 000000000000..32a2759ff24d
+--- /dev/null
++++ b/sound/soc/rockchip/rockchip_vad.c
+@@ -0,0 +1,661 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Rockchip VAD driver
++ *
++ * Copyright (C) 2018 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/uaccess.h>
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/of_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "rockchip_vad.h"
++
++#define DRV_NAME "rockchip-vad"
++
++#define VAD_RATES	SNDRV_PCM_RATE_8000_192000
++#define VAD_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | \
++			SNDRV_PCM_FMTBIT_S20_3LE | \
++			SNDRV_PCM_FMTBIT_S24_LE | \
++			SNDRV_PCM_FMTBIT_S32_LE)
++#define ACODEC_REG_NUM	28
++
++struct vad_buf {
++	void __iomem *begin;
++	void __iomem *end;
++	void __iomem *cur;
++	void __iomem *pos;
++	int size;
++	bool loop;
++};
++
++struct rockchip_vad {
++	struct device *dev;
++	struct clk *hclk;
++	struct regmap *regmap;
++	unsigned int memphy;
++	void __iomem *membase;
++	struct vad_buf vbuf;
++	int mode;
++	u32 audio_src;
++	u32 audio_src_addr;
++	u32 audio_chnl;
++	struct dentry *debugfs_dir;
++};
++
++struct audio_src_addr_map {
++	u32 id;
++	u32 addr;
++};
++
++static int rockchip_vad_stop(struct rockchip_vad *vad)
++{
++	unsigned int val;
++	struct vad_buf *vbuf = &vad->vbuf;
++
++	regmap_update_bits(vad->regmap, VAD_CTRL, VAD_EN_MASK, VAD_DISABLE);
++	regmap_read(vad->regmap, VAD_RAM_END_ADDR, &val);
++	vbuf->end = vbuf->begin + (val - vad->memphy) + 0x8;
++	regmap_read(vad->regmap, VAD_INT, &val);
++	val &= BIT(8);
++	vbuf->loop = val;
++	regmap_read(vad->regmap, VAD_RAM_CUR_ADDR, &val);
++	if (!val) {
++		vbuf->size = 0;
++		vbuf->cur = vbuf->begin;
++		return 0;
++	}
++	vbuf->cur = vbuf->begin + (val - vad->memphy);
++
++	if (vbuf->loop) {
++		vbuf->size = vbuf->end - vbuf->begin;
++		vbuf->pos = vbuf->cur;
++	} else {
++		vbuf->size = vbuf->cur - vbuf->begin;
++		vbuf->end = vbuf->cur;
++		vbuf->pos = vbuf->begin;
++	}
++
++	dev_info(vad->dev,
++		 "begin: %p, cur: %p, end: %p, size: %d, loop: %d\n",
++		 vbuf->begin, vbuf->cur, vbuf->end, vbuf->size, vbuf->loop);
++
++	return 0;
++}
++
++static int rockchip_vad_setup(struct rockchip_vad *vad)
++{
++	struct regmap *regmap = vad->regmap;
++	u32 val, mask;
++
++	regmap_write(regmap, VAD_IS_ADDR, vad->audio_src_addr);
++
++	val = NOISE_ABS(200);
++	mask = NOISE_ABS_MASK;
++	/* regmap_update_bits(regmap, VAD_DET_CON5, mask, val); */
++	val = VAD_DET_CHNL(vad->audio_chnl);
++	val |= vad->audio_src;
++	val |= vad->mode << VAD_MODE_SHIFT;
++	val |= SRC_ADDR_MODE_INC | SRC_BURST_INCR8;
++	val |= VAD_EN;
++
++	mask = VAD_DET_CHNL_MASK | AUDIO_CHNL_NUM_MASK |
++	       AUDIO_SRC_SEL_MASK | VAD_MODE_MASK |
++	       SRC_ADDR_MODE_MASK | SRC_BURST_MASK |
++	       VAD_EN_MASK;
++
++	regmap_update_bits(regmap, VAD_CTRL, mask, val);
++
++	val = ERR_INT_EN | VAD_DET_INT_EN;
++	mask = ERR_INT_EN_MASK | VAD_DET_INT_EN_MASK;
++
++	regmap_update_bits(regmap, VAD_INT, mask, val);
++
++	return 0;
++}
++
++static struct rockchip_vad *substream_get_drvdata(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++	struct rockchip_vad *vad = NULL;
++	int i;
++
++	if (PCM_RUNTIME_CHECK(substream))
++		return NULL;
++	if (!rtd)
++		return NULL;
++
++	for (i = 0; i < rtd->num_codecs; i++) {
++		struct snd_soc_dai *codec_dai = rtd->codec_dais[i];
++
++		if (strstr(codec_dai->name, "vad"))
++			vad = snd_soc_codec_get_drvdata(codec_dai->codec);
++	}
++
++	return vad;
++}
++
++snd_pcm_sframes_t snd_pcm_vad_read(struct snd_pcm_substream *substream,
++				   void __user *buf, snd_pcm_uframes_t frames)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct rockchip_vad *vad = NULL;
++	struct vad_buf *vbuf;
++	snd_pcm_uframes_t avail;
++	int bytes;
++
++	vad = substream_get_drvdata(substream);
++
++	if (!vad)
++		return -EFAULT;
++
++	vbuf = &vad->vbuf;
++
++	avail = snd_pcm_vad_avail(substream);
++	avail = avail > frames ? frames : avail;
++	bytes = frames_to_bytes(runtime, avail);
++
++	if (bytes <= 0)
++		return -EFAULT;
++
++	dev_dbg(vad->dev,
++		"begin: %p, pos: %p, end: %p, size: %d, bytes: %d\n",
++		vbuf->begin, vbuf->pos, vbuf->end, vbuf->size, bytes);
++	if (!vbuf->loop) {
++		if (copy_to_user_fromio(buf, vbuf->pos, bytes))
++			return -EFAULT;
++		vbuf->pos += bytes;
++	} else {
++		if ((vbuf->pos + bytes) <= vbuf->end) {
++			if (copy_to_user_fromio(buf, vbuf->pos, bytes))
++				return -EFAULT;
++			vbuf->pos += bytes;
++		} else {
++			int part1 = vbuf->end - vbuf->pos;
++			int part2 = bytes - part1;
++
++			copy_to_user_fromio(buf, vbuf->pos, part1);
++			copy_to_user_fromio(buf + part1, vbuf->begin, part2);
++			vbuf->pos = vbuf->begin + part2;
++		}
++	}
++
++	vbuf->size -= bytes;
++	dev_dbg(vad->dev,
++		"begin: %p, pos: %p, end: %p, size: %d, bytes: %d\n",
++		vbuf->begin, vbuf->pos, vbuf->end, vbuf->size, bytes);
++
++	return avail;
++}
++EXPORT_SYMBOL(snd_pcm_vad_read);
++
++/**
++ * snd_pcm_vad_avail - Get the available (readable) space for vad
++ * @runtime: PCM substream instance
++ *
++ * Result is between 0 ... (boundary - 1)
++ */
++snd_pcm_uframes_t snd_pcm_vad_avail(struct snd_pcm_substream *substream)
++{
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	struct rockchip_vad *vad = NULL;
++	struct vad_buf *vbuf;
++
++	vad = substream_get_drvdata(substream);
++
++	if (!vad)
++		return 0;
++
++	vbuf = &vad->vbuf;
++
++	if (vbuf->size <= 0)
++		return 0;
++
++	dev_info(vad->dev, "%s, %d frames\n",
++		 __func__, (int)bytes_to_frames(runtime, vbuf->size));
++	return bytes_to_frames(runtime, vbuf->size);
++}
++EXPORT_SYMBOL(snd_pcm_vad_avail);
++
++/**
++ * snd_pcm_vad_attached - Check whether vad is attached to substream or not
++ * @substream: PCM substream instance
++ *
++ * Result is true for attached or false for detached
++ */
++bool snd_pcm_vad_attached(struct snd_pcm_substream *substream)
++{
++	struct rockchip_vad *vad = NULL;
++
++	vad = substream_get_drvdata(substream);
++
++	return vad ? true : false;
++}
++EXPORT_SYMBOL(snd_pcm_vad_attached);
++
++static bool rockchip_vad_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return true;
++}
++
++static bool rockchip_vad_readable_reg(struct device *dev, unsigned int reg)
++{
++	return true;
++}
++
++static bool rockchip_vad_volatile_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case VAD_INT:
++	case VAD_RAM_CUR_ADDR:
++	case VAD_DET_CON5:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static const struct reg_default rockchip_vad_reg_defaults[] = {
++	{VAD_CTRL,     0x03000000},
++	{VAD_DET_CON0, 0x00024020},
++	{VAD_DET_CON1, 0x00ff0064},
++	{VAD_DET_CON2, 0x3bf5e663},
++	{VAD_DET_CON3, 0x3bf58817},
++	{VAD_DET_CON4, 0x382b8858},
++	{VAD_RAM_BEGIN_ADDR, 0xfff88000},
++	{VAD_RAM_END_ADDR, 0xfffbfff8},
++};
++
++static const struct regmap_config rockchip_vad_regmap_config = {
++	.reg_bits = 32,
++	.reg_stride = 4,
++	.val_bits = 32,
++	.max_register = VAD_INT,
++	.reg_defaults = rockchip_vad_reg_defaults,
++	.num_reg_defaults = ARRAY_SIZE(rockchip_vad_reg_defaults),
++	.writeable_reg = rockchip_vad_writeable_reg,
++	.readable_reg = rockchip_vad_readable_reg,
++	.volatile_reg = rockchip_vad_volatile_reg,
++	.cache_type = REGCACHE_FLAT,
++};
++
++static const struct audio_src_addr_map addr_maps[] = {
++	{0, 0xff300800},
++	{1, 0xff310800},
++	{2, 0xff320800},
++	{3, 0xff330800},
++	{4, 0xff380400}
++};
++
++static int rockchip_vad_get_audio_src_address(struct rockchip_vad *vad)
++{
++	const struct audio_src_addr_map *map;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(addr_maps); i++) {
++		map = &addr_maps[i];
++		if (vad->audio_src == map->id) {
++			vad->audio_src_addr = map->addr;
++			return 0;
++		}
++	}
++
++	return -ENODEV;
++}
++
++static irqreturn_t rockchip_vad_irq(int irqno, void *dev_id)
++{
++	struct rockchip_vad *vad = dev_id;
++	unsigned  int val;
++
++	regmap_read(vad->regmap, VAD_INT, &val);
++	regmap_write(vad->regmap, VAD_INT, val);
++
++	dev_dbg(vad->dev, "irq 0x%08x\n", val);
++
++	return IRQ_HANDLED;
++}
++
++static const struct reg_sequence rockchip_vad_acodec_adc_enable[] = {
++	{ VAD_OD_ADDR0, 0x36261606 },
++	{ VAD_D_DATA0, 0x51515151 },
++	{ VAD_OD_ADDR1, 0x30201000 },
++	{ VAD_D_DATA1, 0xbbbbbbbb },
++	{ VAD_OD_ADDR2, 0x32221202 },
++	{ VAD_D_DATA2, 0x11111111 },
++	{ VAD_OD_ADDR3, 0x35251505 },
++	{ VAD_D_DATA3, 0x77777777 },
++	{ VAD_OD_ADDR4, 0x32221202 },
++	{ VAD_D_DATA4, 0x33333333 },
++	{ VAD_OD_ADDR5, 0x30201000 },
++	{ VAD_D_DATA5, 0xffffffff },
++	{ VAD_OD_ADDR6, 0x32221202 },
++	{ VAD_D_DATA6, 0x77777777 },
++};
++
++static int rockchip_vad_config_acodec(struct snd_pcm_hw_params *params,
++				      struct snd_soc_dai *dai)
++{
++	struct snd_soc_codec *codec = dai->codec;
++	struct rockchip_vad *vad = snd_soc_codec_get_drvdata(codec);
++	unsigned int val = 0;
++
++	val = ACODEC_BASE + ACODEC_ADC_ANA_CON0;
++	regmap_write(vad->regmap, VAD_ID_ADDR, val);
++
++	regmap_multi_reg_write(vad->regmap, rockchip_vad_acodec_adc_enable,
++			       ARRAY_SIZE(rockchip_vad_acodec_adc_enable));
++
++	regmap_update_bits(vad->regmap, VAD_CTRL, ACODE_CFG_REG_NUM_MASK,
++			   ACODE_CFG_REG_NUM(ACODEC_REG_NUM));
++	regmap_update_bits(vad->regmap, VAD_CTRL, CFG_ACODE_AFTER_DET_EN_MASK,
++			   CFG_ACODE_AFTER_DET_EN);
++
++	return 0;
++}
++
++static int rockchip_vad_hw_params(struct snd_pcm_substream *substream,
++				  struct snd_pcm_hw_params *params,
++				  struct snd_soc_dai *dai)
++{
++	struct snd_soc_codec *codec = dai->codec;
++	struct rockchip_vad *vad = snd_soc_codec_get_drvdata(codec);
++	unsigned int val = 0;
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		return 0;
++
++	switch (params_format(params)) {
++	case SNDRV_PCM_FORMAT_S16_LE:
++		val = AUDIO_CHNL_16B;
++		break;
++	case SNDRV_PCM_FORMAT_S24_LE:
++	case SNDRV_PCM_FORMAT_S32_LE:
++		val = AUDIO_CHNL_24B;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(vad->regmap, VAD_CTRL, AUDIO_CHNL_BW_MASK, val);
++	regmap_update_bits(vad->regmap, VAD_CTRL, AUDIO_CHNL_NUM_MASK,
++			   AUDIO_CHNL_NUM(params_channels(params)));
++
++	/*
++	 * config acodec
++	 * audio_src 2/3 is connected to acodec
++	 */
++	val = vad->audio_src >> AUDIO_SRC_SEL_SHIFT;
++	if (val == 2 || val == 3)
++		rockchip_vad_config_acodec(params, dai);
++
++	return 0;
++}
++
++static int rockchip_vad_enable_cpudai(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++	struct snd_soc_dai *cpu_dai;
++	int ret = 0;
++
++	if (PCM_RUNTIME_CHECK(substream))
++		return -EFAULT;
++	if (!rtd)
++		return -EFAULT;
++
++	cpu_dai = rtd->cpu_dai;
++
++	pm_runtime_get_sync(cpu_dai->dev);
++
++	if (cpu_dai->driver->ops && cpu_dai->driver->ops->trigger)
++		ret = cpu_dai->driver->ops->trigger(substream,
++						    SNDRV_PCM_TRIGGER_START,
++						    cpu_dai);
++
++	return ret;
++}
++
++static void rockchip_vad_pcm_shutdown(struct snd_pcm_substream *substream,
++				      struct snd_soc_dai *dai)
++{
++	struct snd_soc_codec *codec = dai->codec;
++	struct rockchip_vad *vad = snd_soc_codec_get_drvdata(codec);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++		return;
++
++	rockchip_vad_enable_cpudai(substream);
++	rockchip_vad_setup(vad);
++}
++
++static int rockchip_vad_trigger(struct snd_pcm_substream *substream, int cmd,
++				struct snd_soc_dai *dai)
++{
++	struct snd_soc_codec *codec = dai->codec;
++	struct rockchip_vad *vad = snd_soc_codec_get_drvdata(codec);
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			return 0;
++		rockchip_vad_stop(vad);
++		break;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static struct snd_soc_dai_ops rockchip_vad_dai_ops = {
++	.hw_params = rockchip_vad_hw_params,
++	.shutdown = rockchip_vad_pcm_shutdown,
++	.trigger = rockchip_vad_trigger,
++};
++
++static struct snd_soc_dai_driver vad_dai = {
++	.name = "vad",
++	.playback = {
++		.stream_name = "Playback",
++		.channels_min = 1,
++		.channels_max = 8,
++		.rates = VAD_RATES,
++		.formats = VAD_FORMATS,
++	},
++	.capture = {
++		 .stream_name = "Capture",
++		.channels_min = 1,
++		.channels_max = 8,
++		.rates = VAD_RATES,
++		.formats = VAD_FORMATS,
++	},
++	.ops = &rockchip_vad_dai_ops,
++};
++
++static struct snd_soc_codec_driver soc_vad_codec;
++
++#if defined(CONFIG_DEBUG_FS)
++#include <linux/fs.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++
++static int rockchip_vad_debugfs_reg_show(struct seq_file *s, void *v)
++{
++	struct rockchip_vad *vad = s->private;
++	unsigned int i;
++	unsigned int val;
++
++	for (i = VAD_CTRL; i <= VAD_INT; i += 4) {
++		regmap_read(vad->regmap, i, &val);
++		if (!(i % 16))
++			seq_printf(s, "\n%08x:  ", i);
++		seq_printf(s, "%08x ", val);
++	}
++
++	return 0;
++}
++
++static ssize_t rockchip_vad_debugfs_reg_write(struct file *file,
++					      const char __user *buf,
++					      size_t count, loff_t *ppos)
++{
++	struct rockchip_vad *vad = ((struct seq_file *)file->private_data)->private;
++	unsigned int reg, val;
++	char kbuf[24];
++
++	if (count >= sizeof(kbuf))
++		return -EINVAL;
++
++	if (copy_from_user(kbuf, buf, count))
++		return -EFAULT;
++	kbuf[count] = '\0';
++	if (sscanf(kbuf, "%x %x", &reg, &val) != 2)
++		return -EFAULT;
++
++	regmap_write(vad->regmap, reg, val);
++
++	return count;
++}
++
++static int rockchip_vad_debugfs_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rockchip_vad_debugfs_reg_show, inode->i_private);
++}
++
++static const struct file_operations rockchip_vad_reg_debugfs_fops = {
++	.owner = THIS_MODULE,
++	.open = rockchip_vad_debugfs_open,
++	.read = seq_read,
++	.write = rockchip_vad_debugfs_reg_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++#endif
++
++static int rockchip_vad_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct rockchip_vad *vad;
++	struct resource *res;
++	void __iomem *regbase;
++	int irq;
++	int ret;
++
++	vad = devm_kzalloc(&pdev->dev, sizeof(*vad), GFP_KERNEL);
++	if (!vad)
++		return -ENOMEM;
++
++	vad->dev = &pdev->dev;
++
++	of_property_read_u32(np, "rockchip,mode", &vad->mode);
++	of_property_read_u32(np, "rockchip,audio-src", &vad->audio_src);
++	ret = rockchip_vad_get_audio_src_address(vad);
++	if (ret)
++		return ret;
++
++	vad->audio_src = vad->audio_src << AUDIO_SRC_SEL_SHIFT;
++	of_property_read_u32(np, "rockchip,det-channel", &vad->audio_chnl);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vad");
++	regbase = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(regbase))
++		return PTR_ERR(regbase);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
++					   "vad-memory");
++	vad->memphy = res->start;
++	vad->membase = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(vad->membase))
++		return PTR_ERR(vad->membase);
++
++	vad->hclk = devm_clk_get(&pdev->dev, "hclk");
++	if (IS_ERR(vad->hclk))
++		return PTR_ERR(vad->hclk);
++
++	ret = clk_prepare_enable(vad->hclk);
++	if (ret)
++		return ret;
++
++	vad->regmap = devm_regmap_init_mmio(&pdev->dev, regbase,
++					    &rockchip_vad_regmap_config);
++	if (IS_ERR(vad->regmap)) {
++		ret = PTR_ERR(vad->regmap);
++		goto err;
++	}
++
++	regmap_write(vad->regmap, VAD_RAM_BEGIN_ADDR, vad->memphy);
++	vad->vbuf.begin = vad->membase;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err;
++	}
++
++	ret = devm_request_irq(&pdev->dev, irq, rockchip_vad_irq,
++			       0, dev_name(&pdev->dev), vad);
++	if (ret < 0)
++		goto err;
++
++#if defined(CONFIG_DEBUG_FS)
++	vad->debugfs_dir = debugfs_create_dir("vad", NULL);
++	if (IS_ERR(vad->debugfs_dir))
++		dev_err(&pdev->dev, "failed to create debugfs dir for vad!\n");
++	else
++		debugfs_create_file("reg", 0644, vad->debugfs_dir, vad,
++				    &rockchip_vad_reg_debugfs_fops);
++#endif
++
++	platform_set_drvdata(pdev, vad);
++	return snd_soc_register_codec(&pdev->dev, &soc_vad_codec,
++				      &vad_dai, 1);
++err:
++	clk_disable_unprepare(vad->hclk);
++	return ret;
++}
++
++static int rockchip_vad_remove(struct platform_device *pdev)
++{
++	struct rockchip_vad *vad = dev_get_drvdata(&pdev->dev);
++
++	if (!IS_ERR(vad->hclk))
++		clk_disable_unprepare(vad->hclk);
++	snd_soc_unregister_codec(&pdev->dev);
++	return 0;
++}
++
++static const struct of_device_id rockchip_vad_match[] = {
++	{ .compatible = "rockchip,vad", },
++	{},
++};
++
++static struct platform_driver rockchip_vad_driver = {
++	.probe = rockchip_vad_probe,
++	.remove = rockchip_vad_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = of_match_ptr(rockchip_vad_match),
++	},
++};
++module_platform_driver(rockchip_vad_driver);
++
++MODULE_DESCRIPTION("Rockchip VAD Controller");
++MODULE_AUTHOR("Andy Yan <andy.yan@rock-chips.com>");
++MODULE_AUTHOR("Sugar Zhang <sugar.zhang@rock-chips.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:" DRV_NAME);
++MODULE_DEVICE_TABLE(of, rockchip_vad_match);
+diff --git a/sound/soc/rockchip/rockchip_vad.h b/sound/soc/rockchip/rockchip_vad.h
+new file mode 100644
+index 000000000000..8cd51e34ae9f
+--- /dev/null
++++ b/sound/soc/rockchip/rockchip_vad.h
+@@ -0,0 +1,182 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Rockchip VAD driver
++ *
++ * Copyright (C) 2018 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ */
++
++#ifndef _ROCKCHIP_VAD_H
++#define _ROCKCHIP_VAD_H
++
++#define VAD_CTRL			0x00
++#define VAD_DET_CHNL_SHIFT		29
++#define VAD_DET_CHNL_MASK		GENMASK(31, 29)
++#define VAD_DET_CHNL(x)			((x) << VAD_DET_CHNL_SHIFT)
++#define AUDIO_24BIT_SAT_SHIFT		28
++#define AUDIO_24BIT_SAT_MASK		BIT(28)
++#define AUDIO_H16B			0
++#define AUDIO_SAT_24TO16		BIT(28)
++#define AUDIO_24BIT_ALIGN_MODE_SHIFT	27
++#define AUDIO_24BIT_ALIGN_MODE_MASK	BIT(27)
++#define AUDIO_24BIT_ALIGN_8_31B		0
++#define AUDIO_24BIT_ALIGN_0_23B		BIT(27)
++#define AUDIO_CHNL_BW_SHIFT		26
++#define AUDIO_CHNL_BW_MASK		BIT(26)
++#define AUDIO_CHNL_16B			0
++#define AUDIO_CHNL_24B			BIT(26)
++#define AUDIO_CHNL_NUM_SHIFT		23
++#define AUDIO_CHNL_NUM_MASK		GENMASK(25, 23)
++#define AUDIO_CHNL_NUM(x)		((x - 1) << AUDIO_CHNL_NUM_SHIFT)
++#define CFG_ACODE_AFTER_DET_EN_SHIFT	22
++#define CFG_ACODE_AFTER_DET_EN_MASK	BIT(22)
++#define CFG_ACODE_AFTER_DET_EN		BIT(22)
++#define VAD_MODE_SHIFT			20
++#define VAD_MODE_MASK			GENMASK(21, 20)
++#define STORE_DATA_VAD_DET_ONLY		0
++#define STORE_DATA_ALL			(1 << VAD_MODE_SHIFT)
++#define NO_STORE_DATA			(2 << VAD_MODE_SHIFT)
++#define ACODE_CFG_REG_NUM_SHIFT		15
++#define ACODE_CFG_REG_NUM_MASK		GENMASK(19, 15)
++#define ACODE_CFG_REG_NUM(x)		((x - 1) << ACODE_CFG_REG_NUM_SHIFT)
++#define SRC_ADDR_MODE_SHIFT		14
++#define SRC_ADDR_MODE_MASK		BIT(14)
++#define SRC_ADDR_MODE_INC		0
++#define SRC_ADDR_MODE_FIXED		BIT(14)
++#define INCR_BURST_LEN_SHIFT		10
++#define INCR_BURST_LEN_MASK		GENMASK(13, 10)
++#define INCR_BURST_LEN(x)		((x) << INCR_BURST_LEN_SHIFT)
++#define SRC_BURST_NUM_SHIFT		7
++#define SRC_BURST_NUM_MASK		GENMASK(9, 7)
++#define SRC_BURST_NUM(x)		((x - 1) << SRC_BURST_NUM_SHIFT)
++#define SRC_BURST_SHIFT			4
++#define SRC_BURST_MASK			GENMASK(6, 4)
++#define SRC_BURST_SIGNLE		0
++#define SRC_BURST_INCR			(1 << SRC_BURST_SHIFT)
++#define SRC_BURST_INCR4			(3 << SRC_BURST_SHIFT)
++#define SRC_BURST_INCR8			(5 << SRC_BURST_SHIFT)
++#define SRC_BURST_INCR16		(7 << SRC_BURST_SHIFT)
++#define AUDIO_SRC_SEL_SHIFT		1
++#define AUDIO_SRC_SEL_MASK		GENMASK(3, 1)
++#define AUDIO_SRC_SEL_I2S0		0
++#define AUDIO_SRC_SEL_I2S1		(1 << AUDIO_SRC_SEL_MASK)
++#define AUDIO_SRC_SEL_I2S2		(2 << AUDIO_SRC_SEL_MASK)
++#define AUDIO_SRC_SEL_I2S3		(3 << AUDIO_SRC_SEL_MASK)
++#define AUDIO_SRC_SEL_PDM		(4 << AUDIO_SRC_SEL_MASK)
++#define VAD_EN_SHIFT			0
++#define VAD_EN_MASK			BIT(0)
++#define VAD_EN				BIT(0)
++#define VAD_DISABLE			0
++#define VAD_IS_ADDR			4
++#define VAD_ID_ADDR			8
++#define VAD_OD_ADDR0			0x0c
++#define VAD_OD_ADDR1			0x10
++#define VAD_OD_ADDR2			0x14
++#define VAD_OD_ADDR3			0x18
++#define VAD_OD_ADDR4			0x1c
++#define VAD_OD_ADDR5			0x20
++#define VAD_OD_ADDR6			0x24
++#define VAD_OD_ADDR7			0x28
++#define VAD_D_DATA0			0x2c
++#define VAD_D_DATA1			0x30
++#define VAD_D_DATA2			0x34
++#define VAD_D_DATA3			0x38
++#define VAD_D_DATA4			0x3c
++#define VAD_D_DATA5			0x40
++#define VAD_D_DATA6			0x44
++#define VAD_D_DATA7			0x48
++
++#define VAD_TIMEOUT			0x4c
++#define WORK_TIMEOUT_EN_MASK		BIT(31)
++#define WORK_TIMEOUT_EN			BIT(31)
++#define WORK_TIMEOUT_DISABLE		0
++#define IDLE_TIMEOUT_EN_MASK		BIT(30)
++#define IDLE_TIMEOUT_EN			BIT(30)
++#define IDLE_TIMEOUT_DISABLE		0
++#define WORK_TIMEOUT_THD_SHIFT		20
++#define WORK_TIMEOUT_THD_MASK		GENMASK(29, 20)
++#define WORK_TIMEOUT_THD(x)		((x) << WORK_TIMEOUT_THD_SHIFT)
++#define IDLE_TIMEOUT_THD_SHIFT		0
++#define IDLE_TIMEOUT_THD_MASK		GENMASK(19, 0)
++#define IDLE_TIMEOUT_THD(x)		((x) << IDLE_TIMEOUT_THD_SHIFT)
++
++#define VAD_RAM_BEGIN_ADDR		0x50
++#define VAD_RAM_END_ADDR		0x54
++#define VAD_RAM_CUR_ADDR		0x58
++#define VAD_DET_CON0			0x5c
++#define VAD_CON_THD_SHIFT		16
++#define VAD_CON_THD_MASK		GENMASK(23, 16)
++#define VAD_CON_THD(x)			((x) << VAD_CON_THD_SHIFT)
++#define NOISE_LEVEL_SHIFT		12
++#define NOISE_LEVEL_MASK		GENMASK(14, 12)
++#define NOISE_LEVEL(x)			((x) << NOISE_LEVEL_SHIFT)
++#define GAIN_MASK			GENMASK(9, 0)
++#define GAIN(x)				(x)
++
++#define VAD_DET_CON1			0x60
++#define MIN_NOISE_FIND_MODE_SHIFT	30
++#define MIN_NOISE_FIN_MODE_MASK		BIT(30)
++#define MIN_NOISE_FIND_MODE0		0
++#define MIN_NOISE_FIND_MODE1		BIT(30)
++#define NOISE_CLEAN_MODE_SHIFT		29
++#define NOISE_CLEAN_MODE_MASK		BIT(29)
++#define NOISE_CLEAN_MODE0		0
++#define NOISE_CLEAN_MODE1		BIT(29)
++#define NOISE_CLK_FORCE_EN_MASK		BIT(28)
++#define NOISE_CLK_AUTO_GATING		0
++#define NOISE_CLK_FORCE_EN		BIT(28)
++#define NOISE_SAMPLE_NUM_SHIFT		16
++#define NOISE_SAMPLE_NUM_MASK		GENMASK(25, 16)
++#define NOISE_SAMPLE_NUM		((x) << NOISE_SAMPLE_NUM_SHIFT)
++#define SOUND_THD_MASK			GENMASK(15, 0)
++#define SOUND_THD(x)			(x)
++
++#define VAD_DET_CON2			0x64
++#define IIR_B0_SHIFT			16
++#define IIR_B0_MASK			GENMASK(31, 16)
++#define IIR_B0(x)			((x) << IIR_B0_SHIFT)
++#define NOISE_ALPHA_SHIFT		8
++#define NOISE_ALPHA_MASK		GENMASK(15, 8)
++#define NOISE_ALPHA(x)			((x) << NOISE_ALPHA_SHIFT)
++#define NOISE_FRM_NUM_MASK		GENMASK(6, 0)
++#define NOISE_FRM_NUM(x)		(x)
++
++#define VAD_DET_CON3			0x68
++#define IIR_B2_MASK			GENMASK(31, 16)
++#define IIR_B2(x)			((x) << 16)
++#define IIR_B1_MASK			GENMASK(15, 0)
++#define IIR_B1(x)			(x)
++
++#define VAD_DET_CON4			0x6c
++#define IIR_A2_MASK			GENMASK(31, 16)
++#define IIR_A2(x)			((x) << 16)
++#define IIR_A1_MASK			GENMASK(15, 0)
++#define IIR_A1(x)			(x)
++
++#define VAD_DET_CON5			0x70
++#define IIR_RESULT_SHIFT		16
++#define IIR_RESULT_MASK			GENMASK(31, 16)
++#define NOISE_ABS_MASK			GENMASK(15, 0)
++#define NOISE_ABS(x)			(x)
++
++#define VAD_INT				0x74
++#define VAD_IDLE_MASK			BIT(9)
++#define RAM_LOOP_FLGA_MASK		BIT(8)
++#define WORK_TIMEOUT_FLAG_MASK		BIT(7)
++#define IDLE_TIMEOUT_FLAG_MASK		BIT(6)
++#define ERR_INT_FLAG_MASK		BIT(5)
++#define VAD_DET_INT_FLAG_MASK		BIT(4)
++#define WORK_TIMEOUT_INT_EN_MASK	BIT(3)
++#define WORK_TIMEOUT_INT_EN		BIT(3)
++#define IDLE_TIMEOUT_INT_EN_MASK	BIT(2)
++#define IDLE_TIMEOUT_INT_EN		BIT(2)
++#define ERR_INT_EN_MASK			BIT(1)
++#define ERR_INT_EN			BIT(1)
++#define VAD_DET_INT_EN_MASK		BIT(0)
++#define VAD_DET_INT_EN			BIT(0)
++
++/* acodec */
++#define ACODEC_BASE			0xff560000
++#define ACODEC_ADC_ANA_CON0		0X340
++
++#endif
+-- 
+2.35.3
+

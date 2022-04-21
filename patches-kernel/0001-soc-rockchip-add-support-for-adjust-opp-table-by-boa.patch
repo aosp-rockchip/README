@@ -1,0 +1,177 @@
+From f31ed416e5064502d7538e6e223a4012de36ffab Mon Sep 17 00:00:00 2001
+From: Liang Chen <cl@rock-chips.com>
+Date: Thu, 15 Mar 2018 15:07:21 +0800
+Subject: [PATCH] soc: rockchip: add support for adjust opp-table by board
+ IR-Drop
+
+The IR-Drop is always different between different boards, so we
+need know the IR-Drop to adjust opp-table to guarantee stably
+for the board.
+
+Change-Id: I8ad05d30e15a7e62910a952cc6fa199d70129660
+Signed-off-by: Liang Chen <cl@rock-chips.com>
+---
+ drivers/clk/rockchip/clk-pll.c             | 25 +++++++
+ drivers/clk/rockchip/clk.h                 |  1 +
+ drivers/soc/rockchip/rockchip_opp_select.c | 79 ++++++++++++++++++++++
+ include/soc/rockchip/rockchip_opp_select.h |  1 +
+ 4 files changed, 106 insertions(+)
+
+diff --git a/drivers/clk/rockchip/clk-pll.c b/drivers/clk/rockchip/clk-pll.c
+index 56be4249d6c1..3d6a241bca8b 100644
+--- a/drivers/clk/rockchip/clk-pll.c
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -103,6 +103,31 @@ int rockchip_pll_clk_adaptive_scaling(struct clk *clk, int sel)
+ 	return 0;
+ }
+ 
++int rockchip_pll_clk_adaptive_rate(struct clk *clk, unsigned long rate)
++{
++	const struct rockchip_pll_rate_table *rate_table;
++	struct clk *parent = clk_get_parent(clk);
++	struct rockchip_clk_pll *pll;
++	int i;
++
++	if (IS_ERR_OR_NULL(parent))
++		return -EINVAL;
++
++	pll = to_rockchip_clk_pll(__clk_get_hw(parent));
++	if (!pll)
++		return -EINVAL;
++
++	rate_table = pll->rate_table;
++	for (i = 0; i < pll->rate_count; i++) {
++		if (rate >= rate_table[i].rate) {
++			pll->sel = i;
++			break;
++		}
++	}
++
++	return 0;
++}
++
+ static struct rockchip_pll_rate_table *rk_pll_rate_table_get(void)
+ {
+ 	return &auto_table;
+diff --git a/drivers/clk/rockchip/clk.h b/drivers/clk/rockchip/clk.h
+index 420b5f846e80..a423dc080e2f 100644
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -756,6 +756,7 @@ void rockchip_clk_register_armclk(struct rockchip_clk_provider *ctx,
+ 			int nrates);
+ void rockchip_clk_protect_critical(const char *const clocks[], int nclocks);
+ int rockchip_pll_clk_adaptive_scaling(struct clk *clk, int sel);
++int rockchip_pll_clk_adaptive_rate(struct clk *clk, unsigned long rate);
+ void rockchip_register_restart_notifier(struct rockchip_clk_provider *ctx,
+ 					unsigned int reg, void (*cb)(void));
+ 
+diff --git a/drivers/soc/rockchip/rockchip_opp_select.c b/drivers/soc/rockchip/rockchip_opp_select.c
+index 22b07531d2d4..0f34a4b5f0a0 100644
+--- a/drivers/soc/rockchip/rockchip_opp_select.c
++++ b/drivers/soc/rockchip/rockchip_opp_select.c
+@@ -9,8 +9,12 @@
+ #include <linux/slab.h>
+ #include <linux/soc/rockchip/pvtm.h>
+ #include <linux/thermal.h>
++#include <linux/pm_opp.h>
+ #include <soc/rockchip/rockchip_opp_select.h>
+ 
++#include "../../clk/rockchip/clk.h"
++#include "../../base/power/opp/opp.h"
++
+ #define LEAKAGE_TABLE_END	~1
+ #define LEAKAGE_INVALID		0xff
+ 
+@@ -352,3 +356,78 @@ int rockchip_of_get_pvtm_volt_sel(struct device *dev,
+ }
+ EXPORT_SYMBOL(rockchip_of_get_pvtm_volt_sel);
+ 
++static int rockchip_of_get_irdrop(struct device_node *np, unsigned long rate)
++{
++	int irdrop, ret;
++
++	ret = rockchip_get_volt_sel(np, "rockchip,board-irdrop",
++				    rate / 1000000, &irdrop);
++	return ret ? ret : irdrop;
++}
++
++int rockchip_adjust_opp_by_irdrop(struct device *dev)
++{
++	struct dev_pm_opp *opp, *safe_opp = NULL;
++	struct device_node *np;
++	unsigned long rate;
++	u32 max_volt = UINT_MAX;
++	int evb_irdrop = 0, board_irdrop, delta_irdrop;
++	int i, count, ret = 0;
++	bool reach_max_volt = false;
++
++	np = of_parse_phandle(dev->of_node, "operating-points-v2", 0);
++	if (!np) {
++		dev_warn(dev, "OPP-v2 not supported\n");
++		return -ENOENT;
++	}
++
++	of_property_read_u32_index(np, "rockchip,max-volt", 0, &max_volt);
++	of_property_read_u32_index(np, "rockchip,evb-irdrop", 0, &evb_irdrop);
++
++	count = dev_pm_opp_get_opp_count(dev);
++	if (count <= 0) {
++		ret = count ? count : -ENODATA;
++		goto out;
++	}
++
++	for (i = 0, rate = 0; i < count; i++, rate++) {
++		/* find next rate */
++		opp = dev_pm_opp_find_freq_ceil(dev, &rate);
++		if (IS_ERR(opp)) {
++			ret = PTR_ERR(opp);
++			goto out;
++		}
++		board_irdrop = rockchip_of_get_irdrop(np, opp->rate);
++		if (IS_ERR_VALUE(board_irdrop))
++			/* Assume it has the same IR-Drop as evb */
++			delta_irdrop = 0;
++		else
++			delta_irdrop = board_irdrop - evb_irdrop;
++		if ((opp->u_volt + delta_irdrop) <= max_volt) {
++			opp->u_volt += delta_irdrop;
++			opp->u_volt_min += delta_irdrop;
++			opp->u_volt_max += delta_irdrop;
++			if (!reach_max_volt)
++				safe_opp = opp;
++			if (opp->u_volt == max_volt)
++				reach_max_volt = true;
++		} else {
++			opp->u_volt = max_volt;
++			opp->u_volt_min = max_volt;
++			opp->u_volt_max = max_volt;
++		}
++	}
++
++	if (safe_opp && safe_opp != opp) {
++		struct clk *clk = of_clk_get_by_name(np, NULL);
++
++		if (!IS_ERR(clk)) {
++			rockchip_pll_clk_adaptive_rate(clk, safe_opp->rate);
++			clk_put(clk);
++		}
++	}
++out:
++	of_node_put(np);
++	return ret;
++}
++EXPORT_SYMBOL(rockchip_adjust_opp_by_irdrop);
+diff --git a/include/soc/rockchip/rockchip_opp_select.h b/include/soc/rockchip/rockchip_opp_select.h
+index 4e0b2e12da54..b4317d030bd9 100644
+--- a/include/soc/rockchip/rockchip_opp_select.h
++++ b/include/soc/rockchip/rockchip_opp_select.h
+@@ -11,5 +11,6 @@ int rockchip_of_get_lkg_volt_sel(struct device *dev, char *name);
+ int rockchip_of_get_pvtm_volt_sel(struct device *dev,
+ 				  char *clk_name,
+ 				  char *reg_name);
++int rockchip_adjust_opp_by_irdrop(struct device *dev);
+ 
+ #endif
+-- 
+2.35.3
+

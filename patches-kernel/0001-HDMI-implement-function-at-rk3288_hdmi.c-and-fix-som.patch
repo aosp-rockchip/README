@@ -1,0 +1,601 @@
+From 8244d0b01353d9d2bca8acb60a90756575a62897 Mon Sep 17 00:00:00 2001
+From: zwl <zwl@rock-chips.com>
+Date: Thu, 6 Mar 2014 11:57:41 +0800
+Subject: [PATCH] HDMI: implement function at rk3288_hdmi.c and fix some code
+ error
+
+---
+ .../rockchip/hdmi/chips/rk3288/rk3288_hdmi.c  | 272 +++++++++++++++++-
+ .../rockchip/hdmi/chips/rk3288/rk3288_hdmi.h  |  20 --
+ .../hdmi/chips/rk3288/rk3288_hdmi_hw.c        |  16 +-
+ .../hdmi/chips/rk3288/rk3288_hdmi_hw.h        |  34 ++-
+ drivers/video/rockchip/hdmi/rk_hdmi.h         |  22 +-
+ drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c    |  19 +-
+ 6 files changed, 332 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
+index b25cc2e35ad7..10b122b66e1e 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.c
+@@ -1,9 +1,139 @@
++/*
++ * drivers/video/rockchip/hdmi/chips/rk3288/rk3188_hdmi.c
++ *
++ * Copyright (C) 2014 ROCKCHIP, Inc.
++ *Author:zwl<zwl@rock-chips.com>
++ *This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/interrupt.h>
++#include <linux/clk.h>
++#include <linux/uaccess.h>
++#if defined(CONFIG_OF)
++#include <linux/of.h>
++#include <linux/of_device.h>
++#endif
++#if defined(CONFIG_DEBUG_FS)
++#include <linux/fs.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#endif
++
+ #include "rk3288_hdmi_hw.h"
+ #include "rk3288_hdmi.h"
+ 
++extern irqreturn_t hdmi_irq(int irq, void *priv);
++
++static struct rk3288_hdmi_device *hdmi_dev = NULL;
++
++#if defined(CONFIG_DEBUG_FS)
++static int rk3288_hdmi_reg_show(struct seq_file *s, void *v)
++{
++	int i = 0;
++	u32 val = 0;
++	seq_printf(s, "\n>>>hdmi_ctl reg");
++	for (i = 0; i < 16; i++) {
++		seq_printf(s, " %2x", i);
++	}
++	seq_printf(s, "\n-----------------------------------------------------------------");
++
++	for(i=0; i<= I2CM_SCDC_UPDATE1; i++) {
++                hdmi_readl(hdmi_dev, i, &val);
++		if(i%16==0)
++			seq_printf(s,"\n>>>hdmi_ctl %2x:", i);
++		seq_printf(s," %02x",val);
++
++	}
++	seq_printf(s, "\n-----------------------------------------------------------------\n");
++
++	return 0;
++}
++
++static ssize_t rk3288_hdmi_reg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++	u32 reg;
++	u32 val;
++	char kbuf[25];
++	if (copy_from_user(kbuf, buf, count))
++		return -EFAULT;
++	sscanf(kbuf, "%x%x", &reg, &val);
++        if ((reg < 0) || (reg > I2CM_SCDC_UPDATE1)) {
++                dev_info(hdmi_dev->dev, "it is no hdmi reg\n");
++                return count;
++        }
++	dev_info(hdmi_dev->dev, "/**********rk3288 hdmi reg config******/");
++	dev_info(hdmi_dev->dev, "\n reg=%x val=%x\n", reg, val);
++        hdmi_writel(hdmi_dev, reg, val);
++
++	return count;
++}
++
++static int rk3288_hdmi_reg_open(struct inode *inode, struct file *file)
++{
++	struct rk3288_hdmi_device *hdmi_dev = inode->i_private;
++	return single_open(file,rk3288_hdmi_reg_show,hdmi_dev);
++}
++
++static const struct file_operations rk3288_hdmi_reg_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rk3288_hdmi_reg_open,
++	.read		= seq_read,
++	.write          = rk3288_hdmi_reg_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++#endif
+ 
++static int rk3288_hdmi_drv_init(struct hdmi *hdmi_drv)
++{
++	int ret = 0;
++	//struct rk_hdmi_device *hdmi_dev = container_of(hdmi_drv, struct rk_hdmi_device, driver);
++
++        //grf_writel(HDMI_SEL_LCDC(hdmi_dev->lcdc_id),GRF_SOC_CON6);	//lcdc source select-->have config at lcdc driver so delete it
++	if(hdmi_dev->lcdc_id == 0)
++		hdmi_drv->lcdc = rk_get_lcdc_drv("lcdc0");
++	else
++		hdmi_drv->lcdc = rk_get_lcdc_drv("lcdc1");
++	if(IS_ERR(hdmi_drv->lcdc))
++	{
++		dev_err(hdmi_drv->dev, "can not connect to video source lcdc\n");
++		ret = -ENXIO;
++		return ret;
++	}
++
++	hdmi_drv->xscale = 100;
++	hdmi_drv->yscale = 100;
++
++	spin_lock_init(&hdmi_drv->irq_lock);
++	mutex_init(&hdmi_drv->enable_mutex);
++
++	rk3288_hdmi_initial(hdmi_drv);
++	hdmi_sys_init(hdmi_drv);
++	hdmi_drv_register(hdmi_drv);
++
++	return ret;
++}
+ 
+ #if defined(CONFIG_OF)
++static int rk3288_hdmi_parse_dt(struct rk3288_hdmi_device *hdmi_dev)
++{
++	int val = 0;
++	struct device_node *np = hdmi_dev->dev->of_node;
++
++	if(!of_property_read_u32(np, "rockchips,hdmi_lcdc_source", &val))
++		hdmi_dev->lcdc_id = val;
++
++	return 0;
++}
++
+ static const struct of_device_id rk3288_hdmi_dt_ids[] = {
+ 	{.compatible = "rockchips,rk3288-hdmi",},
+ 	{}
+@@ -11,13 +141,147 @@ static const struct of_device_id rk3288_hdmi_dt_ids[] = {
+ MODULE_DEVICE_TABLE(of, rk3288_hdmi_dt_ids);
+ #endif
+ 
+-static int rk3288_hdmi_probe (struct platform_device *pdev)
++static int rk3288_hdmi_probe(struct platform_device *pdev)
+ {
++	int ret;
++	struct resource *res;
++	struct hdmi *dev_drv = NULL;
++
++	hdmi_dev = kzalloc(sizeof(struct rk3288_hdmi_device), GFP_KERNEL);
++	if(!hdmi_dev) {
++		dev_err(&pdev->dev, ">>rk3288_hdmi_device kzalloc fail!");
++		return -ENOMEM;
++	}
++
++	hdmi_dev->dev = &pdev->dev;
++	platform_set_drvdata(pdev, hdmi_dev);
++
++	rk3288_hdmi_parse_dt(hdmi_dev);
++	//TODO Daisen wait to add cec iomux
++
++	/*enable hclk*/
++	hdmi_dev->hclk = devm_clk_get(hdmi_dev->dev,"hclk_hdmi");	//TODO Daisen wait to modify
++	if(IS_ERR(hdmi_dev->hclk)) {
++		dev_err(hdmi_dev->dev, "Unable to get hdmi hclk\n");
++		ret = -ENXIO;
++		goto err0;
++	}
++	clk_prepare_enable(hdmi_dev->hclk);
++
++	/*request and remap iomem*/
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(hdmi_dev->dev, "Unable to get register resource\n");
++		ret = -ENXIO;
++		goto err0;
++	}
++	hdmi_dev->regbase_phy = res->start;
++	hdmi_dev->regsize_phy = resource_size(res);
++	hdmi_dev->regbase = devm_ioremap_resource(hdmi_dev->dev, res);
++	if (IS_ERR(hdmi_dev->regbase)) {
++		ret = PTR_ERR(hdmi_dev->regbase);
++		dev_err(hdmi_dev->dev, "cannot ioremap registers,err=%d\n",ret);
++		goto err1;
++	}
++
++	/*init hdmi driver*/
++	dev_drv = &hdmi_dev->driver;
++	dev_drv->dev = &pdev->dev;
++	if(rk3288_hdmi_drv_init(dev_drv)) {
++		goto err1;
++	}
++
++	dev_drv->workqueue = create_singlethread_workqueue("hdmi");
++	INIT_DELAYED_WORK(&(dev_drv->delay_work), hdmi_work);
++
++	hdmi_register_display_sysfs(dev_drv, NULL);
++
++#ifdef CONFIG_SWITCH
++	dev_drv->switch_hdmi.name = "hdmi";
++	switch_dev_register(&(dev_drv->switch_hdmi));
++#endif
++
++	/* get and request the IRQ */
++	dev_drv->irq = platform_get_irq(pdev, 0);
++	if(dev_drv->irq <= 0) {
++		dev_err(hdmi_dev->dev, "failed to get hdmi irq resource (%d).\n", hdmi_dev->irq);
++		ret = -ENXIO;
++		goto err2;
++	}
++
++	ret = request_irq(dev_drv->irq, hdmi_irq, 0, dev_name(hdmi_dev->dev), dev_drv);
++	if (ret) {
++		dev_err(hdmi_dev->dev, "hdmi request_irq failed (%d).\n", ret);
++		goto err2;
++	}
++
++#if defined(CONFIG_DEBUG_FS)
++        hdmi_dev->debugfs_dir = debugfs_create_dir("rk3288-hdmi", NULL);
++	if (IS_ERR(hdmi_dev->debugfs_dir)) {
++		dev_err(hdmi_dev->dev,"failed to create debugfs dir for rk3288 hdmi!\n");
++	} else {
++		debugfs_create_file("hdmi", S_IRUSR, hdmi_dev->debugfs_dir, hdmi_dev, &rk3288_hdmi_reg_fops);
++	}
++#endif
++
++	dev_info(hdmi_dev->dev, "rk3288 hdmi probe sucess.\n");
+ 	return 0;
++
++err2:
++#ifdef CONFIG_SWITCH
++	switch_dev_unregister(&(dev_drv->switch_hdmi));
++#endif
++	hdmi_unregister_display_sysfs(dev_drv);
++
++	//iounmap((void*)hdmi_dev->regbase);
++err1:
++	//release_mem_region(res->start,hdmi_dev->regsize_phy);
++	clk_disable_unprepare(hdmi_dev->hclk);
++err0:
++	dev_info(hdmi_dev->dev, "rk3288 hdmi probe error.\n");
++	kfree(hdmi_dev);
++	hdmi_dev = NULL;
++	return ret;
+ }
+ 
+ static int rk3288_hdmi_remove(struct platform_device *pdev)
+ {
++	struct rk3288_hdmi_device *hdmi_dev = platform_get_drvdata(pdev);
++	struct hdmi *hdmi_drv = NULL;
++
++	if(hdmi_dev) {
++		hdmi_drv = &hdmi_dev->driver;
++		mutex_lock(&hdmi_drv->enable_mutex);
++		if(!hdmi_drv->suspend && hdmi_drv->enable)
++			disable_irq(hdmi_drv->irq);
++		mutex_unlock(&hdmi_drv->enable_mutex);
++		free_irq(hdmi_drv->irq, NULL);
++
++		flush_workqueue(hdmi_drv->workqueue);
++		destroy_workqueue(hdmi_drv->workqueue);
++
++		#ifdef CONFIG_SWITCH
++		switch_dev_unregister(&(hdmi_drv->switch_hdmi));
++		#endif
++		hdmi_unregister_display_sysfs(hdmi_drv);
++
++		//iounmap((void*)hdmi_drv->regbase);
++		//release_mem_region(hdmi_drv->regbase_phy, hdmi_drv->regsize_phy);
++		clk_disable_unprepare(hdmi_dev->hclk);
++		fb_destroy_modelist(&hdmi_drv->edid.modelist);
++		if(hdmi_drv->edid.audio)
++			kfree(hdmi_drv->edid.audio);
++		if(hdmi_drv->edid.specs)
++		{
++			if(hdmi_drv->edid.specs->modedb)
++				kfree(hdmi_drv->edid.specs->modedb);
++			kfree(hdmi_drv->edid.specs);
++		}
++
++		kfree(hdmi_dev);
++		hdmi_dev = NULL;
++	}
++	printk(KERN_INFO "rk3288 hdmi removed.\n");
+ 	return 0;
+ }
+ 
+@@ -34,17 +298,17 @@ static struct platform_driver rk3288_hdmi_driver = {
+ 		.owner	= THIS_MODULE,
+ 		.of_match_table = of_match_ptr(rk3288_hdmi_dt_ids),
+ 	},
+-	.shutdown   = rk30_hdmi_shutdown,
++	.shutdown   = rk3288_hdmi_shutdown,
+ };
+ 
+ static int __init rk3288_hdmi_init(void)
+ {
+-    return platform_driver_register(&rk3288_hdmi_driver);
++	return platform_driver_register(&rk3288_hdmi_driver);
+ }
+ 
+ static void __exit rk3288_hdmi_exit(void)
+ {
+-    platform_driver_unregister(&rk3288_hdmi_driver);
++	platform_driver_unregister(&rk3288_hdmi_driver);
+ }
+ 
+ device_initcall_sync(rk3288_hdmi_init);
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.h b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.h
+index bf31bc515fb8..b2d7b2124417 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi.h
+@@ -3,27 +3,7 @@
+ 
+ #include "../../rk_hdmi.h"
+ 
+-#if defined(CONFIG_HDMI_SOURCE_LCDC1)
+-#define HDMI_SOURCE_DEFAULT HDMI_SOURCE_LCDC1
+-#else
+-#define HDMI_SOURCE_DEFAULT HDMI_SOURCE_LCDC0
+-#endif
+-enum{
+-	INPUT_IIS,
+-	INPUT_SPDIF
+-};
+ 
+-#if defined(CONFIG_SND_RK_SOC_HDMI_SPDIF)
+-#define HDMI_CODEC_SOURCE_SELECT INPUT_SPDIF
+-#else
+-#define HDMI_CODEC_SOURCE_SELECT INPUT_IIS
+-#endif
+ 
+-struct rk_hdmi_device {
+-        struct rk_hdmi_driver	hdmi_drv;
+-        struct delayed_work     hdmi_delay_work;
+-        struct work_struct      hdmi_irq_work_struct;
+-        struct dentry           *debugfs_dir;
+-};
+ 
+ #endif /* __RK3288_HDMI_H__ */
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
+index 0432698334b3..383800f415c1 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.c
+@@ -1,3 +1,4 @@
++#include <linux/interrupt.h>
+ #include "rk3288_hdmi_hw.h"
+ 
+ int rk3288_hdmi_detect_hotplug(struct hdmi *hdmi_drv)
+@@ -10,17 +11,22 @@ int rk3288_hdmi_read_edid(struct hdmi *hdmi_drv, int block, unsigned char *buff)
+ 	return 0;
+ }
+ 
+-int rk3288_hdmi_config_video(struct hdmi *hdmi_drv)
++int rk3288_hdmi_config_video(struct hdmi *hdmi_drv, struct hdmi_video_para *vpara)
+ {
+ 	return 0;
+ }
+ 
+-int rk3288_hdmi_config_audio(struct hdmi *hdmi_drv)
++int rk3288_hdmi_config_audio(struct hdmi *hdmi_drv, struct hdmi_audio *audio)
+ {
+ 	return 0;
+ }
+ 
+ void rk3288_hdmi_control_output(struct hdmi *hdmi_drv, int enable)
++{
++
++}
++
++int rk3288_hdmi_removed(struct hdmi *hdmi_drv)
+ {
+ 	return 0;
+ }
+@@ -29,7 +35,7 @@ int rk3288_hdmi_initial(struct hdmi *hdmi_drv)
+ {
+         int rc = HDMI_ERROR_SUCESS;
+ 
+-        hdmi_drv->remove = rk3288_hdmi_removed ;
++        hdmi_drv->remove = rk3288_hdmi_removed;
+         hdmi_drv->control_output = rk3288_hdmi_control_output;
+         hdmi_drv->config_video = rk3288_hdmi_config_video;
+         hdmi_drv->config_audio = rk3288_hdmi_config_audio;
+@@ -39,4 +45,8 @@ int rk3288_hdmi_initial(struct hdmi *hdmi_drv)
+         return rc;
+ }
+ 
++irqreturn_t hdmi_irq(int irq, void *priv)
++{
++	return IRQ_HANDLED;
++}
+ 
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
+index 64a6f038a5a5..fade0975a543 100644
+--- a/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3288/rk3288_hdmi_hw.h
+@@ -1,5 +1,6 @@
+ #ifndef _RK3288_HDMI_HW_H
+ #define _RK3288_HDMI_HW_H
++#include "../../rk_hdmi.h"
+ 
+ enum PWR_MODE{
+ 	NORMAL,
+@@ -409,7 +410,7 @@ enum FRAME_COMPOSER_REG {
+ 	FC_AUDICONF3,
+ 	FC_VSDIEEEID2,
+ 	FC_VSDSIZE,
+-	FC_VSDIEEEID1
++	FC_VSDIEEEID1,
+ 	FC_VSDIEEEID0,
+ 	FC_VSDPAYLOAD0 = 0x1032,	//0~23
+ 	FC_SPDVENDORNAME0 = 0x104a,	//0~7
+@@ -487,7 +488,7 @@ enum HDMI_SOURCE_PHY_REG {
+ #define m_POWER_DOWN_EN		(1 << 7)		//enable depend on PHY_GEN2=0 and PHY_EXTERNAL=0
+ #define v_POWER_DOWN_EN(n)	(((n)&0x01) << 7)
+ #define m_TMDS_EN		(1 << 6)		//enable depend on PHY_GEN2=0 and PHY_EXTERNAL=0
+-#define m_TMDS_EN(n)		(((n)&0x01) << 6)
++#define v_TMDS_EN(n)		(((n)&0x01) << 6)
+ #define	m_SVSRET_SIG		(1 << 5)		//depend on PHY_MHL_COMB0=1
+ #define v_SVSRET_SIG(n)		(((n)&0x01) << 5)
+ #define m_PDDQ_SIG		(1 << 4)		//depend on PHY_GEN2=1 or PHY_EXTERNAL=1
+@@ -827,7 +828,7 @@ enum MAIN_CONTROLLER_REG {
+ enum COLOR_SPACE_CONVERTER_REG {
+ 	CSC_CFG = COLOR_SPACE_CONVERTER_BASE,
+ 	CSC_SCALE,
+-	CSC_COEF_A1_MSB
++	CSC_COEF_A1_MSB,
+ 	CSC_COEF_A1_LSB,
+ 	CSC_COEF_A2_MSB,
+ 	CSC_COEF_A2_LSB,
+@@ -988,30 +989,43 @@ enum I2C_MASTER_REG {
+ };   
+ 
+ 
++struct rk3288_hdmi_device {
++	int			irq;
++	void __iomem  		*regbase;
++	int			regbase_phy;
++	int			regsize_phy;
++	int 			lcdc_id;
++	struct device 		*dev;
++	struct clk		*hclk;				//HDMI AHP clk
++	struct hdmi 		driver;
++        struct dentry           *debugfs_dir;
++};
+ 
+ 
+-static inline int hdmi_readl(struct hdmi *hdmi_drv, u16 offset, u32 *val)
++static inline int hdmi_readl(struct rk3288_hdmi_device *hdmi_dev, u16 offset, u32 *val)
+ {
+         int ret = 0;
+-	*val = readl_relaxed(hdmi_drv->regbase + (offset) * 0x04);
++	*val = readl_relaxed(hdmi_dev->regbase + (offset) * 0x04);
+         return ret;
+ }
+ 
+-static inline int hdmi_writel(struct hdmi *hdmi_drv, u16 offset, u32 val)
++static inline int hdmi_writel(struct rk3288_hdmi_device *hdmi_dev, u16 offset, u32 val)
+ {
+         int ret = 0;
+-        writel_relaxed(val, hdmi_drv->regbase + (offset) * 0x04);
++        writel_relaxed(val, hdmi_dev->regbase + (offset) * 0x04);
+         return ret;
+ }
+ 
+-static inline int hdmi_msk_reg(struct hdmi *hdmi_drv, u16 offset, u32 msk, u32 val)
++static inline int hdmi_msk_reg(struct rk3288_hdmi_device *hdmi_dev, u16 offset, u32 msk, u32 val)
+ {
+         int ret = 0;
+         u32 temp;
+-        temp = readl_relaxed(hdmi_drv->regbase + (offset) * 0x04) & (0xFF - (msk));
+-        writel_relaxed(temp | ( (val) & (msk) ),  hdmi_drv->regbase + (offset) * 0x04);
++        temp = readl_relaxed(hdmi_dev->regbase + (offset) * 0x04) & (0xFF - (msk));
++        writel_relaxed(temp | ( (val) & (msk) ),  hdmi_dev->regbase + (offset) * 0x04);
+         return ret;
+ }
+ 
++int rk3288_hdmi_initial(struct hdmi *hdmi_drv);
++
+ 
+ #endif
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi.h b/drivers/video/rockchip/hdmi/rk_hdmi.h
+index a1355ae9a602..ff20d4d900cb 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi.h
++++ b/drivers/video/rockchip/hdmi/rk_hdmi.h
+@@ -253,12 +253,8 @@ struct hdmi_video_para {
+ 
+ struct hdmi {
+ 	struct device	*dev;
+-	struct clk		*hclk;				//HDMI AHP clk
+ 	int             id;
+-	int 			regbase;
+-	int				irq;
+-	int				regbase_phy;
+-	int				regsize_phy;
++	int		irq;
+ 	struct rk_lcdc_driver *lcdc;
+ 	
+ 	#ifdef CONFIG_SWITCH
+@@ -323,22 +319,26 @@ struct hdmi {
+ #define hdmi_dbg(dev, format, arg...)	
+ #endif
+ 
+-//extern struct hdmi *hdmi;
++extern int hdmi_drv_register(struct hdmi *hdmi_drv);
+ extern int hdmi_get_hotplug(void);
+ extern int hdmi_set_info(struct rk_screen *screen, unsigned int vic);
+ extern void hdmi_init_lcdc(struct rk_screen *screen, struct rk29lcd_info *lcd_info);
+-extern int hdmi_sys_init(struct hdmi *hdmi);
+-extern int hdmi_sys_parse_edid(struct hdmi* hdmi);
++extern int hdmi_sys_init(struct hdmi *hdmi_drv);
++extern int hdmi_sys_parse_edid(struct hdmi* hdmi_drv);
+ extern const char *hdmi_get_video_mode_name(unsigned char vic);
+ extern int hdmi_videomode_to_vic(struct fb_videomode *vmode);
+ extern const struct fb_videomode* hdmi_vic_to_videomode(int vic);
+ extern int hdmi_add_videomode(const struct fb_videomode *mode, struct list_head *head);
+ extern struct hdmi_video_timing * hdmi_find_mode(int vic);
+-extern int hdmi_find_best_mode(struct hdmi* hdmi, int vic);
+-extern int hdmi_ouputmode_select(struct hdmi *hdmi, int edid_ok);
+-extern int hdmi_switch_fb(struct hdmi *hdmi, int vic);
++extern int hdmi_find_best_mode(struct hdmi* hdmi_drv, int vic);
++extern int hdmi_ouputmode_select(struct hdmi *hdmi_drv, int edid_ok);
++extern int hdmi_switch_fb(struct hdmi *hdmi_drv, int vic);
+ extern void hdmi_work(struct work_struct *work);
++extern void hdmi_register_display_sysfs(struct hdmi *hdmi_drv, struct device *parent);
++extern void hdmi_unregister_display_sysfs(struct hdmi *hdmi_drv);
++
+ int rk_hdmi_parse_dt(struct hdmi *hdmi_drv);
+ int rk_hdmi_pwr_enable(struct hdmi *dev_drv);
+ int rk_hdmi_pwr_disable(struct hdmi *dev_drv);
++
+ #endif
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+index 7fe7787bccb0..616f713dc8c5 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+@@ -8,6 +8,8 @@
+ #define SWAP_RB			0
+ #define LCD_ACLK		800000000
+ 
++static struct hdmi *m_hdmi_drv = NULL;
++
+ static const struct fb_videomode hdmi_mode [] = {
+ 	//name			refresh		xres	yres	pixclock		h_bp	h_fp	v_bp	v_fp	h_pw	v_pw	polariry	PorI	flag(used for vic)
+ //{	"640x480p@60Hz",		60,		640,	480,	25175000,	48,	16,	33,	10,	96,	2,	0,	0,	1	},
+@@ -531,17 +533,28 @@ int hdmi_switch_fb(struct hdmi *hdmi, int vic)
+ 	return rc;
+ }
+ 
++/**
++ * hdmi_drv_register: init hdmi_drv variable
++ *
++ * NOTES:
++ *
++ */
++int hdmi_drv_register(struct hdmi *hdmi_drv)
++{
++	m_hdmi_drv = hdmi_drv;
++	return 0;
++}
++
+ /**
+  * hdmi_get_status: get hdmi hotplug status
+  * 
+  * NOTES:
+  * 
+  */
+-extern struct hdmi *hdmi;
+ int hdmi_get_hotplug(void)
+ {
+-	if(hdmi)
+-		return hdmi->hotplug;
++	if(m_hdmi_drv)
++		return m_hdmi_drv->hotplug;
+ 	else
+ 		return HDMI_HPD_REMOVED;
+ }
+-- 
+2.35.3
+

@@ -1,0 +1,160 @@
+From 04fa4e24583e18fd25e4d7af1b1ade6baa9632b7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Wed, 12 Dec 2012 16:42:17 +0800
+Subject: [PATCH] rk30: fix wakeup bug when switch to 32K
+
+---
+ arch/arm/mach-rk30/include/mach/cru-rk3066b.h |  2 +
+ arch/arm/mach-rk30/include/mach/cru.h         |  2 +
+ arch/arm/mach-rk30/include/mach/sram.h        |  2 +-
+ arch/arm/mach-rk30/pm.c                       | 60 ++++++++++++++++---
+ 4 files changed, 58 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm/mach-rk30/include/mach/cru-rk3066b.h b/arch/arm/mach-rk30/include/mach/cru-rk3066b.h
+index 9a2caaa7b4aa..bd7ea8e36dfd 100755
+--- a/arch/arm/mach-rk30/include/mach/cru-rk3066b.h
++++ b/arch/arm/mach-rk30/include/mach/cru-rk3066b.h
+@@ -173,6 +173,8 @@ enum rk_plls_id {
+ /*******************clksel10***************************/
+ 
+ #define PERI_ACLK_DIV_MASK 0x1f
++#define PERI_ACLK_DIV_W_MSK	(PERI_ACLK_DIV_MASK << 16)
++#define PERI_ACLK_DIV(i)	(((i) - 1) & PERI_ACLK_DIV_MASK)
+ #define PERI_ACLK_DIV_OFF 0
+ 
+ #define PERI_HCLK_DIV_MASK 0x3
+diff --git a/arch/arm/mach-rk30/include/mach/cru.h b/arch/arm/mach-rk30/include/mach/cru.h
+index 22bde5c8fd97..1c4e9c9e2d40 100755
+--- a/arch/arm/mach-rk30/include/mach/cru.h
++++ b/arch/arm/mach-rk30/include/mach/cru.h
+@@ -179,6 +179,8 @@ enum rk_plls_id {
+ /*******************clksel10***************************/
+ 
+ #define PERI_ACLK_DIV_MASK 0x1f
++#define PERI_ACLK_DIV_W_MSK	(PERI_ACLK_DIV_MASK << 16)
++#define PERI_ACLK_DIV(i)	(((i) - 1) & PERI_ACLK_DIV_MASK)
+ #define PERI_ACLK_DIV_OFF 0
+ 
+ #define PERI_HCLK_DIV_MASK 0x3
+diff --git a/arch/arm/mach-rk30/include/mach/sram.h b/arch/arm/mach-rk30/include/mach/sram.h
+index 4dec061dfeca..07ef1f0322c6 100644
+--- a/arch/arm/mach-rk30/include/mach/sram.h
++++ b/arch/arm/mach-rk30/include/mach/sram.h
+@@ -8,6 +8,6 @@
+ /* delay on slow mode */
+ #define sram_udelay(usecs)	SRAM_LOOP((usecs)*SRAM_LOOPS_PER_USEC)
+ /* delay on deep slow mode */
+-#define sram_32k_udelay(usecs)	SRAM_LOOP(((usecs)*SRAM_LOOPS_PER_USEC)/(24000000/32768))
++#define sram_32k_udelay(usecs)	SRAM_LOOP(((usecs)*SRAM_LOOPS_PER_USEC)/(24000000/8192))
+ 
+ #endif
+diff --git a/arch/arm/mach-rk30/pm.c b/arch/arm/mach-rk30/pm.c
+index 39d39b9ab08c..6bd00648f487 100755
+--- a/arch/arm/mach-rk30/pm.c
++++ b/arch/arm/mach-rk30/pm.c
+@@ -228,7 +228,7 @@ static void pm_pll_wait_lock(int pll_idx)
+ #else
+ 	u32 bit = 0x10u << pll_state[pll_idx];
+ #endif
+-	u32 delay = 2400000U;
++	u32 delay = pll_idx == APLL_ID ? 600000U : 30000000U;
+ 	dsb();
+ 	dsb();
+ 	dsb();
+@@ -250,9 +250,48 @@ static void pm_pll_wait_lock(int pll_idx)
+ 	}
+ }
+ 
++#if defined(CONFIG_ARCH_RK3066B)
+ #define power_on_pll(id) \
+ 	cru_writel(PLL_PWR_DN_W_MSK | PLL_PWR_ON, PLL_CONS((id), 3));\
+ 	pm_pll_wait_lock((id))
++#else
++static void power_on_pll(enum rk_plls_id pll_id)
++{
++	u32 pllcon0, pllcon1, pllcon2;
++
++	cru_writel(PLL_PWR_DN_W_MSK | PLL_PWR_ON, PLL_CONS((pll_id),3));
++	pllcon0 = cru_readl(PLL_CONS((pll_id),0));
++	pllcon1 = cru_readl(PLL_CONS((pll_id),1));
++	pllcon2 = cru_readl(PLL_CONS((pll_id),2));
++
++	//enter slowmode
++	cru_writel(PLL_MODE_SLOW(pll_id), CRU_MODE_CON);
++
++	//enter rest
++	cru_writel(PLL_REST_W_MSK | PLL_REST, PLL_CONS(pll_id,3));
++	cru_writel(pllcon0, PLL_CONS(pll_id,0));
++	cru_writel(pllcon1, PLL_CONS(pll_id,1));
++	cru_writel(pllcon2, PLL_CONS(pll_id,2));
++	if (pll_id == APLL_ID)
++		sram_udelay(5);
++	else
++		udelay(5);
++
++	//return form rest
++	cru_writel(PLL_REST_W_MSK | PLL_REST_RESM, PLL_CONS(pll_id,3));
++
++	//wating lock state
++	if (pll_id == APLL_ID)
++		sram_udelay(168);
++	else
++		udelay(168);
++	pm_pll_wait_lock(pll_id);
++
++	//return form slow
++	cru_writel(PLL_MODE_NORM(pll_id), CRU_MODE_CON);
++}
++#endif
++
+ #define power_off_pll(id) \
+ 	cru_writel(PLL_PWR_DN_W_MSK | PLL_PWR_DN, PLL_CONS((id), 3))
+ 
+@@ -384,7 +423,7 @@ __weak void __sramfunc rk30_pwm_logic_resume_voltage(void){}
+ 
+ static void __sramfunc rk30_sram_suspend(void)
+ {
+-	u32 cru_clksel0_con;
++	u32 cru_clksel0_con, cru_clksel10_con;
+ 	u32 clkgt_regs[CRU_CLKGATES_CON_CNT];
+ 	u32 cru_mode_con;
+ 	int i;
+@@ -440,16 +479,21 @@ static void __sramfunc rk30_sram_suspend(void)
+ 			  | (1 << CLK_GATE_ACLK_INTMEM3 % 16)
+ 			  , clkgt_regs[9], CRU_CLKGATES_CON(9), 0x07ff);
+ 	
++	cru_clksel0_con = cru_readl(CRU_CLKSELS_CON(0));
+ #ifdef CONFIG_CLK_SWITCH_TO_32K
+ 	cru_mode_con = cru_readl(CRU_MODE_CON);
+-	cru_writel(0|
+-		PLL_MODE_DEEP(APLL_ID)|
+-		PLL_MODE_DEEP(DPLL_ID)|
+-		PLL_MODE_DEEP(CPLL_ID)|PLL_MODE_DEEP(GPLL_ID),CRU_MODE_CON);
++	cru_clksel10_con = cru_readl(CRU_CLKSELS_CON(10));
++	cru_writel(PERI_ACLK_DIV_W_MSK | PERI_ACLK_DIV(4), CRU_CLKSELS_CON(10));
++	cru_writel(CORE_CLK_DIV_W_MSK | CORE_CLK_DIV(4) | CPU_CLK_DIV_W_MSK | CPU_CLK_DIV(4), CRU_CLKSELS_CON(0));
++	cru_writel(0
++		   | PLL_MODE_DEEP(APLL_ID)
++		   | PLL_MODE_DEEP(DPLL_ID)
++		   | PLL_MODE_DEEP(CPLL_ID)
++		   | PLL_MODE_DEEP(GPLL_ID)
++		   , CRU_MODE_CON);
+ 	board_pmu_suspend();
+ #else
+ 	board_pmu_suspend();
+-	cru_clksel0_con = cru_readl(CRU_CLKSELS_CON(0));
+ 	cru_writel(CORE_CLK_DIV_W_MSK | CORE_CLK_DIV_MSK | CPU_CLK_DIV_W_MSK | CPU_CLK_DIV_MSK, CRU_CLKSELS_CON(0));
+ #endif
+ 
+@@ -459,6 +503,8 @@ static void __sramfunc rk30_sram_suspend(void)
+ #ifdef CONFIG_CLK_SWITCH_TO_32K
+ 	board_pmu_resume();
+ 	cru_writel((0xffff<<16) | cru_mode_con, CRU_MODE_CON);
++	cru_writel(CORE_CLK_DIV_W_MSK | CPU_CLK_DIV_W_MSK | cru_clksel0_con, CRU_CLKSELS_CON(0));
++	cru_writel(PERI_ACLK_DIV_W_MSK | cru_clksel10_con, CRU_CLKSELS_CON(10));
+ #else
+ 	cru_writel(CORE_CLK_DIV_W_MSK | CPU_CLK_DIV_W_MSK | cru_clksel0_con, CRU_CLKSELS_CON(0));
+ 	board_pmu_resume();
+-- 
+2.35.3
+

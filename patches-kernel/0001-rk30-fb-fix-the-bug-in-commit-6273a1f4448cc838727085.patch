@@ -1,0 +1,188 @@
+From 5d82cc618fb82dd2ba8d632b6380ff5291be3da0 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Sun, 1 Apr 2012 09:16:51 +0800
+Subject: [PATCH] rk30 fb: fix the bug in commit
+ 6273a1f4448cc838727085aa64df0c11059883fb
+
+	 fix the commit "add early_suspend/resume support,fix a bug for sync"
+	 the wait_for_completion in function  rk30_lcdc_pan_display must match
+	 of complete in interrupt isr rk30_lcdc_isr one by one.
+	 and for safe ,add spin lock protect completion frame_done
+---
+ drivers/video/rockchip/chips/rk30_lcdc.c | 66 +++++++++++++++---------
+ drivers/video/rockchip/rk_fb.c           |  2 +
+ include/linux/rk_fb.h                    |  4 +-
+ 3 files changed, 48 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index 0e83c7c7aaef..f96bc6685ae0 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -72,7 +72,7 @@ static int init_rk30_lcdc(struct rk30_lcdc_device *lcdc_dev)
+ 	LcdSetBit(lcdc_dev,DSP_CTRL0, m_LCDC_AXICLK_AUTO_ENABLE);//eanble axi-clk auto gating for low power
+ 	LcdMskReg(lcdc_dev,INT_STATUS,m_FRM_START_INT_CLEAR | m_BUS_ERR_INT_CLEAR | m_LINE_FLAG_INT_EN |
+               m_FRM_START_INT_EN | m_HOR_START_INT_EN,v_FRM_START_INT_CLEAR(1) | v_BUS_ERR_INT_CLEAR(0) |
+-              v_LINE_FLAG_INT_EN(0) | v_FRM_START_INT_EN(1) | v_HOR_START_INT_EN(0));  //enable frame start interrupt for sync
++              v_LINE_FLAG_INT_EN(0) | v_FRM_START_INT_EN(0) | v_HOR_START_INT_EN(0));  //enable frame start interrupt for sync
+ 	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);  // write any value to  REG_CFG_DONE let config become effective
+ 	return 0;
+ }
+@@ -292,7 +292,6 @@ static  int win0_display(struct rk30_lcdc_device *lcdc_dev,struct layer_par *par
+ 	DBG(KERN_INFO "%s:y_addr:0x%x>>uv_addr:0x%x\n",__func__,y_addr,uv_addr);
+ 	LcdWrReg(lcdc_dev, WIN0_YRGB_MST0, y_addr);
+     	LcdWrReg(lcdc_dev,WIN0_CBR_MST0,uv_addr);
+-	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);  // write any value to  REG_CFG_DONE let config become effective
+ 	return 0;
+ 	
+ }
+@@ -306,8 +305,7 @@ static  int win1_display(struct rk30_lcdc_device *lcdc_dev,struct layer_par *par
+ 	DBG(KERN_INFO "%s>>y_addr:0x%x>>uv_addr:0x%x\n",__func__,y_addr,uv_addr);
+ 	LcdWrReg(lcdc_dev, WIN1_YRGB_MST, y_addr);
+     	LcdWrReg(lcdc_dev,WIN1_CBR_MST,uv_addr);
+-	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);
+-
++	
+ 	return 0;
+ }
+ 
+@@ -483,6 +481,8 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	struct layer_par *par = NULL;
+ 	rk_screen *screen = lcdc_dev->screen;
++	unsigned long flags;
++	int timeout;
+ 	if(!screen)
+ 	{
+ 		printk(KERN_ERR "screen is null!\n");
+@@ -498,9 +498,28 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		par = &(dev_drv->layer_par[1]);
+         	win1_display(lcdc_dev,par);
+ 	}
+-	wait_for_completion(&dev_drv->frame_done);
+-	
+-    return 0;
++	if(dev_drv->first_frame)  //this is the first frame of the system ,enable frame start interrupt
++	{
++		dev_drv->first_frame = 0;
++		LcdMskReg(lcdc_dev,INT_STATUS,m_FRM_START_INT_CLEAR |m_FRM_START_INT_EN ,
++			  v_FRM_START_INT_CLEAR(1) | v_FRM_START_INT_EN(1));
++		 
++	}
++	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);  // write any value to  REG_CFG_DONE let config become effective
++	spin_lock_irqsave(&dev_drv->cpl_lock,flags);
++	init_completion(&dev_drv->frame_done);
++	spin_unlock_irqrestore(&dev_drv->cpl_lock,flags);
++	timeout = wait_for_completion_interruptible_timeout(&dev_drv->frame_done,msecs_to_jiffies(25));
++	if(!timeout)
++	{
++		printk(KERN_ERR "wait for new frame start time out!\n");
++		return -ETIMEDOUT;
++	}
++	else if(timeout < 0)
++	{
++		return timeout;
++	}
++	return 0;
+ }
+ 
+ int rk30_lcdc_ioctl(struct rk_lcdc_device_driver * dev_drv,unsigned int cmd, unsigned long arg,int layer_id)
+@@ -520,7 +539,7 @@ int rk30_lcdc_ioctl(struct rk_lcdc_device_driver * dev_drv,unsigned int cmd, uns
+ 			break;
+ 	}
+ 		
+-   return 0;
++	return 0;
+ }
+ 
+ int rk30_lcdc_suspend(struct rk_lcdc_device_driver *dev_drv)
+@@ -543,7 +562,9 @@ static irqreturn_t rk30_lcdc_isr(int irq, void *dev_id)
+ 	struct rk30_lcdc_device *lcdc_dev = (struct rk30_lcdc_device *)dev_id;
+ 	LcdMskReg(lcdc_dev, INT_STATUS, m_FRM_START_INT_CLEAR, v_FRM_START_INT_CLEAR(1));
+ 	//LcdMskReg(lcdc_dev, INT_STATUS, m_LINE_FLAG_INT_CLEAR, v_LINE_FLAG_INT_CLEAR(1));
++	spin_lock(&(lcdc_dev->driver.cpl_lock));
+ 	complete(&(lcdc_dev->driver.frame_done));
++	spin_unlock(&(lcdc_dev->driver.cpl_lock));
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -627,20 +648,6 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 	
+     	lcdc_dev->preg = (LCDC_REG*)lcdc_dev->reg_vir_base;
+ 	printk("lcdc%d:reg_phy_base = 0x%08x,reg_vir_base:0x%p\n",pdev->id,lcdc_dev->reg_phy_base, lcdc_dev->preg);
+-	lcdc_dev->irq = platform_get_irq(pdev, 0);
+-	if(lcdc_dev->irq < 0)
+-	{
+-		dev_err(&pdev->dev, "cannot find IRQ\n");
+-		goto err3;
+-	}
+-	ret = request_irq(lcdc_dev->irq, rk30_lcdc_isr, IRQF_DISABLED,dev_name(&pdev->dev),lcdc_dev);
+-	if (ret)
+-	{
+-	       dev_err(&pdev->dev, "cannot requeset irq %d - err %d\n", lcdc_dev->irq, ret);
+-	       ret = -EBUSY;
+-	       goto err3;
+-	}
+-	
+ 	init_lcdc_device_driver(&lcdc_driver,&(lcdc_dev->driver),lcdc_dev->id);
+ 	lcdc_dev->driver.dev=&pdev->dev;
+ 	
+@@ -652,7 +659,7 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 	if(ret < 0)
+ 	{
+ 		printk(KERN_ERR "init rk30 lcdc failed!\n");
+-		goto err4;
++		goto err3;
+ 	}
+ 	ret = rk30_load_screen(&(lcdc_dev->driver),1);
+ 	if(ret < 0)
+@@ -661,6 +668,19 @@ static int __devinit rk30_lcdc_probe (struct platform_device *pdev)
+ 		goto err3;
+ 	}
+ 	/*****************	lcdc register		********/
++	lcdc_dev->irq = platform_get_irq(pdev, 0);
++	if(lcdc_dev->irq < 0)
++	{
++		dev_err(&pdev->dev, "cannot find IRQ\n");
++		goto err3;
++	}
++	ret = request_irq(lcdc_dev->irq, rk30_lcdc_isr, IRQF_DISABLED,dev_name(&pdev->dev),lcdc_dev);
++	if (ret)
++	{
++	       dev_err(&pdev->dev, "cannot requeset irq %d - err %d\n", lcdc_dev->irq, ret);
++	       ret = -EBUSY;
++	       goto err3;
++	}
+ 	ret = rk_fb_register(&(lcdc_dev->driver));
+ 	if(ret < 0)
+ 	{
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 511b53027e6c..ce83abb3c8a1 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -732,6 +732,8 @@ int init_lcdc_device_driver(struct rk_lcdc_device_driver *def_drv,
+ 	dev_drv->resume = def_drv->resume;
+ 	dev_drv->load_screen = def_drv->load_screen;
+ 	init_completion(&dev_drv->frame_done);
++	spin_lock_init(&dev_drv->cpl_lock);
++	dev_drv->first_frame = 1;
+ 	
+ 	return 0;
+ }
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 421cdc47e5b5..cef5d416738c 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -189,7 +189,9 @@ struct rk_lcdc_device_driver{
+ 	rk_screen *screen;
+ 	u32 pixclock;
+ 
+-	struct completion  frame_done;
++	struct completion  frame_done;		  //sync for pan_display,whe we set a new frame address to lcdc register,we must make sure the frame begain to display
++	spinlock_t  cpl_lock; 			 //lock for completion  frame done
++	int first_frame ;
+ 	
+ 	int (*ioctl)(struct rk_lcdc_device_driver *dev_drv, unsigned int cmd,unsigned long arg,int layer_id);
+ 	int (*suspend)(struct rk_lcdc_device_driver *dev_drv);
+-- 
+2.35.3
+

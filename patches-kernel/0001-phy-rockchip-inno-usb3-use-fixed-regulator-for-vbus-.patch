@@ -1,0 +1,161 @@
+From 12efa9acad65b4c3256683c1ccd769687be3ca56 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Sat, 24 Feb 2018 16:44:54 +0800
+Subject: [PATCH] phy: rockchip-inno-usb3: use fixed-regulator for vbus power
+
+This patch uses a fixed-regulator instead of GPIO pin for
+usb vbus power. It doesn't fix any issue, but it makes more
+sense to convert the GPIO code into a fixed-regulator.
+
+Change-Id: I76fb8dc5c8cfdba24ccb3fc24f14850defb83b2e
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ .../bindings/phy/phy-rockchip-inno-usb3.txt   |  3 +-
+ drivers/phy/rockchip/phy-rockchip-inno-usb3.c | 50 ++++++++++++++-----
+ 2 files changed, 39 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/phy/phy-rockchip-inno-usb3.txt b/Documentation/devicetree/bindings/phy/phy-rockchip-inno-usb3.txt
+index 9a5281179b9b..35d047022d46 100644
+--- a/Documentation/devicetree/bindings/phy/phy-rockchip-inno-usb3.txt
++++ b/Documentation/devicetree/bindings/phy/phy-rockchip-inno-usb3.txt
+@@ -24,7 +24,7 @@ Required properties (phy (parent) node):
+    * "u3phy-pipe-apb" for the USB 3.0 PHY pipe apb
+ 
+ Optional properties:
+- - vbus-drv-gpios : gpio phandle for vbus supply.
++ - vbus-supply: regulator phandle for vbus power source.
+ 
+ Required nodes : a sub-node is required for USB 3.0 or USB 2.0 the phy provides.
+ 		 The sub-node name is used to identify phy type, and shall be
+@@ -68,7 +68,6 @@ u3phy: usb3-phy@ff470000 {
+ 	reset-names = "u3phy-u2-por", "u3phy-u3-por",
+ 		      "u3phy-pipe-mac", "u3phy-utmi-mac",
+ 		      "u3phy-utmi-apb", "u3phy-pipe-apb";
+-	vbus-drv-gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
+ 	#address-cells = <2>;
+ 	#size-cells = <2>;
+ 	ranges;
+diff --git a/drivers/phy/rockchip/phy-rockchip-inno-usb3.c b/drivers/phy/rockchip/phy-rockchip-inno-usb3.c
+index 22bd72ab4383..1a92caeb957c 100644
+--- a/drivers/phy/rockchip/phy-rockchip-inno-usb3.c
++++ b/drivers/phy/rockchip/phy-rockchip-inno-usb3.c
+@@ -144,12 +144,13 @@ struct rockchip_u3phy {
+ 	int um_ls_irq;
+ 	struct clk *clks[U3PHY_MAX_CLKS];
+ 	struct dentry *root;
+-	struct gpio_desc *vbus_drv_gpio;
++	struct regulator *vbus;
+ 	struct reset_control *rsts[U3PHY_RESET_MAX];
+ 	struct rockchip_u3phy_apbcfg apbcfg;
+ 	const struct rockchip_u3phy_cfg *cfgs;
+ 	struct rockchip_u3phy_port ports[U3PHY_PORT_NUM];
+ 	struct usb_phy usb_phy;
++	bool vbus_enabled;
+ };
+ 
+ static inline int param_write(void __iomem *base,
+@@ -182,6 +183,28 @@ static inline bool param_exped(void __iomem *base,
+ 	return tmp == value;
+ }
+ 
++static int rockchip_set_vbus_power(struct rockchip_u3phy *u3phy, bool en)
++{
++	int ret = 0;
++
++	if (!u3phy->vbus)
++		return 0;
++
++	if (en && !u3phy->vbus_enabled) {
++		ret = regulator_enable(u3phy->vbus);
++		if (ret)
++			dev_err(u3phy->dev,
++				"Failed to enable VBUS supply\n");
++	} else if (!en && u3phy->vbus_enabled) {
++		ret = regulator_disable(u3phy->vbus);
++	}
++
++	if (ret == 0)
++		u3phy->vbus_enabled = en;
++
++	return ret;
++}
++
+ static int rockchip_u3phy_usb2_only_show(struct seq_file *s, void *unused)
+ {
+ 	struct rockchip_u3phy	*u3phy = s->private;
+@@ -219,7 +242,7 @@ static ssize_t rockchip_u3phy_usb2_only_write(struct file *file,
+ 			&u3phy->cfgs->grfcfg.u2_only_ctrl, 1)) {
+ 		dev_info(u3phy->dev, "Set usb3.0 and usb2.0 mode successfully\n");
+ 
+-		gpiod_set_value_cansleep(u3phy->vbus_drv_gpio, 0);
++		rockchip_set_vbus_power(u3phy, false);
+ 
+ 		param_write(u3phy->grf,
+ 			    &u3phy->cfgs->grfcfg.u3_disable, false);
+@@ -235,13 +258,13 @@ static ssize_t rockchip_u3phy_usb2_only_write(struct file *file,
+ 
+ 		atomic_notifier_call_chain(&u3phy->usb_phy.notifier, 0, NULL);
+ 
+-		gpiod_set_value_cansleep(u3phy->vbus_drv_gpio, 1);
++		rockchip_set_vbus_power(u3phy, true);
+ 	} else if (!strncmp(buf, "u2", 2) &&
+ 		   param_exped(u3phy->u3phy_grf,
+ 			       &u3phy->cfgs->grfcfg.u2_only_ctrl, 0)) {
+ 		dev_info(u3phy->dev, "Set usb2.0 only mode successfully\n");
+ 
+-		gpiod_set_value_cansleep(u3phy->vbus_drv_gpio, 0);
++		rockchip_set_vbus_power(u3phy, false);
+ 
+ 		param_write(u3phy->grf,
+ 			    &u3phy->cfgs->grfcfg.u3_disable, true);
+@@ -257,7 +280,7 @@ static ssize_t rockchip_u3phy_usb2_only_write(struct file *file,
+ 
+ 		atomic_notifier_call_chain(&u3phy->usb_phy.notifier, 0, NULL);
+ 
+-		gpiod_set_value_cansleep(u3phy->vbus_drv_gpio, 1);
++		rockchip_set_vbus_power(u3phy, true);
+ 	} else {
+ 		dev_info(u3phy->dev, "Same or illegal mode\n");
+ 	}
+@@ -441,6 +464,7 @@ static int rockchip_u3phy_power_on(struct phy *phy)
+ 	}
+ 
+ done:
++	rockchip_set_vbus_power(u3phy, true);
+ 	u3phy_port->suspended = false;
+ 	return 0;
+ }
+@@ -704,14 +728,15 @@ static int rockchip_u3phy_parse_dt(struct rockchip_u3phy *u3phy,
+ 		return -ENXIO;
+ 	}
+ 
+-	u3phy->vbus_drv_gpio = devm_gpiod_get_optional(dev, "vbus-drv",
+-						       GPIOD_OUT_HIGH);
++	/* Get Vbus regulators */
++	u3phy->vbus = devm_regulator_get_optional(dev, "vbus");
++	if (IS_ERR(u3phy->vbus)) {
++		ret = PTR_ERR(u3phy->vbus);
++		if (ret == -EPROBE_DEFER)
++			return ret;
+ 
+-	if (!u3phy->vbus_drv_gpio) {
+-		dev_warn(&pdev->dev, "vbus_drv is not assigned\n");
+-	} else if (IS_ERR(u3phy->vbus_drv_gpio)) {
+-		dev_err(&pdev->dev, "failed to get vbus_drv\n");
+-		return PTR_ERR(u3phy->vbus_drv_gpio);
++		dev_warn(dev, "Failed to get VBUS supply regulator\n");
++		u3phy->vbus = NULL;
+ 	}
+ 
+ 	for (clk = 0; clk < U3PHY_MAX_CLKS; clk++) {
+@@ -885,6 +910,7 @@ static int rockchip_u3phy_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	u3phy->dev = dev;
++	u3phy->vbus_enabled = false;
+ 	phy_cfgs = match->data;
+ 	platform_set_drvdata(pdev, u3phy);
+ 
+-- 
+2.35.3
+

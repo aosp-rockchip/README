@@ -1,0 +1,164 @@
+From c3370bfa7f8aae1bf3c431c5d87a9546ec709972 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Sat, 26 Mar 2011 10:46:42 +0800
+Subject: [PATCH] rk29: disable irq, delay more time and run in sram while
+ power domain on/off
+
+---
+ arch/arm/mach-rk29/clock.c            | 40 ++++++++++++++++++++++-----
+ arch/arm/mach-rk29/include/mach/cru.h |  3 ++
+ arch/arm/mach-rk29/include/mach/pmu.h | 15 +---------
+ arch/arm/mach-rk29/pm.c               |  4 ---
+ arch/arm/mach-rk29/reset.c            |  3 --
+ 5 files changed, 37 insertions(+), 28 deletions(-)
+
+diff --git a/arch/arm/mach-rk29/clock.c b/arch/arm/mach-rk29/clock.c
+index 4032b4c0c2da..9b022708cf99 100755
+--- a/arch/arm/mach-rk29/clock.c
++++ b/arch/arm/mach-rk29/clock.c
+@@ -31,6 +31,7 @@
+ #include <mach/rk29_iomap.h>
+ #include <mach/cru.h>
+ #include <mach/pmu.h>
++#include <mach/sram.h>
+ 
+ 
+ /* Clock flags */
+@@ -39,9 +40,6 @@
+ #define CONFIG_PARTICIPANT	(1 << 10)	/* Fundamental clock */
+ #define IS_PD			(1 << 2)	/* Power Domain */
+ 
+-#define cru_readl(offset)	readl(RK29_CRU_BASE + offset)
+-#define cru_writel(v, offset)	writel(v, RK29_CRU_BASE + offset)
+-
+ #define regfile_readl(offset)	readl(RK29_GRF_BASE + offset)
+ #define pmu_readl(offset)	readl(RK29_PMU_BASE + offset)
+ 
+@@ -1699,6 +1697,38 @@ GATE_CLK(hclk_mmc1, hclk_periph, HCLK_MMC1);
+ GATE_CLK(hclk_emmc, hclk_periph, HCLK_EMMC);
+ 
+ 
++static void __sramfunc pmu_set_power_domain_sram(enum pmu_power_domain pd, bool on)
++{
++	if (on)
++		writel(readl(RK29_PMU_BASE + PMU_PD_CON) & ~(1 << pd), RK29_PMU_BASE + PMU_PD_CON);
++	else
++		writel(readl(RK29_PMU_BASE + PMU_PD_CON) |  (1 << pd), RK29_PMU_BASE + PMU_PD_CON);
++	dsb();
++
++	while (pmu_power_domain_is_on(pd) != on)
++		;
++}
++
++static noinline void do_pmu_set_power_domain(enum pmu_power_domain pd, bool on)
++{
++	static unsigned long save_sp;
++
++	DDR_SAVE_SP(save_sp);
++	pmu_set_power_domain_sram(pd, on);
++	DDR_RESTORE_SP(save_sp);
++}
++
++void pmu_set_power_domain(enum pmu_power_domain pd, bool on)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	mdelay(10);
++	do_pmu_set_power_domain(pd, on);
++	mdelay(10);
++	local_irq_restore(flags);
++}
++
+ static int pd_vcodec_mode(struct clk *clk, int on)
+ {
+ 	if (on) {
+@@ -1713,8 +1743,6 @@ static int pd_vcodec_mode(struct clk *clk, int on)
+ 
+ 		pmu_set_power_domain(PD_VCODEC, true);
+ 
+-		udelay(10);
+-
+ 		cru_writel(cru_clkgate3_con_mirror, CRU_CLKGATE3_CON);
+ 	} else {
+ 		pmu_set_power_domain(PD_VCODEC, false);
+@@ -1758,8 +1786,6 @@ static int pd_display_mode(struct clk *clk, int on)
+ 
+ 		pmu_set_power_domain(PD_DISPLAY, true);
+ 
+-		udelay(10);
+-
+ 		cru_writel(gate2, CRU_CLKGATE2_CON);
+ 		cru_writel(cru_clkgate3_con_mirror, CRU_CLKGATE3_CON);
+ 	} else {
+diff --git a/arch/arm/mach-rk29/include/mach/cru.h b/arch/arm/mach-rk29/include/mach/cru.h
+index 34b0e3229484..caf955722dc4 100644
+--- a/arch/arm/mach-rk29/include/mach/cru.h
++++ b/arch/arm/mach-rk29/include/mach/cru.h
+@@ -296,6 +296,9 @@ enum cru_soft_reset {
+ #define CRU_SOFTRST1_CON	0x70
+ #define CRU_SOFTRST2_CON	0x74
+ 
++#define cru_readl(offset)	readl(RK29_CRU_BASE + offset)
++#define cru_writel(v, offset)	do { writel(v, RK29_CRU_BASE + offset); dsb(); } while (0)
++
+ extern volatile u32 cru_clkgate3_con_mirror;
+ void cru_set_soft_reset(enum cru_soft_reset idx, bool on);
+ 
+diff --git a/arch/arm/mach-rk29/include/mach/pmu.h b/arch/arm/mach-rk29/include/mach/pmu.h
+index da22426fa587..f11dd7937db6 100644
+--- a/arch/arm/mach-rk29/include/mach/pmu.h
++++ b/arch/arm/mach-rk29/include/mach/pmu.h
+@@ -45,19 +45,6 @@ static inline bool pmu_power_domain_is_on(enum pmu_power_domain pd)
+ 	return !(readl(RK29_PMU_BASE + PMU_PD_ST) & (1 << pd));
+ }
+ 
+-static inline void pmu_set_power_domain(enum pmu_power_domain pd, bool on)
+-{
+-	unsigned long flags;
+-
+-	local_irq_save(flags);
+-	if (on)
+-		writel(readl(RK29_PMU_BASE + PMU_PD_CON) & ~(1 << pd), RK29_PMU_BASE + PMU_PD_CON);
+-	else
+-		writel(readl(RK29_PMU_BASE + PMU_PD_CON) |  (1 << pd), RK29_PMU_BASE + PMU_PD_CON);
+-	local_irq_restore(flags);
+-
+-	while (pmu_power_domain_is_on(pd) != on)
+-		;
+-}
++void pmu_set_power_domain(enum pmu_power_domain pd, bool on);
+ 
+ #endif
+diff --git a/arch/arm/mach-rk29/pm.c b/arch/arm/mach-rk29/pm.c
+index 22b71fde4c38..b5ef46173b6c 100755
+--- a/arch/arm/mach-rk29/pm.c
++++ b/arch/arm/mach-rk29/pm.c
+@@ -27,10 +27,6 @@
+ #include <mach/ddr.h>
+ #include <mach/memtester.h>
+ 
+-#define cru_readl(offset)	readl(RK29_CRU_BASE + offset)
+-#define cru_writel(v, offset)	do { writel(v, RK29_CRU_BASE + offset); readl(RK29_CRU_BASE + offset); } while (0)
+-#define pmu_readl(offset)	readl(RK29_PMU_BASE + offset)
+-#define pmu_writel(v, offset)	do { writel(v, RK29_PMU_BASE + offset); readl(RK29_PMU_BASE + offset); } while (0)
+ static unsigned long save_sp;
+ 
+ #define LOOPS_PER_USEC	13
+diff --git a/arch/arm/mach-rk29/reset.c b/arch/arm/mach-rk29/reset.c
+index fc7cdeb03559..7680d048c178 100755
+--- a/arch/arm/mach-rk29/reset.c
++++ b/arch/arm/mach-rk29/reset.c
+@@ -21,9 +21,6 @@
+ #include <asm/tlbflush.h>
+ #include <asm/cacheflush.h>
+ 
+-#define cru_readl(offset)	readl(RK29_CRU_BASE + offset)
+-#define cru_writel(v, offset)	do { writel(v, RK29_CRU_BASE + offset); readl(RK29_CRU_BASE + offset); } while (0)
+-
+ static inline void delay_500ns(void)
+ {
+ 	int delay = 13;
+-- 
+2.35.3
+

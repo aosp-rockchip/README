@@ -1,0 +1,315 @@
+From cafbe5dcdc707f29a3989a8b90ccc5dd7324ce65 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 21 May 2020 11:35:00 +0800
+Subject: [PATCH] media: rockchip: fix isp and ispp frame id error
+
+Change-Id: I8a4b80411a712b3e080ca95841d98c9891a8f4b6
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c   |  3 ++-
+ drivers/media/platform/rockchip/isp/capture.c  |  3 +--
+ drivers/media/platform/rockchip/isp/csi.c      | 12 +++++++++---
+ drivers/media/platform/rockchip/isp/dmarx.c    | 17 +++++++++++++----
+ drivers/media/platform/rockchip/isp/dmarx.h    | 11 +++++++++--
+ .../platform/rockchip/isp/isp_params_v2x.c     |  2 +-
+ .../platform/rockchip/isp/isp_stats_v2x.c      | 13 ++-----------
+ drivers/media/platform/rockchip/isp/rkisp.c    | 10 +++++++---
+ drivers/media/platform/rockchip/ispp/stream.c  | 18 +++++++++++-------
+ 9 files changed, 55 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 614192241935..c2a05cedaef8 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -51,7 +51,8 @@ static int frame_end(struct rkisp_bridge_device *dev)
+ 	unsigned long lock_flags = 0;
+ 
+ 	if (dev->cur_buf && dev->nxt_buf) {
+-		dev->cur_buf->frame_id = rkisp_dmarx_get_frame_id(dev->ispdev) + 1;
++		dev->cur_buf->frame_id =
++			rkisp_dmarx_get_frame_id(dev->ispdev, false) + 1;
+ 		v4l2_subdev_call(sd, video, s_rx_buffer, dev->cur_buf, NULL);
+ 		dev->cur_buf = NULL;
+ 	}
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index e36b635f7572..eed0d46a74bb 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -1520,7 +1520,6 @@ static void rdbk_frame_end(struct rkisp_stream *stream)
+ static int mi_frame_end(struct rkisp_stream *stream)
+ {
+ 	struct rkisp_device *isp_dev = stream->ispdev;
+-	struct rkisp_isp_subdev *isp_sd = &isp_dev->isp_sdev;
+ 	struct rkisp_capture_device *cap = &isp_dev->cap_dev;
+ 	struct capture_fmt *isp_fmt = &stream->out_isp_fmt;
+ 	bool interlaced = stream->interlaced;
+@@ -1552,7 +1551,7 @@ static int mi_frame_end(struct rkisp_stream *stream)
+ 		if (stream->id == RKISP_STREAM_MP ||
+ 		    stream->id == RKISP_STREAM_SP)
+ 			stream->curr_buf->vb.sequence =
+-				atomic_read(&isp_sd->frm_sync_seq) - 1;
++				rkisp_dmarx_get_frame_id(isp_dev, false);
+ 		else
+ 			stream->curr_buf->vb.sequence =
+ 				atomic_read(&stream->sequence) - 1;
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index 05494d201bbc..457566535a41 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -429,7 +429,7 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	struct rkisp_device *dev = csi->ispdev;
+ 	void __iomem *addr = dev->base_addr + CSI2RX_CTRL0;
+ 	struct rkisp_isp_params_vdev *params_vdev = &dev->params_vdev;
+-	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev);
++	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev, true);
+ 
+ 	if (dma2frm > 2)
+ 		dma2frm = 2;
+@@ -469,6 +469,8 @@ int rkisp_csi_trigger_event(struct rkisp_csi_device *csi, void *arg)
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&csi->rdbk_lock, lock_flags);
++	if (!trigger)
++		csi->is_isp_end = true;
+ 	if (trigger &&
+ 	    (csi->is_first ||
+ 	     (csi->is_isp_end && kfifo_is_empty(fifo)))) {
+@@ -476,7 +478,9 @@ int rkisp_csi_trigger_event(struct rkisp_csi_device *csi, void *arg)
+ 		 * start read back direct
+ 		 */
+ 		csi->is_first = false;
+-		dev->dmarx_dev.frame_id = trigger->frame_id;
++		dev->dmarx_dev.pre_frame_id =
++			dev->dmarx_dev.cur_frame_id;
++		dev->dmarx_dev.cur_frame_id = trigger->frame_id;
+ 		times = trigger->times;
+ 	} else if (csi->is_isp_end && !kfifo_is_empty(fifo)) {
+ 		/* isp idle and events in queue
+@@ -484,7 +488,9 @@ int rkisp_csi_trigger_event(struct rkisp_csi_device *csi, void *arg)
+ 		 * new event in fifo
+ 		 */
+ 		if (kfifo_out(fifo, &t, sizeof(t))) {
+-			dev->dmarx_dev.frame_id = t.frame_id;
++			dev->dmarx_dev.pre_frame_id =
++				dev->dmarx_dev.cur_frame_id;
++			dev->dmarx_dev.cur_frame_id = t.frame_id;
+ 			times = t.times;
+ 		}
+ 		if (trigger)
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index bdda35c42914..41d9997530fe 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -934,12 +934,21 @@ static int dmarx_init(struct rkisp_device *dev, u32 id)
+ 		RKISP_ISP_PAD_SINK, stream->linked);
+ }
+ 
+-u32 rkisp_dmarx_get_frame_id(struct rkisp_device *dev)
++u32 rkisp_dmarx_get_frame_id(struct rkisp_device *dev, bool sync)
+ {
+-	if (dev->dmarx_dev.trigger == T_MANUAL)
+-		return dev->dmarx_dev.frame_id;
+-	else
++	unsigned long flag = 0;
++	u32 id;
++
++	if (!dev->dmarx_dev.trigger)
+ 		return atomic_read(&dev->isp_sdev.frm_sync_seq) - 1;
++
++	spin_lock_irqsave(&dev->csi_dev.rdbk_lock, flag);
++	if (sync || dev->csi_dev.is_isp_end)
++		id = dev->dmarx_dev.cur_frame_id;
++	else
++		id = dev->dmarx_dev.pre_frame_id;
++	spin_unlock_irqrestore(&dev->csi_dev.rdbk_lock, flag);
++	return id;
+ }
+ 
+ int rkisp_register_dmarx_vdev(struct rkisp_device *dev)
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.h b/drivers/media/platform/rockchip/isp/dmarx.h
+index 828d0c3c7d83..226bf963adda 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.h
++++ b/drivers/media/platform/rockchip/isp/dmarx.h
+@@ -26,16 +26,23 @@ enum rkisp_dmarx_trigger {
+ 	T_MANUAL,
+ };
+ 
++/*
++ * struct rkisp_dmarx_device
++ * trigger: read back mode
++ * cur_frame_id: current frame id
++ * pre_frame_id: previous frame id
++ */
+ struct rkisp_dmarx_device {
+ 	struct rkisp_device *ispdev;
+ 	struct rkisp_stream stream[RKISP_MAX_DMARX_STREAM];
+ 	enum rkisp_dmarx_trigger trigger;
+-	u32 frame_id;
++	u32 cur_frame_id;
++	u32 pre_frame_id;
+ };
+ 
+ void rkisp_dmarx_isr(u32 mis_val, struct rkisp_device *dev);
+ void rkisp2_rawrd_isr(u32 mis_val, struct rkisp_device *dev);
+-u32 rkisp_dmarx_get_frame_id(struct rkisp_device *dev);
++u32 rkisp_dmarx_get_frame_id(struct rkisp_device *dev, bool sync);
+ void rkisp_unregister_dmarx_vdev(struct rkisp_device *dev);
+ int rkisp_register_dmarx_vdev(struct rkisp_device *dev);
+ #endif /* _RKISP_DMARX_H */
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index f5a24751d4d8..93c61f381c0c 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -4225,7 +4225,7 @@ rkisp_params_isr_v2x(struct rkisp_isp_params_vdev *params_vdev,
+ 		     u32 isp_mis)
+ {
+ 	struct rkisp_device *dev = params_vdev->dev;
+-	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev);
++	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev, true);
+ 
+ 	if (isp_mis & CIF_ISP_V_START) {
+ 		if (!params_vdev->cur_buf)
+diff --git a/drivers/media/platform/rockchip/isp/isp_stats_v2x.c b/drivers/media/platform/rockchip/isp/isp_stats_v2x.c
+index 81004dcbf5b1..6c76f126e9fd 100644
+--- a/drivers/media/platform/rockchip/isp/isp_stats_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_stats_v2x.c
+@@ -1148,14 +1148,7 @@ rkisp_stats_send_meas_v2x(struct rkisp_isp_stats_vdev *stats_vdev,
+ 	struct rkisp_stats_v2x_ops *ops =
+ 		(struct rkisp_stats_v2x_ops *)stats_vdev->priv_ops;
+ 
+-	cur_frame_id = rkisp_dmarx_get_frame_id(stats_vdev->dev);
+-	if (cur_frame_id != meas_work->frame_id) {
+-		v4l2_warn(stats_vdev->vnode.vdev.v4l2_dev,
+-			  "Measurement late(%d, %d)\n",
+-			  cur_frame_id, meas_work->frame_id);
+-		cur_frame_id = meas_work->frame_id;
+-	}
+-
++	cur_frame_id = meas_work->frame_id;
+ 	spin_lock(&stats_vdev->rd_lock);
+ 	/* get one empty buffer */
+ 	if (!list_empty(&stats_vdev->stat)) {
+@@ -1344,7 +1337,7 @@ rkisp_stats_isr_v2x(struct rkisp_isp_stats_vdev *stats_vdev,
+ 	struct rkisp_device *dev = stats_vdev->dev;
+ 	u32 isp_mis_tmp = 0;
+ 	struct rkisp_isp_readout_work work;
+-	u32 cur_frame_id = rkisp_dmarx_get_frame_id(stats_vdev->dev);
++	u32 cur_frame_id = rkisp_dmarx_get_frame_id(stats_vdev->dev, true);
+ 	u32 iq_isr_mask = ISP2X_SIAWB_DONE | ISP2X_SIAF_FIN |
+ 		ISP2X_YUVAE_END | ISP2X_SIHST_RDY | ISP2X_AFM_SUM_OF | ISP2X_AFM_LUM_OF;
+ 	u32 iq_3a_mask = 0;
+@@ -1355,10 +1348,8 @@ rkisp_stats_isr_v2x(struct rkisp_isp_stats_vdev *stats_vdev,
+ #ifdef LOG_ISR_EXE_TIME
+ 	ktime_t in_t = ktime_get();
+ #endif
+-
+ 	if (IS_HDR_RDBK(dev->hdr.op_mode))
+ 		iq_3a_mask = ISP2X_3A_RAWAE_BIG;
+-
+ 	spin_lock(&stats_vdev->irq_lock);
+ 
+ 	temp_isp_ris = readl(stats_vdev->dev->base_addr + ISP_ISP_RIS);
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 5e50d08b81a2..b50aa535353d 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1731,6 +1731,9 @@ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ 	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
+ 	long ret = 0;
+ 
++	if (!arg)
++		return -EINVAL;
++
+ 	switch (cmd) {
+ 	case RKISP_CMD_TRIGGER_READ_BACK:
+ 		rkisp_csi_trigger_event(&isp_dev->csi_dev, arg);
+@@ -1760,6 +1763,9 @@ static long rkisp_compat_ioctl32(struct v4l2_subdev *sd,
+ 	long ret = 0;
+ 	int mode;
+ 
++	if (!up)
++		return -EINVAL;
++
+ 	switch (cmd) {
+ 	case RKISP_CMD_TRIGGER_READ_BACK:
+ 		ret = copy_from_user(&trigger, up, sizeof(trigger));
+@@ -2134,10 +2140,8 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 	 */
+ 	rkisp_params_isr(&dev->params_vdev, isp_mis);
+ 
+-	if (isp_mis & CIF_ISP_FRAME) {
+-		dev->csi_dev.is_isp_end = true;
++	if (isp_mis & CIF_ISP_FRAME)
+ 		rkisp_csi_trigger_event(&dev->csi_dev, NULL);
+-	}
+ }
+ 
+ irqreturn_t rkisp_vs_isr_handler(int irq, void *ctx)
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 1df7e213e372..161fb765c379 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -1800,12 +1800,15 @@ static void fec_work_event(struct rkispp_device *dev,
+ 	void __iomem *base = dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	unsigned long lock_flags = 0;
+-	bool is_start = false;
++	bool is_start = false, is_quick = false;
+ 	u32 val;
+ 
+ 	if (!(vdev->module_ens & ISPP_MODULE_FEC))
+ 		return;
+ 
++	if (dev->inp == INP_ISP && dev->isp_mode & ISP_ISPP_QUICK)
++		is_quick = true;
++
+ 	spin_lock_irqsave(&vdev->fec.buf_lock, lock_flags);
+ 
+ 	/* event from fec frame end */
+@@ -1855,8 +1858,10 @@ static void fec_work_event(struct rkispp_device *dev,
+ 	if (is_start) {
+ 		u32 seq = 0;
+ 
+-		if (vdev->fec.cur_rd)
++		if (vdev->fec.cur_rd && !is_quick) {
+ 			seq = vdev->fec.cur_rd->id;
++			atomic_set(&dev->ispp_sdev.frm_sync_seq, seq);
++		}
+ 		writel(FEC_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+ 		v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+ 			 "FEC start seq:%d | Y_SHD rd:0x%x\n",
+@@ -1883,6 +1888,7 @@ static void nr_work_event(struct rkispp_device *dev,
+ 	unsigned long lock_flags = 0;
+ 	bool is_start = false, is_quick = false;
+ 	bool is_tnr_en = (vdev->module_ens & ISPP_MODULE_TNR);
++	bool is_fec_en = (vdev->module_ens & ISPP_MODULE_FEC);
+ 	u32 val;
+ 
+ 	if (!(vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)))
+@@ -2005,11 +2011,10 @@ static void nr_work_event(struct rkispp_device *dev,
+ 
+ 		if (vdev->nr.cur_rd) {
+ 			seq = vdev->nr.cur_rd->frame_id;
+-			if (sd)
+-				atomic_set(&dev->ispp_sdev.frm_sync_seq,
+-					   vdev->nr.cur_rd->frame_id);
+ 			if (vdev->nr.cur_wr)
+ 				vdev->nr.cur_wr->id = seq;
++			if (!is_fec_en && !is_quick)
++				atomic_set(&dev->ispp_sdev.frm_sync_seq, seq);
+ 		}
+ 
+ 		writel(OTHER_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
+@@ -2177,8 +2182,7 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 		u32 seq = 0;
+ 
+ 		if (vdev->tnr.cur_rd) {
+-			seq = vdev->tnr.cur_rd->frame_id - is_3to1;
+-			atomic_set(&dev->ispp_sdev.frm_sync_seq, seq);
++			seq = vdev->tnr.cur_rd->frame_id;
+ 			if (vdev->tnr.cur_wr)
+ 				vdev->tnr.cur_wr->frame_id = seq;
+ 		}
+-- 
+2.35.3
+

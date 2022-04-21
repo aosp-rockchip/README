@@ -1,0 +1,431 @@
+From ed6e17cd563365482fcb11397217c765dbbc45d5 Mon Sep 17 00:00:00 2001
+From: Lin Jinhan <troy.lin@rock-chips.com>
+Date: Fri, 7 Aug 2020 14:39:29 +0800
+Subject: [PATCH] crypto: rockchip: fix bugs on multithreading support
+
+Add mutex to prevent race conditions.
+
+Change-Id: I5e0f10c308ee7ce58b2622ede955472e2f6dface
+Signed-off-by: Lin Jinhan <troy.lin@rock-chips.com>
+---
+ drivers/crypto/rockchip/rk_crypto_core.c      | 53 +++++++++++--------
+ drivers/crypto/rockchip/rk_crypto_core.h      |  5 +-
+ .../crypto/rockchip/rk_crypto_v1_ablkcipher.c | 22 +++++---
+ drivers/crypto/rockchip/rk_crypto_v1_ahash.c  | 27 ++++++----
+ .../crypto/rockchip/rk_crypto_v2_ablkcipher.c | 27 ++++++----
+ drivers/crypto/rockchip/rk_crypto_v2_ahash.c  | 24 +++++----
+ .../crypto/rockchip/rk_crypto_v2_akcipher.c   | 22 +++++---
+ 7 files changed, 108 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/crypto/rockchip/rk_crypto_core.c b/drivers/crypto/rockchip/rk_crypto_core.c
+index 48fbdf9edeba..0c516eb383af 100644
+--- a/drivers/crypto/rockchip/rk_crypto_core.c
++++ b/drivers/crypto/rockchip/rk_crypto_core.c
+@@ -53,39 +53,25 @@
+ 	.hw_info_size = sizeof(struct rk_hw_crypto_v2_info),\
+ }
+ 
+-static int crypto_clk_enable_cnt;
+-
+ static int rk_crypto_enable_clk(struct rk_crypto_info *dev)
+ {
+ 	int ret;
+ 
+ 	dev_dbg(dev->dev, "clk_bulk_prepare_enable.\n");
+ 
+-	if (crypto_clk_enable_cnt <= 0) {
+-		ret = clk_bulk_prepare_enable(dev->soc_data->clks_num,
+-					      &dev->clk_bulks[0]);
+-		if (ret < 0) {
+-			dev_err(dev->dev, "failed to enable clks %d\n", ret);
+-			return ret;
+-		}
++	ret = clk_bulk_prepare_enable(dev->soc_data->clks_num,
++				      &dev->clk_bulks[0]);
++	if (ret < 0)
++		dev_err(dev->dev, "failed to enable clks %d\n", ret);
+ 
+-		crypto_clk_enable_cnt = 1;
+-	} else {
+-		crypto_clk_enable_cnt++;
+-	}
+-	return 0;
++	return ret;
+ }
+ 
+ static void rk_crypto_disable_clk(struct rk_crypto_info *dev)
+ {
+ 	dev_dbg(dev->dev, "clk_bulk_disable_unprepare.\n");
+ 
+-	crypto_clk_enable_cnt--;
+-
+-	if (crypto_clk_enable_cnt <= 0) {
+-		crypto_clk_enable_cnt = 0;
+-		clk_bulk_disable_unprepare(dev->soc_data->clks_num, &dev->clk_bulks[0]);
+-	}
++	clk_bulk_disable_unprepare(dev->soc_data->clks_num, &dev->clk_bulks[0]);
+ }
+ 
+ static int check_alignment(struct scatterlist *sg_src,
+@@ -362,6 +348,24 @@ static void rk_crypto_unregister(struct rk_crypto_info *crypto_info)
+ 	}
+ }
+ 
++static void rk_crypto_request(struct rk_crypto_info *dev, const char *name)
++{
++	CRYPTO_TRACE("Crypto is requested by %s\n", name);
++
++	mutex_lock(&dev->mutex);
++
++	rk_crypto_enable_clk(dev);
++}
++
++static void rk_crypto_release(struct rk_crypto_info *dev, const char *name)
++{
++	CRYPTO_TRACE("Crypto is released by %s\n", name);
++
++	rk_crypto_disable_clk(dev);
++
++	mutex_unlock(&dev->mutex);
++}
++
+ static void rk_crypto_action(void *data)
+ {
+ 	struct rk_crypto_info *crypto_info = data;
+@@ -607,8 +611,10 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 		     rk_crypto_done_task_cb, (unsigned long)crypto_info);
+ 	crypto_init_queue(&crypto_info->queue, 50);
+ 
+-	crypto_info->enable_clk = rk_crypto_enable_clk;
+-	crypto_info->disable_clk = rk_crypto_disable_clk;
++	mutex_init(&crypto_info->mutex);
++
++	crypto_info->request_crypto = rk_crypto_request;
++	crypto_info->release_crypto = rk_crypto_release;
+ 	crypto_info->load_data = rk_load_data;
+ 	crypto_info->unload_data = rk_unload_data;
+ 	crypto_info->enqueue = rk_crypto_enqueue;
+@@ -624,6 +630,7 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_register_alg:
++	mutex_destroy(&crypto_info->mutex);
+ 	tasklet_kill(&crypto_info->queue_task);
+ 	tasklet_kill(&crypto_info->done_task);
+ err_crypto:
+@@ -643,6 +650,8 @@ static int rk_crypto_remove(struct platform_device *pdev)
+ 
+ 	crypto_info->soc_data->hw_deinit(&pdev->dev, crypto_info->hw_info);
+ 
++	mutex_destroy(&crypto_info->mutex);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/crypto/rockchip/rk_crypto_core.h b/drivers/crypto/rockchip/rk_crypto_core.h
+index f6e85733cfc8..a3fef5f2cc13 100644
+--- a/drivers/crypto/rockchip/rk_crypto_core.h
++++ b/drivers/crypto/rockchip/rk_crypto_core.h
+@@ -53,6 +53,7 @@ struct rk_crypto_info {
+ 	void				*hw_info;
+ 	/* device lock */
+ 	spinlock_t			lock;
++	struct mutex			mutex;
+ 
+ 	/* the public variable */
+ 	struct scatterlist		*sg_src;
+@@ -72,11 +73,11 @@ struct rk_crypto_info {
+ 	dma_addr_t			addr_in;
+ 	dma_addr_t			addr_out;
+ 	bool				busy;
++	void (*request_crypto)(struct rk_crypto_info *dev, const char *name);
++	void (*release_crypto)(struct rk_crypto_info *dev, const char *name);
+ 	int (*start)(struct rk_crypto_info *dev);
+ 	int (*update)(struct rk_crypto_info *dev);
+ 	void (*complete)(struct crypto_async_request *base, int err);
+-	int (*enable_clk)(struct rk_crypto_info *dev);
+-	void (*disable_clk)(struct rk_crypto_info *dev);
+ 	int (*irq_handle)(int irq, void *dev_id);
+ 	int (*load_data)(struct rk_crypto_info *dev,
+ 			 struct scatterlist *sg_src,
+diff --git a/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c b/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
+index a81654f51ade..256b12a97118 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
++++ b/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
+@@ -361,17 +361,23 @@ static int rk_ablk_cra_init(struct crypto_tfm *tfm)
+ 	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct crypto_alg *alg = tfm->__crt_alg;
+ 	struct rk_crypto_tmp *algt;
++	struct rk_crypto_info *info;
+ 
+ 	algt = container_of(alg, struct rk_crypto_tmp, alg.crypto);
++	info = algt->dev;
+ 
+-	ctx->dev = algt->dev;
+-	ctx->dev->align_size = crypto_tfm_alg_alignmask(tfm) + 1;
+-	ctx->dev->start = rk_ablk_start;
+-	ctx->dev->update = rk_ablk_rx;
+-	ctx->dev->complete = rk_crypto_complete;
+-	ctx->dev->irq_handle = rk_crypto_irq_handle;
++	if (!info->request_crypto)
++		return -EFAULT;
+ 
+-	ctx->dev->enable_clk(ctx->dev);
++	info->request_crypto(info, crypto_tfm_alg_name(tfm));
++
++	info->align_size = crypto_tfm_alg_alignmask(tfm) + 1;
++	info->start = rk_ablk_start;
++	info->update = rk_ablk_rx;
++	info->complete = rk_crypto_complete;
++	info->irq_handle = rk_crypto_irq_handle;
++
++	ctx->dev = info;
+ 
+ 	return 0;
+ }
+@@ -380,7 +386,7 @@ static void rk_ablk_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	ctx->dev->disable_clk(ctx->dev);
++	ctx->dev->release_crypto(ctx->dev, crypto_tfm_alg_name(tfm));
+ }
+ 
+ int rk_hw_crypto_v1_init(struct device *dev, void *hw_info)
+diff --git a/drivers/crypto/rockchip/rk_crypto_v1_ahash.c b/drivers/crypto/rockchip/rk_crypto_v1_ahash.c
+index d8652fed9403..db92cac84762 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v1_ahash.c
++++ b/drivers/crypto/rockchip/rk_crypto_v1_ahash.c
+@@ -292,30 +292,35 @@ static int rk_cra_hash_init(struct crypto_tfm *tfm)
+ 	struct rk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct rk_crypto_tmp *algt;
+ 	struct ahash_alg *alg = __crypto_ahash_alg(tfm->__crt_alg);
+-
+ 	const char *alg_name = crypto_tfm_alg_name(tfm);
++	struct rk_crypto_info *info;
+ 
+ 	algt = container_of(alg, struct rk_crypto_tmp, alg.hash);
++	info = algt->dev;
++
++	if (!info->request_crypto)
++		return -EFAULT;
++
++	info->request_crypto(info, crypto_tfm_alg_name(tfm));
++
++	info->start = rk_ahash_start;
++	info->update = rk_ahash_crypto_rx;
++	info->complete = rk_ahash_crypto_complete;
++	info->irq_handle = rk_crypto_irq_handle;
+ 
+-	ctx->dev = algt->dev;
+-	ctx->dev->start = rk_ahash_start;
+-	ctx->dev->update = rk_ahash_crypto_rx;
+-	ctx->dev->complete = rk_ahash_crypto_complete;
+-	ctx->dev->irq_handle = rk_crypto_irq_handle;
++	ctx->dev = info;
+ 
+ 	/* for fallback */
+ 	ctx->fallback_tfm = crypto_alloc_ahash(alg_name, 0,
+ 					       CRYPTO_ALG_NEED_FALLBACK);
+ 	if (IS_ERR(ctx->fallback_tfm)) {
+-		dev_err(ctx->dev->dev, "Could not load fallback driver.\n");
++		dev_err(info->dev, "Could not load fallback driver.\n");
+ 		return PTR_ERR(ctx->fallback_tfm);
+ 	}
+ 	crypto_ahash_set_reqsize(__crypto_ahash_cast(tfm),
+ 				 sizeof(struct rk_ahash_rctx) +
+ 				 crypto_ahash_reqsize(ctx->fallback_tfm));
+ 
+-	ctx->dev->enable_clk(ctx->dev);
+-
+ 	return 0;
+ }
+ 
+@@ -323,10 +328,10 @@ static void rk_cra_hash_exit(struct crypto_tfm *tfm)
+ {
+ 	struct rk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	ctx->dev->disable_clk(ctx->dev);
+-
+ 	if (ctx->fallback_tfm)
+ 		crypto_free_ahash(ctx->fallback_tfm);
++
++	ctx->dev->release_crypto(ctx->dev, crypto_tfm_alg_name(tfm));
+ }
+ 
+ struct rk_crypto_tmp rk_v1_ahash_sha1 = RK_HASH_ALGO_INIT(SHA1, sha1);
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c b/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
+index 9a09cf9ac8ec..a3da9e181b0b 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
++++ b/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
+@@ -515,15 +515,22 @@ static int rk_ablk_cra_init(struct crypto_tfm *tfm)
+ 	struct rk_crypto_tmp *algt = rk_cipher_get_algt(__crypto_ablkcipher_cast(tfm));
+ 	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	const char *alg_name = crypto_tfm_alg_name(tfm);
++	struct rk_crypto_info *info = algt->dev;
+ 
+ 	CRYPTO_TRACE();
+ 
+-	ctx->dev = algt->dev;
+-	ctx->dev->align_size = crypto_tfm_alg_blocksize(tfm);
+-	ctx->dev->start = rk_ablk_start;
+-	ctx->dev->update = rk_ablk_rx;
+-	ctx->dev->complete = rk_crypto_complete;
+-	ctx->dev->irq_handle = rk_crypto_irq_handle;
++	if (!info->request_crypto)
++		return -EFAULT;
++
++	info->request_crypto(info, alg_name);
++
++	info->align_size = crypto_tfm_alg_blocksize(tfm);
++	info->start = rk_ablk_start;
++	info->update = rk_ablk_rx;
++	info->complete = rk_crypto_complete;
++	info->irq_handle = rk_crypto_irq_handle;
++
++	ctx->dev = info;
+ 
+ 	if (algt->alg.crypto.cra_flags & CRYPTO_ALG_NEED_FALLBACK) {
+ 		CRYPTO_MSG("alloc fallback tfm, name = %s", alg_name);
+@@ -531,14 +538,12 @@ static int rk_ablk_cra_init(struct crypto_tfm *tfm)
+ 							  CRYPTO_ALG_ASYNC |
+ 							  CRYPTO_ALG_NEED_FALLBACK);
+ 		if (IS_ERR(ctx->fallback_tfm)) {
+-			dev_err(ctx->dev->dev, "Could not load fallback driver %s : %ld.\n",
++			dev_err(info->dev, "Could not load fallback driver %s : %ld.\n",
+ 				alg_name, PTR_ERR(ctx->fallback_tfm));
+ 			return PTR_ERR(ctx->fallback_tfm);
+ 		}
+ 	}
+ 
+-	ctx->dev->enable_clk(ctx->dev);
+-
+ 	return 0;
+ }
+ 
+@@ -551,12 +556,12 @@ static void rk_ablk_cra_exit(struct crypto_tfm *tfm)
+ 	/* clear BC_CTL */
+ 	CRYPTO_WRITE(ctx->dev, CRYPTO_BC_CTL, 0 | CRYPTO_WRITE_MASK_ALL);
+ 
+-	ctx->dev->disable_clk(ctx->dev);
+-
+ 	if (ctx->fallback_tfm) {
+ 		CRYPTO_MSG("free fallback tfm");
+ 		crypto_free_skcipher(ctx->fallback_tfm);
+ 	}
++
++	ctx->dev->release_crypto(ctx->dev, crypto_tfm_alg_name(tfm));
+ }
+ 
+ int rk_hw_crypto_v2_init(struct device *dev, void *hw_info)
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_ahash.c b/drivers/crypto/rockchip/rk_crypto_v2_ahash.c
+index 9ac3d63b5f28..a8f15b94ad0f 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v2_ahash.c
++++ b/drivers/crypto/rockchip/rk_crypto_v2_ahash.c
+@@ -574,22 +574,28 @@ static int rk_cra_hash_init(struct crypto_tfm *tfm)
+ 	struct rk_crypto_tmp *algt = rk_ahash_get_algt(__crypto_ahash_cast(tfm));
+ 	const char *alg_name = crypto_tfm_alg_name(tfm);
+ 	struct rk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
++	struct rk_crypto_info *info = algt->dev;
+ 
+ 	CRYPTO_TRACE();
+ 
++	if (!info->request_crypto)
++		return -EFAULT;
++
++	info->request_crypto(info, alg_name);
++	info->start = rk_ahash_start;
++	info->update = rk_ahash_crypto_rx;
++	info->complete = rk_ahash_crypto_complete;
++	info->irq_handle = rk_crypto_irq_handle;
++
+ 	memset(ctx, 0x00, sizeof(*ctx));
+ 
+-	ctx->dev = algt->dev;
+-	ctx->dev->start = rk_ahash_start;
+-	ctx->dev->update = rk_ahash_crypto_rx;
+-	ctx->dev->complete = rk_ahash_crypto_complete;
+-	ctx->dev->irq_handle = rk_crypto_irq_handle;
++	ctx->dev = info;
+ 
+ 	/* for fallback */
+ 	ctx->fallback_tfm = crypto_alloc_ahash(alg_name, 0,
+ 					       CRYPTO_ALG_NEED_FALLBACK);
+ 	if (IS_ERR(ctx->fallback_tfm)) {
+-		dev_err(ctx->dev->dev, "Could not load fallback driver.\n");
++		dev_err(info->dev, "Could not load fallback driver.\n");
+ 		return PTR_ERR(ctx->fallback_tfm);
+ 	}
+ 
+@@ -597,8 +603,6 @@ static int rk_cra_hash_init(struct crypto_tfm *tfm)
+ 				 sizeof(struct rk_ahash_rctx) +
+ 				 crypto_ahash_reqsize(ctx->fallback_tfm));
+ 
+-	ctx->dev->enable_clk(ctx->dev);
+-
+ 	return 0;
+ }
+ 
+@@ -611,10 +615,10 @@ static void rk_cra_hash_exit(struct crypto_tfm *tfm)
+ 	/* clear HASH_CTL */
+ 	CRYPTO_WRITE(ctx->dev, CRYPTO_HASH_CTL, CRYPTO_WRITE_MASK_ALL | 0);
+ 
+-	ctx->dev->disable_clk(ctx->dev);
+-
+ 	if (ctx->fallback_tfm)
+ 		crypto_free_ahash(ctx->fallback_tfm);
++
++	ctx->dev->release_crypto(ctx->dev, crypto_tfm_alg_name(tfm));
+ }
+ 
+ struct rk_crypto_tmp rk_v2_ahash_md5 = RK_HASH_ALGO_INIT(MD5, md5);
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c b/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
+index 02c4cea9dfdb..95598d37d11f 100644
+--- a/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
++++ b/drivers/crypto/rockchip/rk_crypto_v2_akcipher.c
+@@ -247,18 +247,24 @@ static int rk_rsa_init_tfm(struct crypto_akcipher *tfm)
+ 	struct rk_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
+ 	struct akcipher_alg *alg = __crypto_akcipher_alg(tfm->base.__crt_alg);
+ 	struct rk_crypto_tmp *algt;
++	struct rk_crypto_info *info;
+ 
+ 	CRYPTO_TRACE();
+ 
+ 	algt = container_of(alg, struct rk_crypto_tmp, alg.asym);
++	info = algt->dev;
+ 
+-	ctx->dev = algt->dev;
+-	ctx->dev->align_size = crypto_tfm_alg_alignmask(&tfm->base) + 1;
+-	ctx->dev->start = rk_rsa_start;
+-	ctx->dev->update = rk_rsa_crypto_rx;
+-	ctx->dev->complete = rk_rsa_complete;
++	if (!info->request_crypto)
++		return -EFAULT;
+ 
+-	ctx->dev->enable_clk(ctx->dev);
++	info->request_crypto(info, "rsa");
++
++	info->align_size = crypto_tfm_alg_alignmask(&tfm->base) + 1;
++	info->start = rk_rsa_start;
++	info->update = rk_rsa_crypto_rx;
++	info->complete = rk_rsa_complete;
++
++	ctx->dev = info;
+ 
+ 	rk_pka_set_crypto_base(ctx->dev->reg);
+ 
+@@ -271,9 +277,9 @@ static void rk_rsa_exit_tfm(struct crypto_akcipher *tfm)
+ 
+ 	CRYPTO_TRACE();
+ 
+-	ctx->dev->disable_clk(ctx->dev);
+-
+ 	rk_rsa_clear_ctx(ctx);
++
++	ctx->dev->release_crypto(ctx->dev, "rsa");
+ }
+ 
+ struct rk_crypto_tmp rk_v2_asym_rsa = {
+-- 
+2.35.3
+

@@ -1,0 +1,283 @@
+From c6e6466d054f5a03c0a1cbcf7911dde06a549324 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Wed, 28 Dec 2011 14:43:33 +0800
+Subject: [PATCH] power: fix lcd resume taking long time with an ongoing file
+ copy
+
+port from msm:
+This fixes the issue where LCD takes a long time to come back up
+since the execution of backlight on and late_resume works by the
+suspend worker thread is delayed due to one (or more) of the
+sys_sync calls in early_suspend and suspend paths taking a long
+time (sometimes 15sec or more) for the below reported scenario(s):
+
+Scenario 1 (copy with usb connected):
+1. plug usb
+2. adb shell
+3. busybox cp /sdcard/file1 /sdcard/file2 (copy >= 100MB file1
+   in sdcard/emmc to file2 in sdcard/emmc)
+4. press end key to suspend
+5. press end key again and it takes a long time for LCD to come
+   back up
+
+Scenario 2 (background copy):
+1. plug usb
+2. adb shell
+3. busybox cp /sdcard/file1 /sdcard/file2 & (copy >= 100MB file1
+   in sdcard/emmc to file2 in sdcard/emmc)
+4. disconnect usb
+5. press end key to suspend
+6. press end key again and it takes a long time for LCD to come
+   back up
+
+A more common form of Scenario 2 is for the user to just use the
+copy function on the UI to copy large file(s).
+
+We address this by moving sys_sync calls to a separate workqueue
+and having a timeout polling based mechanism to bail out of suspend
+in case of user invoking a wakeup event (like end key press) while
+we are waiting for the sys_sync completion at the synchronization
+point in suspend worker thread context.
+---
+ kernel/power/Kconfig        |  5 ++
+ kernel/power/earlysuspend.c |  4 ++
+ kernel/power/power.h        |  5 ++
+ kernel/power/process.c      |  7 +++
+ kernel/power/suspend.c      |  4 ++
+ kernel/power/wakelock.c     | 93 +++++++++++++++++++++++++++++++++++++
+ 6 files changed, 118 insertions(+)
+
+diff --git a/kernel/power/Kconfig b/kernel/power/Kconfig
+index b90fb99fe45f..d50bb90e1c1f 100644
+--- a/kernel/power/Kconfig
++++ b/kernel/power/Kconfig
+@@ -301,3 +301,8 @@ config SUSPEND_TIME
+ 	  Prints the time spent in suspend in the kernel log, and
+ 	  keeps statistics on the time spent in suspend in
+ 	  /sys/kernel/debug/suspend_time
++
++config SUSPEND_SYNC_WORKQUEUE
++	bool "Suspend sync in workqueue"
++	depends on WAKELOCK
++	default y
+diff --git a/kernel/power/earlysuspend.c b/kernel/power/earlysuspend.c
+index b15f02eba45c..ba5e9763a8a3 100644
+--- a/kernel/power/earlysuspend.c
++++ b/kernel/power/earlysuspend.c
+@@ -103,10 +103,14 @@ static void early_suspend(struct work_struct *work)
+ 	}
+ 	mutex_unlock(&early_suspend_lock);
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	suspend_sys_sync_queue();
++#else
+ 	if (debug_mask & DEBUG_SUSPEND)
+ 		pr_info("early_suspend: sync\n");
+ 
+ 	sys_sync();
++#endif
+ abort:
+ 	spin_lock_irqsave(&state_lock, irqflags);
+ 	if (state == SUSPEND_REQUESTED_AND_SUSPENDED)
+diff --git a/kernel/power/power.h b/kernel/power/power.h
+index b6b9006480ff..ae075550a967 100644
+--- a/kernel/power/power.h
++++ b/kernel/power/power.h
+@@ -253,6 +253,11 @@ extern struct wake_lock main_wake_lock;
+ extern suspend_state_t requested_suspend_state;
+ #endif
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++extern void suspend_sys_sync_queue(void);
++extern int suspend_sys_sync_wait(void);
++#endif
++
+ #ifdef CONFIG_USER_WAKELOCK
+ ssize_t wake_lock_show(struct kobject *kobj, struct kobj_attribute *attr,
+ 			char *buf);
+diff --git a/kernel/power/process.c b/kernel/power/process.c
+index dd7d22d2c0ff..134eb87d0a5d 100644
+--- a/kernel/power/process.c
++++ b/kernel/power/process.c
+@@ -17,6 +17,7 @@
+ #include <linux/delay.h>
+ #include <linux/workqueue.h>
+ #include <linux/wakelock.h>
++#include "power.h"
+ 
+ /* 
+  * Timeout for stopping processes
+@@ -159,6 +160,12 @@ int freeze_processes(void)
+ 		goto Exit;
+ 	printk("done.\n");
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	error = suspend_sys_sync_wait();
++	if (error)
++		goto Exit;
++#endif
++
+ 	printk("Freezing remaining freezable tasks ... ");
+ 	error = try_to_freeze_tasks(false);
+ 	if (error)
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 63774df522bf..16e28b1e2a39 100644
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -276,9 +276,13 @@ int enter_state(suspend_state_t state)
+ 	if (!mutex_trylock(&pm_mutex))
+ 		return -EBUSY;
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	suspend_sys_sync_queue();
++#else
+ 	printk(KERN_INFO "PM: Syncing filesystems ... ");
+ 	sys_sync();
+ 	printk("done.\n");
++#endif
+ 
+ 	pr_debug("PM: Preparing system for %s sleep\n", pm_states[state]);
+ 	error = suspend_prepare();
+diff --git a/kernel/power/wakelock.c b/kernel/power/wakelock.c
+index ffba72597e05..a79defae30b6 100644
+--- a/kernel/power/wakelock.c
++++ b/kernel/power/wakelock.c
+@@ -44,6 +44,12 @@ static DEFINE_SPINLOCK(list_lock);
+ static LIST_HEAD(inactive_locks);
+ static struct list_head active_wake_locks[WAKE_LOCK_TYPE_COUNT];
+ static int current_event_num;
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++static int suspend_sys_sync_count;
++static DEFINE_SPINLOCK(suspend_sys_sync_lock);
++static struct workqueue_struct *suspend_sys_sync_work_queue;
++static DECLARE_COMPLETION(suspend_sys_sync_comp);
++#endif
+ struct workqueue_struct *suspend_work_queue;
+ struct wake_lock main_wake_lock;
+ suspend_state_t requested_suspend_state = PM_SUSPEND_MEM;
+@@ -266,6 +272,72 @@ long has_wake_lock(int type)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++static void suspend_sys_sync(struct work_struct *work)
++{
++	if (debug_mask & DEBUG_SUSPEND)
++		pr_info("PM: Syncing filesystems...\n");
++
++	sys_sync();
++
++	if (debug_mask & DEBUG_SUSPEND)
++		pr_info("sync done.\n");
++
++	spin_lock(&suspend_sys_sync_lock);
++	suspend_sys_sync_count--;
++	spin_unlock(&suspend_sys_sync_lock);
++}
++static DECLARE_WORK(suspend_sys_sync_work, suspend_sys_sync);
++
++void suspend_sys_sync_queue(void)
++{
++	int ret;
++
++	spin_lock(&suspend_sys_sync_lock);
++	ret = queue_work(suspend_sys_sync_work_queue, &suspend_sys_sync_work);
++	if (ret)
++		suspend_sys_sync_count++;
++	spin_unlock(&suspend_sys_sync_lock);
++}
++
++static bool suspend_sys_sync_abort;
++static void suspend_sys_sync_handler(unsigned long);
++static DEFINE_TIMER(suspend_sys_sync_timer, suspend_sys_sync_handler, 0, 0);
++/* value should be less then half of input event wake lock timeout value
++ * which is currently set to 5*HZ (see drivers/input/evdev.c)
++ */
++#define SUSPEND_SYS_SYNC_TIMEOUT (HZ/4)
++static void suspend_sys_sync_handler(unsigned long arg)
++{
++	if (suspend_sys_sync_count == 0) {
++		complete(&suspend_sys_sync_comp);
++	} else if (has_wake_lock(WAKE_LOCK_SUSPEND)) {
++		suspend_sys_sync_abort = true;
++		complete(&suspend_sys_sync_comp);
++	} else {
++		mod_timer(&suspend_sys_sync_timer, jiffies +
++				SUSPEND_SYS_SYNC_TIMEOUT);
++	}
++}
++
++int suspend_sys_sync_wait(void)
++{
++	suspend_sys_sync_abort = false;
++
++	if (suspend_sys_sync_count != 0) {
++		mod_timer(&suspend_sys_sync_timer, jiffies +
++				SUSPEND_SYS_SYNC_TIMEOUT);
++		wait_for_completion(&suspend_sys_sync_comp);
++	}
++	if (suspend_sys_sync_abort) {
++		pr_info("suspend aborted....while waiting for sys_sync\n");
++		return -EAGAIN;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_SUSPEND_SYNC_WORKQUEUE */
++
+ static void suspend_backoff(void)
+ {
+ 	pr_info("suspend: too many immediate wakeups, back off\n");
+@@ -286,7 +358,11 @@ static void suspend(struct work_struct *work)
+ 	}
+ 
+ 	entry_event_num = current_event_num;
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	suspend_sys_sync_queue();
++#else
+ 	sys_sync();
++#endif
+ 	if (debug_mask & DEBUG_SUSPEND)
+ 		pr_info("suspend: enter suspend\n");
+ 	getnstimeofday(&ts_entry);
+@@ -594,6 +670,16 @@ static int __init wakelocks_init(void)
+ 		goto err_platform_driver_register;
+ 	}
+ 
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	INIT_COMPLETION(suspend_sys_sync_comp);
++	suspend_sys_sync_work_queue =
++		create_singlethread_workqueue("suspend_sys_sync");
++	if (suspend_sys_sync_work_queue == NULL) {
++		ret = -ENOMEM;
++		goto err_suspend_sys_sync_work_queue;
++	}
++#endif
++
+ 	suspend_work_queue = create_singlethread_workqueue("suspend");
+ 	if (suspend_work_queue == NULL) {
+ 		ret = -ENOMEM;
+@@ -607,6 +693,10 @@ static int __init wakelocks_init(void)
+ 	return 0;
+ 
+ err_suspend_work_queue:
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	destroy_workqueue(suspend_sys_sync_work_queue);
++err_suspend_sys_sync_work_queue:
++#endif
+ 	platform_driver_unregister(&power_driver);
+ err_platform_driver_register:
+ 	platform_device_unregister(&power_device);
+@@ -626,6 +716,9 @@ static void  __exit wakelocks_exit(void)
+ 	remove_proc_entry("wakelocks", NULL);
+ #endif
+ 	destroy_workqueue(suspend_work_queue);
++#ifdef CONFIG_SUSPEND_SYNC_WORKQUEUE
++	destroy_workqueue(suspend_sys_sync_work_queue);
++#endif
+ 	platform_driver_unregister(&power_driver);
+ 	platform_device_unregister(&power_device);
+ 	wake_lock_destroy(&suspend_backoff_lock);
+-- 
+2.35.3
+

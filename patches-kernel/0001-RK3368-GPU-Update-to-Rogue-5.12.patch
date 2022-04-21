@@ -1,0 +1,240 @@
+From 193c4f6202431a698d786896e0d281cafede95c8 Mon Sep 17 00:00:00 2001
+From: ZhuangXiaoLiang <zhuangxl@rock-chips.com>
+Date: Mon, 10 Jul 2017 17:14:17 +0800
+Subject: [PATCH] RK3368 GPU: Update to Rogue 5.12.
+
+1. PP_fix_KM patch from IMG.
+2. Fix PVRSRVDevicePreClockSpeedChange failed.
+
+Change-Id: I8380b5b90a1a493f15cee73fd272b6eeaf5b8135
+Signed-off-by: ZhuangXiaoLiang <zhuangxl@rock-chips.com>
+---
+ drivers/staging/imgtec/pvrversion.h           |  9 ++-
+ drivers/staging/imgtec/rogue/cache_km.c       | 73 ++++++++++++++++---
+ drivers/staging/imgtec/rogue/power.c          | 23 ++++++
+ drivers/staging/imgtec/rogue/power.h          |  2 +-
+ .../staging/imgtec/rogue/pvr_dvfs_device.c    |  3 +-
+ 5 files changed, 97 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/staging/imgtec/pvrversion.h b/drivers/staging/imgtec/pvrversion.h
+index ffc2f7c3830d..fc1391c4f055 100644
+--- a/drivers/staging/imgtec/pvrversion.h
++++ b/drivers/staging/imgtec/pvrversion.h
+@@ -121,6 +121,13 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  * N 5.05
+  *		1. If freq is equal,but voltage is changed,we also set the new voltage.
+  *		2. Only give a warnning when initialize simple power model failed.
++ * N 5.06
++ *		Rebuild ko.
++ * N 5.11
++ *		Even in suspend mode,we still set the gpu clk.
++ * N 5.12
++ *		1. Fix PVRSRVDevicePreClockSpeedChange failed.
++ *		2. Apply PP_fix_KM patch from IMG.
+  */
+ 
+ #define PVR_STR(X) #X
+@@ -148,5 +155,5 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ #define PVRVERSION_UNPACK_MIN(VERSION) (((VERSION) >> 0) & 0xFFFF)
+ 
+ //chenli:define rockchip version
+-#define RKVERSION                   "KM N 5.05"
++#define RKVERSION                   "Rogue N 5.12"
+ #endif /* _PVRVERSION_H_ */
+diff --git a/drivers/staging/imgtec/rogue/cache_km.c b/drivers/staging/imgtec/rogue/cache_km.c
+index 944df4598188..d518af2d85d5 100644
+--- a/drivers/staging/imgtec/rogue/cache_km.c
++++ b/drivers/staging/imgtec/rogue/cache_km.c
+@@ -1331,10 +1331,10 @@ static PVRSRV_ERROR CacheOpExecQueue (PMR **ppsPMR,
+ 
+ 		for (ui32Idx = 0; ui32Idx < ui32NumCacheOps; ui32Idx++)
+ 		{
+-			eError = CacheOpExec(ppsPMR[ui32Idx],
+-								 puiOffset[ui32Idx],
+-								 puiSize[ui32Idx],
+-								 puiCacheOp[ui32Idx]);
++			(void)CacheOpExec(ppsPMR[ui32Idx],
++							  puiOffset[ui32Idx],
++							  puiSize[ui32Idx],
++							  puiCacheOp[ui32Idx]);
+ 		}
+ 
+ 		/* No CacheOp fence dependencies */
+@@ -1342,6 +1342,7 @@ static PVRSRV_ERROR CacheOpExecQueue (PMR **ppsPMR,
+ 	}
+ 	else
+ 	{
++		IMG_DEVMEM_SIZE_T uiLogicalSize;
+ 		CACHEOP_WORK_ITEM *psCacheOpWorkItem = NULL;
+ 
+ 		for (ui32Idx = 0; ui32Idx < ui32NumCacheOps; ui32Idx++)
+@@ -1349,7 +1350,7 @@ static PVRSRV_ERROR CacheOpExecQueue (PMR **ppsPMR,
+ 			/* As PVRSRV_CACHE_OP_INVALIDATE is used to transfer
+ 			   device memory buffer ownership back to processor
+ 			   we cannot defer it so must action it immediately */
+-			if (puiCacheOp[ui32Idx] == PVRSRV_CACHE_OP_INVALIDATE)
++			if (puiCacheOp[ui32Idx] & PVRSRV_CACHE_OP_INVALIDATE)
+ 			{
+ 				eError = CacheOpExec (ppsPMR[ui32Idx],
+ 									  puiOffset[ui32Idx],
+@@ -1368,6 +1369,33 @@ static PVRSRV_ERROR CacheOpExecQueue (PMR **ppsPMR,
+ 				continue;
+ 			}
+ 
++			/* Ensure request is valid before deferring to CacheOp thread */
++			eError = PMR_LogicalSize(ppsPMR[ui32Idx], &uiLogicalSize);
++			if (eError != PVRSRV_OK)
++			{
++				PVR_DPF((CACHEOP_DPFL,
++						"%s: PMR_LogicalSize failed (%u), cannot defer CacheOp",
++						__FUNCTION__, eError));
++
++				/* Signal the CacheOp thread to ensure queued items get processed */
++				(void) OSEventObjectSignal(psPVRSRVData->hCacheOpThreadEventObject);
++				PVR_LOG_IF_ERROR(eError, "OSEventObjectSignal");
++
++				return eError;
++			}
++			else if ((puiOffset[ui32Idx]+puiSize[ui32Idx]) > uiLogicalSize)
++			{
++				PVR_DPF((CACHEOP_DPFL,
++						"%s: Invalid parameters, cannot defer CacheOp",
++						__FUNCTION__));
++
++				/* Signal the CacheOp thread to ensure queued items get processed */
++				(void) OSEventObjectSignal(psPVRSRVData->hCacheOpThreadEventObject);
++				PVR_LOG_IF_ERROR(eError, "OSEventObjectSignal");
++
++				return PVRSRV_ERROR_INVALID_PARAMS;;
++			}
++
+ 			/* For now use dynamic alloc, static CCB _might_ be faster */
+ 			psCacheOpWorkItem = OSAllocMem(sizeof(CACHEOP_WORK_ITEM));
+ 			if (psCacheOpWorkItem == NULL)
+@@ -1452,10 +1480,17 @@ static PVRSRV_ERROR CacheOpExecQueue(PMR **ppsPMR,
+ 
+ 	for (ui32Idx = 0; ui32Idx < ui32NumCacheOps; ui32Idx++)
+ 	{
+-		eError = CacheOpExec(ppsPMR[ui32Idx],
+-							 puiOffset[ui32Idx],
+-							 puiSize[ui32Idx],
+-							 puiCacheOp[ui32Idx]);
++		PVRSRV_ERROR eError2 = CacheOpExec(ppsPMR[ui32Idx],
++										   puiOffset[ui32Idx],
++										   puiSize[ui32Idx],
++										   puiCacheOp[ui32Idx]);
++		if (eError2 != PVRSRV_OK)
++		{
++			eError = eError2;
++			PVR_DPF((CACHEOP_DPFL,
++					"%s: CacheOpExec failed (%u)",
++					__FUNCTION__, eError));
++		}
+ 	}
+ 
+ 	/* For immediate RBF, common/completed are identical */
+@@ -1715,7 +1750,7 @@ PVRSRV_ERROR CacheOpQueue (IMG_UINT32 ui32NumCacheOps,
+ 	for (ui32Idx = 0; ui32Idx < ui32NumCacheOps; ui32Idx++)
+ 	{
+ 		uiCacheOp = SetCacheOp(uiCacheOp, puiCacheOp[ui32Idx]);
+-		if (puiCacheOp[ui32Idx] == PVRSRV_CACHE_OP_INVALIDATE)
++		if (puiCacheOp[ui32Idx] & PVRSRV_CACHE_OP_INVALIDATE)
+ 		{
+ 			/* Cannot be deferred, action now */
+ 			bHasInvalidate = IMG_TRUE;
+@@ -1902,6 +1937,7 @@ PVRSRV_ERROR CacheOpExec (PMR *psPMR,
+ 						  PVRSRV_CACHE_OP uiCacheOp)
+ {
+ 	PVRSRV_ERROR eError;
++	IMG_DEVMEM_SIZE_T uiLogicalSize;
+ 	IMG_BOOL bUsedGlobalFlush = IMG_FALSE;
+ #if	defined(CACHEOP_DEBUG)
+ 	/* This interface is always synchronous and not deferred;
+@@ -1921,6 +1957,23 @@ PVRSRV_ERROR CacheOpExec (PMR *psPMR,
+ 		OSAtomicIncrement(&ghCommonCacheOpSeqNum) : sCacheOpWorkItem.ui32OpSeqNum;
+ #endif
+ 
++	eError = PMR_LogicalSize(psPMR, &uiLogicalSize);
++	if (eError != PVRSRV_OK)
++	{
++		PVR_DPF((CACHEOP_DPFL,
++				"%s: PMR_LogicalSize failed (%u)",
++				__FUNCTION__, eError));
++		goto e0;
++	}
++	else if ((uiOffset+uiSize) > uiLogicalSize)
++	{
++		PVR_DPF((CACHEOP_DPFL,
++				"%s: Invalid parameters",
++				__FUNCTION__));
++		eError = PVRSRV_ERROR_INVALID_PARAMS;
++		goto e0;
++	}
++
+ 	/* Perform range-based cache maintenance operation */
+ 	eError = PMRLockSysPhysAddresses(psPMR);
+ 	if (eError != PVRSRV_OK)
+diff --git a/drivers/staging/imgtec/rogue/power.c b/drivers/staging/imgtec/rogue/power.c
+index 6a041b82be71..977fa8881501 100644
+--- a/drivers/staging/imgtec/rogue/power.c
++++ b/drivers/staging/imgtec/rogue/power.c
+@@ -167,6 +167,29 @@ static IMG_BOOL _IsSystemStatePowered(PVRSRV_SYS_POWER_STATE eSystemPowerState)
+ 	return (eSystemPowerState == PVRSRV_SYS_POWER_STATE_ON);
+ }
+ 
++/*!
++******************************************************************************
++
++ @Function	IsSystemStatePowered
++
++ @Description	Tests whether a given system state represents powered-up.
++
++ @Return	IMG_BOOL
++
++******************************************************************************/
++IMG_EXPORT
++IMG_BOOL IsSystemStatePowered(PVRSRV_DEVICE_NODE *psDeviceNode)
++{
++	OSLockAcquire(psDeviceNode->hPowerLock);
++	if (_IsSystemStatePowered(psDeviceNode->eCurrentSysPowerState))
++	{
++		OSLockRelease(psDeviceNode->hPowerLock);
++		return IMG_TRUE;
++	}
++	OSLockRelease(psDeviceNode->hPowerLock);
++	return IMG_FALSE;
++}
++
+ 
+ /*!
+ ******************************************************************************
+diff --git a/drivers/staging/imgtec/rogue/power.h b/drivers/staging/imgtec/rogue/power.h
+index c8b801bcf6b5..3e0884bd1f95 100644
+--- a/drivers/staging/imgtec/rogue/power.h
++++ b/drivers/staging/imgtec/rogue/power.h
+@@ -80,7 +80,7 @@ typedef struct _PVRSRV_POWER_DEV_TAG_ PVRSRV_POWER_DEV;
+ 
+ typedef IMG_BOOL (*PFN_SYS_DEV_IS_DEFAULT_STATE_OFF)(PVRSRV_POWER_DEV *psPowerDevice);
+ 
+-
++IMG_IMPORT IMG_BOOL IsSystemStatePowered(PVRSRV_DEVICE_NODE *psDeviceNode);
+ IMG_IMPORT PVRSRV_ERROR PVRSRVPowerLock(PVRSRV_DEVICE_NODE *psDeviceNode);
+ IMG_IMPORT void PVRSRVForcedPowerLock(PVRSRV_DEVICE_NODE *psDeviceNode);
+ IMG_IMPORT void PVRSRVPowerUnlock(PVRSRV_DEVICE_NODE *psDeviceNode);
+diff --git a/drivers/staging/imgtec/rogue/pvr_dvfs_device.c b/drivers/staging/imgtec/rogue/pvr_dvfs_device.c
+index 5463fa8f5571..59c8f4a839db 100644
+--- a/drivers/staging/imgtec/rogue/pvr_dvfs_device.c
++++ b/drivers/staging/imgtec/rogue/pvr_dvfs_device.c
+@@ -94,7 +94,8 @@ static IMG_INT32 devfreq_target(struct device *dev, long unsigned *requested_fre
+ 	IMG_UINT32		ui32Freq, ui32CurFreq, ui32Volt, ui32CurVolt;
+ 	struct OPP_STRUCT	*opp;
+ 
+-	if (!psDVFSDevice->bEnabled)
++
++	if (!psDVFSDevice->bEnabled && !IsSystemStatePowered(gpsDeviceNode))
+ 	{
+ 		return 0;
+ 	}
+-- 
+2.35.3
+

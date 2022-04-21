@@ -1,0 +1,145 @@
+From 9b9fea95bfd2c300109649c7e1a8aa950c066907 Mon Sep 17 00:00:00 2001
+From: Wyon Bi <bivvy.bi@rock-chips.com>
+Date: Wed, 14 Mar 2018 10:10:49 +0800
+Subject: [PATCH] drm/rockchip: rgb: Add support for PX30
+
+Change-Id: I56f8edccdc1bca477c81c44a3bcaa7287c7dd7ba
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ .../display/rockchip/rockchip-rgb.txt         | 42 ++++++++++++++++++-
+ drivers/gpu/drm/rockchip/rockchip_rgb.c       | 29 +++++++++++++
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/display/rockchip/rockchip-rgb.txt b/Documentation/devicetree/bindings/display/rockchip/rockchip-rgb.txt
+index 99b27f73e1a2..a53b1f6dea89 100644
+--- a/Documentation/devicetree/bindings/display/rockchip/rockchip-rgb.txt
++++ b/Documentation/devicetree/bindings/display/rockchip/rockchip-rgb.txt
+@@ -1,8 +1,9 @@
+-Rockchip RV1108 RGB interface
++Rockchip RGB interface
+ ================================
+ 
+ Required properties:
+ - compatible: matching the soc type:
++	- "rockchip,px30-rgb";
+ 	- "rockchip,rv1108-rgb";
+ 	- "rockchip,rk3066-rgb";
+ 	- "rockchip,rk3308-rgb";
+@@ -72,3 +73,42 @@ For Rockchip RV1108:
+ 			};
+ 		};
+ 	};
++
++For Rockchip PX30:
++
++	grf: syscon@ff140000 {
++		compatible = "rockchip,px30-grf", "syscon", "simple-mfd";
++		...
++
++		rgb: rgb {
++			compatible = "rockchip,px30-rgb";
++			pinctrl-names = "default";
++			pinctrl-0 = <&lcdc_rgb_dclk_pin
++				     &lcdc_rgb_m0_den_pin
++				     &lcdc_rgb_m0_hsync_pin
++				     &lcdc_rgb_m0_vsync_pin
++				     &lcdc_rgb888_m0_data_pins>;
++			status = "disabled";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					rgb_in_vopb: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&vopb_out_rgb>;
++					};
++
++					rgb_in_vopl: endpoint@1 {
++						reg = <1>;
++						remote-endpoint = <&vopl_out_rgb>;
++					};
++				};
++			};
++		};
++	};
+diff --git a/drivers/gpu/drm/rockchip/rockchip_rgb.c b/drivers/gpu/drm/rockchip/rockchip_rgb.c
+index 09deb92e772d..668ed2bcc820 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_rgb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_rgb.c
+@@ -22,10 +22,18 @@
+ 
+ #include <linux/component.h>
+ #include <linux/of_graph.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
+ 
+ #include "rockchip_drm_drv.h"
+ #include "rockchip_drm_vop.h"
+ 
++#define HIWORD_UPDATE(v, l, h)	(((v) << (l)) | (GENMASK(h, l) << 16))
++#define PX30_GRF_PD_VO_CON1	0x0438
++#define PX30_LCDC_DCLK_INV(v)	HIWORD_UPDATE(v, 4, 4)
++#define PX30_RGB_SYNC_BYPASS(v)	HIWORD_UPDATE(v, 3, 3)
++#define PX30_RGB_VOP_SEL(v)	HIWORD_UPDATE(v, 2, 2)
++
+ #define connector_to_rgb(c) container_of(c, struct rockchip_rgb, connector)
+ #define encoder_to_rgb(c) container_of(c, struct rockchip_rgb, encoder)
+ 
+@@ -38,6 +46,7 @@ struct rockchip_rgb {
+ 	struct drm_encoder encoder;
+ 	struct dev_pin_info *pins;
+ 	int output_mode;
++	struct regmap *grf;
+ };
+ 
+ static inline int name_to_output_mode(const char *s)
+@@ -103,6 +112,15 @@ static void rockchip_rgb_encoder_enable(struct drm_encoder *encoder)
+ {
+ 	struct rockchip_rgb *rgb = encoder_to_rgb(encoder);
+ 
++	if (rgb->grf) {
++		int pipe = drm_of_encoder_active_endpoint_id(rgb->dev->of_node,
++							     encoder);
++		regmap_write(rgb->grf, PX30_GRF_PD_VO_CON1,
++			     PX30_RGB_VOP_SEL(pipe));
++		regmap_write(rgb->grf, PX30_GRF_PD_VO_CON1,
++			     PX30_RGB_SYNC_BYPASS(1));
++	}
++
+ 	drm_panel_prepare(rgb->panel);
+ 	/* iomux to LCD data/sync mode */
+ 	if (rgb->pins && !IS_ERR(rgb->pins->default_state))
+@@ -146,6 +164,8 @@ static const struct drm_encoder_funcs rockchip_rgb_encoder_funcs = {
+ 
+ static const struct of_device_id rockchip_rgb_dt_ids[] = {
+ 	{
++		.compatible = "rockchip,px30-rgb",
++	}, {
+ 		.compatible = "rockchip,rv1108-rgb",
+ 	}, {
+ 		.compatible = "rockchip,rk3066-rgb",
+@@ -322,6 +342,15 @@ static int rockchip_rgb_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
++	if (dev->parent && dev->parent->of_node) {
++		rgb->grf = syscon_node_to_regmap(dev->parent->of_node);
++		if (IS_ERR(rgb->grf)) {
++			ret = PTR_ERR(rgb->grf);
++			dev_err(dev, "Unable to get grf: %d\n", ret);
++			return ret;
++		}
++	}
++
+ 	rgb->pins = devm_kzalloc(rgb->dev, sizeof(*rgb->pins), GFP_KERNEL);
+ 	if (!rgb->pins)
+ 		return -ENOMEM;
+-- 
+2.35.3
+

@@ -1,0 +1,170 @@
+From 8ad93d71d31a48098348ee1e5f3c4df4a8c63ade Mon Sep 17 00:00:00 2001
+From: Finley Xiao <finley.xiao@rock-chips.com>
+Date: Tue, 22 Nov 2016 17:43:43 +0800
+Subject: [PATCH] PM / OPP: Add dev_pm_opp_check_initial_rate()
+
+Bootloader or kernel sets CPU frequency to an initial value before cpufreq
+starts on rockchip platform, if cpu's opp table is modified to a specified
+value, it will cause an issue.
+
+For example, the initial frequency is 816MHz and voltage set by hardware
+is 900mV:
+1. there is only one opp whose frequency is 816MHz and voltage is 850mV
+in opp table list, as they frequency is equal, the voltage will not be
+changed, it is still 900mV and a little too large relative to 850mV.
+2. there is only one opp whose frequency is 1200MHz and voltage is 1100mV
+in opp table list, as it doesn't set voltage to 1100mV before set frequency
+to 1200MHz in the dev_pm_opp_set_rate function, the initial voltage 900mV
+cann't supply for 1200MHz, the system crash.
+
+Change-Id: Id8c5efc34d9c94ff37921b33f5a76e059240d368
+Signed-off-by: Finley Xiao <finley.xiao@rock-chips.com>
+---
+ drivers/base/power/opp/core.c | 105 ++++++++++++++++++++++++++++++++++
+ include/linux/pm_opp.h        |   7 +++
+ 2 files changed, 112 insertions(+)
+
+diff --git a/drivers/base/power/opp/core.c b/drivers/base/power/opp/core.c
+index 9d232ea6c718..cd17cd9eb50d 100644
+--- a/drivers/base/power/opp/core.c
++++ b/drivers/base/power/opp/core.c
+@@ -706,6 +706,111 @@ int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq)
+ }
+ EXPORT_SYMBOL_GPL(dev_pm_opp_set_rate);
+ 
++/**
++ * dev_pm_opp_check_initial_rate() - Configure new OPP based on initial rate
++ * @dev:	 device for which we do this operation
++ *
++ * This configures the power-supplies and clock source to the levels specified
++ * by the OPP corresponding to the system initial rate.
++ *
++ * Locking: This function takes rcu_read_lock().
++ */
++int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq)
++{
++	struct opp_table *opp_table;
++	struct dev_pm_opp *opp;
++	struct regulator *reg;
++	struct clk *clk;
++	unsigned long target_freq, old_freq;
++	unsigned long u_volt, u_volt_min, u_volt_max;
++	int old_volt;
++	int ret;
++
++	rcu_read_lock();
++
++	opp_table = _find_opp_table(dev);
++	if (IS_ERR(opp_table)) {
++		dev_err(dev, "%s: device opp doesn't exist\n", __func__);
++		rcu_read_unlock();
++		return PTR_ERR(opp_table);
++	}
++
++	clk = opp_table->clk;
++	reg = opp_table->regulator;
++
++	old_freq = clk_get_rate(clk);
++	*cur_freq = old_freq;
++	target_freq = old_freq;
++
++	opp = dev_pm_opp_find_freq_ceil(dev, &target_freq);
++	if (IS_ERR(opp)) {
++		opp = dev_pm_opp_find_freq_floor(dev, &target_freq);
++		if (IS_ERR(opp)) {
++			dev_err(dev, "failed to find OPP for freq %lu\n",
++				target_freq);
++			rcu_read_unlock();
++			return PTR_ERR(opp);
++		}
++	}
++
++	u_volt = opp->u_volt;
++	u_volt_min = opp->u_volt_min;
++	u_volt_max = opp->u_volt_max;
++
++	rcu_read_unlock();
++
++	target_freq = clk_round_rate(clk, target_freq);
++	old_volt = regulator_get_voltage(reg);
++
++	dev_dbg(dev, "%lu Hz %d uV --> %lu Hz %lu uV\n", old_freq, old_volt,
++		target_freq, u_volt);
++
++	if (old_freq == target_freq && old_volt == u_volt)
++		return 0;
++
++	if (old_freq == target_freq && old_volt != u_volt) {
++		ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
++				       u_volt_max);
++		if (ret) {
++			dev_err(dev, "failed to set volt %lu\n", u_volt);
++			return ret;
++		}
++		return 0;
++	}
++
++	/* Scaling up? Scale voltage before frequency */
++	if (target_freq > old_freq) {
++		ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
++				       u_volt_max);
++		if (ret) {
++			dev_err(dev, "failed to set volt %lu\n", u_volt);
++			return ret;
++		}
++	}
++
++	/* Change frequency */
++	ret = clk_set_rate(clk, target_freq);
++	if (ret) {
++		dev_err(dev, "failed to set clock rate %lu\n", target_freq);
++		return ret;
++	}
++
++	*cur_freq = clk_get_rate(clk);
++
++	/* Scaling down? Scale voltage after frequency */
++	if (target_freq < old_freq) {
++		ret = _set_opp_voltage(dev, reg, u_volt, u_volt_min,
++				       u_volt_max);
++		if (ret) {
++			dev_err(dev, "failed to set volt %lu\n", u_volt);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dev_pm_opp_check_initial_rate);
++
+ /* OPP-dev Helpers */
+ static void _kfree_opp_dev_rcu(struct rcu_head *head)
+ {
+diff --git a/include/linux/pm_opp.h b/include/linux/pm_opp.h
+index 8c0c6d86e2b4..ce6a29efa9ae 100644
+--- a/include/linux/pm_opp.h
++++ b/include/linux/pm_opp.h
+@@ -69,6 +69,7 @@ void dev_pm_opp_put_prop_name(struct device *dev);
+ int dev_pm_opp_set_regulator(struct device *dev, const char *name);
+ void dev_pm_opp_put_regulator(struct device *dev);
+ int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq);
++int dev_pm_opp_check_initial_rate(struct device *dev, unsigned long *cur_freq);
+ #else
+ static inline unsigned long dev_pm_opp_get_voltage(struct dev_pm_opp *opp)
+ {
+@@ -189,6 +190,12 @@ static inline int dev_pm_opp_set_rate(struct device *dev, unsigned long target_f
+ 	return -EINVAL;
+ }
+ 
++static inline int dev_pm_opp_check_initial_rate(struct device *dev,
++						unsigned long *cur_freq)
++{
++	return -EINVAL;
++}
++
+ #endif		/* CONFIG_PM_OPP */
+ 
+ #if defined(CONFIG_PM_OPP) && defined(CONFIG_OF)
+-- 
+2.35.3
+

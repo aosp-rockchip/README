@@ -1,0 +1,2122 @@
+From b4eb07282a9cc5c9445b092f932070ec9d6211aa Mon Sep 17 00:00:00 2001
+From: zhoupeng <benjo.zhou@rock-chips.com>
+Date: Tue, 19 Sep 2017 11:32:47 +0800
+Subject: [PATCH] media: soc_camera: add adv7181 sensor driver
+
+Change-Id: I09f9e18ae61cdb165236c77ff467449ba6ae2537
+Signed-off-by: Peng Zhou <benjo.zhou@rock-chips.com>
+---
+ drivers/media/i2c/soc_camera/rockchip/Kconfig |    7 +
+ .../media/i2c/soc_camera/rockchip/Makefile    |    1 +
+ .../rockchip/adv7181_v4l2-i2c-subdev.c        |  569 ++++++++
+ .../soc_camera/rockchip/adv_camera_module.c   | 1206 +++++++++++++++++
+ .../soc_camera/rockchip/adv_camera_module.h   |  284 ++++
+ 5 files changed, 2067 insertions(+)
+ create mode 100644 drivers/media/i2c/soc_camera/rockchip/adv7181_v4l2-i2c-subdev.c
+ create mode 100644 drivers/media/i2c/soc_camera/rockchip/adv_camera_module.c
+ create mode 100644 drivers/media/i2c/soc_camera/rockchip/adv_camera_module.h
+
+diff --git a/drivers/media/i2c/soc_camera/rockchip/Kconfig b/drivers/media/i2c/soc_camera/rockchip/Kconfig
+index d277e180fc79..62b759aaa74e 100644
+--- a/drivers/media/i2c/soc_camera/rockchip/Kconfig
++++ b/drivers/media/i2c/soc_camera/rockchip/Kconfig
+@@ -39,3 +39,10 @@ config VIDEO_TC358749XBG
+ 	default n
+ 	---help---
+ 	  This is tc358749xbg hdmi video driver adapt to rockchip cif isp platform.
++
++config VIDEO_ADV7181
++	tristate "adv7181 driver adapt to rockchip cif isp platform"
++	depends on VIDEO_V4L2 && VIDEO_RK_CIF_ISP10 && I2C
++	default n
++	---help---
++	  This is adv7181 cvbs video driver adapt to rockchip cif isp platform.
+diff --git a/drivers/media/i2c/soc_camera/rockchip/Makefile b/drivers/media/i2c/soc_camera/rockchip/Makefile
+index ba29f02768e9..0647d17bdb7c 100644
+--- a/drivers/media/i2c/soc_camera/rockchip/Makefile
++++ b/drivers/media/i2c/soc_camera/rockchip/Makefile
+@@ -4,3 +4,4 @@ obj-$(CONFIG_VIDEO_OV4689) += ov_camera_module.o rk_camera_module.o ov4689_v4l2-
+ obj-$(CONFIG_VIDEO_IMX323) += imx_camera_module.o rk_camera_module.o imx323_v4l2-i2c-subdev.o
+ obj-$(CONFIG_VIDEO_OV7750) += ov_camera_module.o rk_camera_module.o ov7750_v4l2-i2c-subdev.o
+ obj-$(CONFIG_VIDEO_TC358749XBG) += tc_camera_module.o rk_camera_module.o tc358749xbg_v4l2-i2c-subdev.o
++obj-$(CONFIG_VIDEO_ADV7181) += adv_camera_module.o rk_camera_module.o adv7181_v4l2-i2c-subdev.o
+diff --git a/drivers/media/i2c/soc_camera/rockchip/adv7181_v4l2-i2c-subdev.c b/drivers/media/i2c/soc_camera/rockchip/adv7181_v4l2-i2c-subdev.c
+new file mode 100644
+index 000000000000..5908294b73e7
+--- /dev/null
++++ b/drivers/media/i2c/soc_camera/rockchip/adv7181_v4l2-i2c-subdev.c
+@@ -0,0 +1,569 @@
++/*
++ * adv7181 sensor driver
++ *
++ * Copyright (C) 2017 Fuzhou Rockchip Electronics Co., Ltd.
++ *
++ * Copyright (C) 2012-2014 Intel Mobile Communications GmbH
++ *
++ * Copyright (C) 2008 Texas Instruments.
++ *
++ * Author: zhoupeng <benjo.zhou@rock-chips.com>
++ *
++ * This file is licensed under the terms of the GNU General Public License
++ * version 2. This program is licensed "as is" without any warranty of any
++ * kind, whether express or implied.
++ *
++ * Note:
++ *
++ * v0.1.0:
++ *	1. Initialize version;
++ *	2. Stream on sensor in configuration,
++ *     and stream off sensor after 1frame;
++ *	3. Stream delay time is define in power_up_delays_ms[2];
++ */
++
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf-core.h>
++#include <linux/slab.h>
++#include <linux/debugfs.h>
++#include <media/v4l2-controls_rockchip.h>
++#include "adv_camera_module.h"
++
++#define ADV7181_DRIVER_NAME "adv7181"
++
++/* product ID */
++#define ADV7181_PID_MAGIC	0x20
++#define ADV7181_PID_ADDR	0x11
++
++#define ADV7181_STATUS1_REG		0x10
++#define ADV7181_STATUS1_IN_LOCK		0x01
++#define ADV7181_STATUS1_AUTOD_MASK	0x70
++#define ADV7181_STATUS1_AUTOD_NTSM_M_J	0x00
++#define ADV7181_STATUS1_AUTOD_NTSC_4_43 0x10
++#define ADV7181_STATUS1_AUTOD_PAL_M	0x20
++#define ADV7181_STATUS1_AUTOD_PAL_60	0x30
++#define ADV7181_STATUS1_AUTOD_PAL_B_G	0x40
++#define ADV7181_STATUS1_AUTOD_SECAM	0x50
++#define ADV7181_STATUS1_AUTOD_PAL_COMB	0x60
++#define ADV7181_STATUS1_AUTOD_SECAM_525	0x70
++
++#define ADV7181_INPUT_CONTROL		0x00
++#define ADV7181_INPUT_DEFAULT		0x00
++#define ADV7181_INPUT_CVBS_AIN2		0x00
++#define ADV7181_INPUT_CVBS_AIN3		0x01
++#define ADV7181_INPUT_CVBS_AIN5		0x02
++#define ADV7181_INPUT_CVBS_AIN6		0x03
++#define ADV7181_INPUT_CVBS_AIN8		0x04
++#define ADV7181_INPUT_CVBS_AIN10	0x05
++#define ADV7181_INPUT_CVBS_AIN1		0x0B
++#define ADV7181_INPUT_CVBS_AIN4		0x0D
++#define ADV7181_INPUT_CVBS_AIN7		0x0F
++#define ADV7181_INPUT_YPRPB_AIN6_8_10	0x09
++
++#define ADV7181_EXT_CLK 24000000
++
++/* ======================================================================== */
++/* Base sensor configs */
++/* ======================================================================== */
++/* resolution 720x480  30fps */
++static struct adv_camera_module_reg adv7180_cvbs_30fps[] = {
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x04, 0x77},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x17, 0x41},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x1D, 0x47},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x31, 0x02},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x3A, 0x17},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x3B, 0x81},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x3D, 0xA2},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x3E, 0x6A},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x3F, 0xA0},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x86, 0x0B},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xF3, 0x01},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xF9, 0x03},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x0E, 0x80},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x52, 0x46},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x54, 0x80},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x7F, 0xFF},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x81, 0x30},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x90, 0xC9},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x91, 0x40},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x92, 0x3C},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x93, 0xCA},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x94, 0xD5},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xB1, 0xFF},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xB6, 0x08},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xC0, 0x9A},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xCF, 0x50},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xD0, 0x4E},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xD1, 0xB9},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xD6, 0xDD},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xD7, 0xE2},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xE5, 0x51},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0xF6, 0x3B},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x0E, 0x00},
++	/* disable out put data */
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0x03, 0x4C},
++	{ADV_CAMERA_MODULE_REG_TYPE_DATA, 0X00, 0X0B},
++
++};
++
++/* ======================================================================== */
++static struct adv_camera_module_config adv7181_configs[] = {
++	/* For normal preview NTSC 480i */
++	{
++		.name = "adv7180_cvbs_ntsc_30fps",
++		.frm_fmt = {
++			.width			= 720,
++			.height			= 480,
++			.code			= MEDIA_BUS_FMT_UYVY8_2X8
++		},
++		.frm_intrvl = {
++			.interval = {
++				.numerator	= 1,
++				.denominator	= 30
++			}
++		},
++		.reg_table			= (void *)adv7180_cvbs_30fps,
++		.reg_table_num_entries		=
++			sizeof(adv7180_cvbs_30fps)
++			/
++			sizeof(adv7180_cvbs_30fps[0]),
++		.v_blanking_time_us		= 0,
++		.ignore_measurement_check = 1,
++		PLTFRM_CAM_ITF_DVP_CFG(
++			PLTFRM_CAM_ITF_BT656_8I,
++			PLTFRM_CAM_SIGNAL_HIGH_LEVEL,
++			PLTFRM_CAM_SIGNAL_HIGH_LEVEL,
++			PLTFRM_CAM_SDR_NEG_EDG,
++			ADV7181_EXT_CLK)
++	},
++	/* For normal preview PAL 576i */
++	{
++		.name = "adv7180_cvbs_pal_25fps",
++		.frm_fmt = {
++			.width			= 720,
++			.height			= 576,
++			.code			= MEDIA_BUS_FMT_UYVY8_2X8
++		},
++		.frm_intrvl = {
++			.interval = {
++				.numerator	= 1,
++				.denominator	= 25
++			}
++		},
++		.reg_table			= (void *)adv7180_cvbs_30fps,
++		.reg_table_num_entries		=
++			sizeof(adv7180_cvbs_30fps)
++			/
++			sizeof(adv7180_cvbs_30fps[0]),
++		.v_blanking_time_us		= 0,
++		.ignore_measurement_check = 1,
++		PLTFRM_CAM_ITF_DVP_CFG(
++			PLTFRM_CAM_ITF_BT656_8I,
++			PLTFRM_CAM_SIGNAL_HIGH_LEVEL,
++			PLTFRM_CAM_SIGNAL_HIGH_LEVEL,
++			PLTFRM_CAM_SDR_NEG_EDG,
++			ADV7181_EXT_CLK)
++	},
++};
++
++/*--------------------------------------------------------------------------*/
++static int adv7181_set_flip(
++	struct adv_camera_module *cam_mod,
++	struct pltfrm_camera_module_reg reglist[],
++	int len)
++{
++	return 0;
++}
++
++static int adv7181_g_ctrl(struct adv_camera_module *cam_mod, u32 ctrl_id)
++{
++	int ret = 0;
++
++	adv_camera_module_pr_debug(cam_mod, "\n");
++
++	switch (ctrl_id) {
++	case V4L2_CID_GAIN:
++	case V4L2_CID_EXPOSURE:
++	case V4L2_CID_FLASH_LED_MODE:
++		/* nothing to be done here */
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	if (IS_ERR_VALUE(ret))
++		adv_camera_module_pr_debug(cam_mod,
++			"failed with error (%d)\n", ret);
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_g_timings(struct adv_camera_module *cam_mod,
++			     struct adv_camera_module_timings *timings)
++{
++	int ret = 0;
++	unsigned int vts;
++
++	if (IS_ERR_OR_NULL(cam_mod->active_config))
++		goto err;
++
++	*timings = cam_mod->active_config->timings;
++
++	vts = (!cam_mod->vts_cur) ?
++		timings->frame_length_lines :
++		cam_mod->vts_cur;
++	if (cam_mod->frm_intrvl_valid)
++		timings->vt_pix_clk_freq_hz =
++			cam_mod->frm_intrvl.interval.denominator
++			* vts
++			* timings->line_length_pck;
++	else
++		timings->vt_pix_clk_freq_hz =
++		cam_mod->active_config->frm_intrvl.interval.denominator *
++		vts * timings->line_length_pck;
++
++	return ret;
++err:
++	adv_camera_module_pr_err(cam_mod,
++				 "failed with error (%d)\n",
++				 ret);
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_s_ctrl(struct adv_camera_module *cam_mod, u32 ctrl_id)
++{
++	int ret = 0;
++
++	adv_camera_module_pr_debug(cam_mod, "\n");
++
++	switch (ctrl_id) {
++	case V4L2_CID_GAIN:
++	case V4L2_CID_EXPOSURE:
++		break;
++	case V4L2_CID_FLASH_LED_MODE:
++		/* nothing to be done here */
++		break;
++	case V4L2_CID_FOCUS_ABSOLUTE:
++		/* todo*/
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	if (IS_ERR_VALUE(ret))
++		adv_camera_module_pr_err(cam_mod,
++					 "failed with error (%d)\n",
++					 ret);
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_s_ext_ctrls(struct adv_camera_module *cam_mod,
++			       struct adv_camera_module_ext_ctrls *ctrls)
++{
++	int ret = 0;
++
++	/* Handles only exposure and gain together special case. */
++	if (ctrls->count == 1)
++		ret = adv7181_s_ctrl(cam_mod, ctrls->ctrls[0].id);
++	else
++		ret = -EINVAL;
++
++	if (IS_ERR_VALUE(ret))
++		adv_camera_module_pr_debug(cam_mod,
++			"failed with error (%d)\n", ret);
++
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_start_streaming(struct adv_camera_module *cam_mod)
++{
++	int ret = 0;
++
++	adv_camera_module_pr_debug(cam_mod,
++		"active config=%s\n", cam_mod->active_config->name);
++
++	adv_camera_module_pr_debug(cam_mod, "=====streaming on ===\n");
++	ret = adv_camera_module_write_reg(cam_mod, 0x03, 0x0c);
++
++	if (IS_ERR_VALUE(ret))
++		goto err;
++
++	return 0;
++err:
++	adv_camera_module_pr_err(cam_mod, "failed with error (%d)\n", ret);
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_stop_streaming(struct adv_camera_module *cam_mod)
++{
++	int ret = 0;
++
++	adv_camera_module_pr_debug(cam_mod, "\n");
++	ret = adv_camera_module_write_reg(cam_mod, 0x03, 0x4c);
++
++	if (IS_ERR_VALUE(ret))
++		goto err;
++
++	return 0;
++err:
++	adv_camera_module_pr_err(cam_mod, "failed with error (%d)\n", ret);
++	return ret;
++}
++
++/*--------------------------------------------------------------------------*/
++
++static int adv7181_check_camera_id(struct adv_camera_module *cam_mod)
++{
++	u8 pid;
++	int ret = 0;
++
++	adv_camera_module_pr_err(cam_mod, "\n");
++
++	ret |= adv_camera_module_read_reg(cam_mod, ADV7181_PID_ADDR, &pid);
++	if (IS_ERR_VALUE(ret)) {
++		adv_camera_module_pr_err(cam_mod,
++			"register read failed, camera module powered off?\n");
++		goto err;
++	}
++
++	if (pid == ADV7181_PID_MAGIC)
++		adv_camera_module_pr_err(cam_mod,
++			"successfully detected camera ID 0x%02x\n",
++			pid);
++	else {
++		adv_camera_module_pr_err(cam_mod,
++			"wrong camera ID, expected 0x%02x, detected 0x%02x\n",
++			ADV7181_PID_MAGIC, pid);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	return 0;
++err:
++	adv_camera_module_pr_err(cam_mod, "failed with error (%d)\n", ret);
++	return ret;
++}
++
++/* ======================================================================== */
++int adv_camera_7181_module_s_ctrl(
++	struct v4l2_subdev *sd,
++	struct v4l2_control *ctrl)
++{
++	return 0;
++}
++
++/* ======================================================================== */
++
++int adv_camera_7181_module_s_ext_ctrls(
++	struct v4l2_subdev *sd,
++	struct v4l2_ext_controls *ctrls)
++{
++	return 0;
++}
++
++long adv_camera_7181_module_ioctl(struct v4l2_subdev *sd,
++	unsigned int cmd,
++	void *arg)
++{
++	return 0;
++}
++
++/* ======================================================================== */
++/* This part is platform dependent */
++/* ======================================================================== */
++
++static struct v4l2_subdev_core_ops adv7181_camera_module_core_ops = {
++	.g_ctrl = adv_camera_module_g_ctrl,
++	.s_ctrl = adv_camera_module_s_ctrl,
++	.s_ext_ctrls = adv_camera_module_s_ext_ctrls,
++	.s_power = adv_camera_module_s_power,
++	.ioctl = adv_camera_module_ioctl
++};
++
++static struct v4l2_subdev_video_ops adv7181_camera_module_video_ops = {
++	.s_frame_interval = adv_camera_module_s_frame_interval,
++	.s_stream = adv_camera_module_s_stream
++};
++
++static struct v4l2_subdev_pad_ops adv7181_camera_module_pad_ops = {
++	.enum_frame_interval = adv_camera_module_enum_frameintervals,
++	.get_fmt = adv_camera_module_g_fmt,
++	.set_fmt = adv_camera_module_s_fmt,
++};
++
++static struct v4l2_subdev_ops adv7181_camera_module_ops = {
++	.core = &adv7181_camera_module_core_ops,
++	.video = &adv7181_camera_module_video_ops,
++	.pad = &adv7181_camera_module_pad_ops
++};
++
++static struct adv_camera_module adv7181;
++
++static struct adv_camera_module_custom_config adv7181_custom_config = {
++	.start_streaming = adv7181_start_streaming,
++	.stop_streaming = adv7181_stop_streaming,
++	.s_ctrl = adv7181_s_ctrl,
++	.g_ctrl = adv7181_g_ctrl,
++	.s_ext_ctrls = adv7181_s_ext_ctrls,
++	.g_timings = adv7181_g_timings,
++	.set_flip = adv7181_set_flip,
++	.check_camera_id = adv7181_check_camera_id,
++	.configs = adv7181_configs,
++	.num_configs = ARRAY_SIZE(adv7181_configs),
++	.power_up_delays_ms = {5, 30, 30}
++};
++
++static ssize_t adv7181_debugfs_reg_write(
++	struct file *file,
++	const char __user *buf,
++	size_t count,
++	loff_t *ppos)
++{
++	struct adv_camera_module *cam_mod =
++		((struct seq_file *)file->private_data)->private;
++
++	char kbuf[30];
++	int reg;
++	int reg_value;
++	int ret;
++	int nbytes = min(count, sizeof(kbuf) - 1);
++
++	if (copy_from_user(kbuf, buf, nbytes))
++		return -EFAULT;
++
++	kbuf[nbytes] = '\0';
++	adv_camera_module_pr_err(cam_mod, "kbuf is %s\n", kbuf);
++	ret = sscanf(kbuf, " %x %x", &reg, &reg_value);
++	adv_camera_module_pr_err(cam_mod, "ret = %d!\n", ret);
++	if (ret != 2) {
++		adv_camera_module_pr_err(cam_mod, "sscanf failed!\n");
++		return 0;
++	}
++
++	adv_camera_module_write_reg(cam_mod, (u8)reg, (u8)reg_value);
++	adv_camera_module_pr_err(cam_mod,
++				"%s(%d): read reg 0x%02x ---> 0x%x!\n",
++				__func__, __LINE__,
++				reg, reg_value);
++
++	return count;
++}
++
++static int adv7181_debugfs_reg_show(struct seq_file *s, void *v)
++{
++	int i;
++	u8 val;
++	struct adv_camera_module *cam_mod = s->private;
++
++	adv_camera_module_pr_err(cam_mod, "test\n");
++
++	for (i = 0; i <= 0xff; i++) {
++		adv_camera_module_read_reg(cam_mod, (u8)i, &val);
++		seq_printf(s, "0x%02x : 0x%02x\n", i, val);
++	}
++	return 0;
++}
++
++static int adv7181_debugfs_open(struct inode *inode, struct file *file)
++{
++	struct specific_sensor *spsensor = inode->i_private;
++
++	return single_open(file, adv7181_debugfs_reg_show, spsensor);
++}
++
++static const struct file_operations adv7181_debugfs_fops = {
++	.owner			= THIS_MODULE,
++	.open			= adv7181_debugfs_open,
++	.read			= seq_read,
++	.write			= adv7181_debugfs_reg_write,
++	.llseek			= seq_lseek,
++	.release		= single_release
++};
++
++static struct dentry *debugfs_dir;
++
++static int adv7181_probe(
++	struct i2c_client *client,
++	const struct i2c_device_id *id)
++{
++	dev_info(&client->dev, "probing...\n");
++
++	v4l2_i2c_subdev_init(&adv7181.sd, client,
++				&adv7181_camera_module_ops);
++
++	adv7181.custom = adv7181_custom_config;
++
++	debugfs_dir = debugfs_create_dir("adv7181", NULL);
++	if (IS_ERR(debugfs_dir))
++		printk(KERN_ERR "%s(%d): create debugfs dir failed!\n",
++		       __func__, __LINE__);
++	else
++		debugfs_create_file("register", S_IRUSR,
++				    debugfs_dir, &adv7181,
++				    &adv7181_debugfs_fops);
++
++	dev_info(&client->dev, "probing successful\n");
++	return 0;
++}
++
++/* ======================================================================== */
++
++static int adv7181_remove(
++	struct i2c_client *client)
++{
++	struct adv_camera_module *cam_mod = i2c_get_clientdata(client);
++
++	dev_info(&client->dev, "remadving device...\n");
++
++	if (!client->adapter)
++		return -ENODEV;	/* our client isn't attached */
++
++	adv_camera_module_release(cam_mod);
++
++	dev_info(&client->dev, "removed\n");
++	return 0;
++}
++
++static const struct i2c_device_id adv7181_id[] = {
++	{ ADV7181_DRIVER_NAME, 0 },
++	{ }
++};
++
++static const struct of_device_id adv7181_of_match[] = {
++	{.compatible = "adi,adv7181-v4l2-i2c-subdev"},
++	{},
++};
++
++MODULE_DEVICE_TABLE(i2c, adv7181_id);
++
++static struct i2c_driver adv7181_i2c_driver = {
++	.driver = {
++		.name = ADV7181_DRIVER_NAME,
++		.of_match_table = adv7181_of_match
++	},
++	.probe = adv7181_probe,
++	.remove = adv7181_remove,
++	.id_table = adv7181_id,
++};
++
++module_i2c_driver(adv7181_i2c_driver);
++
++MODULE_DESCRIPTION("SoC Camera driver for adv7181");
++MODULE_AUTHOR("Benjo");
++MODULE_LICENSE("GPL");
++
+diff --git a/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.c b/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.c
+new file mode 100644
+index 000000000000..f6f08c9d7978
+--- /dev/null
++++ b/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.c
+@@ -0,0 +1,1206 @@
++/*
++ * adv_camera_module.c
++ *
++ * Generic adi sensor driver
++ *
++ * Copyright (C) 2017 Fuzhou Rockchip Electronics Co., Ltd.
++ *
++ * Copyright (C) 2012-2014 Intel Mobile Communications GmbH
++ *
++ * Copyright (C) 2008 Texas Instruments.
++ *
++ * This file is licensed under the terms of the GNU General Public License
++ * version 2. This program is licensed "as is" without any warranty of any
++ * kind, whether express or implied.
++ *
++ */
++
++#include <linux/delay.h>
++#include <media/v4l2-subdev.h>
++#include <media/v4l2-device.h>
++#include <media/videobuf-core.h>
++#include <linux/slab.h>
++#include <linux/gcd.h>
++#include <linux/i2c.h>
++
++#include <media/v4l2-controls_rockchip.h>
++
++#include "adv_camera_module.h"
++
++static struct adv_camera_module *to_adv_camera_module(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct adv_camera_module, sd);
++}
++
++/* ======================================================================== */
++
++static void adv_camera_module_reset(
++	struct adv_camera_module *cam_mod)
++{
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	cam_mod->inited = false;
++	cam_mod->active_config = NULL;
++	cam_mod->update_config = true;
++	cam_mod->frm_fmt_valid = false;
++	cam_mod->frm_intrvl_valid = false;
++	cam_mod->exp_config.auto_exp = false;
++	cam_mod->exp_config.auto_gain = false;
++	cam_mod->wb_config.auto_wb = false;
++	cam_mod->hflip = false;
++	cam_mod->vflip = false;
++	cam_mod->auto_adjust_fps = true;
++	cam_mod->rotation = 0;
++	cam_mod->ctrl_updt = 0;
++	cam_mod->state = ADV_CAMERA_MODULE_POWER_OFF;
++	cam_mod->state_before_suspend = ADV_CAMERA_MODULE_POWER_OFF;
++
++	cam_mod->exp_config.exp_time = 0;
++	cam_mod->exp_config.gain = 0;
++	cam_mod->vts_cur = 0;
++}
++
++/* ======================================================================== */
++
++static void adv_camera_module_set_active_config(
++	struct adv_camera_module *cam_mod,
++	struct adv_camera_module_config *new_config)
++{
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	if (IS_ERR_OR_NULL(new_config)) {
++		cam_mod->active_config = new_config;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"no active config\n");
++	} else {
++		cam_mod->ctrl_updt &= ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_EXP |
++			ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_GAIN |
++			ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_WB;
++		if (new_config->auto_exp_enabled !=
++			cam_mod->exp_config.auto_exp) {
++			cam_mod->ctrl_updt |=
++				ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_EXP;
++			cam_mod->exp_config.auto_exp =
++				new_config->auto_exp_enabled;
++		}
++		if (new_config->auto_gain_enabled !=
++			cam_mod->exp_config.auto_gain) {
++			cam_mod->ctrl_updt |=
++				ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_GAIN;
++			cam_mod->exp_config.auto_gain =
++				new_config->auto_gain_enabled;
++		}
++		if (new_config->auto_wb_enabled !=
++			cam_mod->wb_config.auto_wb) {
++			cam_mod->ctrl_updt |=
++				ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_WB;
++			cam_mod->wb_config.auto_wb =
++				new_config->auto_wb_enabled;
++		}
++		if (new_config != cam_mod->active_config) {
++			cam_mod->update_config = true;
++			cam_mod->active_config = new_config;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++				"activating config '%s'\n",
++				cam_mod->active_config->name);
++		}
++	}
++}
++
++/* ======================================================================== */
++
++static struct adv_camera_module_config *adv_camera_module_find_config(
++	struct adv_camera_module *cam_mod,
++	struct v4l2_mbus_framefmt *fmt,
++	struct v4l2_subdev_frame_interval *frm_intrvl)
++{
++	u32 i;
++	unsigned long gcdiv;
++	struct v4l2_subdev_frame_interval norm_interval;
++
++	if (!IS_ERR_OR_NULL(fmt))
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"%dx%d, fmt code 0x%04x\n",
++			fmt->width, fmt->height, fmt->code);
++
++	if (!IS_ERR_OR_NULL(frm_intrvl))
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"frame interval %d/%d\n",
++			frm_intrvl->interval.numerator,
++			frm_intrvl->interval.denominator);
++
++	for (i = 0; i < cam_mod->custom.num_configs; i++) {
++		if (!IS_ERR_OR_NULL(frm_intrvl)) {
++			gcdiv = gcd(cam_mod->custom.configs[i].
++				frm_intrvl.interval.numerator,
++				cam_mod->custom.configs[i].
++					frm_intrvl.interval.denominator);
++			norm_interval.interval.numerator =
++				cam_mod->custom.configs[i].
++					frm_intrvl.interval.numerator / gcdiv;
++			norm_interval.interval.denominator =
++				cam_mod->custom.configs[i].
++				frm_intrvl.interval.denominator / gcdiv;
++			if ((frm_intrvl->interval.numerator !=
++				norm_interval.interval.numerator) ||
++				(frm_intrvl->interval.denominator !=
++				norm_interval.interval.denominator))
++				continue;
++		}
++		if (!IS_ERR_OR_NULL(fmt)) {
++			if ((cam_mod->custom.configs[i].frm_fmt.width !=
++				fmt->width) ||
++				(cam_mod->custom.configs[i].frm_fmt.height !=
++				fmt->height) ||
++				(cam_mod->custom.configs[i].frm_fmt.code !=
++				fmt->code)) {
++				continue;
++			}
++		}
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"found matching config %s\n",
++			cam_mod->custom.configs[i].name);
++		return &cam_mod->custom.configs[i];
++	}
++	pltfrm_camera_module_pr_debug(&cam_mod->sd,
++		"no matching config found\n");
++
++	return ERR_PTR(-EINVAL);
++}
++
++/* ======================================================================== */
++
++static int adv_camera_module_write_config(
++	struct adv_camera_module *cam_mod)
++{
++	int ret = 0;
++	struct adv_camera_module_reg *reg_table;
++	u32 reg_table_num_entries;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	if (IS_ERR_OR_NULL(cam_mod->active_config)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"no active sensor configuration");
++		ret = -EFAULT;
++		goto err;
++	}
++
++	if (!cam_mod->inited) {
++		cam_mod->active_config->soft_reset = true;
++		reg_table = cam_mod->active_config->reg_table;
++		reg_table_num_entries =
++			cam_mod->active_config->reg_table_num_entries;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++				"write config %s\n",
++				cam_mod->active_config->name);
++	} else {
++		if (cam_mod->active_config->reg_diff_table &&
++		cam_mod->active_config->reg_diff_table_num_entries) {
++			cam_mod->active_config->soft_reset = false;
++			reg_table = cam_mod->active_config->reg_diff_table;
++			reg_table_num_entries =
++				cam_mod->active_config->reg_diff_table_num_entries;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++				"write config %s%s\n",
++				cam_mod->active_config->name, "_diff");
++		} else {
++			cam_mod->active_config->soft_reset = true;
++			reg_table = cam_mod->active_config->reg_table;
++			reg_table_num_entries =
++				cam_mod->active_config->reg_table_num_entries;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++				"write config %s\n",
++				cam_mod->active_config->name);
++		}
++	}
++
++	if (!IS_ERR_OR_NULL(cam_mod->custom.set_flip))
++		cam_mod->custom.set_flip(cam_mod,
++			reg_table, reg_table_num_entries);
++
++	ret = adv_camera_module_write_reglist(cam_mod,
++		reg_table, (int)reg_table_num_entries);
++	if (IS_ERR_VALUE(ret))
++		goto err;
++	ret = pltfrm_camera_module_patch_config(&cam_mod->sd,
++		&cam_mod->frm_fmt,
++		&cam_mod->frm_intrvl);
++	if (IS_ERR_VALUE(ret))
++		goto err;
++
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++static int adv_camera_module_attach(
++	struct adv_camera_module *cam_mod)
++{
++	int ret = 0;
++	struct adv_camera_module_custom_config *custom;
++
++	custom = &cam_mod->custom;
++
++	if (custom->check_camera_id) {
++		adv_camera_module_s_power(&cam_mod->sd, 1);
++		ret = custom->check_camera_id(cam_mod);
++		adv_camera_module_s_power(&cam_mod->sd, 0);
++		if (ret != 0)
++			goto err;
++	}
++
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	adv_camera_module_release(cam_mod);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_try_fmt(struct v4l2_subdev *sd,
++	struct v4l2_mbus_framefmt *fmt)
++{
++	struct adv_camera_module *cam_mod = to_adv_camera_module(sd);
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%dx%d, fmt code 0x%04x\n",
++		fmt->width, fmt->height, fmt->code);
++
++	if (IS_ERR_OR_NULL(adv_camera_module_find_config(cam_mod, fmt, NULL))) {
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"format not supported\n");
++		return -EINVAL;
++	}
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "format supported\n");
++
++	return 0;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_fmt(struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_format *format)
++{
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	struct v4l2_mbus_framefmt *fmt = &format->format;
++	int ret = 0;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%dx%d, fmt code 0x%04x\n",
++		fmt->width, fmt->height, fmt->code);
++
++	if (IS_ERR_OR_NULL(adv_camera_module_find_config(cam_mod, fmt, NULL))) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"format %dx%d, code 0x%04x, not supported\n",
++			fmt->width, fmt->height, fmt->code);
++		ret = -EINVAL;
++		goto err;
++	}
++	cam_mod->frm_fmt_valid = true;
++	cam_mod->frm_fmt = *fmt;
++	if (cam_mod->frm_intrvl_valid) {
++		adv_camera_module_set_active_config(cam_mod,
++			adv_camera_module_find_config(cam_mod,
++				fmt, &cam_mod->frm_intrvl));
++	}
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_g_fmt(struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_format *format)
++{
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	struct v4l2_mbus_framefmt *fmt = &format->format;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	if (cam_mod->active_config) {
++		fmt->code = cam_mod->active_config->frm_fmt.code;
++		fmt->width = cam_mod->active_config->frm_fmt.width;
++		fmt->height = cam_mod->active_config->frm_fmt.height;
++		return 0;
++	}
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "no active config\n");
++
++	return -1;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_frame_interval(
++	struct v4l2_subdev *sd,
++	struct v4l2_subdev_frame_interval *interval)
++{
++	struct adv_camera_module *cam_mod = to_adv_camera_module(sd);
++	unsigned long gcdiv;
++	struct v4l2_subdev_frame_interval norm_interval;
++	int ret = 0;
++
++	if ((interval->interval.denominator == 0) ||
++		(interval->interval.numerator == 0)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"invalid frame interval %d/%d\n",
++			interval->interval.numerator,
++			interval->interval.denominator);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%d/%d (%dfps)\n",
++		interval->interval.numerator, interval->interval.denominator,
++		(interval->interval.denominator +
++		(interval->interval.numerator >> 1)) /
++		interval->interval.numerator);
++
++	/* normalize interval */
++	gcdiv = gcd(interval->interval.numerator,
++		interval->interval.denominator);
++	norm_interval.interval.numerator =
++		interval->interval.numerator / gcdiv;
++	norm_interval.interval.denominator =
++		interval->interval.denominator / gcdiv;
++
++	if (IS_ERR_OR_NULL(adv_camera_module_find_config(cam_mod,
++			NULL, &norm_interval))) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"frame interval %d/%d not supported\n",
++			interval->interval.numerator,
++			interval->interval.denominator);
++		ret = -EINVAL;
++		goto err;
++	}
++	cam_mod->frm_intrvl_valid = true;
++	cam_mod->frm_intrvl = norm_interval;
++	if (cam_mod->frm_fmt_valid) {
++		adv_camera_module_set_active_config(cam_mod,
++			adv_camera_module_find_config(cam_mod,
++				&cam_mod->frm_fmt, interval));
++	}
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	int ret = 0;
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%d\n", enable);
++
++	if (enable) {
++		if (cam_mod->state == ADV_CAMERA_MODULE_STREAMING)
++			return 0;
++		if (IS_ERR_OR_NULL(cam_mod->active_config)) {
++			pltfrm_camera_module_pr_err(&cam_mod->sd,
++				"no active sensor configuration, cannot start streaming\n");
++			ret = -EFAULT;
++			goto err;
++		}
++		if (cam_mod->state != ADV_CAMERA_MODULE_SW_STANDBY) {
++			pltfrm_camera_module_pr_err(&cam_mod->sd,
++				"sensor is not powered on (in state %d), cannot start streaming\n",
++				cam_mod->state);
++			ret = -EINVAL;
++			goto err;
++		}
++		if (cam_mod->update_config) {
++			ret = adv_camera_module_write_config(cam_mod);
++			if (IS_ERR_VALUE(ret))
++				goto err;
++		}
++
++		ret = cam_mod->custom.start_streaming(cam_mod);
++		if (IS_ERR_VALUE(ret))
++			goto err;
++		if (!cam_mod->inited && cam_mod->update_config)
++			cam_mod->inited = true;
++		cam_mod->update_config = false;
++		cam_mod->ctrl_updt = 0;
++		mdelay(cam_mod->custom.power_up_delays_ms[2]);
++		cam_mod->state = ADV_CAMERA_MODULE_STREAMING;
++	} else {
++		int pclk;
++		int wait_ms;
++		struct isp_supplemental_sensor_mode_data timings;
++
++		if (cam_mod->state != ADV_CAMERA_MODULE_STREAMING)
++			return 0;
++		ret = cam_mod->custom.stop_streaming(cam_mod);
++		if (IS_ERR_VALUE(ret))
++			goto err;
++
++		ret = adv_camera_module_ioctl(sd,
++					RK_VIDIOC_SENSOR_MODE_DATA,
++					&timings);
++
++		cam_mod->state = ADV_CAMERA_MODULE_SW_STANDBY;
++
++		if (IS_ERR_VALUE(ret))
++			goto err;
++
++		pclk = timings.vt_pix_clk_freq_hz / 1000;
++
++		if (!pclk)
++			goto err;
++
++		wait_ms =
++			(timings.line_length_pck *
++			timings.frame_length_lines) /
++			pclk;
++
++		/*
++		 * wait for a frame period to make sure that there is
++		 * no pending frame left.
++		 */
++
++		msleep(wait_ms + 1);
++	}
++
++	cam_mod->state_before_suspend = cam_mod->state;
++
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_power(struct v4l2_subdev *sd, int on)
++{
++	int ret = 0;
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	struct v4l2_subdev *af_ctrl;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%d\n", on);
++
++	if (on) {
++		if (cam_mod->state == ADV_CAMERA_MODULE_POWER_OFF) {
++			ret = pltfrm_camera_module_s_power(&cam_mod->sd, 1);
++			if (!IS_ERR_VALUE(ret)) {
++				mdelay(cam_mod->custom.power_up_delays_ms[0]);
++				cam_mod->state = ADV_CAMERA_MODULE_HW_STANDBY;
++			}
++		}
++		if (cam_mod->state == ADV_CAMERA_MODULE_HW_STANDBY) {
++			ret = pltfrm_camera_module_set_pin_state(&cam_mod->sd,
++				PLTFRM_CAMERA_MODULE_PIN_PD,
++				PLTFRM_CAMERA_MODULE_PIN_STATE_INACTIVE);
++			if (!IS_ERR_VALUE(ret)) {
++				mdelay(cam_mod->custom.power_up_delays_ms[1]);
++				cam_mod->state = ADV_CAMERA_MODULE_SW_STANDBY;
++				if (!IS_ERR_OR_NULL(
++				    cam_mod->custom.init_common) &&
++				    cam_mod->custom.init_common(
++				    cam_mod))
++					usleep_range(1000, 1500);
++
++				af_ctrl = pltfrm_camera_module_get_af_ctrl(sd);
++				if (!IS_ERR_OR_NULL(af_ctrl)) {
++					v4l2_subdev_call(af_ctrl,
++							 core, init, 0);
++				}
++			}
++		}
++		if (cam_mod->update_config) {
++			adv_camera_module_write_config(cam_mod);
++			cam_mod->update_config = false;
++		}
++	} else {
++		if (cam_mod->state == ADV_CAMERA_MODULE_STREAMING) {
++			ret = adv_camera_module_s_stream(sd, 0);
++			if (!IS_ERR_VALUE(ret))
++				cam_mod->state = ADV_CAMERA_MODULE_SW_STANDBY;
++		}
++		if (cam_mod->state == ADV_CAMERA_MODULE_SW_STANDBY) {
++			ret = pltfrm_camera_module_set_pin_state(
++				&cam_mod->sd,
++				PLTFRM_CAMERA_MODULE_PIN_PD,
++				PLTFRM_CAMERA_MODULE_PIN_STATE_ACTIVE);
++
++			if (!IS_ERR_VALUE(ret))
++				cam_mod->state = ADV_CAMERA_MODULE_HW_STANDBY;
++		}
++		if (cam_mod->state == ADV_CAMERA_MODULE_HW_STANDBY) {
++			ret = pltfrm_camera_module_s_power(&cam_mod->sd, 0);
++			if (!IS_ERR_VALUE(ret)) {
++				cam_mod->state = ADV_CAMERA_MODULE_POWER_OFF;
++				adv_camera_module_reset(cam_mod);
++			}
++		}
++	}
++
++	cam_mod->state_before_suspend = cam_mod->state;
++
++	if (IS_ERR_VALUE(ret)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"%s failed, camera left in state %d\n",
++			on ? "on" : "off", cam_mod->state);
++		goto err;
++	} else
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"camera powered %s\n", on ? "on" : "off");
++
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_g_ctrl(struct v4l2_subdev *sd,
++	struct v4l2_control *ctrl)
++{
++	struct adv_camera_module *cam_mod = to_adv_camera_module(sd);
++	int ret;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, " id 0x%x\n", ctrl->id);
++
++	if (ctrl->id == V4L2_CID_FLASH_LED_MODE) {
++		ctrl->value = cam_mod->exp_config.flash_mode;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_FLASH_LED_MODE %d\n",
++			ctrl->value);
++		return 0;
++	}
++
++	if (IS_ERR_OR_NULL(cam_mod->active_config)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"no active configuration\n");
++		return -EFAULT;
++	}
++
++	if (ctrl->id == RK_V4L2_CID_VBLANKING) {
++		ctrl->value = cam_mod->active_config->v_blanking_time_us;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"RK_V4L2_CID_VBLANKING %d\n",
++			ctrl->value);
++		return 0;
++	}
++
++	if ((cam_mod->state != ADV_CAMERA_MODULE_SW_STANDBY) &&
++		(cam_mod->state != ADV_CAMERA_MODULE_STREAMING)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"cannot get controls when camera is off\n");
++		return -EFAULT;
++	}
++
++	if (ctrl->id == V4L2_CID_FOCUS_ABSOLUTE) {
++		struct v4l2_subdev *af_ctrl;
++
++		af_ctrl = pltfrm_camera_module_get_af_ctrl(sd);
++		if (!IS_ERR_OR_NULL(af_ctrl)) {
++			ret = v4l2_subdev_call(af_ctrl, core, g_ctrl, ctrl);
++			return ret;
++		}
++	}
++
++	if (!IS_ERR_OR_NULL(cam_mod->custom.g_ctrl)) {
++		ret = cam_mod->custom.g_ctrl(cam_mod, ctrl->id);
++		if (IS_ERR_VALUE(ret))
++			return ret;
++	}
++
++	switch (ctrl->id) {
++	case V4L2_CID_GAIN:
++		ctrl->value = cam_mod->exp_config.gain;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			     "V4L2_CID_GAIN %d\n",
++			     ctrl->value);
++		break;
++	case V4L2_CID_EXPOSURE:
++		ctrl->value = cam_mod->exp_config.exp_time;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			     "V4L2_CID_EXPOSURE %d\n",
++			     ctrl->value);
++		break;
++	case V4L2_CID_WHITE_BALANCE_TEMPERATURE:
++		ctrl->value = cam_mod->wb_config.temperature;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_WHITE_BALANCE_TEMPERATURE %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE:
++		ctrl->value = cam_mod->wb_config.preset_id;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_AUTOGAIN:
++		ctrl->value = cam_mod->exp_config.auto_gain;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTOGAIN %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_EXPOSURE_AUTO:
++		ctrl->value = cam_mod->exp_config.auto_exp;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_EXPOSURE_AUTO %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_AUTO_WHITE_BALANCE:
++		ctrl->value = cam_mod->wb_config.auto_wb;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTO_WHITE_BALANCE %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_FOCUS_ABSOLUTE:
++		ctrl->value = cam_mod->af_config.abs_pos;
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_FOCUS_ABSOLUTE %d\n",
++			ctrl->value);
++		break;
++	case V4L2_CID_HFLIP:
++	case V4L2_CID_VFLIP:
++		/* TBD */
++		/* fallthrough */
++	default:
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"failed, unknown ctrl %d\n", ctrl->id);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int flash_light_ctrl(
++		struct v4l2_subdev *sd,
++		struct adv_camera_module *cam_mod,
++		int value)
++{
++	return 0;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_ext_ctrls(
++	struct v4l2_subdev *sd,
++	struct v4l2_ext_controls *ctrls)
++{
++	int i;
++	int ctrl_cnt = 0;
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	int ret = 0;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++	if (ctrls->count == 0)
++		return -EINVAL;
++
++	for (i = 0; i < ctrls->count; i++) {
++		struct v4l2_ext_control *ctrl;
++		u32 ctrl_updt = 0;
++
++		ctrl = &ctrls->controls[i];
++
++		switch (ctrl->id) {
++		case V4L2_CID_GAIN:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_GAIN;
++			cam_mod->exp_config.gain = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_GAIN %d\n",
++			ctrl->value);
++			break;
++		case RK_V4L2_CID_GAIN_PERCENT:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_GAIN;
++			cam_mod->exp_config.gain_percent = ctrl->value;
++			break;
++		case V4L2_CID_FLASH_LED_MODE:
++			ret = flash_light_ctrl(sd, cam_mod, ctrl->value);
++			if (ret == 0) {
++				cam_mod->exp_config.flash_mode = ctrl->value;
++				pltfrm_camera_module_pr_debug(&cam_mod->sd,
++					"V4L2_CID_FLASH_LED_MODE %d\n",
++					ctrl->value);
++			}
++			break;
++		case V4L2_CID_EXPOSURE:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_EXP_TIME;
++			cam_mod->exp_config.exp_time = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_EXPOSURE %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_WHITE_BALANCE_TEMPERATURE:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_WB_TEMPERATURE;
++			cam_mod->wb_config.temperature = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_WHITE_BALANCE_TEMPERATURE %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_PRESET_WB;
++			cam_mod->wb_config.preset_id = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_AUTOGAIN:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_GAIN;
++			cam_mod->exp_config.auto_gain = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTOGAIN %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_EXPOSURE_AUTO:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_EXP;
++			cam_mod->exp_config.auto_exp = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_EXPOSURE_AUTO %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_AUTO_WHITE_BALANCE:
++			ctrl_updt = ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_WB;
++			cam_mod->wb_config.auto_wb = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_AUTO_WHITE_BALANCE %d\n",
++			ctrl->value);
++			break;
++		case RK_V4L2_CID_AUTO_FPS:
++			cam_mod->auto_adjust_fps = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"RK_V4L2_CID_AUTO_FPS %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_FOCUS_ABSOLUTE:
++			{
++				struct v4l2_subdev *af_ctrl;
++
++				af_ctrl = pltfrm_camera_module_get_af_ctrl(sd);
++				if (!IS_ERR_OR_NULL(af_ctrl)) {
++					struct v4l2_control single_ctrl;
++
++					single_ctrl.id =
++						V4L2_CID_FOCUS_ABSOLUTE;
++					single_ctrl.value = ctrl->value;
++					ret = v4l2_subdev_call(af_ctrl,
++						core, s_ctrl, &single_ctrl);
++					return ret;
++				}
++			}
++			ctrl_updt =
++				ADV_CAMERA_MODULE_CTRL_UPDT_FOCUS_ABSOLUTE;
++			cam_mod->af_config.abs_pos = ctrl->value;
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"V4L2_CID_FOCUS_ABSOLUTE %d\n",
++			ctrl->value);
++			break;
++		case V4L2_CID_HFLIP:
++			if (ctrl->value)
++				cam_mod->hflip = true;
++			else
++				cam_mod->hflip = false;
++			break;
++		case V4L2_CID_VFLIP:
++			if (ctrl->value)
++				cam_mod->vflip = true;
++			else
++				cam_mod->vflip = false;
++			break;
++		default:
++			pltfrm_camera_module_pr_warn(&cam_mod->sd,
++			"ignoring unknown ctrl 0x%x\n", ctrl->id);
++			break;
++		}
++
++		if (cam_mod->state != ADV_CAMERA_MODULE_SW_STANDBY &&
++		cam_mod->state != ADV_CAMERA_MODULE_STREAMING)
++			cam_mod->ctrl_updt |= ctrl_updt;
++		else if (ctrl_updt)
++			ctrl_cnt++;
++	}
++
++	/* if camera module is already streaming, write through */
++	if (ctrl_cnt &&
++		(cam_mod->state == ADV_CAMERA_MODULE_STREAMING ||
++		cam_mod->state == ADV_CAMERA_MODULE_SW_STANDBY)) {
++		struct adv_camera_module_ext_ctrls adv_ctrls;
++
++		adv_ctrls.ctrls =
++		(struct adv_camera_module_ext_ctrl *)
++		kmalloc(ctrl_cnt * sizeof(struct adv_camera_module_ext_ctrl),
++			GFP_KERNEL);
++
++		if (adv_ctrls.ctrls) {
++			for (i = 0; i < ctrl_cnt; i++) {
++				adv_ctrls.ctrls[i].id = ctrls->controls[i].id;
++				adv_ctrls.ctrls[i].value =
++					ctrls->controls[i].value;
++			}
++
++			adv_ctrls.count = ctrl_cnt;
++
++			ret = cam_mod->custom.s_ext_ctrls(cam_mod, &adv_ctrls);
++
++			kfree(adv_ctrls.ctrls);
++		} else {
++			ret = -ENOMEM;
++		}
++		if (IS_ERR_VALUE(ret))
++			pltfrm_camera_module_pr_debug(&cam_mod->sd,
++				"failed with error %d\n", ret);
++	}
++
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_s_ctrl(
++	struct v4l2_subdev *sd,
++	struct v4l2_control *ctrl)
++{
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	struct v4l2_ext_control ext_ctrl[1];
++	struct v4l2_ext_controls ext_ctrls;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd,
++		"0x%x 0x%x\n", ctrl->id, ctrl->value);
++
++	ext_ctrl[0].id = ctrl->id;
++	ext_ctrl[0].value = ctrl->value;
++
++	ext_ctrls.count = 1;
++	ext_ctrls.controls = ext_ctrl;
++
++	return adv_camera_module_s_ext_ctrls(sd, &ext_ctrls);
++}
++
++/* ======================================================================== */
++
++long adv_camera_module_ioctl(struct v4l2_subdev *sd,
++	unsigned int cmd,
++	void *arg)
++{
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++	int ret;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "cmd: 0x%x\n", cmd);
++
++	if (cmd == RK_VIDIOC_SENSOR_MODE_DATA) {
++		struct adv_camera_module_timings adv_timings;
++		struct isp_supplemental_sensor_mode_data *timings =
++		(struct isp_supplemental_sensor_mode_data *)arg;
++
++		if (cam_mod->custom.g_timings)
++			ret = cam_mod->custom.g_timings(cam_mod, &adv_timings);
++		else
++			ret = -EPERM;
++
++		if (IS_ERR_VALUE(ret)) {
++			pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"failed with error %d\n", ret);
++			return ret;
++		}
++
++		timings->sensor_output_width = adv_timings.sensor_output_width;
++		timings->sensor_output_height = adv_timings.sensor_output_height;
++		timings->crop_horizontal_start =
++			adv_timings.crop_horizontal_start;
++		timings->crop_vertical_start = adv_timings.crop_vertical_start;
++		timings->crop_horizontal_end = adv_timings.crop_horizontal_end;
++		timings->crop_vertical_end = adv_timings.crop_vertical_end;
++		timings->line_length_pck = adv_timings.line_length_pck;
++		timings->frame_length_lines = adv_timings.frame_length_lines;
++		timings->vt_pix_clk_freq_hz = adv_timings.vt_pix_clk_freq_hz;
++		timings->binning_factor_x = adv_timings.binning_factor_x;
++		timings->binning_factor_y = adv_timings.binning_factor_y;
++		timings->coarse_integration_time_max_margin =
++			adv_timings.coarse_integration_time_max_margin;
++		timings->coarse_integration_time_min =
++			adv_timings.coarse_integration_time_min;
++		timings->fine_integration_time_max_margin =
++			adv_timings.fine_integration_time_max_margin;
++		timings->fine_integration_time_min =
++			adv_timings.fine_integration_time_min;
++
++		if (cam_mod->custom.g_exposure_valid_frame)
++			timings->exposure_valid_frame =
++				cam_mod->custom.g_exposure_valid_frame(cam_mod);
++		if (cam_mod->exp_config.exp_time)
++			timings->exp_time = cam_mod->exp_config.exp_time;
++		else
++			timings->exp_time = adv_timings.exp_time;
++		if (cam_mod->exp_config.gain)
++			timings->gain = cam_mod->exp_config.gain;
++		else
++			timings->gain = adv_timings.gain;
++		return ret;
++	} else if (cmd == PLTFRM_CIFCAM_G_ITF_CFG) {
++		struct pltfrm_cam_itf *itf_cfg = (struct pltfrm_cam_itf *)arg;
++		struct adv_camera_module_config *config;
++
++		if (cam_mod->custom.num_configs <= 0) {
++			pltfrm_camera_module_pr_err(&cam_mod->sd,
++				"cam_mod->custom.num_configs is NULL, Get interface config failed!\n");
++			return -EINVAL;
++		}
++
++		if (IS_ERR_OR_NULL(cam_mod->active_config))
++			config = &cam_mod->custom.configs[0];
++		else
++			config = cam_mod->active_config;
++
++		*itf_cfg = config->itf_cfg;
++
++		pltfrm_camera_module_ioctl(sd, PLTFRM_CIFCAM_G_ITF_CFG, arg);
++		return 0;
++	} else if (cmd == PLTFRM_CIFCAM_ATTACH) {
++		adv_camera_module_init(cam_mod, &cam_mod->custom);
++		pltfrm_camera_module_pr_err(&cam_mod->sd, "test\n");
++		pltfrm_camera_module_ioctl(sd, cmd, arg);
++		return adv_camera_module_attach(cam_mod);
++	}
++
++	ret = pltfrm_camera_module_ioctl(sd, cmd, arg);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_get_flip_mirror(
++	struct adv_camera_module *cam_mod)
++{
++	return pltfrm_camera_module_get_flip_mirror(&cam_mod->sd);
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_enum_frameintervals(
++	struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_frame_interval_enum *fie)
++{
++	struct adv_camera_module *cam_mod =  to_adv_camera_module(sd);
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "%d\n", fie->index);
++
++	if (fie->index >= cam_mod->custom.num_configs)
++		return -EINVAL;
++	fie->code =
++		cam_mod->custom.configs[fie->index].frm_fmt.code;
++	fie->width =
++		cam_mod->custom.configs[fie->index].frm_fmt.width;
++	fie->height =
++		cam_mod->custom.configs[fie->index].frm_fmt.height;
++	fie->interval.numerator = cam_mod->custom.
++		configs[fie->index].frm_intrvl.interval.numerator;
++	fie->interval.denominator = cam_mod->custom.
++		configs[fie->index].frm_intrvl.interval.denominator;
++
++	return 0;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_write_reg(
++	struct adv_camera_module *cam_mod,
++	u8 reg,
++	u8 val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&cam_mod->sd);
++	int ret = 0;
++	struct i2c_msg msg;
++	unsigned char data[2];
++	int retries;
++
++	if (!client->adapter) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd, "client->adapter NULL\n");
++		return -ENODEV;
++	}
++
++	for (retries = 0; retries < 5; retries++) {
++		msg.addr = client->addr;
++		msg.flags = 0;
++		msg.len = 2;
++		msg.buf = data;
++
++		data[0] = reg;
++		data[1] = val;
++
++		ret = i2c_transfer(client->adapter, &msg, 1);
++		if (ret == 1) {
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++			"i2c write to offset 0x%02x success\n", reg);
++			return 0;
++		}
++
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"retrying I2C... %d\n", retries);
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		schedule_timeout(msecs_to_jiffies(20));
++	}
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"i2c write to offset 0x%02x failed with error %d\n", reg, ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_read_reg(
++	struct adv_camera_module *cam_mod,
++	u8 reg,
++	u8 *val)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(&cam_mod->sd);
++	int ret = 0;
++	struct i2c_msg msg[2];
++	char data[2];
++	char pval;
++
++	if (!client->adapter) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd, "client->adapter NULL\n");
++		return -ENODEV;
++	}
++
++	data[0] = reg;
++	msg[0].addr = client->addr;
++	msg[0].flags = 0;
++	msg[0].len = 1;
++	msg[0].buf = data;
++
++	msg[1].addr = client->addr;
++	msg[1].flags = 1;
++	msg[1].len = 1;
++	msg[1].buf = &pval;
++
++	ret = i2c_transfer(client->adapter, msg, 2);
++	if (ret >= 0) {
++		pltfrm_camera_module_pr_debug(&cam_mod->sd,
++					    "i2c read from 0x%02x return 0x%02x\n",
++					    reg,
++					    pval);
++
++		*val = pval;
++		return 0;
++	}
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"i2c read from offset 0x%02x failed with error %d\n", reg, ret);
++	return ret;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_read_reg_table(
++	struct adv_camera_module *cam_mod,
++	u16 reg,
++	u32 *val)
++{
++	int i;
++
++	if (cam_mod->state == ADV_CAMERA_MODULE_STREAMING)
++		return pltfrm_camera_module_read_reg(&cam_mod->sd,
++			1, reg, val);
++
++	if (!IS_ERR_OR_NULL(cam_mod->active_config)) {
++		for (
++			i = cam_mod->active_config->reg_table_num_entries - 1;
++			i > 0;
++			i--) {
++			if (cam_mod->active_config->reg_table[i].reg == reg) {
++				*val = cam_mod->active_config->reg_table[i].val;
++				return 0;
++			}
++		}
++	}
++
++	if (cam_mod->state == ADV_CAMERA_MODULE_SW_STANDBY)
++		return pltfrm_camera_module_read_reg(&cam_mod->sd,
++			1, reg, val);
++
++	return -EFAULT;
++}
++
++/* ======================================================================== */
++
++int adv_camera_module_write_reglist(
++	struct adv_camera_module *cam_mod,
++	const struct adv_camera_module_reg reglist[],
++	int len)
++{
++	int i;
++	int ret = 0;
++
++	for (i = 0; i < len; i++)
++		ret |= adv_camera_module_write_reg(cam_mod,
++						   reglist[i].reg,
++						   reglist[i].val);
++
++	return ret;
++}
++
++int adv_camera_module_init(struct adv_camera_module *cam_mod,
++	struct adv_camera_module_custom_config *custom)
++{
++	int ret = 0;
++
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	adv_camera_module_reset(cam_mod);
++
++	if (IS_ERR_OR_NULL(custom->start_streaming) ||
++		IS_ERR_OR_NULL(custom->stop_streaming) ||
++		IS_ERR_OR_NULL(custom->s_ctrl) ||
++		IS_ERR_OR_NULL(custom->g_ctrl)) {
++		pltfrm_camera_module_pr_err(&cam_mod->sd,
++			"mandatory callback function is missing\n");
++		ret = -EINVAL;
++		goto err;
++	}
++
++	ret = pltfrm_camera_module_init(&cam_mod->sd, &cam_mod->pltfm_data);
++	if (IS_ERR_VALUE(ret))
++		goto err;
++
++	ret = pltfrm_camera_module_set_pin_state(&cam_mod->sd,
++				PLTFRM_CAMERA_MODULE_PIN_PD,
++				PLTFRM_CAMERA_MODULE_PIN_STATE_INACTIVE);
++	ret = pltfrm_camera_module_set_pin_state(&cam_mod->sd,
++				PLTFRM_CAMERA_MODULE_PIN_RESET,
++				PLTFRM_CAMERA_MODULE_PIN_STATE_ACTIVE);
++	if (IS_ERR_VALUE(ret)) {
++		adv_camera_module_release(cam_mod);
++		goto err;
++	}
++
++	return 0;
++err:
++	pltfrm_camera_module_pr_err(&cam_mod->sd,
++		"failed with error %d\n", ret);
++	return ret;
++}
++
++void adv_camera_module_release(struct adv_camera_module *cam_mod)
++{
++	pltfrm_camera_module_pr_debug(&cam_mod->sd, "\n");
++
++	if (cam_mod->otp_work.wq) {
++		flush_workqueue(cam_mod->otp_work.wq);
++		destroy_workqueue(cam_mod->otp_work.wq);
++		cam_mod->otp_work.wq = NULL;
++	}
++
++	cam_mod->custom.configs = NULL;
++
++	pltfrm_camera_module_release(&cam_mod->sd);
++	v4l2_device_unregister_subdev(&cam_mod->sd);
++}
+diff --git a/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.h b/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.h
+new file mode 100644
+index 000000000000..5f505ee16379
+--- /dev/null
++++ b/drivers/media/i2c/soc_camera/rockchip/adv_camera_module.h
+@@ -0,0 +1,284 @@
++/*
++ * adv_camera_module.h
++ *
++ * Generic adi sensor driver
++ *
++ * Copyright (C) 2017 Fuzhou Rockchip Electronics Co., Ltd.
++ *
++ * Copyright (C) 2012-2014 Intel Mobile Communications GmbH
++ *
++ * Copyright (C) 2008 Texas Instruments.
++ *
++ * This file is licensed under the terms of the GNU General Public License
++ * version 2. This program is licensed "as is" without any warranty of any
++ * kind, whether express or implied.
++ *
++ */
++
++#ifndef ADV_CAMERA_MODULE_H
++#define ADV_CAMERA_MODULE_H
++#include <linux/workqueue.h>
++#include <linux/platform_data/rk_isp10_platform_camera_module.h>
++#include <linux/platform_data/rk_isp10_platform.h>
++
++/*
++ * TODO: references to v4l2 should be reomved from here and go into a
++ * platform dependent wrapper
++ */
++
++#define ADV_CAMERA_MODULE_REG_TYPE_DATA PLTFRM_CAMERA_MODULE_REG_TYPE_DATA
++#define ADV_CAMERA_MODULE_REG_TYPE_TIMEOUT PLTFRM_CAMERA_MODULE_REG_TYPE_TIMEOUT
++#define adv_camera_module_csi_config
++#define adv_camera_module_reg pltfrm_camera_module_reg
++#define ADV_FLIP_BIT_MASK					0x2
++#define ADV_MIRROR_BIT_MASK					0x1
++
++#define ADV_CAMERA_MODULE_CTRL_UPDT_GAIN			0x01
++#define ADV_CAMERA_MODULE_CTRL_UPDT_EXP_TIME			0x02
++#define ADV_CAMERA_MODULE_CTRL_UPDT_WB_TEMPERATURE		0x04
++#define ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_WB			0x08
++#define ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_GAIN			0x10
++#define ADV_CAMERA_MODULE_CTRL_UPDT_AUTO_EXP			0x20
++#define ADV_CAMERA_MODULE_CTRL_UPDT_FOCUS_ABSOLUTE		0x40
++#define ADV_CAMERA_MODULE_CTRL_UPDT_PRESET_WB			0x80
++
++enum adv_camera_module_state {
++	ADV_CAMERA_MODULE_POWER_OFF = 0,
++	ADV_CAMERA_MODULE_HW_STANDBY = 1,
++	ADV_CAMERA_MODULE_SW_STANDBY = 2,
++	ADV_CAMERA_MODULE_STREAMING = 3
++};
++
++struct adv_camera_module;
++
++struct adv_camera_module_timings {
++	/* public */
++	u32 coarse_integration_time_min;
++	u32 coarse_integration_time_max_margin;
++	u32 fine_integration_time_min;
++	u32 fine_integration_time_max_margin;
++	u32 frame_length_lines;
++	u32 line_length_pck;
++	u32 vt_pix_clk_freq_hz;
++	u32 sensor_output_width;
++	u32 sensor_output_height;
++	u32 crop_horizontal_start; /* Sensor crop start cord. (x0,y0) */
++	u32 crop_vertical_start;
++	u32 crop_horizontal_end; /* Sensor crop end cord. (x1,y1) */
++	u32 crop_vertical_end;
++	u8 binning_factor_x;
++	u8 binning_factor_y;
++	u32 exp_time;
++	u32 gain;
++};
++
++struct adv_camera_module_config {
++	const char *name;
++	struct v4l2_mbus_framefmt frm_fmt;
++	struct v4l2_subdev_frame_interval frm_intrvl;
++	bool auto_exp_enabled;
++	bool auto_gain_enabled;
++	bool auto_wb_enabled;
++	struct adv_camera_module_reg *reg_table;
++	u32 reg_table_num_entries;
++	struct adv_camera_module_reg *reg_diff_table;
++	u32 reg_diff_table_num_entries;
++	u32 v_blanking_time_us;
++	u32 line_length_pck;
++	u32 frame_length_lines;
++	struct adv_camera_module_timings timings;
++	bool soft_reset;
++	bool ignore_measurement_check;
++
++	struct pltfrm_cam_itf itf_cfg;
++};
++
++struct adv_camera_module_exp_config {
++	s32 exp_time;
++	bool auto_exp;
++	u16 gain;
++	u16 gain_percent;
++	bool auto_gain;
++	enum v4l2_flash_led_mode flash_mode;
++};
++
++struct adv_camera_module_wb_config {
++	u32 temperature;
++	u32 preset_id;
++	bool auto_wb;
++};
++
++struct adv_camera_module_af_config {
++	u32 abs_pos;
++	u32 rel_pos;
++};
++
++struct adv_camera_module_ext_ctrl {
++	/* public */
++	u32 id;
++	u32 value;
++	__u32 reserved2[1];
++};
++
++struct adv_camera_module_ext_ctrls {
++	/* public */
++	u32 count;
++	struct adv_camera_module_ext_ctrl *ctrls;
++};
++
++/*
++ *	start_streaming: (mandatory) will be called when sensor should be
++ *		put into streaming mode right after the base config has been
++ *		written to the sensor. After a successful call of this function
++ *		the sensor should start delivering frame data.
++ *
++ *	stop_streaming: (mandatory) will be called when sensor should stop
++ *		delivering data. After a successful call of this function the
++ *		sensor should not deliver any more frame data.
++ *
++ *	check_camera_id: (optional) will be called when the sensor is
++ *		powered on. If pradvided should check the sensor ID/version
++ *		required by the custom driver. Register access should be
++ *		possible when this function is invoked.
++ *
++ *	s_ctrl: (mandatory) will be called at the successful end of
++ *		adv_camera_module_s_ctrl with the ctrl_id as argument.
++ *
++ *	priv: (optional) for private data used by the custom driver.
++ */
++struct adv_camera_module_custom_config {
++	int (*start_streaming)(struct adv_camera_module *cam_mod);
++	int (*stop_streaming)(struct adv_camera_module *cam_mod);
++	int (*check_camera_id)(struct adv_camera_module *cam_mod);
++	int (*s_ctrl)(struct adv_camera_module *cam_mod, u32 ctrl_id);
++	int (*g_ctrl)(struct adv_camera_module *cam_mod, u32 ctrl_id);
++	int (*g_timings)(struct adv_camera_module *cam_mod,
++		struct adv_camera_module_timings *timings);
++	int (*g_exposure_valid_frame)(struct adv_camera_module *cam_mod);
++	int (*s_ext_ctrls)(struct adv_camera_module *cam_mod,
++		struct adv_camera_module_ext_ctrls *ctrls);
++	int (*set_flip)(
++		struct adv_camera_module *cam_mod,
++		struct pltfrm_camera_module_reg reglist[],
++		int len);
++	int (*init_common)(struct adv_camera_module *cam_mod);
++	int (*read_otp)(struct adv_camera_module *cam_mod);
++	struct adv_camera_module_config *configs;
++	u32 num_configs;
++	u32 power_up_delays_ms[3];
++	void *priv;
++};
++
++struct adv_camera_module_otp_work {
++	struct work_struct work;
++	struct workqueue_struct *wq;
++	void *cam_mod;
++};
++
++struct adv_camera_module {
++	/* public */
++	struct v4l2_subdev sd;
++	struct v4l2_mbus_framefmt frm_fmt;
++	struct v4l2_subdev_frame_interval frm_intrvl;
++	struct adv_camera_module_exp_config exp_config;
++	struct adv_camera_module_wb_config wb_config;
++	struct adv_camera_module_af_config af_config;
++	struct adv_camera_module_custom_config custom;
++	enum adv_camera_module_state state;
++	enum adv_camera_module_state state_before_suspend;
++	struct adv_camera_module_config *active_config;
++	struct adv_camera_module_otp_work otp_work;
++	u32 ctrl_updt;
++	u32 vts_cur;
++	u32 vts_min;
++	bool auto_adjust_fps;
++	bool update_config;
++	bool frm_fmt_valid;
++	bool frm_intrvl_valid;
++	bool hflip;
++	bool vflip;
++	u32 rotation;
++	void *pltfm_data;
++	bool inited;
++};
++
++#define adv_camera_module_pr_info(cam_mod, fmt, arg...) \
++	pltfrm_camera_module_pr_info(&(cam_mod)->sd, fmt, ## arg)
++#define adv_camera_module_pr_debug(cam_mod, fmt, arg...) \
++		pltfrm_camera_module_pr_debug(&(cam_mod)->sd, fmt, ## arg)
++#define adv_camera_module_pr_warn(cam_mod, fmt, arg...) \
++		pltfrm_camera_module_pr_warn(&(cam_mod)->sd, fmt, ## arg)
++#define adv_camera_module_pr_err(cam_mod, fmt, arg...) \
++		pltfrm_camera_module_pr_err(&(cam_mod)->sd, fmt, ## arg)
++
++int adv_camera_module_write_reglist(
++	struct adv_camera_module *cam_mod,
++	const struct adv_camera_module_reg reglist[],
++	int len);
++
++int adv_camera_module_write_reg(
++	struct adv_camera_module *cam_mod,
++	u8 reg,
++	u8 val);
++
++int adv_camera_module_read_reg(
++	struct adv_camera_module *cam_mod,
++	u8 reg,
++	u8 *val);
++
++int adv_camera_module_read_reg_table(
++	struct adv_camera_module *cam_mod,
++	u16 reg,
++	u32 *val);
++
++int adv_camera_module_s_fmt(struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_format *format);
++
++int adv_camera_module_g_fmt(struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_format *format);
++
++int adv_camera_module_s_frame_interval(
++	struct v4l2_subdev *sd,
++	struct v4l2_subdev_frame_interval *interval);
++
++int adv_camera_module_s_stream(
++	struct v4l2_subdev *sd,
++	int enable);
++
++int adv_camera_module_s_power(
++	struct v4l2_subdev *sd,
++	int on);
++
++int adv_camera_module_g_ctrl(
++	struct v4l2_subdev *sd,
++	struct v4l2_control *ctrl);
++
++int adv_camera_module_s_ctrl(
++	struct v4l2_subdev *sd,
++	struct v4l2_control *ctrl);
++
++int adv_camera_module_s_ext_ctrls(
++	struct v4l2_subdev *sd,
++	struct v4l2_ext_controls *ctrls);
++
++int adv_camera_module_enum_frameintervals(
++	struct v4l2_subdev *sd,
++	struct v4l2_subdev_pad_config *cfg,
++	struct v4l2_subdev_frame_interval_enum *fie);
++
++int adv_camera_module_init(
++	struct adv_camera_module *cam_mod,
++	struct adv_camera_module_custom_config *custom);
++
++void adv_camera_module_release(
++	struct adv_camera_module *cam_mod);
++
++long adv_camera_module_ioctl(struct v4l2_subdev *sd,
++	unsigned int cmd,
++	void *arg);
++
++int adv_camera_module_get_flip_mirror(
++	struct adv_camera_module *cam_mod);
++#endif
+-- 
+2.35.3
+

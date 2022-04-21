@@ -1,0 +1,679 @@
+From 7da18b01959283e6001d721a6818caa3360274bf Mon Sep 17 00:00:00 2001
+From: luowei <lw@rock-chips.com>
+Date: Thu, 11 Oct 2012 19:24:36 +0800
+Subject: [PATCH] rk30_phonepad:add gt828 support for auto touchscreen
+
+---
+ drivers/input/ts/chips/Kconfig  |  12 +-
+ drivers/input/ts/chips/Makefile |   4 +-
+ drivers/input/ts/chips/ft5306.c |   8 +-
+ drivers/input/ts/chips/gt8110.c |   6 +-
+ drivers/input/ts/chips/gt828.c  | 322 ++++++++++++++++++++++++++++++++
+ drivers/input/ts/ts-auto.c      |  81 +++++++-
+ drivers/input/ts/ts-i2c.c       |  30 ++-
+ include/linux/ts-auto.h         |  12 +-
+ 8 files changed, 451 insertions(+), 24 deletions(-)
+ create mode 100755 drivers/input/ts/chips/gt828.c
+
+diff --git a/drivers/input/ts/chips/Kconfig b/drivers/input/ts/chips/Kconfig
+index 7dc4b2ab2f48..8dbe1802670d 100755
+--- a/drivers/input/ts/chips/Kconfig
++++ b/drivers/input/ts/chips/Kconfig
+@@ -1,11 +1,11 @@
+ config TS_FT5306
+   bool "touch screen ft5306"
+ 	default n
+- 
+-config TS_CT360
+-  bool "touch screen ct360"
+-	default n
+-
++ 
+ config TS_GT8110
+   bool "touch screen gt8110"
+-	default n	  
+\ No newline at end of file
++	default n	
++
++config TS_GT828
++  bool "touch screen gt828"
++	default n
+\ No newline at end of file
+diff --git a/drivers/input/ts/chips/Makefile b/drivers/input/ts/chips/Makefile
+index aec7f1c31b27..7f758978d773 100755
+--- a/drivers/input/ts/chips/Makefile
++++ b/drivers/input/ts/chips/Makefile
+@@ -1,3 +1,3 @@
+ obj-$(CONFIG_TS_FT5306)			+= ft5306.o
+-obj-$(CONFIG_TS_CT360)			+= ct360.o
+-obj-$(CONFIG_TS_GT8110)			+= gt8110.o
+\ No newline at end of file
++obj-$(CONFIG_TS_GT8110)			+= gt8110.o
++obj-$(CONFIG_TS_GT828)			+= gt828.o
+\ No newline at end of file
+diff --git a/drivers/input/ts/chips/ft5306.c b/drivers/input/ts/chips/ft5306.c
+index cb3a7417f0d6..6e005d1adf50 100755
+--- a/drivers/input/ts/chips/ft5306.c
++++ b/drivers/input/ts/chips/ft5306.c
+@@ -57,7 +57,7 @@ static int ts_active(struct i2c_client *client, int enable)
+ 	if(enable)
+ 	{
+ 		gpio_direction_output(ts->pdata->reset_pin, GPIO_LOW);
+-		mdelay(10);
++		msleep(10);
+ 		gpio_direction_output(ts->pdata->reset_pin, GPIO_HIGH);
+ 		msleep(100);
+ 	}
+@@ -208,9 +208,13 @@ struct ts_operate ts_ft5306_ops = {
+ 	.name				= "ft5306",
+ 	.slave_addr			= 0x3e,
+ 	.id_i2c				= TS_ID_FT5306,			//i2c id number
++	.reg_size			= 1,
+ 	.pixel				= {1024,768},
+ 	.id_reg				= FT5306_ID_REG,
+-	.id_data			= TS_UNKNOW_DATA,	
++	.id_data			= TS_UNKNOW_DATA,
++	.version_reg			= TS_UNKNOW_DATA,
++	.version_len			= 0,
++	.version_data			= NULL,
+ 	.read_reg			= FT5306_DATA_REG,		//read data
+ 	.read_len			= 32,				//data length
+ 	.trig				= IRQF_TRIGGER_FALLING,		
+diff --git a/drivers/input/ts/chips/gt8110.c b/drivers/input/ts/chips/gt8110.c
+index 301bb273d838..de04d89925e4 100755
+--- a/drivers/input/ts/chips/gt8110.c
++++ b/drivers/input/ts/chips/gt8110.c
+@@ -329,9 +329,13 @@ struct ts_operate ts_gt8110_ops = {
+ 	.name				= "gt8110",
+ 	.slave_addr			= 0x5c,
+ 	.id_i2c				= TS_ID_GT8110,			//i2c id number
++	.reg_size			= 1,
+ 	.pixel				= {1280,800},
+ 	.id_reg				= GT8110_ID_REG,
+-	.id_data			= TS_UNKNOW_DATA,	
++	.id_data			= TS_UNKNOW_DATA,
++	.version_reg			= TS_UNKNOW_DATA,
++	.version_len			= 0,
++	.version_data			= NULL,
+ 	.read_reg			= GT8110_DATA_REG,		//read data
+ 	.read_len			= 5*10+3+1,			//data length
+ 	.trig				= IRQ_TYPE_LEVEL_LOW,		
+diff --git a/drivers/input/ts/chips/gt828.c b/drivers/input/ts/chips/gt828.c
+new file mode 100755
+index 000000000000..bee168e1fbd6
+--- /dev/null
++++ b/drivers/input/ts/chips/gt828.c
+@@ -0,0 +1,322 @@
++/* drivers/input/ts/chips/gt828.c
++ *
++ * Copyright (C) 2012-2015 ROCKCHIP.
++ * Author: luowei <lw@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/input/mt.h>
++#include <mach/gpio.h>
++#include <mach/board.h> 
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif	 
++#include <linux/ts-auto.h>
++	 
++	 
++#if 0
++#define DBG(x...)  printk(x)
++#else
++#define DBG(x...)
++#endif
++
++
++//Register define
++#define GTP_READ_COOR_ADDR    0x0F40
++#define GTP_REG_SLEEP         0x0FF2
++#define GTP_REG_SENSOR_ID     0x0FF5
++#define GTP_REG_CONFIG_DATA   0x0F80
++#define GTP_REG_VERSION       0x0F7D
++
++
++
++/****************operate according to ts chip:start************/
++
++int ts_i2c_end_cmd(struct i2c_client *client)
++{
++	int result  = -1;
++	char end_cmd_data[2]={0x80, 0x00};
++
++	result = ts_tx_data(client, end_cmd_data, 2);
++	if(result < 0)
++	{
++		printk("%s:fail to init ts\n",__func__);
++		return result;
++	}
++
++	return result;
++}
++
++
++static int ts_active(struct i2c_client *client, int enable)
++{
++	struct ts_private_data *ts =
++	    (struct ts_private_data *) i2c_get_clientdata(client);	
++	int result = 0;
++
++	if(enable)
++	{
++		gpio_direction_output(ts->pdata->reset_pin, GPIO_LOW);
++		msleep(10);
++		gpio_direction_output(ts->pdata->reset_pin, GPIO_HIGH);
++		msleep(100);
++	}
++	else
++	{
++		gpio_direction_output(ts->pdata->reset_pin, GPIO_LOW);	
++	}
++		
++	
++	return result;
++}
++
++static int ts_init(struct i2c_client *client)
++{
++	struct ts_private_data *ts =
++	    (struct ts_private_data *) i2c_get_clientdata(client);
++	int result = 0;
++	char version_data[4] = {ts->ops->version_reg >> 8, ts->ops->version_reg & 0xff};
++	
++	//read version
++	result = ts_rx_data(client, version_data, 4);
++	if(result < 0)
++	{
++		printk("%s:fail to init ts\n",__func__);
++		return result;
++	}
++	version_data[4]='\0';
++	
++	result = ts_i2c_end_cmd(client);
++	if(result < 0)
++	{
++		printk("%s:fail to end ts\n",__func__);
++		//return result;
++	}
++	
++	printk("%s:%s version is %s\n",__func__,ts->ops->name, version_data);
++
++	//init some register
++	//to do
++	
++	return result;
++}
++
++
++static int ts_report_value(struct i2c_client *client)
++{
++	struct ts_private_data *ts =
++		(struct ts_private_data *) i2c_get_clientdata(client);	
++	struct ts_platform_data *pdata = ts->pdata;
++	struct ts_event *event = &ts->event;
++	unsigned char buf[2 + 2 + 5 * 5 + 1] = {0};
++	int result = 0 , i = 0, off = 0, id = 0;
++	int finger = 0;
++	int checksum = 0;
++
++	buf[0] = ts->ops->read_reg >> 8;
++	buf[1] = ts->ops->read_reg & 0xff;
++	result = ts_rx_data_word(client, buf, ts->ops->read_len);
++	if(result < 0)
++	{
++		printk("%s:fail to init ts\n",__func__);
++		return result;
++	}
++
++	result = ts_i2c_end_cmd(client);
++	if(result < 0)
++	{
++		printk("%s:fail to end ts\n",__func__);
++		return result;
++	}
++	
++	//for(i=0; i<ts->ops->read_len; i++)
++	//DBG("buf[%d]=0x%x\n",i,buf[i]);
++	finger = buf[0];
++	if((finger & 0xc0) != 0x80)
++	{
++		DBG("%s:data not ready!\n",__func__);
++		return -1;
++	}
++
++
++#if 0	
++	event->touch_point = 0;
++	for(i=0; i<ts->ops->max_point; i++)
++	{
++		if(finger & (1<<i))
++			event->touch_point++;
++	}
++
++	check_sum = 0;
++	for ( i = 0; i < 5 * event->touch_point; i++)
++	{
++		check_sum += buf[2+i];
++	}
++	if (check_sum != buf[5 * event->touch_point])
++	{
++		DBG("%s:check sum error!\n",__func__);
++		return -1;
++	}
++#endif
++	
++	for(i = 0; i<ts->ops->max_point; i++)
++	{
++		off = i*5+2;
++
++		id = i;				
++		event->point[id].id = id;
++		event->point[id].status = !!(finger & (1 << i));
++		event->point[id].x = (buf[off+0]<<8) | buf[off+1];
++		event->point[id].y = (buf[off+2]<<8) | buf[off+3];
++		event->point[id].press = buf[off+4];	
++		
++		if(ts->ops->xy_swap)
++		{
++			swap(event->point[id].x, event->point[id].y);
++		}
++
++		if(ts->ops->x_revert)
++		{
++			event->point[id].x = ts->ops->pixel.max_x - event->point[id].x;	
++		}
++
++		if(ts->ops->y_revert)
++		{
++			event->point[id].y = ts->ops->pixel.max_y - event->point[id].y;
++		}
++
++		if(event->point[id].status != 0)
++		{		
++			input_mt_slot(ts->input_dev, event->point[id].id);
++			input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, event->point[id].id);
++			input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, event->point[id].press);
++			input_report_abs(ts->input_dev, ABS_MT_POSITION_X, event->point[id].x);
++			input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, event->point[id].y);
++			input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, 1);
++	   		DBG("%s:%s press down,id=%d,x=%d,y=%d\n",__func__,ts->ops->name, event->point[id].id, event->point[id].x,event->point[id].y);
++		}
++		else if ((event->point[id].status == 0) && (event->point[id].last_status != 0))
++		{			
++			input_mt_slot(ts->input_dev, event->point[i].id);				
++			input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, -1);
++			input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, false);
++			DBG("%s:%s press up,id=%d\n",__func__,ts->ops->name, event->point[i].id);
++		}
++
++		event->point[i].last_status = event->point[i].status;	
++		
++	}
++	
++	input_sync(ts->input_dev);
++
++	return 0;
++}
++
++static int ts_suspend(struct i2c_client *client)
++{
++	struct ts_private_data *ts =
++		(struct ts_private_data *) i2c_get_clientdata(client);	
++	struct ts_platform_data *pdata = ts->pdata;
++
++	if(ts->ops->active)
++		ts->ops->active(client, 0);
++	
++	return 0;
++}
++
++
++
++
++static int ts_resume(struct i2c_client *client)
++{
++	struct ts_private_data *ts =
++		(struct ts_private_data *) i2c_get_clientdata(client);	
++	struct ts_platform_data *pdata = ts->pdata;
++	
++	if(ts->ops->active)
++		ts->ops->active(client, 1);
++	return 0;
++}
++
++
++
++
++
++struct ts_operate ts_gt828_ops = {
++	.name				= "gt828",
++	.slave_addr			= 0x5d,
++	.id_i2c				= TS_ID_GT828,			//i2c id number
++	.reg_size			= 2,
++	.pixel				= {1024,600},
++	.id_reg				= GTP_REG_SENSOR_ID,
++	.id_data			= TS_UNKNOW_DATA,
++	.version_reg			= 0x0F7D,
++	.version_len			= 0,
++	.version_data			= NULL,
++	.read_reg			= GTP_READ_COOR_ADDR,		//read data
++	.read_len			= 2 + 2 + 5 * 5 + 1,		//data length
++	.trig				= IRQF_TRIGGER_FALLING,		
++	.max_point			= 5,
++	.xy_swap 			= 0,
++	.x_revert 			= 0,
++	.y_revert			= 0,
++	.range				= {1024,600},
++	.irq_enable			= 1,
++	.poll_delay_ms			= 0,
++	.active				= ts_active,	
++	.init				= ts_init,
++	.check_irq			= NULL,
++	.report 			= ts_report_value,
++	.firmware			= NULL,
++	.suspend			= ts_suspend,
++	.resume				= ts_resume,
++};
++
++/****************operate according to ts chip:end************/
++
++//function name should not be changed
++static struct ts_operate *ts_get_ops(void)
++{
++	return &ts_gt828_ops;
++}
++
++
++static int __init ts_gt828_init(void)
++{
++	struct ts_operate *ops = ts_get_ops();
++	int result = 0;
++	result = ts_register_slave(NULL, NULL, ts_get_ops);	
++	DBG("%s\n",__func__);
++	return result;
++}
++
++static void __exit ts_gt828_exit(void)
++{
++	struct ts_operate *ops = ts_get_ops();
++	ts_unregister_slave(NULL, NULL, ts_get_ops);
++}
++
++
++subsys_initcall(ts_gt828_init);
++module_exit(ts_gt828_exit);
++
+diff --git a/drivers/input/ts/ts-auto.c b/drivers/input/ts/ts-auto.c
+index 2eff50e2748f..fc305cb30ecd 100755
+--- a/drivers/input/ts/ts-auto.c
++++ b/drivers/input/ts/ts-auto.c
+@@ -51,18 +51,29 @@ static int ts_get_id(struct ts_operate *ops, struct i2c_client *client, int *val
+ 	struct ts_private_data *ts =
+ 	    (struct ts_private_data *) i2c_get_clientdata(client);	
+ 	int result = 0;
+-	char temp = ops->id_reg;
++	char temp[4] = {ops->id_reg & 0xff};
+ 	int i = 0;
+ 	
+ 	DBG("%s:start\n",__func__);
+ 	if(ops->id_reg >= 0)
+ 	{
+-		for(i=0; i<1; i++)
++		for(i=0; i<2; i++)
+ 		{
+-			result = ts_rx_data(client, &temp, 1);
+-			*value = temp;
++			if(ops->reg_size == 2)
++			{
++				temp[0] = ops->id_reg >> 8;
++				temp[1] = ops->id_reg & 0xff;
++				result = ts_rx_data_word(client, &temp, 2);
++				*value = (temp[0] << 8) | temp[1];
++			}
++			else
++			{
++				result = ts_rx_data(client, &temp, 1);
++				*value = temp[0];
++			}
+ 			if(!result)
+ 			break;
++
+ 		}
+ 
+ 		if(result)
+@@ -81,6 +92,55 @@ static int ts_get_id(struct ts_operate *ops, struct i2c_client *client, int *val
+ }
+ 
+ 
++static int ts_get_version(struct ts_operate *ops, struct i2c_client *client)
++{
++	struct ts_private_data *ts =
++	    (struct ts_private_data *) i2c_get_clientdata(client);	
++	int result = 0;
++	char temp[TS_MAX_VER_LEN + 1] = {0};
++	int i = 0;
++	
++	DBG("%s:start\n",__func__);
++	
++	if(ops->version_reg >= 0)
++	{
++		if((ops->version_len < 0) || (ops->version_len > TS_MAX_VER_LEN))
++		{
++			printk("%s:version_len is error\n",__func__,ops->version_len);
++			ops->version_len = TS_MAX_VER_LEN;
++		}
++	
++		if(ops->reg_size == 2)
++		{
++			result = ts_rx_data_word(client, temp, ops->version_len);
++		}
++		else
++		{
++			result = ts_rx_data(client, temp, ops->version_len);
++		}
++	
++
++		if(result)
++			return result;
++		
++		if(ops->version_data)
++		{
++			for(i=0; i<ops->version_len; i++)
++			{
++				if(temp[i] == ops->version_data[i])
++					continue;
++				printk("%s:version %s is not %s\n",__func__,temp, ops->version_data);
++				result = -1;
++			}
++		}
++			
++		DBG("%s:%s version: %s\n",__func__,ops->name, temp);
++	}
++
++	return result;
++}
++
++
+ static int ts_chip_init(struct i2c_client *client)
+ {
+ 	struct ts_private_data *ts =
+@@ -110,23 +170,30 @@ static int ts_chip_init(struct i2c_client *client)
+ 		}
+ 
+ 		client->addr = ops->slave_addr;	//use slave_addr of ops
+-		
++#if 0		
+ 		if(ops->active)
+ 		{
+ 			result = ops->active(client, TS_ENABLE);
+ 			if(result < 0)
+ 			{
+-				printk("%s:fail to init ts\n",__func__);
++				printk("%s:fail to active ts\n",__func__);
+ 				continue;
+ 			}
+ 		}
+-
++#endif
+ 		result = ts_get_id(ops, client, &ts->devid);//get id
+ 		if(result < 0)
+ 		{	
+ 			printk("%s:fail to read %s devid:0x%x\n",__func__, ops->name, ts->devid);	
+ 			continue;
+ 		}
++
++		result = ts_get_version(ops, client);	//get version
++		if(result < 0)
++		{	
++			printk("%s:fail to read %s version\n",__func__, ops->name);	
++			continue;
++		}
+ 	
+ 		ts->ops = ops;	//save ops
+ 
+diff --git a/drivers/input/ts/ts-i2c.c b/drivers/input/ts/ts-i2c.c
+index 8c00ff7d7ea3..c7e4d9695098 100755
+--- a/drivers/input/ts/ts-i2c.c
++++ b/drivers/input/ts/ts-i2c.c
+@@ -71,7 +71,7 @@ static int ts_i2c_write(struct i2c_adapter *i2c_adap,
+ 
+ static int senosr_i2c_read(struct i2c_adapter *i2c_adap,
+ 			   unsigned char address, unsigned char reg,
+-			   unsigned int len, unsigned char *data)
++			   unsigned int tx_len, unsigned int rx_len, unsigned char *data)
+ {
+ 	struct i2c_msg msgs[2];
+ 	int res;
+@@ -84,13 +84,13 @@ static int senosr_i2c_read(struct i2c_adapter *i2c_adap,
+ 	msgs[0].addr = address;
+ 	msgs[0].flags = 0;	/* write */
+ 	msgs[0].buf = &reg;
+-	msgs[0].len = 1;
++	msgs[0].len = tx_len;
+ 	msgs[0].scl_rate = TS_I2C_RATE;
+ 	
+ 	msgs[1].addr = address;
+ 	msgs[1].flags = I2C_M_RD;
+ 	msgs[1].buf = data;
+-	msgs[1].len = len;
++	msgs[1].len = rx_len;
+ 	msgs[1].scl_rate = TS_I2C_RATE;	
+ 
+ 	res = i2c_transfer(i2c_adap, msgs, 2);
+@@ -113,7 +113,7 @@ int ts_rx_data(struct i2c_client *client, char *rxData, int length)
+ #endif
+ 	int ret = 0;
+ 	char reg = rxData[0];
+-	ret = senosr_i2c_read(client->adapter, client->addr, reg, length, rxData);
++	ret = senosr_i2c_read(client->adapter, client->addr, reg, 1, length, rxData);
+ 	
+ #ifdef TS_DEBUG_ENABLE
+ 	DBG("addr=0x%x,len=%d,rxdata:",reg,length);
+@@ -125,6 +125,28 @@ int ts_rx_data(struct i2c_client *client, char *rxData, int length)
+ }
+ EXPORT_SYMBOL(ts_rx_data);
+ 
++int ts_rx_data_word(struct i2c_client *client, char *rxData, int length)
++{
++#ifdef TS_DEBUG_ENABLE
++	struct ts_private_data* ts = 
++		(struct ts_private_data *)i2c_get_clientdata(client);
++	int i = 0;
++#endif
++	int ret = 0;
++	char reg = rxData[0];
++	ret = senosr_i2c_read(client->adapter, client->addr, reg, 2, length, rxData);
++	
++#ifdef TS_DEBUG_ENABLE
++	DBG("addr=0x%x,len=%d,rxdata:",reg,length);
++	for(i=0; i<length; i++)
++		DBG("0x%x,",rxData[i]);
++	DBG("\n");
++#endif	
++	return ret;
++}
++EXPORT_SYMBOL(ts_rx_data_word);
++
++
+ int ts_tx_data(struct i2c_client *client, char *txData, int length)
+ {
+ #ifdef TS_DEBUG_ENABLE	
+diff --git a/include/linux/ts-auto.h b/include/linux/ts-auto.h
+index c5af819f39f4..3d5661997d1a 100755
+--- a/include/linux/ts-auto.h
++++ b/include/linux/ts-auto.h
+@@ -6,6 +6,8 @@
+ #define	TS_DISABLE	0
+ #define TS_UNKNOW_DATA	-1
+ #define	TS_MAX_POINT	20
++#define	TS_MAX_VER_LEN	64
++
+ 
+ enum ts_id {
+ 	TS_ID_INVALID = 0,
+@@ -13,6 +15,7 @@ enum ts_id {
+ 	TS_ID_FT5306,
+ 	TS_ID_CT360,
+ 	TS_ID_GT8110,
++	TS_ID_GT828,
+ 	
+ 	TS_NUM_ID,
+ };
+@@ -51,9 +54,13 @@ struct ts_operate {
+ 	char *name;
+ 	char slave_addr;
+ 	int id_i2c;
+-	struct ts_max_pixel pixel;	
++	struct ts_max_pixel pixel;
++	int reg_size;
+ 	int id_reg;
+ 	int id_data;
++	int version_reg;
++	char *version_data;
++	int version_len;	//<64
+ 	int read_reg;
+ 	int read_len;
+ 	int trig;	//intterupt trigger
+@@ -65,7 +72,7 @@ struct ts_operate {
+ 	int irq_enable;         //if irq_enable=1 then use irq else use polling  
+ 	int poll_delay_ms;      //polling
+ 	int gpio_level_no_int;
+-	int (*active)(struct i2c_client *client, int enable);	
++	int (*active)(struct i2c_client *client, int enable);
+ 	int (*init)(struct i2c_client *client);	
+ 	int (*check_irq)(struct i2c_client *client);
+ 	int (*report)(struct i2c_client *client);
+@@ -111,6 +118,7 @@ extern int ts_unregister_slave(struct i2c_client *client,
+ 
+ extern int ts_rx_data(struct i2c_client *client, char *rxData, int length);
+ extern int ts_tx_data(struct i2c_client *client, char *txData, int length);
++extern int ts_rx_data_word(struct i2c_client *client, char *rxData, int length);
+ extern int ts_write_reg(struct i2c_client *client, int addr, int value);
+ extern int ts_read_reg(struct i2c_client *client, int addr);
+ extern int ts_tx_data_normal(struct i2c_client *client, char *buf, int num);
+-- 
+2.35.3
+

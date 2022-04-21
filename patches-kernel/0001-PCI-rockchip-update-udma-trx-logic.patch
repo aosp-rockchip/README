@@ -1,0 +1,274 @@
+From 0cd2eda71e532fd349770ee3f38d8d4b99bf58e6 Mon Sep 17 00:00:00 2001
+From: Simon Xue <xxm@rock-chips.com>
+Date: Tue, 17 Nov 2020 17:41:51 +0800
+Subject: [PATCH] PCI: rockchip: update udma trx logic
+
+Move udma related config and start operation to master place and expose
+as a hook, udma trx obj just call the hook.
+
+Change-Id: If410280629eafa9d8829ac89a8cef6e931b37c3c
+Signed-off-by: Simon Xue <xxm@rock-chips.com>
+---
+ drivers/pci/controller/dwc/pcie-dw-rockchip.c | 48 ++++++++++++++++++-
+ drivers/pci/controller/pcie-rockchip-host.c   | 22 ++++++++-
+ drivers/pci/controller/rockchip-pcie-dma.c    | 44 +++++------------
+ drivers/pci/controller/rockchip-pcie-dma.h    | 23 +++------
+ 4 files changed, 86 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-dw-rockchip.c b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+index 6704a8e8d950..ce67e8eb3755 100644
+--- a/drivers/pci/controller/dwc/pcie-dw-rockchip.c
++++ b/drivers/pci/controller/dwc/pcie-dw-rockchip.c
+@@ -439,6 +439,26 @@ static int rk_pcie_establish_link(struct dw_pcie *pci)
+ 	return -EINVAL;
+ }
+ 
++static int rk_pcie_host_init_dma_trx(struct rk_pcie *rk_pcie)
++{
++	rk_pcie->dma_obj = rk_pcie_dma_obj_probe(rk_pcie->pci->dev);
++	if (IS_ERR(rk_pcie->dma_obj)) {
++		dev_err(rk_pcie->pci->dev, "failed to prepare dma object\n");
++		return -EINVAL;
++	}
++
++	/* Enable client write and read interrupt */
++	rk_pcie_writel_apb(rk_pcie, PCIE_CLIENT_INTR_MASK, 0xc000000);
++
++	/* Enable core write interrupt */
++	dw_pcie_writel_dbi(rk_pcie->pci, PCIE_DMA_OFFSET + PCIE_DMA_WR_INT_MASK,
++			   0x0);
++	/* Enable core read interrupt */
++	dw_pcie_writel_dbi(rk_pcie->pci, PCIE_DMA_OFFSET + PCIE_DMA_RD_INT_MASK,
++			   0x0);
++	return 0;
++}
++
+ static void rk_pcie_ep_setup(struct rk_pcie *rk_pcie)
+ {
+ 	int ret;
+@@ -615,6 +635,11 @@ static int rk_add_pcie_port(struct rk_pcie *rk_pcie)
+ 		return ret;
+ 	}
+ 
++	ret = rk_pcie_host_init_dma_trx(rk_pcie);
++	if (ret) {
++		dev_err(dev, "failed to init host dma trx\n");
++		return ret;
++	}
+ 	return 0;
+ }
+ 
+@@ -857,7 +882,7 @@ static int rk_pcie_reset_grant_ctrl(struct rk_pcie *rk_pcie,
+ 	return ret;
+ }
+ 
+-void rk_pcie_start_dma_1808(struct dma_trx_obj *obj)
++static void rk_pcie_start_dma_dwc(struct dma_trx_obj *obj)
+ {
+ 	struct rk_pcie *rk_pcie = dev_get_drvdata(obj->dev);
+ 
+@@ -882,7 +907,23 @@ void rk_pcie_start_dma_1808(struct dma_trx_obj *obj)
+ 	dw_pcie_writel_dbi(rk_pcie->pci, PCIE_DMA_OFFSET + PCIE_DMA_WR_DOORBELL,
+ 					   obj->cur->start.asdword);
+ }
+-EXPORT_SYMBOL(rk_pcie_start_dma_1808);
++
++static void rk_pcie_config_dma_dwc(struct dma_table *table)
++{
++	table->wr_enb.enb = 0x1;
++	table->ctx_reg.ctrllo.lie = 0x1;
++	table->ctx_reg.ctrllo.rie = 0x0;
++	table->ctx_reg.ctrllo.td = 0x1;
++	table->ctx_reg.ctrlhi.asdword = 0x0;
++	table->ctx_reg.xfersize = table->buf_size;
++	table->ctx_reg.sarptrlo = (u32)(table->local & 0xffffffff);
++	table->ctx_reg.sarptrhi = (u32)(table->local >> 32);
++	table->ctx_reg.darptrlo = (u32)(table->bus & 0xffffffff);
++	table->ctx_reg.darptrhi = (u32)(table->bus >> 32);
++	table->wr_weilo.weight0 = 0x0;
++	table->start.stop = 0x0;
++	table->start.chnl = PCIE_DMA_CHN0;
++}
+ 
+ static inline void
+ rk_pcie_handle_dma_interrupt(struct rk_pcie *rk_pcie)
+@@ -1139,6 +1180,9 @@ static int rk_pcie_probe(struct platform_device *pdev)
+ 		break;
+ 	}
+ 
++	rk_pcie->dma_obj->start_dma_func = rk_pcie_start_dma_dwc;
++	rk_pcie->dma_obj->config_dma_func = rk_pcie_config_dma_dwc;
++
+ 	if (ret)
+ 		goto deinit_clk;
+ 
+diff --git a/drivers/pci/controller/pcie-rockchip-host.c b/drivers/pci/controller/pcie-rockchip-host.c
+index 1ea9a412a002..8652b293dd15 100644
+--- a/drivers/pci/controller/pcie-rockchip-host.c
++++ b/drivers/pci/controller/pcie-rockchip-host.c
+@@ -40,7 +40,7 @@
+ #include "pcie-rockchip.h"
+ #include "rockchip-pcie-dma.h"
+ 
+-void rk_pcie_start_dma_3399(struct dma_trx_obj *obj)
++void rk_pcie_start_dma_rk3399(struct dma_trx_obj *obj)
+ {
+ 	struct rockchip_pcie *rockchip = dev_get_drvdata(obj->dev);
+ 	struct dma_table *tbl = obj->cur;
+@@ -53,7 +53,22 @@ void rk_pcie_start_dma_3399(struct dma_trx_obj *obj)
+ 	rockchip_pcie_write(rockchip, BIT(0) | (tbl->dir << 1),
+ 			    PCIE_APB_CORE_UDMA_BASE + 0x14 * chn + 0x00);
+ }
+-EXPORT_SYMBOL(rk_pcie_start_dma_3399);
++
++static void rk_pcie_config_dma_rk3399(struct dma_table *table)
++{
++	u32 *desc = table->descs;
++
++	*(desc + 0) = (u32)(table->local & 0xffffffff);
++	*(desc + 1) = (u32)(table->local >> 32);
++	*(desc + 2) = (u32)(table->bus & 0xffffffff);
++	*(desc + 3) = (u32)(table->bus >> 32);
++	*(desc + 4) = 0;
++	*(desc + 5) = 0;
++	*(desc + 6) = table->buf_size;
++	*(desc + 7) = 0;
++	*(desc + 8) = 0;
++	*(desc + 6) |= 1 << 24;
++}
+ 
+ static void rockchip_pcie_enable_bw_int(struct rockchip_pcie *rockchip)
+ {
+@@ -1261,6 +1276,9 @@ static int rockchip_pcie_probe(struct platform_device *pdev)
+ 		goto err_probe_dma;
+ 	}
+ 
++	rockchip->dma_obj->start_dma_func = rk_pcie_start_dma_rk3399;
++	rockchip->dma_obj->config_dma_func = rk_pcie_config_dma_rk3399;
++
+ 	return 0;
+ 
+ err_probe_dma:
+diff --git a/drivers/pci/controller/rockchip-pcie-dma.c b/drivers/pci/controller/rockchip-pcie-dma.c
+index e09f8143bdea..5e23a51acf03 100644
+--- a/drivers/pci/controller/rockchip-pcie-dma.c
++++ b/drivers/pci/controller/rockchip-pcie-dma.c
+@@ -147,7 +147,6 @@ static void rk_pcie_prepare_dma(struct dma_trx_obj *obj,
+ 	struct device *dev = obj->dev;
+ 	phys_addr_t local, bus;
+ 	void *virt;
+-	u32 *desc;
+ 	unsigned long flags;
+ 	struct dma_table *table = NULL;
+ 
+@@ -207,33 +206,15 @@ static void rk_pcie_prepare_dma(struct dma_trx_obj *obj,
+ 		return;
+ 	}
+ 
+-	if (is_rc(obj)) {
+-		desc = table->descs;
+-		*(desc + 0) = (u32)(local & 0xffffffff);
+-		*(desc + 1) = (u32)(local >> 32);
+-		*(desc + 2) = (u32)(bus & 0xffffffff);
+-		*(desc + 3) = (u32)(bus >> 32);
+-		*(desc + 4) = 0;
+-		*(desc + 5) = 0;
+-		*(desc + 6) = buf_size;
+-		*(desc + 7) = 0;
+-		*(desc + 8) = 0;
+-		*(desc + 6) |= 1 << 24;
+-	} else {
+-		table->wr_enb.enb = 0x1;
+-		table->ctx_reg.ctrllo.lie = 0x1;
+-		table->ctx_reg.ctrllo.rie = 0x0;
+-		table->ctx_reg.ctrllo.td = 0x1;
+-		table->ctx_reg.ctrlhi.asdword = 0x0;
+-		table->ctx_reg.xfersize = buf_size;
+-		table->ctx_reg.sarptrlo = (u32)(local & 0xffffffff);
+-		table->ctx_reg.sarptrhi = (u32)(local >> 32);
+-		table->ctx_reg.darptrlo = (u32)(bus & 0xffffffff);
+-		table->ctx_reg.darptrhi = (u32)(bus >> 32);
+-		table->wr_weilo.weight0 = 0x0;
+-		table->start.stop = 0x0;
+-		table->start.chnl = PCIE_DMA_CHN0;
++	table->buf_size = buf_size;
++	table->bus = bus;
++	table->local = local;
++
++	if (!obj->config_dma_func) {
++		WARN_ON(1);
++		return;
+ 	}
++	obj->config_dma_func(table);
+ 
+ 	spin_lock_irqsave(&obj->tbl_list_lock, flags);
+ 	list_add_tail(&table->tbl_node, &obj->tbl_list);
+@@ -256,10 +237,11 @@ static void rk_pcie_dma_trx_work(struct work_struct *work)
+ 			list_del_init(&table->tbl_node);
+ 			spin_unlock_irqrestore(&obj->tbl_list_lock, flags);
+ 			obj->cur = table;
+-			if (is_rc(obj))
+-				rk_pcie_start_dma_3399(obj);
+-			else
+-				rk_pcie_start_dma_1808(obj);
++			if (!obj->start_dma_func) {
++				WARN_ON(1);
++				return;
++			}
++			obj->start_dma_func(obj);
+ 		}
+ 	}
+ }
+diff --git a/drivers/pci/controller/rockchip-pcie-dma.h b/drivers/pci/controller/rockchip-pcie-dma.h
+index 8a0797d083e8..50e203b7f51f 100644
+--- a/drivers/pci/controller/rockchip-pcie-dma.h
++++ b/drivers/pci/controller/rockchip-pcie-dma.h
+@@ -9,6 +9,8 @@
+ 
+ #define PCIE_DMA_TRX_TYPE_NUM		3
+ 
++#define PCIE_DMA_CHN0			0x0
++
+ #define PCIE_DMA_DATA_SND_TABLE_OFFSET		0x0
+ #define PCIE_DMA_DATA_RCV_ACK_TABLE_OFFSET	0x8
+ #define PCIE_DMA_DATA_FREE_ACK_TABLE_OFFSET	0x10
+@@ -145,6 +147,9 @@ struct dma_table {
+ 	union weight			wr_weilo;
+ 	union weight			wr_weihi;
+ 	union db			start;
++	phys_addr_t			local;
++	phys_addr_t			bus;
++	size_t				buf_size;
+ };
+ 
+ struct dma_trx_obj {
+@@ -175,24 +180,10 @@ struct dma_trx_obj {
+ 	unsigned long			irq_num;
+ 	struct dentry			*pcie_root;
+ 	struct pcie_misc_dev		*pcie_dev;
++	void 				(*start_dma_func)(struct dma_trx_obj *obj);
++	void				(*config_dma_func)(struct dma_table *table);
+ };
+ 
+-#ifdef CONFIG_PCIE_DW_ROCKCHIP
+-void rk_pcie_start_dma_1808(struct dma_trx_obj *obj);
+-#else
+-static inline void rk_pcie_start_dma_1808(struct dma_trx_obj *obj)
+-{
+-}
+-#endif
+-
+-#ifdef CONFIG_PCIE_ROCKCHIP
+-void rk_pcie_start_dma_3399(struct dma_trx_obj *obj);
+-#else
+-static inline void rk_pcie_start_dma_3399(struct dma_trx_obj *obj)
+-{
+-}
+-#endif
+-
+ #ifdef CONFIG_ROCKCHIP_PCIE_DMA_OBJ
+ struct dma_trx_obj *rk_pcie_dma_obj_probe(struct device *dev);
+ void rk_pcie_dma_obj_remove(struct dma_trx_obj *obj);
+-- 
+2.35.3
+

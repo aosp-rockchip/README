@@ -1,0 +1,352 @@
+From 59d4ed13c7e29022cf1ea993ad4882158f6c8028 Mon Sep 17 00:00:00 2001
+From: Simon <xxm@rock-chips.com>
+Date: Mon, 23 Nov 2015 20:21:14 +0800
+Subject: [PATCH] iommu/rk: support kernel version 4.4
+
+Change-Id: I430577668f50284c1b318636ea5e1009b5e90ca5
+Signed-off-by: Simon <xxm@rock-chips.com>
+---
+ drivers/iommu/Kconfig                         | 29 +++++++++++
+ drivers/iommu/Makefile                        |  2 +
+ drivers/iommu/rk-iommu.c                      | 49 ++++++++++++-------
+ .../iommu/{rockchip-iommu.h => rk-iommu.h}    |  7 +--
+ .../iommu/{rockchip-iovmm.c => rk-iovmm.c}    |  8 +--
+ include/linux/rockchip-iovmm.h                |  5 +-
+ 6 files changed, 72 insertions(+), 28 deletions(-)
+ rename drivers/iommu/{rockchip-iommu.h => rk-iommu.h} (94%)
+ rename drivers/iommu/{rockchip-iovmm.c => rk-iovmm.c} (99%)
+
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index b9094e9da537..8d5dde499aa3 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -221,6 +221,35 @@ config ROCKCHIP_IOMMU
+ 	  Say Y here if you are using a Rockchip SoC that includes an IOMMU
+ 	  device.
+ 
++config RK_IOMMU
++	bool "RK IOMMU Support"
++	depends on ARCH_ROCKCHIP || COMPILE_TEST
++	select IOMMU_API
++	help
++	  Support for IOMMUs found on Rockchip rk32xx,rk313x,rk33xx SOCs.
++	  These IOMMUs allow virtualization of the address space used by most
++	  cores within the multimedia subsystem.
++	  Say Y here if you are using a Rockchip SoC that includes an IOMMU
++	  device.
++
++config RK_IOVMM
++	bool "IO Virtual Memory Manager for RK IOMMUs"
++	select GENERIC_ALLOCATOR
++	depends on RK_IOMMU
++	help
++	  Supporting the users of Rockchip IOMMU for allocating and mapping
++	  an IO virtual memory region with a physical memory region
++	  and managing the allocated virtual memory regions.
++
++config RK_IOMMU_DEBUG
++	bool "Debugging log for RK IOMMU"
++	depends on RK_IOMMU
++	help
++	  Select this to see the detailed log message that shows what
++	  happens in the IOMMU driver
++
++	  Say N unless you need kernel log message for IOMMU debugging
++
+ config TEGRA_IOMMU_GART
+ 	bool "Tegra GART IOMMU Support"
+ 	depends on ARCH_TEGRA_2x_SOC
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+index 68faca02225d..99c659d7c6d9 100644
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -19,6 +19,8 @@ obj-$(CONFIG_IRQ_REMAP) += intel_irq_remapping.o irq_remapping.o
+ obj-$(CONFIG_OMAP_IOMMU) += omap-iommu.o
+ obj-$(CONFIG_OMAP_IOMMU_DEBUG) += omap-iommu-debug.o
+ obj-$(CONFIG_ROCKCHIP_IOMMU) += rockchip-iommu.o
++obj-$(CONFIG_RK_IOMMU) += rk-iommu.o
++obj-$(CONFIG_RK_IOVMM) += rk-iovmm.o
+ obj-$(CONFIG_TEGRA_IOMMU_GART) += tegra-gart.o
+ obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
+ obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
+diff --git a/drivers/iommu/rk-iommu.c b/drivers/iommu/rk-iommu.c
+index db5a66d11a38..b3bb9f38b313 100644
+--- a/drivers/iommu/rk-iommu.c
++++ b/drivers/iommu/rk-iommu.c
+@@ -27,7 +27,7 @@
+ #include <linux/rockchip/cpu.h>
+ #include <linux/rockchip/iomap.h>
+ #include <linux/device.h>
+-#include "rockchip-iommu.h"
++#include "rk-iommu.h"
+ 
+ /* We does not consider super section mapping (16MB) */
+ #define SPAGE_ORDER 12
+@@ -187,8 +187,14 @@ struct rk_iommu_domain {
+ 	short *lv2entcnt; /* free lv2 entry counter for each section */
+ 	spinlock_t lock; /* lock for this structure */
+ 	spinlock_t pgtablelock; /* lock for modifying page table @ pgtable */
++	struct iommu_domain domain;
+ };
+ 
++static struct rk_iommu_domain *to_rk_domain(struct iommu_domain *dom)
++{
++	return container_of(dom, struct rk_iommu_domain, domain);
++}
++
+ static bool rockchip_set_iommu_active(struct iommu_drvdata *data)
+ {
+ 	/* return true if the IOMMU was not active previously
+@@ -594,7 +600,7 @@ static irqreturn_t rockchip_iommu_irq(int irq, void *dev_id)
+ 				report_iommu_fault(data->domain, data->iommu,
+ 						   fault_address, flags);
+ 			if (data->fault_handler)
+-				data->fault_handler(data->iommu, IOMMU_PAGEFAULT, dte, fault_address, 1);
++				data->fault_handler(data->master, IOMMU_PAGEFAULT, dte, fault_address, 1);
+ 
+ 			rockchip_iommu_page_fault_done(data->res_bases[i],
+ 					               data->dbgname);
+@@ -821,7 +827,7 @@ int rockchip_iommu_tlb_invalidate(struct device *dev)
+ static phys_addr_t rockchip_iommu_iova_to_phys(struct iommu_domain *domain,
+ 					       dma_addr_t iova)
+ {
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	unsigned int *entry;
+ 	unsigned long flags;
+ 	phys_addr_t phys = 0;
+@@ -872,7 +878,7 @@ static unsigned int *rockchip_alloc_lv2entry(unsigned int *sent,
+ static size_t rockchip_iommu_unmap(struct iommu_domain *domain,
+ 				   unsigned long iova, size_t size)
+ {
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	unsigned long flags;
+ 	unsigned int *ent;
+ 
+@@ -913,7 +919,7 @@ static size_t rockchip_iommu_unmap(struct iommu_domain *domain,
+ static int rockchip_iommu_map(struct iommu_domain *domain, unsigned long iova,
+ 			      phys_addr_t paddr, size_t size, int prot)
+ {
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	unsigned int *entry;
+ 	unsigned long flags;
+ 	int ret = -ENOMEM;
+@@ -945,7 +951,7 @@ static int rockchip_iommu_map(struct iommu_domain *domain, unsigned long iova,
+ static void rockchip_iommu_detach_device(struct iommu_domain *domain, struct device *dev)
+ {
+ 	struct iommu_drvdata *data = dev_get_drvdata(dev->archdata.iommu);
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	struct list_head *pos;
+ 	unsigned long flags;
+ 	bool found = false;
+@@ -981,7 +987,7 @@ static void rockchip_iommu_detach_device(struct iommu_domain *domain, struct dev
+ static int rockchip_iommu_attach_device(struct iommu_domain *domain, struct device *dev)
+ {
+ 	struct iommu_drvdata *data = dev_get_drvdata(dev->archdata.iommu);
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	unsigned long flags;
+ 	int ret;
+ 
+@@ -994,6 +1000,7 @@ static int rockchip_iommu_attach_device(struct iommu_domain *domain, struct devi
+ 		BUG_ON(!list_empty(&data->node));
+ 		list_add_tail(&data->node, &priv->clients);
+ 		data->domain = domain;
++		data->master = dev;
+ 	}
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1005,7 +1012,9 @@ static int rockchip_iommu_attach_device(struct iommu_domain *domain, struct devi
+ 		dev_dbg(dev->archdata.iommu,"%s: IOMMU with pgtable 0x%x already attached\n",
+ 			__func__, (unsigned int)virt_to_phys(priv->pgtable));
+ 	} else {
+-		if (!(strstr(data->dbgname, "vpu") || strstr(data->dbgname, "hevc")))
++		if (!(strstr(data->dbgname, "vpu") ||
++		      strstr(data->dbgname, "hevc") ||
++		      strstr(data->dbgname, "vdec")))
+ 			dev_info(dev->archdata.iommu,"%s: Attached new IOMMU with pgtable 0x%x\n",
+ 				__func__, (unsigned int)virt_to_phys(priv->pgtable));
+ 	}
+@@ -1013,9 +1022,9 @@ static int rockchip_iommu_attach_device(struct iommu_domain *domain, struct devi
+ 	return ret;
+ }
+ 
+-static void rockchip_iommu_domain_destroy(struct iommu_domain *domain)
++static void rockchip_iommu_domain_free(struct iommu_domain *domain)
+ {
+-	struct rk_iommu_domain *priv = domain->priv;
++	struct rk_iommu_domain *priv = to_rk_domain(domain);
+ 	int i;
+ 
+ 	WARN_ON(!list_empty(&priv->clients));
+@@ -1027,17 +1036,19 @@ static void rockchip_iommu_domain_destroy(struct iommu_domain *domain)
+ 
+ 	free_pages((unsigned long)priv->pgtable, 0);
+ 	free_pages((unsigned long)priv->lv2entcnt, 0);
+-	kfree(domain->priv);
+-	domain->priv = NULL;
++	kfree(priv);
+ }
+ 
+-static int rockchip_iommu_domain_init(struct iommu_domain *domain)
++static struct iommu_domain *rockchip_iommu_domain_alloc(unsigned type)
+ {
+ 	struct rk_iommu_domain *priv;
+ 
++	if (type != IOMMU_DOMAIN_UNMANAGED)
++		return NULL;
++
+ 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+-		return -ENOMEM;
++		return NULL;
+ 
+ /*rk32xx iommu use 2 level pagetable,
+    level1 and leve2 both have 1024 entries,each entry  occupy 4 bytes,
+@@ -1059,19 +1070,18 @@ static int rockchip_iommu_domain_init(struct iommu_domain *domain)
+ 	spin_lock_init(&priv->pgtablelock);
+ 	INIT_LIST_HEAD(&priv->clients);
+ 
+-	domain->priv = priv;
+-	return 0;
++	return &priv->domain;
+ 
+ err_counter:
+ 	free_pages((unsigned long)priv->pgtable, 0);
+ err_pgtable:
+ 	kfree(priv);
+-	return -ENOMEM;
++	return NULL;
+ }
+ 
+ static struct iommu_ops rk_iommu_ops = {
+-	.domain_init = rockchip_iommu_domain_init,
+-	.domain_destroy = rockchip_iommu_domain_destroy,
++	.domain_alloc = rockchip_iommu_domain_alloc,
++	.domain_free = rockchip_iommu_domain_free,
+ 	.attach_dev = rockchip_iommu_attach_device,
+ 	.detach_dev = rockchip_iommu_detach_device,
+ 	.map = rockchip_iommu_map,
+@@ -1214,6 +1224,7 @@ static const struct of_device_id iommu_dt_ids[] = {
+ 	{ .compatible = VPU_IOMMU_COMPATIBLE_NAME},
+ 	{ .compatible = ISP_IOMMU_COMPATIBLE_NAME},
+ 	{ .compatible = VOP_IOMMU_COMPATIBLE_NAME},
++	{ .compatible = VDEC_IOMMU_COMPATIBLE_NAME},
+ 	{ /* end */ }
+ };
+ 
+diff --git a/drivers/iommu/rockchip-iommu.h b/drivers/iommu/rk-iommu.h
+similarity index 94%
+rename from drivers/iommu/rockchip-iommu.h
+rename to drivers/iommu/rk-iommu.h
+index 46b2e8ee4f23..80e6f6fb3e39 100644
+--- a/drivers/iommu/rockchip-iommu.h
++++ b/drivers/iommu/rk-iommu.h
+@@ -29,6 +29,7 @@ struct rk_iovmm {
+ struct iommu_drvdata {
+ 	struct list_head node; /* entry of rk_iommu_domain.clients */
+ 	struct device *iommu;	/*  IOMMU's device descriptor */
++	struct device *master; /* IOMMU's master device descriptor */
+ 	int num_res_mem;
+ 	int num_res_irq;
+ 	const char *dbgname;
+@@ -41,7 +42,7 @@ struct iommu_drvdata {
+ 	rockchip_iommu_fault_handler_t fault_handler;
+ };
+ 
+-#ifdef CONFIG_ROCKCHIP_IOVMM
++#ifdef CONFIG_RK_IOVMM
+ 
+ #define IOVA_START 0x10000000
+ #define IOVM_SIZE (SZ_1G - SZ_4K) /* last 4K is for error values */
+@@ -71,7 +72,7 @@ static inline int rockchip_init_iovmm(struct device *iommu,
+ #endif
+ 
+ 
+-#ifdef CONFIG_ROCKCHIP_IOMMU
++#ifdef CONFIG_RK_IOMMU
+ 
+ /**
+  * rockchip_iommu_tlb_invalidate() - flush all TLB entry in iommu
+@@ -82,7 +83,7 @@ static inline int rockchip_init_iovmm(struct device *iommu,
+ int rockchip_iommu_tlb_invalidate(struct device *owner);
+ int rockchip_iommu_tlb_invalidate_global(struct device *owner);
+ 
+-#else /* CONFIG_ROCKCHIP_IOMMU */
++#else /* CONFIG_RK_IOMMU */
+ static inline int rockchip_iommu_tlb_invalidate(struct device *owner)
+ {
+ 	return -1;
+diff --git a/drivers/iommu/rockchip-iovmm.c b/drivers/iommu/rk-iovmm.c
+similarity index 99%
+rename from drivers/iommu/rockchip-iovmm.c
+rename to drivers/iommu/rk-iovmm.c
+index 29f885fc0275..e071e8653dcb 100644
+--- a/drivers/iommu/rockchip-iovmm.c
++++ b/drivers/iommu/rk-iovmm.c
+@@ -17,7 +17,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ 
+-#include "rockchip-iommu.h"
++#include "rk-iommu.h"
+ 
+ #define IOMMU_REGION_GUARD		(2<<PAGE_SHIFT)
+ 
+@@ -71,7 +71,7 @@ dma_addr_t rockchip_iovmm_map(struct device *dev,
+ 	struct rk_iovmm *vmm = rockchip_get_iovmm(dev);
+ 	int order;
+ 	int ret;
+-	
++
+ 	for (; sg_dma_len(sg) < offset; sg = sg_next(sg))
+ 		offset -= sg_dma_len(sg);
+ 
+@@ -204,10 +204,10 @@ void rockchip_iovmm_unmap(struct device *dev, dma_addr_t iova)
+ 		      region->size+IOMMU_REGION_GUARD);
+ 
+ 	WARN_ON(unmapped_size != region->size);
+-	
++
+ 	dev_dbg(dev->archdata.iommu, "IOVMM: Unmapped %zx bytes from %pad.\n",
+ 		unmapped_size, &region->start);
+-	
++
+ 	kfree(region);
+ }
+ 
+diff --git a/include/linux/rockchip-iovmm.h b/include/linux/rockchip-iovmm.h
+index 919663457d7b..ab7f8bb61f0f 100644
+--- a/include/linux/rockchip-iovmm.h
++++ b/include/linux/rockchip-iovmm.h
+@@ -19,6 +19,7 @@
+ #define VOP_IOMMU_COMPATIBLE_NAME	"rockchip,vop_mmu"
+ #define HEVC_IOMMU_COMPATIBLE_NAME "rockchip,hevc_mmu"
+ #define VPU_IOMMU_COMPATIBLE_NAME "rockchip,vpu_mmu"
++#define VDEC_IOMMU_COMPATIBLE_NAME "rockchip,vdec_mmu"
+ 
+ enum rk_iommu_inttype {
+ 	IOMMU_PAGEFAULT,
+@@ -47,7 +48,7 @@ typedef int (*rockchip_iommu_fault_handler_t)(struct device *dev,
+ struct scatterlist;
+ struct device;
+ 
+-#ifdef CONFIG_ROCKCHIP_IOVMM
++#ifdef CONFIG_RK_IOVMM
+ 
+ int rockchip_iovmm_activate(struct device *dev);
+ void rockchip_iovmm_deactivate(struct device *dev);
+@@ -148,6 +149,6 @@ static inline int rockchip_iovmm_invalidate_tlb(struct device *dev)
+ 	return -ENOSYS;
+ }
+ 
+-#endif /* CONFIG_ROCKCHIP_IOVMM */
++#endif /* CONFIG_RK_IOVMM */
+ 
+ #endif /*__ASM_PLAT_IOVMM_H*/
+-- 
+2.35.3
+

@@ -1,0 +1,299 @@
+From b0342bc168dc6fb2917b11bb9481dcc452eb8af5 Mon Sep 17 00:00:00 2001
+From: Allon Huang <allon.huang@rock-chips.com>
+Date: Wed, 21 Oct 2020 21:03:20 +0800
+Subject: [PATCH] media: rockchip: cif: support bt1120 single path
+
+Signed-off-by: Allon Huang <allon.huang@rock-chips.com>
+Change-Id: I325e477157f53e656fc184784b56534ee4ecbf64
+---
+ drivers/media/platform/rockchip/cif/capture.c | 27 +++++++++---
+ drivers/media/platform/rockchip/cif/dev.c     | 44 +++++++++++++++++--
+ drivers/media/platform/rockchip/cif/dev.h     |  4 ++
+ drivers/media/platform/rockchip/cif/hw.c      |  6 +++
+ drivers/media/platform/rockchip/cif/hw.h      |  1 +
+ drivers/media/platform/rockchip/cif/regs.h    | 27 ++++++++++++
+ drivers/media/platform/rockchip/cif/version.h |  1 +
+ 7 files changed, 100 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+index a90efd425f80..3a6fc19387a8 100644
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -2018,7 +2018,11 @@ static int rkcif_stream_start(struct rkcif_stream *stream)
+ {
+ 	u32 val, mbus_flags, href_pol, vsync_pol,
+ 	    xfer_mode = 0, yc_swap = 0,
+-	    inputmode = 0, mipimode = 0, workmode = 0;
++	    inputmode = 0, mipimode = 0, workmode = 0,
++	    multi_id_en = BT656_1120_MULTI_ID_DISABLE,
++	    multi_id_mode = BT656_1120_MULTI_ID_MODE_1,
++	    multi_id_sel = BT656_1120_MULTI_ID_SEL_LSB,
++	    bt1120_edge_mode = BT1120_CLOCK_SINGLE_EDGES;
+ 	struct rkcif_device *dev = stream->cifdev;
+ 	struct rkcif_sensor_info *sensor_info;
+ 	const struct cif_output_fmt *fmt;
+@@ -2027,12 +2031,22 @@ static int rkcif_stream_start(struct rkcif_stream *stream)
+ 	stream->frame_idx = 0;
+ 
+ 	mbus_flags = sensor_info->mbus.flags;
++	if (mbus_flags & V4L2_MBUS_PCLK_SAMPLE_RISING)
++		rkcif_write_grf_reg(dev,
++				    CIF_REG_GRF_CIFIO_CON,
++				    CIF_PCLK_SAMPLING_EDGE_RISING);
++	else
++		rkcif_write_grf_reg(dev,
++				    CIF_REG_GRF_CIFIO_CON,
++				    CIF_PCLK_SAMPLING_EDGE_FALLING);
++
+ 	href_pol = (mbus_flags & V4L2_MBUS_HSYNC_ACTIVE_HIGH) ?
+ 		    HSY_HIGH_ACTIVE : HSY_LOW_ACTIVE;
+ 	vsync_pol = (mbus_flags & V4L2_MBUS_VSYNC_ACTIVE_HIGH) ?
+ 		     VSY_HIGH_ACTIVE : VSY_LOW_ACTIVE;
+ 
+-	if (rkcif_determine_input_mode(stream) == INPUT_MODE_BT1120) {
++	inputmode = rkcif_determine_input_mode(stream);
++	if (inputmode == INPUT_MODE_BT1120) {
+ 		if (stream->cif_fmt_in->field == V4L2_FIELD_NONE)
+ 			xfer_mode = BT1120_TRANSMIT_PROGRESS;
+ 		else
+@@ -2057,14 +2071,13 @@ static int rkcif_stream_start(struct rkcif_stream *stream)
+ 			mipimode = MIPI_MODE_RGB;
+ 		else
+ 			mipimode = MIPI_MODE_32BITS_BYPASS;
+-	} else {
+-		inputmode = rkcif_determine_input_mode(stream);
+ 	}
+ 
+ 	val = vsync_pol | href_pol | inputmode | mipimode
+ 	      | stream->cif_fmt_out->fmt_val
+ 	      | stream->cif_fmt_in->dvp_fmt_val
+-	      | xfer_mode | yc_swap;
++	      | xfer_mode | yc_swap | multi_id_en
++	      | multi_id_sel | multi_id_mode | bt1120_edge_mode;
+ 	rkcif_write_register(dev, CIF_REG_DVP_FOR, val);
+ 
+ 	val = stream->pixm.width;
+@@ -2099,7 +2112,7 @@ static int rkcif_stream_start(struct rkcif_stream *stream)
+ 
+ 	if ((dev->chip_id == CHIP_RK1808_CIF ||
+ 	     dev->chip_id == CHIP_RV1126_CIF) &&
+-	    rkcif_determine_input_mode(stream) == INPUT_MODE_BT1120)
++	     inputmode == INPUT_MODE_BT1120)
+ 		rkcif_assign_new_buffer_pingpong(stream, 1, 0);
+ 	else
+ 		/* Set up an buffer for the next frame */
+@@ -2118,7 +2131,7 @@ static int rkcif_stream_start(struct rkcif_stream *stream)
+ 
+ 	if ((dev->chip_id == CHIP_RK1808_CIF ||
+ 	     dev->chip_id == CHIP_RV1126_CIF) &&
+-	    rkcif_determine_input_mode(stream) == INPUT_MODE_BT1120) {
++	     inputmode == INPUT_MODE_BT1120) {
+ 		dev->workmode = RKCIF_WORKMODE_PINGPONG;
+ 		rkcif_write_register(dev, CIF_REG_DVP_CTRL,
+ 				     AXI_BURST_16 | MODE_PINGPONG | ENABLE_CAPTURE);
+diff --git a/drivers/media/platform/rockchip/cif/dev.c b/drivers/media/platform/rockchip/cif/dev.c
+index ea920d265efb..9f51aa87e1e8 100644
+--- a/drivers/media/platform/rockchip/cif/dev.c
++++ b/drivers/media/platform/rockchip/cif/dev.c
+@@ -118,7 +118,7 @@ void rkcif_write_register(struct rkcif_device *dev,
+ 		    (index != CIF_REG_DVP_CTRL && reg->offset != 0x0))
+ 			write_cif_reg(base, reg->offset, val);
+ 		else
+-			dev_warn(dev->dev,
++			v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
+ 				 "write reg[%d]:0x%x failed, maybe useless!!!\n",
+ 				 index, val);
+ 	}
+@@ -138,7 +138,7 @@ void rkcif_write_register_or(struct rkcif_device *dev,
+ 			reg_val |= val;
+ 			write_cif_reg(base, reg->offset, reg_val);
+ 		} else {
+-			dev_warn(dev->dev,
++			v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
+ 				 "write reg[%d]:0x%x with OR failed, maybe useless!!!\n",
+ 				 index, val);
+ 		}
+@@ -178,7 +178,7 @@ unsigned int rkcif_read_register(struct rkcif_device *dev,
+ 		    (index != CIF_REG_DVP_CTRL && reg->offset != 0x0))
+ 			val = read_cif_reg(base, reg->offset);
+ 		else
+-			dev_warn(dev->dev,
++			v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
+ 				 "read reg[%d] failed, maybe useless!!!\n",
+ 				 index);
+ 	}
+@@ -186,6 +186,44 @@ unsigned int rkcif_read_register(struct rkcif_device *dev,
+ 	return val;
+ }
+ 
++void rkcif_write_grf_reg(struct rkcif_device *dev,
++			 enum cif_reg_index index, u32 val)
++{
++	struct rkcif_hw *cif_hw = dev->hw_dev;
++	const struct cif_reg *reg = &cif_hw->cif_regs[index];
++
++	if (index < CIF_REG_INDEX_MAX) {
++		if (index > CIF_REG_DVP_CTRL) {
++			if (!IS_ERR(cif_hw->grf))
++				regmap_write(cif_hw->grf, reg->offset, val);
++		} else {
++			v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
++				 "write reg[%d]:0x%x failed, maybe useless!!!\n",
++				 index, val);
++		}
++	}
++}
++
++u32 rkcif_read_grf_reg(struct rkcif_device *dev, enum cif_reg_index index)
++{
++	struct rkcif_hw *cif_hw = dev->hw_dev;
++	const struct cif_reg *reg = &cif_hw->cif_regs[index];
++	u32 val = 0xffff;
++
++	if (index < CIF_REG_INDEX_MAX) {
++		if (index > CIF_REG_DVP_CTRL) {
++			if (!IS_ERR(cif_hw->grf))
++				regmap_read(cif_hw->grf, reg->offset, &val);
++		} else {
++			v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
++				 "read reg[%d] failed, maybe useless!!!\n",
++				 index);
++		}
++	}
++
++	return val;
++}
++
+ static bool is_iommu_enable(struct device *dev)
+ {
+ 	struct device_node *iommu;
+diff --git a/drivers/media/platform/rockchip/cif/dev.h b/drivers/media/platform/rockchip/cif/dev.h
+index be61db77b0c7..96fa0532f3ec 100644
+--- a/drivers/media/platform/rockchip/cif/dev.h
++++ b/drivers/media/platform/rockchip/cif/dev.h
+@@ -478,6 +478,10 @@ void rkcif_write_register_and(struct rkcif_device *dev,
+ 			      enum cif_reg_index index, u32 val);
+ unsigned int rkcif_read_register(struct rkcif_device *dev,
+ 				 enum cif_reg_index index);
++void rkcif_write_grf_reg(struct rkcif_device *dev,
++			 enum cif_reg_index index, u32 val);
++u32 rkcif_read_grf_reg(struct rkcif_device *dev,
++		       enum cif_reg_index index);
+ void rkcif_unregister_stream_vdevs(struct rkcif_device *dev,
+ 				   int stream_num);
+ int rkcif_register_stream_vdevs(struct rkcif_device *dev,
+diff --git a/drivers/media/platform/rockchip/cif/hw.c b/drivers/media/platform/rockchip/cif/hw.c
+index 18af35b7e769..2c701c435024 100644
+--- a/drivers/media/platform/rockchip/cif/hw.c
++++ b/drivers/media/platform/rockchip/cif/hw.c
+@@ -395,6 +395,7 @@ static const struct cif_reg rv1126_cif_regs[] = {
+ 	[CIF_REG_LVDS_SAV_EAV_BLK1_ID3] = CIF_REG(CIF_LVDS_SAV_EAV_BLK1_ID3),
+ 	[CIF_REG_Y_STAT_CONTROL] = CIF_REG(CIF_Y_STAT_CONTROL),
+ 	[CIF_REG_Y_STAT_VALUE] = CIF_REG(CIF_Y_STAT_VALUE),
++	[CIF_REG_GRF_CIFIO_CON] = CIF_REG(CIF_GRF_CIFIO_CON),
+ };
+ 
+ static const char * const rv1126_cif_lite_clks[] = {
+@@ -671,6 +672,7 @@ static int rkcif_plat_probe(struct platform_device *pdev)
+ 	const struct of_device_id *match;
+ 	struct device_node *node = pdev->dev.of_node;
+ 	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
+ 	struct rkcif_hw *cif_hw;
+ 	struct rkcif_device *cif_dev;
+ 	const struct rkcif_hw_match_data *data;
+@@ -728,6 +730,10 @@ static int rkcif_plat_probe(struct platform_device *pdev)
+ 			return PTR_ERR(cif_hw->base_addr);
+ 	}
+ 
++	cif_hw->grf = syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
++	if (IS_ERR(cif_hw->grf))
++		dev_warn(dev, "unable to get rockchip,grf\n");
++
+ 	if (data->clks_num > RKCIF_MAX_BUS_CLK ||
+ 	    data->rsts_num > RKCIF_MAX_RESET) {
+ 		dev_err(dev, "out of range: clks(%d %d) rsts(%d %d)\n",
+diff --git a/drivers/media/platform/rockchip/cif/hw.h b/drivers/media/platform/rockchip/cif/hw.h
+index 97b574e0bccf..79f357ef6199 100644
+--- a/drivers/media/platform/rockchip/cif/hw.h
++++ b/drivers/media/platform/rockchip/cif/hw.h
+@@ -64,6 +64,7 @@ struct rkcif_hw {
+ 	int				irq;
+ 	void __iomem			*base_addr;
+ 	void __iomem			*csi_base;
++	struct regmap			*grf;
+ 	struct clk			*clks[RKCIF_MAX_BUS_CLK];
+ 	int				clk_size;
+ 	bool				iommu_en;
+diff --git a/drivers/media/platform/rockchip/cif/regs.h b/drivers/media/platform/rockchip/cif/regs.h
+index 17a0476d3dbc..35a36d92397e 100644
+--- a/drivers/media/platform/rockchip/cif/regs.h
++++ b/drivers/media/platform/rockchip/cif/regs.h
+@@ -130,6 +130,8 @@ enum cif_reg_index {
+ 	CIF_REG_MMU_INT_MASK,
+ 	CIF_REG_MMU_INT_STATUS,
+ 	CIF_REG_MMU_AUTO_GATING,
++	/* reg belowed is in grf */
++	CIF_REG_GRF_CIFIO_CON,
+ 	CIF_REG_INDEX_MAX
+ };
+ 
+@@ -341,6 +343,13 @@ enum cif_reg_index {
+ #define BT1120_TRANSMIT_INTERFACE	(0x00 << 25)
+ #define BT1120_TRANSMIT_PROGRESS	(0x01 << 25)
+ #define BT1120_YC_SWAP			(0x01 << 26)
++#define BT656_1120_MULTI_ID_DISABLE	(0x00 << 28)
++#define BT656_1120_MULTI_ID_ENABLE	(0x01 << 28)
++#define BT656_1120_MULTI_ID_SEL_MSB	(0x00 << 29)
++#define BT656_1120_MULTI_ID_SEL_LSB	(0x01 << 29)
++#define BT656_1120_MULTI_ID_MODE_1	(0x00 << 30)
++#define BT656_1120_MULTI_ID_MODE_2	(0x01 << 30)
++#define BT656_1120_MULTI_ID_MODE_4	(0x02 << 30)
+ 
+ /* CIF_SCL_CTRL */
+ #define ENABLE_SCL_DOWN			(0x01 << 0)
+@@ -459,6 +468,14 @@ enum cif_reg_index {
+ #define CSI_DMA_LVDS_ID2_FIFO_OVERFLOW	(0x1 << 25)
+ #define CSI_DMA_LVDS_ID3_FIFO_OVERFLOW	(0x1 << 26)
+ 
++#define CSI_FRAME_START_ID0	(CSI_FRAME0_START_ID0 |\
++				 CSI_FRAME1_START_ID0)
++#define CSI_FRAME_START_ID1	(CSI_FRAME0_START_ID1 |\
++				 CSI_FRAME1_START_ID1)
++#define CSI_FRAME_START_ID2	(CSI_FRAME0_START_ID2 |\
++				 CSI_FRAME1_START_ID2)
++#define CSI_FRAME_START_ID3	(CSI_FRAME0_START_ID3 |\
++				 CSI_FRAME1_START_ID3)
+ #define CSI_FRAME_END_ID0	(CSI_FRAME0_END_ID0 |\
+ 				 CSI_FRAME1_END_ID0)
+ #define CSI_FRAME_END_ID1	(CSI_FRAME0_END_ID1 |\
+@@ -525,4 +542,14 @@ enum cif_reg_index {
+ #define SW_LVDS_EAV_BLK(code)	(((code) & 0xfff) << 16)
+ #define SW_LVDS_SAV_BLK(code)	(((code) & 0xfff) << 0)
+ 
++/* GRF related with CIF */
++#define CIF_GRF_CIFIO_CON		(0x10250)
++#define CIF_PCLK_SAMPLING_EDGE_RISING	(0x04000400)
++#define CIF_PCLK_SAMPLING_EDGE_FALLING	(0x04000000)
++#define CIF_PCLK_DELAY_ENABLE		(0x02000200)
++#define CIF_PCLK_DELAY_DISABLE		(0x02000000)
++#define CIF_SAMPLING_EDGE_DOUBLE	(0x01000100)
++#define CIF_SAMPLING_EDGE_SINGLE	(0x01000000)
++#define CIF_PCLK_DELAY_NUM(num)	(0x00ff0000 | ((num) & 0xff))
++
+ #endif
+diff --git a/drivers/media/platform/rockchip/cif/version.h b/drivers/media/platform/rockchip/cif/version.h
+index 4846296fc5db..b8f4bcf9bce5 100644
+--- a/drivers/media/platform/rockchip/cif/version.h
++++ b/drivers/media/platform/rockchip/cif/version.h
+@@ -48,6 +48,7 @@
+  *v0.1.8
+  *1. add proc interface
+  *2. add reset mechanism to resume when csi crc err
++ *3. support bt1120 single path
+  */
+ 
+ #define RKCIF_DRIVER_VERSION RKCIF_API_VERSION
+-- 
+2.35.3
+

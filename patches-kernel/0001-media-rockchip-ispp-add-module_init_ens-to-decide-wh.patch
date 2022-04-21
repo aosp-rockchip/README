@@ -1,0 +1,196 @@
+From f6061a0b51ec7a2a809ac7305485aff73e70fb84 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 2 Apr 2020 19:19:24 +0800
+Subject: [PATCH] media: rockchip: ispp: add module_init_ens to decide which
+ function on
+
+Change-Id: Ie6412446cc9b0fd54c6dc6fb277e1564c538da62
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/dev.c    |  1 -
+ drivers/media/platform/rockchip/ispp/ispp.c   |  3 ++-
+ drivers/media/platform/rockchip/ispp/params.c | 26 +++++++++++++------
+ drivers/media/platform/rockchip/ispp/stream.c |  7 +++--
+ drivers/media/platform/rockchip/ispp/stream.h |  1 -
+ include/uapi/linux/rkispp-config.h            | 10 ++++---
+ 6 files changed, 32 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 124dc024b892..fc9c4826c4f1 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -185,7 +185,6 @@ static int rkispp_create_links(struct rkispp_device *ispp_dev)
+ 	/* default enable tnr (2to1), nr, sharp */
+ 	ispp_dev->stream_vdev.module_ens =
+ 		ISPP_MODULE_TNR | ISPP_MODULE_NR | ISPP_MODULE_SHP;
+-	ispp_dev->stream_vdev.tnr_mode = 0;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index 5e335462e53f..041bd6581fe2 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -253,7 +253,8 @@ static int rkispp_s_rx_buffer(struct rkispp_subdev *ispp_sdev)
+ 		buf = &vdev->tnr_buf.gain_cur;
+ 		size = &buf->size;
+ 		dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
+-		if (vdev->tnr_mode) {
++		if ((vdev->module_ens & ISPP_MODULE_TNR_3TO1) ==
++		    ISPP_MODULE_TNR_3TO1) {
+ 			ret = v4l2_subdev_call(ispp_sdev->remote_sd,
+ 				video, s_rx_buffer, dbuf, size);
+ 			if (ret)
+diff --git a/drivers/media/platform/rockchip/ispp/params.c b/drivers/media/platform/rockchip/ispp/params.c
+index 1afe75dfa55c..51a3ef52b50e 100644
+--- a/drivers/media/platform/rockchip/ispp/params.c
++++ b/drivers/media/platform/rockchip/ispp/params.c
+@@ -633,18 +633,21 @@ static void rkispp_params_vb2_buf_queue(struct vb2_buffer *vb)
+ 	struct rkispp_params_cfg *new_params;
+ 	unsigned long flags;
+ 
++	new_params = (struct rkispp_params_cfg *)vb2_plane_vaddr(vb, 0);
++	spin_lock_irqsave(&params_vdev->config_lock, flags);
+ 	if (params_vdev->first_params) {
+-		new_params = (struct rkispp_params_cfg *)
+-			(vb2_plane_vaddr(vb, 0));
+ 		vb2_buffer_done(&params_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+ 		params_vdev->first_params = false;
+ 		params_vdev->cur_params = *new_params;
+-		stream_vdev->module_ens = new_params->module_ens;
+-		stream_vdev->tnr_mode = new_params->tnr_cfg.mode;
++		if (new_params->module_init_ens)
++			stream_vdev->module_ens = new_params->module_init_ens;
++		spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+ 		return;
+ 	}
++	spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+ 
+-	params_buf->vaddr[0] = vb2_plane_vaddr(vb, 0);
++	new_params->module_init_ens = stream_vdev->module_ens;
++	params_buf->vaddr[0] = new_params;
+ 	spin_lock_irqsave(&params_vdev->config_lock, flags);
+ 	list_add_tail(&params_buf->queue, &params_vdev->params);
+ 	spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+@@ -779,7 +782,8 @@ rkispp_params_init_vb2_queue(struct vb2_queue *q,
+ void rkispp_params_isr(struct rkispp_params_vdev *params_vdev, u32 mis)
+ {
+ 	struct rkispp_params_cfg *new_params = NULL;
+-	u32 module_en_update, module_cfg_update, module_ens;
++	u32 module_en_update, module_cfg_update;
++	u32 module_ens, module_init_ens;
+ 
+ 	spin_lock(&params_vdev->config_lock);
+ 	if (!params_vdev->streamon) {
+@@ -800,9 +804,10 @@ void rkispp_params_isr(struct rkispp_params_vdev *params_vdev, u32 mis)
+ 	}
+ 	new_params = (struct rkispp_params_cfg *)(params_vdev->cur_buf->vaddr[0]);
+ 
++	module_init_ens = new_params->module_init_ens;
+ 	module_en_update = new_params->module_en_update;
+ 	module_cfg_update = new_params->module_cfg_update;
+-	module_ens = new_params->module_ens;
++	module_ens = new_params->module_ens & module_init_ens;
+ 
+ 	if (module_cfg_update & ISPP_MODULE_TNR &&
+ 	    mis & TNR_INT) {
+@@ -874,10 +879,15 @@ void rkispp_params_configure(struct rkispp_params_vdev *params_vdev)
+ 	u32 module_en_update = params_vdev->cur_params.module_en_update;
+ 	u32 module_cfg_update = params_vdev->cur_params.module_cfg_update;
+ 	u32 module_ens = params_vdev->cur_params.module_ens;
++	unsigned long flags;
+ 
+-	if (!module_cfg_update && !module_en_update)
++	spin_lock_irqsave(&params_vdev->config_lock, flags);
++	if (params_vdev->first_params) {
++		params_vdev->first_params = false;
+ 		v4l2_warn(&params_vdev->dev->v4l2_dev,
+ 			  "can not get first iq setting in stream on\n");
++	}
++	spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+ 
+ 	if (module_cfg_update & ISPP_MODULE_TNR)
+ 		tnr_config(params_vdev,
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index cbece1512b62..38d2d7a2117f 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -427,7 +427,8 @@ static int config_tnr(struct rkispp_device *dev)
+ 			if (ret < 0)
+ 				goto err;
+ 
+-			if (vdev->tnr_mode) {
++			if ((vdev->module_ens & ISPP_MODULE_TNR_3TO1) ==
++			    ISPP_MODULE_TNR_3TO1) {
+ 				buf = &vdev->tnr_buf.pic_next;
+ 				buf->size = pic_size;
+ 				ret = rkispp_allow_buffer(dev, buf);
+@@ -506,7 +507,9 @@ static int config_tnr(struct rkispp_device *dev)
+ 			base + RKISPP_TNR_NXT_VIR_STRIDE);
+ 	}
+ 	rkispp_set_bits(base + RKISPP_TNR_CORE_CTRL, SW_TNR_MODE,
+-		(vdev->tnr_mode && dev->inp == INP_ISP) ? SW_TNR_MODE : 0);
++		((vdev->module_ens & ISPP_MODULE_TNR_3TO1) ==
++		 ISPP_MODULE_TNR_3TO1 &&
++		 dev->inp == INP_ISP) ? SW_TNR_MODE : 0);
+ 	writel(ALIGN(width, 64) >> 4,
+ 		base + RKISPP_TNR_GAIN_CUR_VIR_STRIDE);
+ 	writel(ALIGN(width, 64) >> 4,
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index b5ce3c6ec3dc..65355276d351 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -146,7 +146,6 @@ struct rkispp_stream_vdev {
+ 	struct in_fec_buf fec_buf;
+ 	atomic_t refcnt;
+ 	u32 module_ens;
+-	u8 tnr_mode;
+ 	u8 is_update_manual;
+ };
+ 
+diff --git a/include/uapi/linux/rkispp-config.h b/include/uapi/linux/rkispp-config.h
+index a82503675df9..a0fcb26f3a5d 100644
+--- a/include/uapi/linux/rkispp-config.h
++++ b/include/uapi/linux/rkispp-config.h
+@@ -9,11 +9,14 @@
+ #include <linux/types.h>
+ #include <linux/v4l2-controls.h>
+ 
+-#define ISPP_MODULE_TNR			BIT(0)
++#define ISPP_MODULE_TNR			BIT(0)//2TO1
+ #define ISPP_MODULE_NR			BIT(1)
+ #define ISPP_MODULE_SHP			BIT(2)
+-#define ISPP_MODULE_FEC			BIT(3)
++#define ISPP_MODULE_FEC			BIT(3)//CALIBRATION
+ #define ISPP_MODULE_ORB			BIT(4)
++//extra function
++#define ISPP_MODULE_TNR_3TO1		(BIT(16) | ISPP_MODULE_TNR)
++#define ISPP_MODULE_FEC_ST		(BIT(17) | ISPP_MODULE_FEC)//STABILIZATION
+ 
+ #define TNR_SIGMA_CURVE_SIZE		17
+ #define TNR_LUMA_CURVE_SIZE		6
+@@ -69,7 +72,6 @@
+ #define FEC_MESH_XY_NUM			5120
+ 
+ struct rkispp_tnr_config {
+-	u8 mode;
+ 	u8 opty_en;
+ 	u8 optc_en;
+ 	u8 gain_en;
+@@ -236,11 +238,13 @@ struct rkispp_orb_config {
+  * @module_ens: mask the enable value of each module, only update the module
+  * which correspond bit was set in module_en_update
+  * @module_cfg_update: mask the config bits of which module  should be updated
++ * @module_init_en: initial enable module function
+  */
+ struct rkispp_params_cfg {
+ 	u32 module_en_update;
+ 	u32 module_ens;
+ 	u32 module_cfg_update;
++	u32 module_init_ens;
+ 
+ 	struct rkispp_tnr_config tnr_cfg;
+ 	struct rkispp_nr_config nr_cfg;
+-- 
+2.35.3
+

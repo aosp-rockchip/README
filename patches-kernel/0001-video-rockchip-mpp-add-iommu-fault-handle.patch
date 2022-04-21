@@ -1,0 +1,576 @@
+From fdd815e6029fec0ce0b1b1ccfa28dd6abbe33c39 Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Thu, 23 Apr 2020 18:35:06 +0800
+Subject: [PATCH] video: rockchip: mpp: add iommu fault handle
+
+when iommu fault, dump mem region and register.
+
+Change-Id: Ifa5f175c6f0d8f7688c2d65a4423d975c37fe1af
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c | 62 +++++++++++++++++++++++--
+ drivers/video/rockchip/mpp/mpp_common.h |  2 +
+ drivers/video/rockchip/mpp/mpp_iommu.h  |  1 +
+ drivers/video/rockchip/mpp/mpp_rkvdec.c | 42 ++++-------------
+ drivers/video/rockchip/mpp/mpp_rkvenc.c | 24 ++++------
+ drivers/video/rockchip/mpp/mpp_vdpu1.c  | 24 +++-------
+ drivers/video/rockchip/mpp/mpp_vdpu2.c  | 22 +++------
+ drivers/video/rockchip/mpp/mpp_vepu1.c  | 23 +++------
+ drivers/video/rockchip/mpp/mpp_vepu2.c  | 24 +++-------
+ 9 files changed, 108 insertions(+), 116 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 7316a7866bef..1784cb548e84 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -1186,14 +1186,15 @@ int mpp_translate_reg_address(struct mpp_session *session,
+ 
+ 		mem_region = mpp_task_attach_fd(task, usr_fd);
+ 		if (IS_ERR(mem_region)) {
+-			mpp_debug(DEBUG_IOMMU, "reg[%3d]: %08x failed\n",
+-				  tbl[i], reg[tbl[i]]);
++			mpp_debug(DEBUG_IOMMU, "reg[%3d]: %08x fd %d failed\n",
++				  tbl[i], reg[tbl[i]], usr_fd);
+ 			return PTR_ERR(mem_region);
+ 		}
+-
++		mpp_debug(DEBUG_IOMMU,
++			  "reg[%3d]: %d => %pad, offset %10d, size %lx\n",
++			  tbl[i], usr_fd, &mem_region->iova,
++			  offset, mem_region->len);
+ 		mem_region->reg_idx = tbl[i];
+-		mpp_debug(DEBUG_IOMMU, "reg[%3d]: %3d => %pad + offset %10d\n",
+-			  tbl[i], usr_fd, &mem_region->iova, offset);
+ 		reg[tbl[i]] = mem_region->iova + offset;
+ 	}
+ 
+@@ -1332,6 +1333,51 @@ int mpp_task_finalize(struct mpp_session *session,
+ 	return 0;
+ }
+ 
++static int mpp_iommu_handle(struct iommu_domain *iommu,
++			    struct device *iommu_dev,
++			    unsigned long iova,
++			    int status, void *arg)
++{
++	u32 i, s, e;
++	struct mpp_mem_region *mem = NULL, *n;
++	struct mpp_dev *mpp = (struct mpp_dev *)arg;
++	struct mpp_task *task = mpp->cur_task;
++
++	dev_err(mpp->dev, "fault addr 0x%08lx status %x\n", iova, status);
++
++	if (!task)
++		return -EIO;
++
++	if (!list_empty(&task->mem_region_list)) {
++		/* dump mem region */
++		mpp_err("--- dump mem region ---\n");
++		list_for_each_entry_safe(mem, n,
++					 &task->mem_region_list,
++					 reg_link) {
++			mpp_err("reg[%3d]: %pad, size %lx\n",
++				mem->reg_idx, &mem->iova, mem->len);
++		}
++	} else {
++		dev_err(mpp->dev, "no memory region mapped\n");
++	}
++
++	/* dump register */
++	s = mpp->var->hw_info->reg_start;
++	e = mpp->var->hw_info->reg_end;
++	mpp_err("--- dump register ---\n");
++	for (i = s; i <= e; i++) {
++		u32 reg = i * sizeof(u32);
++
++		mpp_err("reg[%3d]: %08x\n",
++			i, readl_relaxed(mpp->reg_base + reg));
++	}
++
++	if (mpp->iommu_info->hdl)
++		mpp->iommu_info->hdl(iommu, iommu_dev, iova, status, arg);
++
++	return 0;
++}
++
+ /* The device will do more probing work after this */
+ int mpp_dev_probe(struct mpp_dev *mpp,
+ 		  struct platform_device *pdev)
+@@ -1411,6 +1457,12 @@ int mpp_dev_probe(struct mpp_dev *mpp,
+ 		if (ret)
+ 			goto failed_init;
+ 	}
++	/* set iommu fault handler */
++	if (!IS_ERR(mpp->iommu_info))
++		iommu_set_fault_handler(mpp->iommu_info->domain,
++					mpp_iommu_handle, mpp);
++
++	/* read hardware id */
+ 	if (hw_info->reg_id >= 0) {
+ 		if (mpp->hw_ops->power_on)
+ 			mpp->hw_ops->power_on(mpp);
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index 6d68c205c68d..24b598f7e1b6 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -195,6 +195,8 @@ struct mpp_dev {
+ 	atomic_t total_running;
+ 	/* task for work queue */
+ 	struct workqueue_struct *workq;
++	/* current task in running */
++	struct mpp_task *cur_task;
+ 	/* set session max buffers */
+ 	u32 session_max_buffers;
+ 	struct mpp_taskqueue *queue;
+diff --git a/drivers/video/rockchip/mpp/mpp_iommu.h b/drivers/video/rockchip/mpp/mpp_iommu.h
+index 767ada326897..e33b3ff77623 100644
+--- a/drivers/video/rockchip/mpp/mpp_iommu.h
++++ b/drivers/video/rockchip/mpp/mpp_iommu.h
+@@ -64,6 +64,7 @@ struct mpp_iommu_info {
+ 	struct iommu_domain *domain;
+ 	struct iommu_group *group;
+ 	struct mpp_rk_iommu *iommu;
++	iommu_fault_handler_t hdl;
+ };
+ 
+ struct mpp_dma_session *
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index d4b316ec4064..4578655863c6 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -185,7 +185,6 @@ struct rkvdec_dev {
+ 	enum RKVDEC_STATE state;
+ 	unsigned long aux_iova;
+ 	struct page *aux_page;
+-	struct rkvdec_task *current_task;
+ 	/* regulator and devfreq */
+ 	struct regulator *vdd;
+ 	struct devfreq *devfreq;
+@@ -901,7 +900,7 @@ static int rkvdec_run(struct mpp_dev *mpp,
+ 			mpp_write_req(mpp, task->reg, s, e, reg_en);
+ 		}
+ 		/* init current task */
+-		dec->current_task = task;
++		mpp->cur_task = mpp_task;
+ 		/* Flush the register before the start the device */
+ 		wmb();
+ 		mpp_write(mpp, RKVDEC_REG_INT_EN,
+@@ -961,17 +960,17 @@ static int rkvdec_isr(struct mpp_dev *mpp)
+ {
+ 	u32 err_mask;
+ 	struct rkvdec_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+ 	/* FIXME use a spin lock here */
+-	task = dec->current_task;
+-	if (!task) {
+-		dev_err(dec->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+-	mpp_time_diff(&task->mpp_task);
+-	dec->current_task = NULL;
++	mpp_time_diff(mpp_task);
++	mpp->cur_task = NULL;
++	task = to_rkvdec_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+ 	switch (dec->state) {
+ 	case RKVDEC_STATE_NORMAL:
+@@ -987,7 +986,6 @@ static int rkvdec_isr(struct mpp_dev *mpp)
+ 		if (err_mask & task->irq_status)
+ 			atomic_inc(&mpp->reset_request);
+ 
+-		mpp_task = &task->mpp_task;
+ 		mpp_task_finish(mpp_task->session, mpp_task);
+ 
+ 		mpp_debug_leave();
+@@ -1204,25 +1202,8 @@ static int rkvdec_3328_iommu_hdl(struct iommu_domain *iommu,
+ 				 int status, void *arg)
+ {
+ 	int ret = 0;
+-	struct device *dev = (struct device *)arg;
+-	struct platform_device *pdev = NULL;
+-	struct rkvdec_dev *dec = NULL;
+-	struct mpp_dev *mpp = NULL;
+-
+-	pdev = container_of(dev, struct platform_device, dev);
+-	if (!pdev) {
+-		dev_err(dev, "invalid platform_device\n");
+-		ret = -ENXIO;
+-		goto done;
+-	}
+-
+-	dec = platform_get_drvdata(pdev);
+-	if (!dec) {
+-		dev_err(dev, "invalid device instance\n");
+-		ret = -ENXIO;
+-		goto done;
+-	}
+-	mpp = &dec->mpp;
++	struct mpp_dev *mpp = (struct mpp_dev *)arg;
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
+ 	/*
+ 	 * defeat workaround, invalidate address generated when rk322x
+@@ -1246,7 +1227,6 @@ static int rkvdec_3328_iommu_hdl(struct iommu_domain *iommu,
+ 			dec->aux_iova = page_iova;
+ 	}
+ 
+-done:
+ 	return ret;
+ }
+ 
+@@ -1346,9 +1326,7 @@ static int rkvdec_3328_init(struct mpp_dev *mpp)
+ 		goto done;
+ 	}
+ 	dec->aux_iova = 0;
+-	iommu_set_fault_handler(mpp->iommu_info->domain,
+-				rkvdec_3328_iommu_hdl,
+-				mpp->dev);
++	mpp->iommu_info->hdl = rkvdec_3328_iommu_hdl;
+ 
+ 	ret = rkvdec_devfreq_init(mpp);
+ done:
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index b932e63b3234..28d64db2cbff 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -32,6 +32,8 @@
+ /* The maximum registers number of all the version */
+ #define RKVENC_REG_L1_NUM			780
+ #define RKVENC_REG_L2_NUM			200
++#define RKVENC_REG_START_INDEX			0
++#define RKVENC_REG_END_INDEX			131
+ /* rkvenc register info */
+ #define RKVENC_REG_NUM				112
+ #define RKVENC_REG_HW_ID_INDEX			0
+@@ -159,10 +161,6 @@ struct rkvenc_dev {
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ 	struct reset_control *rst_core;
+-
+-	void *current_task;
+-
+-	struct mpp_dma_buffer *buffer;
+ };
+ 
+ struct link_table_elem {
+@@ -176,6 +174,8 @@ static struct mpp_hw_info rkvenc_hw_info = {
+ 	.reg_num = RKVENC_REG_NUM,
+ 	.reg_id = RKVENC_REG_HW_ID_INDEX,
+ 	.reg_en = RKVENC_ENC_START_INDEX,
++	.reg_start = RKVENC_REG_START_INDEX,
++	.reg_end = RKVENC_REG_END_INDEX,
+ };
+ 
+ /*
+@@ -370,7 +370,6 @@ static int rkvenc_read_req_l2(struct mpp_dev *mpp,
+ static int rkvenc_run(struct mpp_dev *mpp,
+ 		      struct mpp_task *mpp_task)
+ {
+-	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+ 	struct rkvenc_task *task = to_rkvenc_task(mpp_task);
+ 
+ 	mpp_debug_enter();
+@@ -409,7 +408,7 @@ static int rkvenc_run(struct mpp_dev *mpp,
+ 			}
+ 		}
+ 		/* init current task */
+-		enc->current_task = task;
++		mpp->cur_task = mpp_task;
+ 		/* Flush the register before the start the device */
+ 		wmb();
+ 		mpp_write(mpp, RKVENC_ENC_START_BASE, task->reg[reg_en]);
+@@ -446,21 +445,18 @@ static int rkvenc_irq(struct mpp_dev *mpp)
+ static int rkvenc_isr(struct mpp_dev *mpp)
+ {
+ 	struct rkvenc_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
+-	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 
+ 	/* FIXME use a spin lock here */
+-	task = (struct rkvenc_task *)enc->current_task;
+-	if (!task) {
+-		dev_err(enc->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+ 
+-	mpp_task = &task->mpp_task;
+ 	mpp_time_diff(mpp_task);
+-	enc->current_task = NULL;
++	mpp->cur_task = NULL;
++	task = to_rkvenc_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+-
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n", task->irq_status);
+ 
+ 	if (task->irq_status & RKVENC_INT_ERROR_BITS) {
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu1.c b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+index f8094d7645a7..91c6b19bff99 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu1.c
+@@ -127,7 +127,6 @@ struct vdpu_dev {
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+-	struct vdpu_task *current_task;
+ };
+ 
+ static struct mpp_hw_info vdpu_v1_hw_info = {
+@@ -399,14 +398,10 @@ static int vdpu_run(struct mpp_dev *mpp,
+ {
+ 	u32 i;
+ 	u32 reg_en;
+-	struct vdpu_task *task = NULL;
+-	struct vdpu_dev *dec = NULL;
++	struct vdpu_task *task = to_vdpu_task(mpp_task);
+ 
+ 	mpp_debug_enter();
+ 
+-	task = to_vdpu_task(mpp_task);
+-	dec = to_vdpu_dev(mpp);
+-
+ 	/* clear cache */
+ 	mpp_write_relaxed(mpp, VDPU1_REG_CLR_CACHE_BASE, 1);
+ 	/* set registers for hardware */
+@@ -419,7 +414,7 @@ static int vdpu_run(struct mpp_dev *mpp,
+ 		mpp_write_req(mpp, task->reg, s, e, reg_en);
+ 	}
+ 	/* init current task */
+-	dec->current_task = task;
++	mpp->cur_task = mpp_task;
+ 	/* Flush the register before the start the device */
+ 	wmb();
+ 	mpp_write(mpp, VDPU1_REG_DEC_INT_EN,
+@@ -610,8 +605,6 @@ static int vdpu_probe_width(struct mpp_dev *mpp,
+ 	case VDPU1_ID_9190:
+ 		width = VDPU1_GET_WIDTH(task->reg[VDPU1_RGE_WIDTH_INDEX]);
+ 		break;
+-	default:
+-		break;
+ 	}
+ 
+ 	return width;
+@@ -687,19 +680,16 @@ static int vdpu_isr(struct mpp_dev *mpp)
+ {
+ 	u32 err_mask;
+ 	struct vdpu_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
+-	struct vdpu_dev *dec = to_vdpu_dev(mpp);
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 
+ 	/* FIXME use a spin lock here */
+-	task = dec->current_task;
+-	if (!task) {
+-		dev_err(dec->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+-
+-	mpp_task = &task->mpp_task;
+ 	mpp_time_diff(mpp_task);
+-	dec->current_task = NULL;
++	mpp->cur_task = NULL;
++	task = to_vdpu_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n",
+ 		  task->irq_status);
+diff --git a/drivers/video/rockchip/mpp/mpp_vdpu2.c b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+index 951ef1a064be..b1a0fd624d72 100644
+--- a/drivers/video/rockchip/mpp/mpp_vdpu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vdpu2.c
+@@ -113,7 +113,6 @@ struct vdpu_dev {
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+-	struct vdpu_task *current_task;
+ };
+ 
+ static struct mpp_hw_info vdpu_v2_hw_info = {
+@@ -352,14 +351,10 @@ static int vdpu_run(struct mpp_dev *mpp,
+ {
+ 	u32 i;
+ 	u32 reg_en;
+-	struct vdpu_task *task = NULL;
+-	struct vdpu_dev *dec = NULL;
++	struct vdpu_task *task = to_vdpu_task(mpp_task);
+ 
+ 	mpp_debug_enter();
+ 
+-	task = to_vdpu_task(mpp_task);
+-	dec = to_vdpu_dev(mpp);
+-
+ 	/* clear cache */
+ 	mpp_write_relaxed(mpp, VDPU2_REG_CLR_CACHE_BASE, 1);
+ 	/* set registers for hardware */
+@@ -372,7 +367,7 @@ static int vdpu_run(struct mpp_dev *mpp,
+ 		mpp_write_req(mpp, task->reg, s, e, reg_en);
+ 	}
+ 	/* init current task */
+-	dec->current_task = task;
++	mpp->cur_task = mpp_task;
+ 	/* Flush the registers */
+ 	wmb();
+ 	mpp_write(mpp, VDPU2_REG_DEC_EN,
+@@ -598,19 +593,16 @@ static int vdpu_isr(struct mpp_dev *mpp)
+ {
+ 	u32 err_mask;
+ 	struct vdpu_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
+-	struct vdpu_dev *dec = to_vdpu_dev(mpp);
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 
+ 	/* FIXME use a spin lock here */
+-	task = dec->current_task;
+-	if (!task) {
+-		dev_err(dec->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+-
+-	mpp_task = &task->mpp_task;
+ 	mpp_time_diff(mpp_task);
+-	dec->current_task = NULL;
++	mpp->cur_task = NULL;
++	task = to_vdpu_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n",
+ 		  task->irq_status);
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu1.c b/drivers/video/rockchip/mpp/mpp_vepu1.c
+index 43e8798cb143..a64a9b1298a0 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu1.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu1.c
+@@ -95,8 +95,6 @@ struct vepu_dev {
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+-
+-	struct vepu_task *current_task;
+ };
+ 
+ static struct mpp_hw_info vepu_v1_hw_info = {
+@@ -268,14 +266,10 @@ static int vepu_run(struct mpp_dev *mpp,
+ {
+ 	u32 i;
+ 	u32 reg_en;
+-	struct vepu_task *task = NULL;
+-	struct vepu_dev *enc = NULL;
++	struct vepu_task *task = to_vepu_task(mpp_task);
+ 
+ 	mpp_debug_enter();
+ 
+-	task = to_vepu_task(mpp_task);
+-	enc = to_vepu_dev(mpp);
+-
+ 	/* clear cache */
+ 	mpp_write_relaxed(mpp, VEPU1_REG_CLR_CACHE_BASE, 1);
+ 	/* set registers for hardware */
+@@ -292,7 +286,7 @@ static int vepu_run(struct mpp_dev *mpp,
+ 		mpp_write_req(mpp, task->reg, s, e, reg_en);
+ 	}
+ 	/* init current task */
+-	enc->current_task = task;
++	mpp->cur_task = mpp_task;
+ 	/* Last, flush start registers */
+ 	wmb();
+ 	mpp_write(mpp, VEPU1_REG_ENC_EN,
+@@ -318,19 +312,16 @@ static int vepu_isr(struct mpp_dev *mpp)
+ {
+ 	u32 err_mask;
+ 	struct vepu_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
+-	struct vepu_dev *enc = to_vepu_dev(mpp);
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 
+ 	/* FIXME use a spin lock here */
+-	task = enc->current_task;
+-	if (!task) {
+-		dev_err(enc->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+-
+-	mpp_task = &task->mpp_task;
+ 	mpp_time_diff(mpp_task);
+-	enc->current_task = NULL;
++	mpp->cur_task = NULL;
++	task = to_vepu_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n",
+ 		  task->irq_status);
+diff --git a/drivers/video/rockchip/mpp/mpp_vepu2.c b/drivers/video/rockchip/mpp/mpp_vepu2.c
+index d24440ff1b9f..7bfa62d64e5c 100644
+--- a/drivers/video/rockchip/mpp/mpp_vepu2.c
++++ b/drivers/video/rockchip/mpp/mpp_vepu2.c
+@@ -103,7 +103,6 @@ struct vepu_dev {
+ 
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+-	struct vepu_task *current_task;
+ };
+ 
+ static struct mpp_hw_info vepu_v2_hw_info = {
+@@ -276,16 +275,10 @@ static int vepu_run(struct mpp_dev *mpp,
+ {
+ 	u32 i;
+ 	u32 reg_en;
+-	struct vepu_task *task = NULL;
+-	struct vepu_dev *enc = NULL;
++	struct vepu_task *task = to_vepu_task(mpp_task);
+ 
+ 	mpp_debug_enter();
+ 
+-	task = to_vepu_task(mpp_task);
+-	enc = to_vepu_dev(mpp);
+-
+-	/* FIXME: spin lock here */
+-	enc->current_task = task;
+ 	/* clear cache */
+ 	mpp_write_relaxed(mpp, VEPU2_REG_CLR_CACHE_BASE, 1);
+ 
+@@ -302,7 +295,7 @@ static int vepu_run(struct mpp_dev *mpp,
+ 		mpp_write_req(mpp, task->reg, s, e, reg_en);
+ 	}
+ 	/* init current task */
+-	enc->current_task = task;
++	mpp->cur_task = mpp_task;
+ 	/* Last, flush the registers */
+ 	wmb();
+ 	mpp_write(mpp, VEPU2_REG_ENC_EN,
+@@ -328,19 +321,16 @@ static int vepu_isr(struct mpp_dev *mpp)
+ {
+ 	u32 err_mask;
+ 	struct vepu_task *task = NULL;
+-	struct mpp_task *mpp_task = NULL;
+-	struct vepu_dev *enc = to_vepu_dev(mpp);
++	struct mpp_task *mpp_task = mpp->cur_task;
+ 
+ 	/* FIXME use a spin lock here */
+-	task = enc->current_task;
+-	if (!task) {
+-		dev_err(enc->mpp.dev, "no current task\n");
++	if (!mpp_task) {
++		dev_err(mpp->dev, "no current task\n");
+ 		return IRQ_HANDLED;
+ 	}
+-
+-	mpp_task = &task->mpp_task;
+ 	mpp_time_diff(mpp_task);
+-	enc->current_task = NULL;
++	mpp->cur_task = NULL;
++	task = to_vepu_task(mpp_task);
+ 	task->irq_status = mpp->irq_status;
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n",
+ 		  task->irq_status);
+-- 
+2.35.3
+

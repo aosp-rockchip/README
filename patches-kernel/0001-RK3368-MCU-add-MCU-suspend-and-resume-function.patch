@@ -1,0 +1,173 @@
+From ce118b8a83e13b1bbdf953be8bc3baf0d6443a17 Mon Sep 17 00:00:00 2001
+From: Tang Yun ping <typ@rock-chips.com>
+Date: Mon, 11 May 2015 14:54:22 +0800
+Subject: [PATCH] RK3368 MCU: add MCU suspend and resume function
+
+Signed-off-by: Tang Yun ping <typ@rock-chips.com>
+---
+ drivers/devfreq/ddr_rk3368.c       |  9 ++++++++
+ drivers/mailbox/rockchip_mailbox.c | 29 +++++++++++++++++++++++
+ drivers/mailbox/scpi_cmd.h         |  2 ++
+ drivers/mailbox/scpi_protocol.c    | 37 ++++++++++++++++++++++++++++++
+ include/linux/scpi_protocol.h      |  3 +++
+ 5 files changed, 80 insertions(+)
+
+diff --git a/drivers/devfreq/ddr_rk3368.c b/drivers/devfreq/ddr_rk3368.c
+index d7ed33cd8d3a..56d3b679475f 100644
+--- a/drivers/devfreq/ddr_rk3368.c
++++ b/drivers/devfreq/ddr_rk3368.c
+@@ -257,6 +257,12 @@ static void ddr_init(u32 dram_speed_bin, u32 freq)
+ 		printk(KERN_DEBUG pr_fmt("%s out\n"), __func__);
+ }
+ 
++static int ddr_init_resume(struct platform_device *pdev)
++{
++	ddr_init(DDR3_DEFAULT, 0);
++	return 0;
++}
++
+ static int __init rockchip_ddr_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np;
+@@ -311,6 +317,9 @@ static const struct of_device_id rockchip_ddr_of_match[] __refdata = {
+ };
+ 
+ static struct platform_driver rockchip_ddr_driver = {
++#ifdef CONFIG_PM
++	.resume = ddr_init_resume,
++#endif /* CONFIG_PM */
+ 	.driver = {
+ 		   .name = "rockchip_ddr",
+ 		   .of_match_table = rockchip_ddr_of_match,
+diff --git a/drivers/mailbox/rockchip_mailbox.c b/drivers/mailbox/rockchip_mailbox.c
+index ca8cb4d1aeb3..ca88773a48ed 100644
+--- a/drivers/mailbox/rockchip_mailbox.c
++++ b/drivers/mailbox/rockchip_mailbox.c
+@@ -23,6 +23,7 @@
+ #include <linux/clk.h>
+ 
+ #include <linux/rockchip-mailbox.h>
++#include <linux/scpi_protocol.h>
+ 
+ #define MAILBOX_A2B_INTEN		0x00
+ #define MAILBOX_A2B_STATUS		0x04
+@@ -160,6 +161,30 @@ static struct of_device_id rockchip_mbox_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, rockchp_mbox_of_match);
+ 
++#ifdef CONFIG_PM
++static int rockchip_mbox_suspend(struct platform_device *pdev,
++				 pm_message_t state)
++{
++	struct rockchip_mbox *mb = platform_get_drvdata(pdev);
++
++	if (scpi_sys_set_mcu_state_suspend())
++		dev_err(mb->mbox.dev, "scpi_sys_set_mcu_state_suspend timeout.\n");
++	return 0;
++}
++
++static int rockchip_mbox_resume(struct platform_device *pdev)
++{
++	struct rockchip_mbox *mb = platform_get_drvdata(pdev);
++
++	writel_relaxed((1 << mb->mbox.num_chans) - 1,
++		       mb->mbox_base + MAILBOX_B2A_INTEN);
++
++	if (scpi_sys_set_mcu_state_resume())
++		dev_err(mb->mbox.dev, "scpi_sys_set_mcu_state_resume timeout.\n");
++	return 0;
++}
++#endif /* CONFIG_PM */
++
+ static int rockchip_mbox_probe(struct platform_device *pdev)
+ {
+ 	struct rockchip_mbox *mb;
+@@ -266,6 +291,10 @@ static int rockchip_mbox_remove(struct platform_device *pdev)
+ static struct platform_driver rockchip_mbox_driver = {
+ 	.probe	= rockchip_mbox_probe,
+ 	.remove	= rockchip_mbox_remove,
++#ifdef CONFIG_PM
++	.suspend = rockchip_mbox_suspend,
++	.resume	= rockchip_mbox_resume,
++#endif /* CONFIG_PM */
+ 	.driver = {
+ 		.name = "rockchip-mailbox",
+ 		.of_match_table = of_match_ptr(rockchip_mbox_of_match),
+diff --git a/drivers/mailbox/scpi_cmd.h b/drivers/mailbox/scpi_cmd.h
+index 5f5ca45474df..0f6b9345616a 100644
+--- a/drivers/mailbox/scpi_cmd.h
++++ b/drivers/mailbox/scpi_cmd.h
+@@ -57,6 +57,8 @@ enum scpi_ddr_cmd {
+ enum scpi_sys_cmd {
+ 	SCPI_SYS_GET_VERSION,
+ 	SCPI_SYS_REFRESH_MCU_FREQ,
++	SCPI_SYS_SET_MCU_STATE_SUSPEND,
++	SCPI_SYS_SET_MCU_STATE_RESUME,
+ };
+ 
+ enum scpi_std_cmd {
+diff --git a/drivers/mailbox/scpi_protocol.c b/drivers/mailbox/scpi_protocol.c
+index 9ddb1221545a..8313912ea8b9 100644
+--- a/drivers/mailbox/scpi_protocol.c
++++ b/drivers/mailbox/scpi_protocol.c
+@@ -400,6 +400,43 @@ static int scpi_get_version(u32 old, u32 *ver)
+ 	return ret;
+ }
+ 
++int scpi_sys_set_mcu_state_suspend(void)
++{
++	struct scpi_data_buf sdata;
++	struct rockchip_mbox_msg mdata;
++	struct __packed1 {
++		u32 status;
++	} tx_buf;
++	struct __packed2 {
++		u32 status;
++	} rx_buf;
++
++	tx_buf.status = 0;
++	SCPI_SETUP_DBUF(sdata, mdata, SCPI_CL_SYS,
++			SCPI_SYS_SET_MCU_STATE_SUSPEND, tx_buf, rx_buf);
++	return scpi_execute_cmd(&sdata);
++}
++EXPORT_SYMBOL_GPL(scpi_sys_set_mcu_state_suspend);
++
++int scpi_sys_set_mcu_state_resume(void)
++{
++	struct scpi_data_buf sdata;
++	struct rockchip_mbox_msg mdata;
++	struct __packed1 {
++		u32 status;
++	} tx_buf;
++	struct __packed2 {
++		u32 status;
++	} rx_buf;
++
++	tx_buf.status = 0;
++
++	SCPI_SETUP_DBUF(sdata, mdata, SCPI_CL_SYS,
++			SCPI_SYS_SET_MCU_STATE_RESUME, tx_buf, rx_buf);
++	return scpi_execute_cmd(&sdata);
++}
++EXPORT_SYMBOL_GPL(scpi_sys_set_mcu_state_resume);
++
+ int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type)
+ {
+ 	struct scpi_data_buf sdata;
+diff --git a/include/linux/scpi_protocol.h b/include/linux/scpi_protocol.h
+index 4df7c00a073b..fb32c0b543bf 100644
+--- a/include/linux/scpi_protocol.h
++++ b/include/linux/scpi_protocol.h
+@@ -37,6 +37,9 @@ struct scpi_opp *scpi_dvfs_get_opps(u8 domain);
+ int scpi_get_sensor(char *name);
+ int scpi_get_sensor_value(u16 sensor, u32 *val);
+ 
++int scpi_sys_set_mcu_state_suspend(void);
++int scpi_sys_set_mcu_state_resume(void);
++
+ int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type);
+ int scpi_ddr_set_clk_rate(u32 rate);
+ int scpi_ddr_round_rate(u32 m_hz);
+-- 
+2.35.3
+

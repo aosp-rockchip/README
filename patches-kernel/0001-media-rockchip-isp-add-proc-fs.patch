@@ -1,0 +1,537 @@
+From 7059d79cecd0c922321fc36bc07fa3baefad5028 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Mon, 31 Aug 2020 14:11:51 +0800
+Subject: [PATCH] media: rockchip: isp: add proc fs
+
+Change-Id: I4e8ca0c89275fae04c14ad4c1e1a7750758692fe
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/Makefile  |  3 +-
+ drivers/media/platform/rockchip/isp/bridge.c  |  6 +-
+ drivers/media/platform/rockchip/isp/bridge.h  |  1 +
+ drivers/media/platform/rockchip/isp/dev.c     |  5 +-
+ drivers/media/platform/rockchip/isp/dev.h     |  3 +
+ drivers/media/platform/rockchip/isp/hw.c      | 10 ---
+ drivers/media/platform/rockchip/isp/hw.h      | 10 +++
+ .../media/platform/rockchip/isp/isp_ispp.h    |  6 ++
+ drivers/media/platform/rockchip/isp/procfs.c  | 87 +++++++++++++++++++
+ drivers/media/platform/rockchip/isp/procfs.h  | 21 +++++
+ drivers/media/platform/rockchip/isp/rkisp.c   | 30 ++++++-
+ drivers/media/platform/rockchip/isp/rkisp.h   |  1 +
+ 12 files changed, 169 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/isp/procfs.c
+ create mode 100644 drivers/media/platform/rockchip/isp/procfs.h
+
+diff --git a/drivers/media/platform/rockchip/isp/Makefile b/drivers/media/platform/rockchip/isp/Makefile
+index c92e79ffcf47..569a709d37ca 100644
+--- a/drivers/media/platform/rockchip/isp/Makefile
++++ b/drivers/media/platform/rockchip/isp/Makefile
+@@ -16,7 +16,8 @@ video_rkisp-objs += rkisp.o \
+ 			dmarx.o \
+ 			csi.o \
+ 			bridge.o \
+-			isp_mipi_luma.o
++			isp_mipi_luma.o \
++			procfs.o
+ 
+ ifdef CONFIG_VIDEO_ROCKCHIP_THUNDER_BOOT_ISP
+ video_rkisp-objs += rkisp_tb_helper.o
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 586af13437f7..bf8bc3e688b6 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -53,14 +53,18 @@ static int frame_end(struct rkisp_bridge_device *dev, bool en)
+ 	struct rkisp_hw_dev *hw = dev->ispdev->hw_dev;
+ 	struct v4l2_subdev *sd = v4l2_get_subdev_hostdata(&dev->sd);
+ 	unsigned long lock_flags = 0;
+-	u64 ns = 0;
++	u64 ns = ktime_get_ns();
+ 
++	rkisp_dmarx_get_frame(dev->ispdev, &dev->dbg.id, NULL, true);
++	dev->dbg.interval = ns - dev->dbg.timestamp;
++	dev->dbg.timestamp = ns;
+ 	if (hw->cur_buf && hw->nxt_buf) {
+ 		if (!en) {
+ 			spin_lock_irqsave(&hw->buf_lock, lock_flags);
+ 			list_add_tail(&hw->cur_buf->list, &hw->list);
+ 			spin_unlock_irqrestore(&hw->buf_lock, lock_flags);
+ 		} else {
++			ns = 0;
+ 			rkisp_dmarx_get_frame(dev->ispdev,
+ 				&hw->cur_buf->frame_id, &ns, true);
+ 			hw->cur_buf->frame_id++;
+diff --git a/drivers/media/platform/rockchip/isp/bridge.h b/drivers/media/platform/rockchip/isp/bridge.h
+index 0835527e8d67..391ca2326f22 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.h
++++ b/drivers/media/platform/rockchip/isp/bridge.h
+@@ -48,6 +48,7 @@ struct rkisp_bridge_device {
+ 	wait_queue_head_t done;
+ 	struct rkisp_bridge_ops *ops;
+ 	struct rkisp_bridge_config *cfg;
++	struct frame_debug_info dbg;
+ 	u8 work_mode;
+ 	u8 buf_num;
+ 	bool pingpong;
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index bbca4b1a04e3..36889e6f66e7 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -208,7 +208,7 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
+ end:
+ 	/* set isp clock rate */
+ 	clk_set_rate(hw_dev->clks[0], hw_dev->clk_rate_tbl[i].clk_rate * 1000000UL);
+-	dev_info(hw_dev->dev, "set isp clk = %luHz\n", clk_get_rate(hw_dev->clks[0]));
++	dev_dbg(hw_dev->dev, "set isp clk = %luHz\n", clk_get_rate(hw_dev->clks[0]));
+ 
+ 	return 0;
+ }
+@@ -751,6 +751,8 @@ static int rkisp_plat_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_unreg_media_dev;
+ 
++	rkisp_proc_init(isp_dev);
++
+ 	mutex_lock(&rkisp_dev_mutex);
+ 	list_add_tail(&isp_dev->list, &rkisp_device_list);
+ 	mutex_unlock(&rkisp_dev_mutex);
+@@ -771,6 +773,7 @@ static int rkisp_plat_remove(struct platform_device *pdev)
+ 
+ 	pm_runtime_disable(&pdev->dev);
+ 
++	rkisp_proc_cleanup(isp_dev);
+ 	media_device_unregister(&isp_dev->media_dev);
+ 	v4l2_device_unregister(&isp_dev->v4l2_dev);
+ 	rkisp_unregister_luma_vdev(&isp_dev->luma_vdev);
+diff --git a/drivers/media/platform/rockchip/isp/dev.h b/drivers/media/platform/rockchip/isp/dev.h
+index 6ab92f1498eb..c327e5d1b91e 100644
+--- a/drivers/media/platform/rockchip/isp/dev.h
++++ b/drivers/media/platform/rockchip/isp/dev.h
+@@ -44,6 +44,7 @@
+ #include "isp_params.h"
+ #include "isp_stats.h"
+ #include "isp_mipi_luma.h"
++#include "procfs.h"
+ 
+ #define DRIVER_NAME "rkisp"
+ #define ISP_VDEV_NAME DRIVER_NAME  "_ispdev"
+@@ -188,6 +189,7 @@ struct rkisp_device {
+ 	struct rkisp_csi_device csi_dev;
+ 	struct rkisp_bridge_device br_dev;
+ 	struct rkisp_luma_vdev luma_vdev;
++	struct proc_dir_entry *procfs;
+ 	struct rkisp_pipeline pipe;
+ 	enum rkisp_isp_ver isp_ver;
+ 	struct rkisp_emd_data emd_data_fifo[RKISP_EMDDATA_FIFO_MAX];
+@@ -199,6 +201,7 @@ struct rkisp_device {
+ 	struct rkisp_hdr hdr;
+ 	enum rkisp_isp_state isp_state;
+ 	unsigned int isp_err_cnt;
++	unsigned int isp_isr_cnt;
+ 	unsigned int isp_inp;
+ 	struct mutex apilock; /* mutex to serialize the calls of stream */
+ 	struct mutex iqlock; /* mutex to serialize the calls of iq */
+diff --git a/drivers/media/platform/rockchip/isp/hw.c b/drivers/media/platform/rockchip/isp/hw.c
+index 9d5d2527752a..5baad0f89d16 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -36,16 +36,6 @@ struct isp_irqs_data {
+ 	irqreturn_t (*irq_hdl)(int irq, void *ctx);
+ };
+ 
+-struct isp_match_data {
+-	const char * const *clks;
+-	int num_clks;
+-	enum rkisp_isp_ver isp_ver;
+-	const struct isp_clk_info  *clk_rate_tbl;
+-	int num_clk_rate_tbl;
+-	struct isp_irqs_data *irqs;
+-	int num_irqs;
+-};
+-
+ /* using default value if reg no write for multi device */
+ static void default_sw_reg_flag(struct rkisp_device *dev)
+ {
+diff --git a/drivers/media/platform/rockchip/isp/hw.h b/drivers/media/platform/rockchip/isp/hw.h
+index 6849fc458203..d3ed23cb8850 100644
+--- a/drivers/media/platform/rockchip/isp/hw.h
++++ b/drivers/media/platform/rockchip/isp/hw.h
+@@ -13,6 +13,16 @@ struct isp_clk_info {
+ 	u32 refer_data;
+ };
+ 
++struct isp_match_data {
++	const char * const *clks;
++	int num_clks;
++	enum rkisp_isp_ver isp_ver;
++	const struct isp_clk_info  *clk_rate_tbl;
++	int num_clk_rate_tbl;
++	struct isp_irqs_data *irqs;
++	int num_irqs;
++};
++
+ struct rkisp_hw_dev {
+ 	const struct isp_match_data *match_data;
+ 	struct platform_device *pdev;
+diff --git a/drivers/media/platform/rockchip/isp/isp_ispp.h b/drivers/media/platform/rockchip/isp/isp_ispp.h
+index c219ee6da6d9..0bb44edd923b 100644
+--- a/drivers/media/platform/rockchip/isp/isp_ispp.h
++++ b/drivers/media/platform/rockchip/isp/isp_ispp.h
+@@ -41,6 +41,12 @@ enum rkisp_ispp_work_mode {
+ 	ISP_ISPP_INIT_FAIL = BIT(7),
+ };
+ 
++struct frame_debug_info {
++	u64 timestamp;
++	u32 interval;
++	u32 id;
++};
++
+ struct max_input {
+ 	u32 w;
+ 	u32 h;
+diff --git a/drivers/media/platform/rockchip/isp/procfs.c b/drivers/media/platform/rockchip/isp/procfs.c
+new file mode 100644
+index 000000000000..d2b020e4ea7c
+--- /dev/null
++++ b/drivers/media/platform/rockchip/isp/procfs.c
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) Rockchip Electronics Co., Ltd. */
++#include <linux/clk.h>
++#include <linux/proc_fs.h>
++#include <linux/sem.h>
++#include <linux/seq_file.h>
++
++#include "dev.h"
++#include "procfs.h"
++#include "version.h"
++
++#ifdef CONFIG_PROC_FS
++static int isp_show(struct seq_file *p, void *v)
++{
++	struct rkisp_device *dev = p->private;
++	struct rkisp_isp_subdev *sdev = &dev->isp_sdev;
++	struct rkisp_sensor_info *sensor = dev->active_sensor;
++	u32 val = 0;
++
++	seq_printf(p, "%-10s Version:v%02x.%02x.%02x\n",
++		   dev->name,
++		   RKISP_DRIVER_VERSION >> 16,
++		   (RKISP_DRIVER_VERSION & 0xff00) >> 8,
++		   RKISP_DRIVER_VERSION & 0x00ff);
++	if (sensor && sensor->fi.interval.numerator)
++		val = sensor->fi.interval.denominator / sensor->fi.interval.numerator;
++	seq_printf(p, "%-10s %s Format:%s Size:%dx%d@%dfps Offset(%d,%d) | RDBK_X%d(frame:%d rate:%dms)\n",
++		   "Input",
++		   sensor ? sensor->sd->name : NULL,
++		   sdev->in_fmt.name,
++		   sdev->in_crop.width, sdev->in_crop.height, val,
++		   sdev->in_crop.left, sdev->in_crop.top,
++		   dev->csi_dev.rd_mode - 3,
++		   dev->dmarx_dev.cur_frame.id,
++		   (u32)(dev->dmarx_dev.cur_frame.timestamp - dev->dmarx_dev.pre_frame.timestamp) / 1000 / 1000);
++	seq_printf(p, "%-10s rkispp%d Format:%s%s Size:%dx%d (frame:%d rate:%dms)\n",
++		   "Output",
++		   dev->dev_id,
++		   (dev->br_dev.work_mode & ISP_ISPP_FBC) ? "FBC" : "YUV",
++		   (dev->br_dev.work_mode & ISP_ISPP_422) ? "422" : "420",
++		   dev->br_dev.crop.width,
++		   dev->br_dev.crop.height,
++		   dev->br_dev.dbg.id,
++		   dev->br_dev.dbg.interval / 1000 / 1000);
++	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
++		   "Interrupt",
++		   dev->isp_isr_cnt,
++		   dev->isp_err_cnt);
++	for (val = 0; val < dev->hw_dev->num_clks; val++) {
++		seq_printf(p, "%-10s %ld\n",
++			   dev->hw_dev->match_data->clks[val],
++			   clk_get_rate(dev->hw_dev->clks[val]));
++	}
++	return 0;
++}
++
++static int isp_open(struct inode *inode, struct file *file)
++{
++	struct rkisp_device *data = PDE_DATA(inode);
++
++	return single_open(file, isp_show, data);
++}
++
++static const struct file_operations ops = {
++	.owner		= THIS_MODULE,
++	.open		= isp_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++int rkisp_proc_init(struct rkisp_device *dev)
++{
++	dev->procfs = proc_create_data(dev->name, 0, NULL, &ops, dev);
++	if (!dev->procfs)
++		return -EINVAL;
++	return 0;
++}
++
++void rkisp_proc_cleanup(struct rkisp_device *dev)
++{
++	if (dev->procfs)
++		remove_proc_entry(dev->name, NULL);
++	dev->procfs = NULL;
++}
++
++#endif /* CONFIG_PROC_FS */
+diff --git a/drivers/media/platform/rockchip/isp/procfs.h b/drivers/media/platform/rockchip/isp/procfs.h
+new file mode 100644
+index 000000000000..09c650abc5cb
+--- /dev/null
++++ b/drivers/media/platform/rockchip/isp/procfs.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2020 Rockchip Electronics Co., Ltd. */
++
++#ifndef _RKISP_PROCFS_H
++#define _RKISP_PROCFS_H
++
++#ifdef CONFIG_PROC_FS
++int rkisp_proc_init(struct rkisp_device *dev);
++void rkisp_proc_cleanup(struct rkisp_device *dev);
++#else
++static inline int rkisp_proc_init(struct rkisp_device *dev)
++{
++	return 0;
++}
++static inline void rkisp_proc_cleanup(struct rkisp_device *dev)
++{
++
++}
++#endif
++
++#endif
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index e997471d5a26..646bb3ff7946 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -998,6 +998,7 @@ static int rkisp_isp_start(struct rkisp_device *dev)
+ 	rkisp_write(dev, CIF_ISP_CTRL, val, is_direct);
+ 
+ 	dev->isp_err_cnt = 0;
++	dev->isp_isr_cnt = 0;
+ 	dev->isp_state = ISP_START;
+ 
+ 	/* XXX: Is the 1000us too long?
+@@ -1024,162 +1025,189 @@ static int rkisp_isp_start(struct rkisp_device *dev)
+ 
+ static const struct ispsd_in_fmt rkisp_isp_input_formats[] = {
+ 	{
++		.name		= "SBGGR10_1X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_SBGGR10_1X10,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW10,
+ 		.bayer_pat	= RAW_BGGR,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "SRGGB10_1X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_SRGGB10_1X10,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW10,
+ 		.bayer_pat	= RAW_RGGB,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "SGBRG10_1X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGBRG10_1X10,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW10,
+ 		.bayer_pat	= RAW_GBRG,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "SGRBG10_1X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGRBG10_1X10,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW10,
+ 		.bayer_pat	= RAW_GRBG,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "SRGGB12_1X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_SRGGB12_1X12,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW12,
+ 		.bayer_pat	= RAW_RGGB,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "SBGGR12_1X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_SBGGR12_1X12,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW12,
+ 		.bayer_pat	= RAW_BGGR,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "SGBRG12_1X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGBRG12_1X12,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW12,
+ 		.bayer_pat	= RAW_GBRG,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "SGRBG12_1X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGRBG12_1X12,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW12,
+ 		.bayer_pat	= RAW_GRBG,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "SRGGB8_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_SRGGB8_1X8,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW8,
+ 		.bayer_pat	= RAW_RGGB,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "SBGGR8_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_SBGGR8_1X8,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW8,
+ 		.bayer_pat	= RAW_BGGR,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "SGBRG8_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGBRG8_1X8,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW8,
+ 		.bayer_pat	= RAW_GBRG,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "SGRBG8_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_SGRBG8_1X8,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW8,
+ 		.bayer_pat	= RAW_GRBG,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "YUYV8_2X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_YUYV8_2X8,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "YVYU8_2X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_YVYU8_2X8,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCRYCB,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "UYVY8_2X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_UYVY8_2X8,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CBYCRY,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "VYUY8_2X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_VYUY8_2X8,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CRYCBY,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "YUYV10_2X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_YUYV10_2X10,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "YVYU10_2X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_YVYU10_2X10,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCRYCB,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "UYVY10_2X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_UYVY10_2X10,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CBYCRY,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "VYUY10_2X10",
+ 		.mbus_code	= MEDIA_BUS_FMT_VYUY10_2X10,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CRYCBY,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "YUYV12_2X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_YUYV12_2X12,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "YVYU12_2X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_YVYU12_2X12,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCRYCB,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "UYVY12_2X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_UYVY12_2X12,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CBYCRY,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "VYUY12_2X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_VYUY12_2X12,
+ 		.fmt_type	= FMT_YUV,
+ 		.mipi_dt	= CIF_CSI2_DT_YUV422_8b,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_CRYCBY,
+ 		.bus_width	= 12,
+ 	}, {
++		.name		= "Y8_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_Y8_1X8,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW8,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
+ 		.bus_width	= 8,
+ 	}, {
++		.name		= "Y10_1X8",
+ 		.mbus_code	= MEDIA_BUS_FMT_Y10_1X10,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW10,
+ 		.yuv_seq	= CIF_ISP_ACQ_PROP_YCBYCR,
+ 		.bus_width	= 10,
+ 	}, {
++		.name		= "Y12_1X12",
+ 		.mbus_code	= MEDIA_BUS_FMT_Y12_1X12,
+ 		.fmt_type	= FMT_BAYER,
+ 		.mipi_dt	= CIF_CSI2_DT_RAW12,
+@@ -2158,7 +2186,7 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 
+ 	v4l2_dbg(3, rkisp_debug, &dev->v4l2_dev,
+ 		 "isp isr:0x%x, 0x%x\n", isp_mis, isp3a_mis);
+-
++	dev->isp_isr_cnt++;
+ 	/* start edge of v_sync */
+ 	if (isp_mis & CIF_ISP_V_START) {
+ 		rkisp_set_state(dev, ISP_FRAME_VS);
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.h b/drivers/media/platform/rockchip/isp/rkisp.h
+index ac95ee322b04..8dd119952f1b 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.h
++++ b/drivers/media/platform/rockchip/isp/rkisp.h
+@@ -66,6 +66,7 @@ struct rkisp_stream;
+  */
+ struct ispsd_in_fmt {
+ 	u32 mbus_code;
++	u8 name[16];
+ 	u8 fmt_type;
+ 	u32 mipi_dt;
+ 	u32 yuv_seq;
+-- 
+2.35.3
+

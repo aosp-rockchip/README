@@ -1,0 +1,839 @@
+From 4b7f326afd4ab240a2380ffb9d9acbc0f0608f44 Mon Sep 17 00:00:00 2001
+From: ddl <ddl@rock-chips.com>
+Date: Mon, 19 Aug 2013 11:58:26 +0800
+Subject: [PATCH] rk_cam_cif:v0.3.f  rk_cam_io:v0.1.3 generic_sensor:v0.1.b
+
+---
+ arch/arm/plat-rk/include/plat/rk_camera.h  |  88 ++++++-
+ arch/arm/plat-rk/rk_camera.c               |  13 +-
+ drivers/media/video/generic_sensor.c       |  34 ++-
+ drivers/media/video/generic_sensor.h       |  69 +++--
+ drivers/media/video/rk30_camera_oneframe.c | 280 +++++++++++++++------
+ 5 files changed, 370 insertions(+), 114 deletions(-)
+
+diff --git a/arch/arm/plat-rk/include/plat/rk_camera.h b/arch/arm/plat-rk/include/plat/rk_camera.h
+index ed3621320c9f..b0a3b88696c4 100755
+--- a/arch/arm/plat-rk/include/plat/rk_camera.h
++++ b/arch/arm/plat-rk/include/plat/rk_camera.h
+@@ -113,7 +113,7 @@
+                           flash_attach,\
+                           mir,\
+                           i2c_chl,\
+-                          cif_chl)    \
++                          cif_chl)\
+     new_camera_device_ex(sensor_name,\
+                         face,\
+                         INVALID_VALUE,\
+@@ -131,6 +131,85 @@
+                         cif_chl,\
+                         24)
+ 
++#define new_camera_device_raw_ex(sensor_name,\
++                             face,\
++                             ori,\
++                             pwr_io,\
++                             pwr_active,\
++                             rst_io,\
++                             rst_active,\
++                             pwdn_io,\
++                             pwdn_active,\
++                             flash_attach,\
++                             res,\
++                             mir,\
++                             i2c_chl,\
++                             i2c_spd,\
++                             i2c_addr,\
++                             cif_chl,\
++                             mclk)\
++            .dev = {\
++                .i2c_cam_info = {\
++                    I2C_BOARD_INFO(STR(sensor_name), i2c_addr>>1),\
++                },\
++                .link_info = {\
++                	.bus_id= RK29_CAM_PLATFORM_DEV_ID+cif_chl,\
++                	.i2c_adapter_id = i2c_chl,\
++                	.module_name	= STR(sensor_name),\
++                },\
++                .device_info = {\
++                	.name = "soc-camera-pdrv",\
++                	.dev	= {\
++                		.init_name = STR(CONS(_CONS(sensor_name,_),face)),\
++                	},\
++                },\
++            },\
++            .io = {\
++                .gpio_power = pwr_io,\
++                .gpio_reset = rst_io,\
++                .gpio_powerdown = pwdn_io,\
++                .gpio_flash = INVALID_GPIO,\
++                .gpio_flag = ((pwr_active&0x01)<<RK29_CAM_POWERACTIVE_BITPOS)|((rst_active&0x01)<<RK29_CAM_RESETACTIVE_BITPOS)|((pwdn_active&0x01)<<RK29_CAM_POWERDNACTIVE_BITPOS),\
++            },\
++            .orientation = ori,\
++            .resolution = res,\
++            .mirror = mir,\
++            .i2c_rate = i2c_spd,\
++            .flash = flash_attach,\
++            .pwdn_info = ((pwdn_active&0x10)|0x01),\
++            .powerup_sequence = CONS(sensor_name,_PWRSEQ),\
++            .mclk_rate = mclk,\
++
++
++#define new_camera_device_raw(sensor_name,\
++                          face,\
++                          pwdn_io,\
++                          flash_attach,\
++                          mir,\
++                          i2c_chl,\
++                          cif_chl)\
++    new_camera_device_raw_ex(sensor_name,\
++                        face,\
++                        INVALID_VALUE,\
++                        INVALID_VALUE,\
++                        INVALID_VALUE,\
++                        INVALID_VALUE,\
++                        INVALID_VALUE,\
++                        pwdn_io,\
++                        CONS(sensor_name,_PWRDN_ACTIVE),\
++                        flash_attach,\
++                        CONS(sensor_name,_FULL_RESOLUTION),\
++                        mir,i2c_chl,\
++                        100000,\
++                        CONS(sensor_name,_I2C_ADDR),\
++                        cif_chl,\
++                        24)
++
++#define new_camera_device_fov(a,b)\
++    .fov_h = a,\
++    .fov_v = b,
++                                
++
+ #define new_camera_device_end new_camera_device_ex(end,end,\
+                                     INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,\
+                                     INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,\
+@@ -505,6 +584,9 @@
+ #define Sensor_HasBeen_PwrOff(a)            (a&0x01)
+ #define Sensor_Support_DirectResume(a)      ((a&0x10)==0x10)
+ 
++#define Sensor_CropSet(a,b)                  a->reserved[1] = b;
++#define Sensor_CropGet(a)                    a->reserved[1]
++
+ enum rk29camera_ioctrl_cmd
+ {
+ 	Cam_Power,
+@@ -603,7 +685,9 @@ struct rkcamera_platform_data {
+                                     bit4-bit7 --- power up sequence second step;
+                                      .....
+                                   */
+-    int mclk_rate;       /* MHz : 24/48 */                                  
++    int mclk_rate;       /* MHz : 24/48 */ 
++    int fov_h;           /* fied of view horizontal */
++    int fov_v;           /* fied of view vertical */
+                       
+ };
+ 
+diff --git a/arch/arm/plat-rk/rk_camera.c b/arch/arm/plat-rk/rk_camera.c
+index 4b8bfc3f8bdc..496accc83aa9 100755
+--- a/arch/arm/plat-rk/rk_camera.c
++++ b/arch/arm/plat-rk/rk_camera.c
+@@ -266,8 +266,11 @@
+ *v0.0.1: this driver is compatible with generic_sensor
+ *v0.1.1:
+ *        Cam_Power return success in rk_sensor_ioctrl when power io havn't config;
++*v0.1.3:
++*        1. this version support fov configuration in new_camera_device;
++*        2. Reduce delay time after power off or power down camera;
+ */
+-static int camio_version = KERNEL_VERSION(0,1,1);
++static int camio_version = KERNEL_VERSION(0,1,3);
+ module_param(camio_version, int, S_IRUGO);
+ 
+ 
+@@ -1618,7 +1621,7 @@ static int rk_sensor_power(struct device *dev, int on)
+             rk_sensor_ioctrl(dev,Cam_Mclk, 0);
+         }
+ 
+-        msleep(500);
++        mdelay(10);/* ddl@rock-chips.com: v0.1.3 */
+     }
+     return ret;
+ }
+@@ -1727,6 +1730,12 @@ int rk_sensor_register(void)
+                 new_camera[i].orientation = 270;
+             }
+         }
++        /* ddl@rock-chips.com: v0.1.3 */
++        if ((new_camera[i].fov_h <= 0) || (new_camera[i].fov_h>360))
++            new_camera[i].fov_h = 100;
++        
++        if ((new_camera[i].fov_v <= 0) || (new_camera[i].fov_v>360))
++            new_camera[i].fov_v = 100;        
+ 
+         new_camera[i].dev.link_info.power = rk_sensor_power;
+         new_camera[i].dev.link_info.powerdown = rk_sensor_powerdown; 
+diff --git a/drivers/media/video/generic_sensor.c b/drivers/media/video/generic_sensor.c
+index 00e26c6f6ac6..b8fa6773d46b 100755
+--- a/drivers/media/video/generic_sensor.c
++++ b/drivers/media/video/generic_sensor.c
+@@ -25,8 +25,12 @@
+ *        fix use v4l2_mbus_framefmt.reserved array overflow in generic_sensor_s_fmt;  
+ *v0.1.9:
+ *        fix sensor_find_ctrl may be overflow;
++*v0.1.b:
++*        1. support sensor driver crop by redefine SENSOR_CROP_PERCENT;
++*        2. fix sensor_ops which is independent for driver;
++*        3. support cropcap;
+ */
+-static int version = KERNEL_VERSION(0,1,9);
++static int version = KERNEL_VERSION(0,1,0xb);
+ module_param(version, int, S_IRUGO);
+ 
+ 
+@@ -549,11 +553,11 @@ int generic_sensor_try_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf
+         SENSOR_DG("Query resolution: %dx%d",mf->width, mf->height);
+         goto generic_sensor_try_fmt_end;
+     }
+- //use this to filter unsupported resolutions
+-   if (sensor->sensor_cb.sensor_try_fmt_cb_th){
+-   	ret = sensor->sensor_cb.sensor_try_fmt_cb_th(client, mf);
+-	if(ret < 0)
+-		goto generic_sensor_try_fmt_end;
++    //use this to filter unsupported resolutions
++    if (sensor->sensor_cb.sensor_try_fmt_cb_th){
++   	    ret = sensor->sensor_cb.sensor_try_fmt_cb_th(client, mf);
++	    if(ret < 0)
++		    goto generic_sensor_try_fmt_end;
+    	}
+     if (mf->height > sensor->info_priv.max_res.h)
+         mf->height = sensor->info_priv.max_res.h;
+@@ -575,6 +579,23 @@ int generic_sensor_try_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf
+     return ret;
+ }
+ 
++int generic_sensor_cropcap(struct v4l2_subdev *sd, struct v4l2_cropcap *cc)
++{
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
++    struct generic_sensor *sensor = to_generic_sensor(client);
++    int ret=0;
++
++    cc->bounds.left = 0;
++    cc->bounds.top = 0;
++    cc->bounds.width = sensor->info_priv.max_res.w;
++    cc->bounds.height = sensor->info_priv.max_res.h;
++    
++    cc->pixelaspect.denominator = sensor->info_priv.max_res.w;
++    cc->pixelaspect.numerator = sensor->info_priv.max_res.h;
++
++    return ret;
++}
++
+ int generic_sensor_enum_frameintervals(struct v4l2_subdev *sd, struct v4l2_frmivalenum *fival){
+ 	int err = 0,index_tmp;
+     unsigned int set_w,set_h;
+@@ -904,6 +925,7 @@ int generic_sensor_s_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ 	 
+ //video or capture special process
+ sensor_s_fmt_end:
++    Sensor_CropSet(mf,sensor->crop_percent);    /* ddl@rock-chips.com: v0.1.b */
+ 	return ret;
+ }
+  int generic_sensor_g_chip_ident(struct v4l2_subdev *sd, struct v4l2_dbg_chip_ident *id)
+diff --git a/drivers/media/video/generic_sensor.h b/drivers/media/video/generic_sensor.h
+index 8b77a356e473..b31814eba3e3 100755
+--- a/drivers/media/video/generic_sensor.h
++++ b/drivers/media/video/generic_sensor.h
+@@ -30,6 +30,8 @@
+ //a represents a generic_sensor type point
+ #define to_specific_sensor(a) (container_of(a, struct specific_sensor, common_sensor))
+ 
++#define SENSOR_CROP_PERCENT   0         // Redefine this macro in sensor driver if user want to crop
++
+ #define SENSOR_INIT_IS_ERR	 (0x00<<28)
+ #define SENSOR_INIT_IS_OK	 (0x01<<28)
+ 
+@@ -242,21 +244,23 @@ struct	rk_flash_timer{
+ struct generic_sensor
+ {
+     char dev_name[32];
+-	struct v4l2_subdev subdev;
+-	struct i2c_client *client;
+-	rk_sensor_info_priv_t info_priv;
+-	int model;	/* V4L2_IDENT_OV* codes from v4l2-chip-ident.h */
+-	
+-	bool is_need_tasklock;
+-	atomic_t tasklock_cnt;
+-	struct soc_camera_ops *sensor_ops; 
+-	struct v4l2_queryctrl* sensor_controls;  
+-	struct sensor_v4l2ctrl_info_s *ctrls;
+-	struct rk_flash_timer flash_off_timer;
+-	struct sensor_ops_cb_s sensor_cb;
+-	struct rk_sensor_focus_op_s sensor_focus;
+-	struct rk29camera_platform_data *sensor_io_request;
+-	struct rk29camera_gpio_res *sensor_gpio_res;
++    struct v4l2_subdev subdev;
++    struct i2c_client *client;
++    rk_sensor_info_priv_t info_priv;
++    int model;	/* V4L2_IDENT_OV* codes from v4l2-chip-ident.h */
++
++    int crop_percent;
++
++    bool is_need_tasklock;
++    atomic_t tasklock_cnt;
++    struct soc_camera_ops *sensor_ops; 
++    struct v4l2_queryctrl* sensor_controls;  
++    struct sensor_v4l2ctrl_info_s *ctrls;
++    struct rk_flash_timer flash_off_timer;
++    struct sensor_ops_cb_s sensor_cb;
++    struct rk_sensor_focus_op_s sensor_focus;
++    struct rk29camera_platform_data *sensor_io_request;
++    struct rk29camera_gpio_res *sensor_gpio_res;
+ 	
+ };
+ 
+@@ -295,6 +299,7 @@ extern int generic_sensor_g_chip_ident(struct v4l2_subdev *sd, struct v4l2_dbg_c
+ extern int generic_sensor_af_workqueue_set(struct soc_camera_device *icd, enum rk_sensor_focus_wq_cmd cmd, int var, bool wait);
+ extern int generic_sensor_s_stream(struct v4l2_subdev *sd, int enable);
+ extern int generic_sensor_writebuf(struct i2c_client *client, char *buf, int buf_size);
++extern int generic_sensor_cropcap(struct v4l2_subdev *sd, struct v4l2_cropcap *cc);
+ 
+ static inline int sensor_get_full_width_height(int full_resolution, unsigned short *w, unsigned short *h)
+ {
+@@ -704,6 +709,7 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+     struct rk_sensor_reg *reg_data; \
+     int config_flash = 0;\
+     int sensor_config;\
++ 	struct soc_camera_ops* sensor_ops_p = NULL;\
+  \
+     if (pdata == NULL) {\
+         printk("WARNING: Camera sensor device is registered in board by CONFIG_SENSOR_XX,\n"\
+@@ -773,6 +779,7 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+     } else {  \
+         spsensor->common_sensor.info_priv.sensor_series = sensor_series;  \
+         spsensor->common_sensor.info_priv.num_series = num;  \
++        spsensor->common_sensor.crop_percent = SENSOR_CROP_PERCENT;\
+  \
+         sensor_series->gSeq_info.w = SENSOR_PREVIEW_W;  \
+         sensor_series->gSeq_info.h = SENSOR_PREVIEW_H;  \
+@@ -914,8 +921,13 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+         BUG();  \
+     }  \
+     spsensor->common_sensor.sensor_controls = controls;  \
+-    sensor_ops.controls = controls;  \
+-    sensor_ops.num_controls = num;  \
++    sensor_ops_p = (struct soc_camera_ops*)kzalloc(sizeof(struct soc_camera_ops),GFP_KERNEL);  \
++	if (sensor_ops_p == NULL) {  \
++		SENSOR_TR("kzalloc struct soc_camera_ops failed");	\
++		BUG();	\
++	}  \
++    sensor_ops_p->controls = controls;  \
++    sensor_ops_p->num_controls = num;  \
+   \
+     ctrls = (struct sensor_v4l2ctrl_info_s*)kzalloc(sizeof(struct sensor_v4l2ctrl_info_s)*num,GFP_KERNEL);  \
+     if (ctrls == NULL) {  \
+@@ -940,13 +952,13 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+         SENSOR_TR("kzalloc struct v4l2_querymenu(%d) failed",num);  \
+         BUG();  \
+     }  \
+-    sensor_ops.menus = menus;  \
+-    sensor_ops.num_menus = num;  \
++    sensor_ops_p->menus = menus;  \
++    sensor_ops_p->num_menus = num;  \
+  \
+-    sensor_ops.suspend = sensor_suspend;  \
+-    sensor_ops.resume = sensor_resume;  \
+-    sensor_ops.set_bus_param = generic_sensor_set_bus_param;  \
+-	sensor_ops.query_bus_param = generic_sensor_query_bus_param;  \
++    sensor_ops_p->suspend = sensor_suspend;  \
++    sensor_ops_p->resume = sensor_resume;  \
++    sensor_ops_p->set_bus_param = generic_sensor_set_bus_param;  \
++	sensor_ops_p->query_bus_param = generic_sensor_query_bus_param;  \
+  \
+     if (sizeof(sensor_ZoomSeqe)/sizeof(struct rk_sensor_reg *))\
+         sensor_ZoomSeqe[0] = NULL;\
+@@ -1111,8 +1123,8 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+     }  \
+  \
+     for (i=0; i<(sizeof(sensor_menus)/sizeof(struct v4l2_querymenu)); i++) { \
+-        num = sensor_ops.num_menus - sizeof(sensor_menus)/sizeof(struct v4l2_querymenu); \
+-        menu = sensor_ops.menus; \
++        num = sensor_ops_p->num_menus - sizeof(sensor_menus)/sizeof(struct v4l2_querymenu); \
++        menu = sensor_ops_p->menus; \
+         while (num--) { \
+             if (menu->id == sensor_menus[i].id) { \
+                 menu->id = 0xffffffff; \
+@@ -1126,8 +1138,8 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+  \
+ 	spsensor->common_sensor.info_priv.datafmt = sensor_colour_fmts;  \
+ 	spsensor->common_sensor.info_priv.num_datafmt = ARRAY_SIZE(sensor_colour_fmts);  \
+-	spsensor->common_sensor.sensor_ops = &sensor_ops;  \
+-	icd->ops		= &sensor_ops;  \
++	spsensor->common_sensor.sensor_ops = sensor_ops_p;  \
++	icd->ops		= sensor_ops_p;  \
+ 	spsensor->common_sensor.info_priv.curfmt= sensor_colour_fmts[0];  \
+  \
+     if (config_flash) { \
+@@ -1179,6 +1191,7 @@ static inline int sensor_face_detect_default_cb(struct soc_camera_device *icd, s
+ static struct v4l2_subdev_video_ops sensor_subdev_video_ops = {\
+ 	.s_mbus_fmt = generic_sensor_s_fmt,\
+ 	.g_mbus_fmt = generic_sensor_g_fmt,\
++    .cropcap = generic_sensor_cropcap,\
+ 	.try_mbus_fmt	= generic_sensor_try_fmt,\
+ 	.enum_mbus_fmt	= generic_sensor_enum_fmt,\
+ 	.enum_frameintervals = generic_sensor_enum_frameintervals,\
+@@ -1248,6 +1261,7 @@ sensor_probe_end:\
+                 kfree(icd->ops->menus);\
+                 icd->ops->menus = NULL;\
+             }\
++            kfree(icd->ops);\
+     	    icd->ops = NULL;\
+         }\
+         i2c_set_clientdata(client, NULL);\
+@@ -1283,6 +1297,7 @@ sensor_probe_end:\
+             kfree(icd->ops->menus);\
+             icd->ops->menus = NULL;\
+         }\
++	    kfree(icd->ops);\
+ 	    icd->ops = NULL;\
+     }\
+ 	i2c_set_clientdata(client, NULL);\
+diff --git a/drivers/media/video/rk30_camera_oneframe.c b/drivers/media/video/rk30_camera_oneframe.c
+index a7f9b743474c..9c1cbf1e895c 100755
+--- a/drivers/media/video/rk30_camera_oneframe.c
++++ b/drivers/media/video/rk30_camera_oneframe.c
+@@ -313,10 +313,14 @@ module_param(debug, int, S_IRUGO|S_IWUSR);
+ *v0.3.b:  
+ *         1. this verison is support for 3188M, the version has been revert in v0.3.d;
+ *v0.3.d:
+-*         1. this version is support foe rk3028a;
++*         1. this version is support for rk3028a;
++*
++*v0.3.f:  
++*         1. this version is support query fov orientation; 
++*         2. support cropcap , setcrop, getcrop;
+ */
+ 
+-#define RK_CAM_VERSION_CODE KERNEL_VERSION(0, 3, 0xd)
++#define RK_CAM_VERSION_CODE KERNEL_VERSION(0, 3, 0xf)
+ static int version = RK_CAM_VERSION_CODE;
+ module_param(version, int, S_IRUGO);
+ 
+@@ -335,11 +339,13 @@ module_param(version, int, S_IRUGO);
+ 
+ #define RK_CAM_W_MIN        48
+ #define RK_CAM_H_MIN        32
+-#define RK_CAM_W_MAX        3856            /* ddl@rock-chips.com : 10M Pixel */
++#define RK_CAM_W_MAX        3856                /* ddl@rock-chips.com : 10M Pixel */
+ #define RK_CAM_H_MAX        2764
+-#define RK_CAM_FRAME_INVAL_INIT 3
+-#define RK_CAM_FRAME_INVAL_DC 3          /* ddl@rock-chips.com :  */
+-#define RK30_CAM_FRAME_MEASURE  5
++#define RK_CAM_FRAME_INVAL_INIT      3
++#define RK_CAM_FRAME_INVAL_DC        3          /* ddl@rock-chips.com :  */
++#define RK30_CAM_FRAME_MEASURE       5
++
++
+ extern void videobuf_dma_contig_free(struct videobuf_queue *q, struct videobuf_buffer *buf);
+ extern dma_addr_t videobuf_to_dma_contig(struct videobuf_buffer *buf);
+ /* buffer for one video frame */
+@@ -421,6 +427,13 @@ struct rk_cif_clk
+     bool on;
+ };
+ 
++struct rk_cif_crop
++{
++    spinlock_t lock;
++    struct v4l2_rect c;
++    struct v4l2_rect bounds;
++};
++
+ struct rk_camera_dev
+ {
+ 	struct soc_camera_host	soc_host;
+@@ -453,6 +466,8 @@ struct rk_camera_dev
+     int icd_width;
+     int icd_height;
+ 
++    struct rk_cif_crop cropinfo;
++
+ 	struct rk29camera_platform_data *pdata;
+ 	struct resource		*res;
+ 	struct list_head	capture;
+@@ -1522,6 +1537,9 @@ static int rk_camera_add_device(struct soc_camera_device *icd)
+     struct v4l2_subdev *sd;
+     int ret,i,icd_catch;
+     struct rk_camera_frmivalenum *fival_list,*fival_nxt;
++    struct v4l2_cropcap cropcap;
++    struct v4l2_mbus_framefmt mf;
++    const struct soc_camera_format_xlate *xlate = NULL;
+     
+     mutex_lock(&camera_lock);
+ 
+@@ -1557,6 +1575,23 @@ static int rk_camera_add_device(struct soc_camera_device *icd)
+             goto ebusy;
+         #endif
+         v4l2_subdev_call(sd, core, ioctl, RK29_CAM_SUBDEV_CB_REGISTER,(void*)(&pcdev->icd_cb));
++
++        if (v4l2_subdev_call(sd, video, cropcap, &cropcap) == 0) {
++            memcpy(&pcdev->cropinfo.bounds ,&cropcap.bounds,sizeof(struct v4l2_rect));
++        } else {
++            xlate = soc_camera_xlate_by_fourcc(icd, V4L2_PIX_FMT_NV12);
++            mf.width = 10000;
++            mf.height = 10000;
++            mf.field = V4L2_FIELD_NONE;
++            mf.code = xlate->code;
++            mf.reserved[6] = 0xfefe5a5a;
++            v4l2_subdev_call(sd, video, try_mbus_fmt, &mf);
++
++            pcdev->cropinfo.bounds.left = 0;
++            pcdev->cropinfo.bounds.top = 0;
++            pcdev->cropinfo.bounds.width = mf.width;
++            pcdev->cropinfo.bounds.height = mf.height;
++        }
+     }
+     pcdev->icd = icd;
+     pcdev->icd_init = 0;
+@@ -1997,38 +2032,41 @@ static void rk_camera_put_formats(struct soc_camera_device *icd)
+ {
+ 	return;
+ }
+-
+-static int rk_camera_set_crop(struct soc_camera_device *icd,
+-			       struct v4l2_crop *a)
++static int rk_camera_cropcap(struct soc_camera_device *icd, struct v4l2_cropcap *cropcap)
+ {
+     struct v4l2_subdev *sd = soc_camera_to_subdev(icd);
+-	struct v4l2_mbus_framefmt mf;
+-	u32 fourcc = icd->current_fmt->host_fmt->fourcc;
+-    int ret;
+-
+-    ret = v4l2_subdev_call(sd, video, g_mbus_fmt, &mf);
+-    if (ret < 0)
+-        return ret;
+-
+-    if ((mf.width < (a->c.left + a->c.width)) || (mf.height < (a->c.top + a->c.height)))  {
+-
+-        mf.width = a->c.left + a->c.width;
+-        mf.height = a->c.top + a->c.height;
+-
+-        v4l_bound_align_image(&mf.width, RK_CAM_W_MIN, RK_CAM_W_MAX, 1,
+-            &mf.height, RK_CAM_H_MIN, RK_CAM_H_MAX, 0,
+-            fourcc == V4L2_PIX_FMT_NV16 ?4 : 0);
+-
+-        ret = v4l2_subdev_call(sd, video, s_mbus_fmt, &mf);
+-        if (ret < 0)
+-            return ret;
+-    }
++    int ret=0;
++
++    ret = v4l2_subdev_call(sd, video, cropcap, cropcap);
++    if (ret != 0)
++        goto end;
++    /* ddl@rock-chips.com: driver decide the cropping rectangle */
++    memset(&cropcap->defrect,0x00,sizeof(struct v4l2_rect));
++end:    
++    return ret;
++}
++static int rk_camera_get_crop(struct soc_camera_device *icd,struct v4l2_crop *crop)
++{
++    struct soc_camera_host *ici =to_soc_camera_host(icd->dev.parent);
++    struct rk_camera_dev *pcdev = ici->priv;
+ 
+-    rk_camera_setup_format(icd, fourcc, mf.code, &a->c);
++    spin_lock(&pcdev->cropinfo.lock);
++    memcpy(&crop->c,&pcdev->cropinfo.c,sizeof(struct v4l2_rect));
++    spin_unlock(&pcdev->cropinfo.lock);
++    
++    return 0;
++}
++static int rk_camera_set_crop(struct soc_camera_device *icd,
++			       struct v4l2_crop *crop)
++{
++    struct soc_camera_host *ici =to_soc_camera_host(icd->dev.parent);
++    struct rk_camera_dev *pcdev = ici->priv;
+ 
+-    icd->user_width = mf.width;
+-    icd->user_height = mf.height;
++    spin_lock(&pcdev->cropinfo.lock);
++    memcpy(&pcdev->cropinfo.c,&crop->c,sizeof(struct v4l2_rect));
++    spin_unlock(&pcdev->cropinfo.lock);
+ 
++    
+     return 0;
+ }
+ static bool rk_camera_fmt_capturechk(struct v4l2_format *f)
+@@ -2068,8 +2106,9 @@ static int rk_camera_set_fmt(struct soc_camera_device *icd,
+     struct v4l2_pix_format *pix = &f->fmt.pix;
+     struct v4l2_mbus_framefmt mf;
+     struct v4l2_rect rect;
+-    int ret,usr_w,usr_h;
++    int ret,usr_w,usr_h,sensor_w,sensor_h;
+     int stream_on = 0;
++    int ratio, bounds_aspect;
+     
+ 	usr_w = pix->width;
+ 	usr_h = pix->height;
+@@ -2092,20 +2131,51 @@ static int rk_camera_set_fmt(struct soc_camera_device *icd,
+     if (stream_on & ENABLE_CAPTURE)
+         write_cif_reg(pcdev->base,CIF_CIF_CTRL, (stream_on & (~ENABLE_CAPTURE)));
+ 
+-	mf.width	= pix->width;
+-	mf.height	= pix->height;
+-	mf.field	= pix->field;
+-	mf.colorspace	= pix->colorspace;
+-	mf.code		= xlate->code;
++    mf.width	= pix->width;
++    mf.height	= pix->height;
++    mf.field	= pix->field;
++    mf.colorspace	= pix->colorspace;
++    mf.code		= xlate->code;
+     mf.reserved[0] = pix->priv;              /* ddl@rock-chips.com : v0.3.3 */
+-    
+-	ret = v4l2_subdev_call(sd, video, s_mbus_fmt, &mf);
+-	if (mf.code != xlate->code)
+-		return -EINVAL;
+-    
++    mf.reserved[1] = 0;
++
++    ret = v4l2_subdev_call(sd, video, s_mbus_fmt, &mf);
++    if (mf.code != xlate->code)
++		return -EINVAL;    		
++
++    if ((pcdev->cropinfo.c.width == pcdev->cropinfo.bounds.width) && 
++        (pcdev->cropinfo.c.height == pcdev->cropinfo.bounds.height)) {
++        bounds_aspect = (pcdev->cropinfo.bounds.width*10/pcdev->cropinfo.bounds.height);
++        if ((mf.width*10/mf.height) != bounds_aspect) {
++            RKCAMERA_DG("User request fov unchanged in %dx%d, But sensor %dx%d is croped, so switch to full resolution %dx%d\n",
++                        usr_w,usr_h,mf.width, mf.height,pcdev->cropinfo.bounds.width,pcdev->cropinfo.bounds.height);
++            
++            mf.width	= pcdev->cropinfo.bounds.width/4;
++            mf.height	= pcdev->cropinfo.bounds.height/4;
++
++            mf.field	= pix->field;
++            mf.colorspace	= pix->colorspace;
++            mf.code		= xlate->code;
++            mf.reserved[0] = pix->priv; 
++            mf.reserved[1] = 0;
++
++            ret = v4l2_subdev_call(sd, video, s_mbus_fmt, &mf);
++            if (mf.code != xlate->code)
++            	return -EINVAL; 
++        }
++    }
++
++    sensor_w = mf.width;
++    sensor_h = mf.height;
++
++    ratio = ((mf.width*mf.reserved[1])/100)&(~0x03);      // 4 align
++    mf.width -= ratio;
++
++    ratio = ((ratio*mf.height/mf.width)+1)&(~0x01);       // 2 align
++    mf.height -= ratio;
+ 
+ 	if ((mf.width != usr_w) || (mf.height != usr_h)) {
+-	  int ratio;
++        
+         if (unlikely((mf.width <16) || (mf.width > 8190) || (mf.height < 16) || (mf.height > 8190))) {
+     		RKCAMERA_TR("Senor and IPP both invalid source resolution(%dx%d)\n",mf.width,mf.height);
+     		ret = -EINVAL;
+@@ -2116,37 +2186,73 @@ static int rk_camera_set_fmt(struct soc_camera_device *icd,
+     		ret = -EINVAL;
+             goto RK_CAMERA_SET_FMT_END;
+         }
+-		//need crop ?
+-		if((mf.width*10/mf.height) != (usr_w*10/usr_h)){
+-			ratio = ((mf.width*10/usr_w) >= (mf.height*10/usr_h))?(mf.height*10/usr_h):(mf.width*10/usr_w);
+-			pcdev->host_width = ratio*usr_w/10;
+-			pcdev->host_height = ratio*usr_h/10;
+-            //for ipp ,need 4 bit alligned.
+-        	pcdev->host_width &= ~CROP_ALIGN_BYTES;
+-        	pcdev->host_height &= ~CROP_ALIGN_BYTES;
+-			RKCAMERA_DG("ratio = %d ,host:%d*%d\n",ratio,pcdev->host_width,pcdev->host_height);
+-        } else { // needn't crop ,just scaled by ipp
+-			pcdev->host_width = mf.width;
+-			pcdev->host_height = mf.height;
++        
++		spin_lock(&pcdev->cropinfo.lock);
++		if (((mf.width*10/mf.height) != (usr_w*10/usr_h))) {  
++            if ((pcdev->cropinfo.c.width == 0)&&(pcdev->cropinfo.c.height == 0)) {        
++                //Scale + Crop center is for keep aspect ratio unchange
++                ratio = ((mf.width*10/usr_w) >= (mf.height*10/usr_h))?(mf.height*10/usr_h):(mf.width*10/usr_w);
++                pcdev->host_width = ratio*usr_w/10;
++                pcdev->host_height = ratio*usr_h/10;
++                pcdev->host_width &= ~CROP_ALIGN_BYTES;
++                pcdev->host_height &= ~CROP_ALIGN_BYTES;
++
++                pcdev->host_left = ((sensor_w-pcdev->host_width )>>1);
++                pcdev->host_top = ((sensor_h-pcdev->host_height)>>1);
++            } else {    
++                //Scale + crop(user define)
++                pcdev->host_width = pcdev->cropinfo.c.width*mf.width/pcdev->cropinfo.bounds.width;
++                pcdev->host_height = pcdev->cropinfo.c.height*mf.height/pcdev->cropinfo.bounds.height;
++                pcdev->host_left = (pcdev->cropinfo.c.left*mf.width/pcdev->cropinfo.bounds.width);
++                pcdev->host_top = (pcdev->cropinfo.c.top*mf.height/pcdev->cropinfo.bounds.height);
++            }
++
++            pcdev->host_left &= (~0x01);
++            pcdev->host_top &= (~0x01);
++        } else { 
++            if ((pcdev->cropinfo.c.width == 0)&&(pcdev->cropinfo.c.height == 0)) {
++                //Crop Center for cif can work , then scale
++                pcdev->host_width = mf.width;
++                pcdev->host_height = mf.height;
++                pcdev->host_left = ((sensor_w - mf.width)>>1)&(~0x01);
++                pcdev->host_top = ((sensor_h - mf.height)>>1)&(~0x01);
++            } else {
++                //Crop center for cif can work + crop(user define), then scale 
++                pcdev->host_width = pcdev->cropinfo.c.width*mf.width/pcdev->cropinfo.bounds.width;
++                pcdev->host_height = pcdev->cropinfo.c.height*mf.height/pcdev->cropinfo.bounds.height;
++                pcdev->host_left = (pcdev->cropinfo.c.left*mf.width/pcdev->cropinfo.bounds.width)+((sensor_w - mf.width)>>1);
++                pcdev->host_top = (pcdev->cropinfo.c.top*mf.height/pcdev->cropinfo.bounds.height)+((sensor_h - mf.height)>>1);
++            }
++
++            pcdev->host_left &= (~0x01);
++            pcdev->host_top &= (~0x01);
+         }
++        spin_unlock(&pcdev->cropinfo.lock);
+     } else {
+-        pcdev->host_width = usr_w;
+-        pcdev->host_height = usr_h;
++        spin_lock(&pcdev->cropinfo.lock);
++        if ((pcdev->cropinfo.c.width == 0)&&(pcdev->cropinfo.c.height == 0)) {
++            pcdev->host_width = mf.width;
++            pcdev->host_height = mf.height;
++            pcdev->host_left = 0;
++            pcdev->host_top = 0;
++        } else {
++            pcdev->host_width = pcdev->cropinfo.c.width*mf.width/pcdev->cropinfo.bounds.width;
++            pcdev->host_height = pcdev->cropinfo.c.height*mf.height/pcdev->cropinfo.bounds.height;
++            pcdev->host_left = (pcdev->cropinfo.c.left*mf.width/pcdev->cropinfo.bounds.width);
++            pcdev->host_top = (pcdev->cropinfo.c.top*mf.height/pcdev->cropinfo.bounds.height);
++        }
++        spin_unlock(&pcdev->cropinfo.lock);
+     }
+     
+     icd->sense = NULL;
+     if (!ret) {
+-        RKCAMERA_DG("host:%d*%d , sensor output:%d*%d,user demand:%d*%d\n",
+-	  	pcdev->host_width,pcdev->host_height,mf.width,mf.height,usr_w,usr_h);
+         rect.width = pcdev->host_width;
+         rect.height = pcdev->host_height;
+-    	rect.left = ((mf.width-pcdev->host_width )>>1)&(~0x01);
+-    	rect.top = ((mf.height-pcdev->host_height)>>1)&(~0x01);
+-    	pcdev->host_left = rect.left;
+-    	pcdev->host_top = rect.top;
++    	rect.left = pcdev->host_left;
++    	rect.top = pcdev->host_top;
+         
+         down(&pcdev->zoominfo.sem);
+-#if CIF_DO_CROP
++#if CIF_DO_CROP   // this crop is only for digital zoom
+         pcdev->zoominfo.a.c.left = 0;
+         pcdev->zoominfo.a.c.top = 0;
+         pcdev->zoominfo.a.c.width = pcdev->host_width*100/pcdev->zoominfo.zoom_rate;
+@@ -2194,9 +2300,15 @@ static int rk_camera_set_fmt(struct soc_camera_device *icd,
+                 }
+             }
+         }
+-        RKCAMERA_DG(" %s icd width:%d  user width:%d (zoom: %dx%d@(%d,%d)->%dx%d)\n",xlate->host_fmt->name,
+-			           rect.width, pix->width, pcdev->zoominfo.a.c.width,pcdev->zoominfo.a.c.height, pcdev->zoominfo.a.c.left,pcdev->zoominfo.a.c.top,
++        
++        RKCAMERA_DG("%s CIF Host:%dx%d@(%d,%d) Sensor:%dx%d->%dx%d User crop:(%d,%d,%d,%d)in(%d,%d) (zoom: %dx%d@(%d,%d)->%dx%d)\n",xlate->host_fmt->name,
++			           pcdev->host_width,pcdev->host_height,pcdev->host_left,pcdev->host_top,
++			           sensor_w,sensor_h,mf.width,mf.height,
++			           pcdev->cropinfo.c.left,pcdev->cropinfo.c.top,pcdev->cropinfo.c.width,pcdev->cropinfo.c.height,
++			           pcdev->cropinfo.bounds.width,pcdev->cropinfo.bounds.height,
++			           pcdev->zoominfo.a.c.width,pcdev->zoominfo.a.c.height, pcdev->zoominfo.a.c.left,pcdev->zoominfo.a.c.top,
+ 			           pix->width, pix->height);
++			           
+         rk_camera_setup_format(icd, pix->pixelformat, mf.code, &rect); 
+         
+ 		if (CAM_IPPWORK_IS_EN()) {
+@@ -2370,20 +2482,25 @@ static unsigned int rk_camera_poll(struct file *file, poll_table *pt)
+ 
+     return 0;
+ }
+-
++/*
++*card:  sensor name _ facing _ device index - orientation _ fov horizontal _ fov vertical
++*           10          5           1            3              3                3         + 5 < 32           
++*/
+ static int rk_camera_querycap(struct soc_camera_host *ici,
+                                 struct v4l2_capability *cap)
+ {
+     struct rk_camera_dev *pcdev = ici->priv;
+     struct rkcamera_platform_data *new_camera;
+     char orientation[5];
++    char fov[9];
+     int i;
+ 
+-    strlcpy(cap->card, dev_name(pcdev->icd->pdev), sizeof(cap->card));    
++    strlcpy(cap->card, dev_name(pcdev->icd->pdev), 18);       
+     memset(orientation,0x00,sizeof(orientation));
+     for (i=0; i<RK_CAM_NUM;i++) {
+         if ((pcdev->pdata->info[i].dev_name!=NULL) && (strcmp(dev_name(pcdev->icd->pdev), pcdev->pdata->info[i].dev_name) == 0)) {
+             sprintf(orientation,"-%d",pcdev->pdata->info[i].orientation);
++            sprintf(fov,"_50_50");
+         }
+     }
+ 
+@@ -2392,6 +2509,7 @@ static int rk_camera_querycap(struct soc_camera_host *ici,
+     while (strstr(new_camera->dev_name,"end")==NULL) {
+         if (strcmp(dev_name(pcdev->icd->pdev), new_camera->dev_name) == 0) {
+             sprintf(orientation,"-%d",new_camera->orientation);
++            sprintf(fov,"_%d_%d",new_camera->fov_h,new_camera->fov_v);
+         }
+         new_camera++;
+     }
+@@ -2405,6 +2523,8 @@ static int rk_camera_querycap(struct soc_camera_host *ici,
+     } else {
+         strcat(cap->card,orientation); 
+     }
++    
++    strcat(cap->card,fov);                          /* ddl@rock-chips.com: v0.3.f */
+     cap->version = RK_CAM_VERSION_CODE;
+     cap->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+ 
+@@ -2942,7 +3062,9 @@ static struct soc_camera_host_ops rk_soc_camera_host_ops =
+     .suspend	= rk_camera_suspend,
+     .resume		= rk_camera_resume,
+     .enum_frameinervals = rk_camera_enum_frameintervals,
++    .cropcap    = rk_camera_cropcap,
+     .set_crop	= rk_camera_set_crop,
++    .get_crop   = rk_camera_get_crop,
+     .get_formats	= rk_camera_get_formats, 
+     .put_formats	= rk_camera_put_formats,
+     .set_fmt	= rk_camera_set_fmt,
+@@ -3062,13 +3184,14 @@ static int rk_camera_probe(struct platform_device *pdev)
+         goto exit_alloc;
+     }
+ 
+-	pcdev->zoominfo.zoom_rate = 100;
+-	pcdev->hostid = pdev->id;
+-	#ifdef CONFIG_SOC_RK3028
+-	pcdev->chip_id = rk3028_version_val();
+-	#else
+-	pcdev->chip_id = -1;
+-	#endif
++    pcdev->zoominfo.zoom_rate = 100;
++    pcdev->hostid = pdev->id;
++    #ifdef CONFIG_SOC_RK3028
++    pcdev->chip_id = rk3028_version_val();
++    #else
++    pcdev->chip_id = -1;
++    #endif
++
+ 	
+     if (IS_CIF0()) {
+         clk = &cif_clk[0];
+@@ -3136,6 +3259,9 @@ static int rk_camera_probe(struct platform_device *pdev)
+     INIT_LIST_HEAD(&pcdev->camera_work_queue);
+     spin_lock_init(&pcdev->lock);
+     spin_lock_init(&pcdev->camera_work_lock);
++
++    memset(&pcdev->cropinfo.c,0x00,sizeof(struct v4l2_rect));
++    spin_lock_init(&pcdev->cropinfo.lock);
+     sema_init(&pcdev->zoominfo.sem,1);
+ 
+     /*
+-- 
+2.35.3
+

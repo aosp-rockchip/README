@@ -1,0 +1,957 @@
+From a3c79584a44219e2845301e7f10d1ef7601c1653 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Tue, 10 Oct 2017 14:14:01 +0800
+Subject: [PATCH] media: rk-isp10: support isp0 and isp1 run at the same time
+
+1. support isp0 and isp1 run at the same time;
+2. support VIDIOC_G_INPUT command;
+3. support VIDIOC_G_PARM command;
+4. support VIDIOC_G_PARM command;
+5. add pix.bytesperline and pix.sizeimage in VIDIOC_G_FMT command;
+
+Change-Id: I6d0347350a0bef372ee2e01c508b2fb581ea7cfc
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ drivers/media/platform/rk-isp10/cif_isp10.c   |  83 +++++++---
+ drivers/media/platform/rk-isp10/cif_isp10.h   |  18 ++-
+ .../platform/rk-isp10/cif_isp10_pltfrm.c      |  13 +-
+ .../platform/rk-isp10/cif_isp10_pltfrm.h      |   5 +-
+ .../platform/rk-isp10/cif_isp10_rk3288.c      |   3 +-
+ .../platform/rk-isp10/cif_isp10_rk3399.c      | 151 ++++++++++--------
+ .../media/platform/rk-isp10/cif_isp10_v4l2.c  | 129 ++++++++++++++-
+ .../platform/rk-isp10/cif_isp10_version.h     |   9 +-
+ .../linux/platform_data/rk_isp10_platform.h   |   9 +-
+ 9 files changed, 307 insertions(+), 113 deletions(-)
+
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10.c b/drivers/media/platform/rk-isp10/cif_isp10.c
+index 48874f37c518..4b22a66f6a4f 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10.c
+@@ -4690,7 +4690,7 @@ static int cif_isp10_stop(
+ {
+ 	unsigned long flags = 0;
+ 	bool stop_all;
+-	int timeout;
++	unsigned long isp_ctrl;
+ 
+ 	cif_isp10_pltfrm_pr_dbg(dev->dev,
+ 		"SP state = %s, MP state = %s, img_src state = %s, stop_sp = %d, stop_mp = %d\n",
+@@ -4724,12 +4724,15 @@ static int cif_isp10_stop(
+ 		cif_isp10_stop_sp(dev);
+ 		cif_isp10_stop_dma(dev);
+ 
+-		local_irq_save(flags);
+ 		/* stop and clear MI, MIPI, and ISP interrupts */
+ 		cif_iowrite32(0, dev->config.base_addr + CIF_MIPI_IMSC);
+ 		cif_iowrite32(~0, dev->config.base_addr + CIF_MIPI_ICR);
+ 
+-		cif_iowrite32(0, dev->config.base_addr + CIF_ISP_IMSC);
++		spin_lock_irqsave(&dev->isp_state_lock, flags);
++		dev->isp_state = CIF_ISP10_STATE_STOPPING;
++		spin_unlock_irqrestore(&dev->isp_state_lock, flags);
++		dev->isp_stop_flags = 0;
++		cif_iowrite32(CIF_ISP_OFF, dev->config.base_addr + CIF_ISP_IMSC);
+ 		cif_iowrite32(~0, dev->config.base_addr + CIF_ISP_ICR);
+ 
+ 		cif_iowrite32_verify(0,
+@@ -4745,13 +4748,19 @@ static int cif_isp10_stop(
+ 		cif_iowrite32OR(CIF_ISP_CTRL_ISP_CFG_UPD,
+ 			dev->config.base_addr + CIF_ISP_CTRL);
+ 
+-		timeout = 100;
+-		while ((timeout-- > 0) &&
+-			((cif_ioread32(dev->config.base_addr + CIF_ISP_RIS)
+-			& CIF_ISP_OFF) != CIF_ISP_OFF)) {
+-			msleep(20);
+-		};
+-		local_irq_restore(flags);
++		wait_event_interruptible_timeout(dev->isp_stop_wait,
++						dev->isp_stop_flags != 0,
++						HZ);
++
++		isp_ctrl = cif_ioread32(dev->config.base_addr + CIF_ISP_CTRL);
++		if ((isp_ctrl & 0x0001) != 0) {
++			cif_isp10_pltfrm_pr_err(dev->dev,
++				"Stop ISP Failure(0x%lx)!\n", isp_ctrl);
++		} else {
++			spin_lock_irqsave(&dev->isp_state_lock, flags);
++			dev->isp_state = CIF_ISP10_STATE_IDLE;
++			spin_unlock_irqrestore(&dev->isp_state_lock, flags);
++		}
+ 
+ 		if (!CIF_ISP10_INP_IS_DMA(dev->config.input_sel)) {
+ 			if (IS_ERR_VALUE(cif_isp10_img_src_set_state(dev,
+@@ -4765,9 +4774,7 @@ static int cif_isp10_stop(
+ 			"unable to put CIF into standby\n");
+ 	} else if (stop_sp) {
+ 		if (!dev->config.mi_config.async_updt) {
+-			local_irq_save(flags);
+ 			cif_isp10_stop_mi(dev, true, false);
+-			local_irq_restore(flags);
+ 		}
+ 		cif_isp10_stop_sp(dev);
+ 		cif_iowrite32AND_verify(~CIF_MI_SP_FRAME,
+@@ -4775,9 +4782,7 @@ static int cif_isp10_stop(
+ 
+ 	} else /* stop_mp */ {
+ 		if (!dev->config.mi_config.async_updt) {
+-			local_irq_save(flags);
+ 			cif_isp10_stop_mi(dev, false, true);
+-			local_irq_restore(flags);
+ 		}
+ 		cif_isp10_stop_mp(dev);
+ 		cif_iowrite32AND_verify(~(CIF_MI_MP_FRAME |
+@@ -4825,6 +4830,7 @@ static int cif_isp10_start(
+ {
+ 	unsigned int ret;
+ 	struct vb2_buffer *vb, *n;
++	unsigned long flags;
+ 
+ 	cif_isp10_pltfrm_pr_dbg(dev->dev,
+ 		"SP state = %s, MP state = %s, DMA state = %s, img_src state = %s, start_sp = %d, start_mp = %d\n",
+@@ -4865,6 +4871,10 @@ static int cif_isp10_start(
+ 				CIF_ISP_CTRL_ISP_INFORM_ENABLE |
+ 				CIF_ISP_CTRL_ISP_ENABLE,
+ 				dev->config.base_addr + CIF_ISP_CTRL);
++
++		spin_lock_irqsave(&dev->isp_state_lock, flags);
++		dev->isp_state = CIF_ISP10_STATE_RUNNING;
++		spin_unlock_irqrestore(&dev->isp_state_lock, flags);
+ 	}
+ 
+ 	if (start_sp &&
+@@ -5809,6 +5819,22 @@ void cif_isp10_destroy(
+ 		kfree(dev);
+ }
+ 
++int cif_isp10_g_input(
++	struct cif_isp10_device *dev,
++	unsigned int *input)
++{
++	unsigned int i;
++
++	for (i = 0; i < dev->img_src_cnt; i++) {
++		if (dev->img_src != NULL && dev->img_src == dev->img_src_array[i]) {
++			*input = i;
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
+ int cif_isp10_s_input(
+ 	struct cif_isp10_device *dev,
+ 	unsigned int input)
+@@ -6502,6 +6528,15 @@ int cif_isp10_isp_isr(unsigned int isp_mis, void *cntxt)
+ 		cif_ioread32(dev->config.base_addr + CIF_ISP_RIS),
+ 		cif_ioread32(dev->config.base_addr + CIF_ISP_IMSC));
+ 
++	if (isp_mis & CIF_ISP_OFF) {
++		cif_iowrite32(CIF_ISP_OFF,
++				dev->config.base_addr + CIF_ISP_ICR);
++		cif_isp10_pltfrm_pr_dbg(dev->dev, "ISP Stop Interrupt!\n");
++		dev->isp_stop_flags = 1;
++		wake_up_interruptible(&dev->isp_stop_wait);
++		return 0;
++	}
++
+ 	if (isp_mis & CIF_ISP_V_START) {
+ 		struct cif_isp10_isp_vs_work *vs_wk;
+ 		struct cif_isp10_img_src_exp *exp;
+@@ -6603,14 +6638,18 @@ int cif_isp10_isp_isr(unsigned int isp_mis, void *cntxt)
+ 				      CIF_ISP_ICR);
+ 		}
+ 
+-		/* Stop ISP */
+-		cif_iowrite32AND(~CIF_ISP_CTRL_ISP_INFORM_ENABLE &
+-				~CIF_ISP_CTRL_ISP_ENABLE,
+-				dev->config.base_addr + CIF_ISP_CTRL);
+-		/* isp_update */
+-		cif_iowrite32OR(CIF_ISP_CTRL_ISP_CFG_UPD,
+-				dev->config.base_addr + CIF_ISP_CTRL);
+-		cif_isp10_hw_restart(dev);
++		spin_lock(&dev->isp_state_lock);
++		if (dev->isp_state == CIF_ISP10_STATE_RUNNING) {
++			/* Stop ISP */
++			cif_iowrite32AND(~CIF_ISP_CTRL_ISP_INFORM_ENABLE &
++					~CIF_ISP_CTRL_ISP_ENABLE,
++					dev->config.base_addr + CIF_ISP_CTRL);
++			/* isp_update */
++			cif_iowrite32OR(CIF_ISP_CTRL_ISP_CFG_UPD,
++					dev->config.base_addr + CIF_ISP_CTRL);
++			cif_isp10_hw_restart(dev);
++		}
++		spin_unlock(&dev->isp_state_lock);
+ 	}
+ 
+ 	if (isp_mis & CIF_ISP_FRAME_IN) {
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10.h b/drivers/media/platform/rk-isp10/cif_isp10.h
+index 421a68ea34cb..0bd6ee108906 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10.h
++++ b/drivers/media/platform/rk-isp10/cif_isp10.h
+@@ -98,6 +98,12 @@ enum cif_isp10_pm_state {
+ 	CIF_ISP10_PM_STATE_STREAMING
+ };
+ 
++enum cif_isp10_ispstate {
++	CIF_ISP10_STATE_IDLE      = 0,
++	CIF_ISP10_STATE_RUNNING   = 1,
++	CIF_ISP10_STATE_STOPPING  = 2
++};
++
+ enum cif_isp10_inp {
+ 	CIF_ISP10_INP_CSI     = 0x10000000,
+ 	CIF_ISP10_INP_CPI     = 0x20000000,
+@@ -606,9 +612,15 @@ struct cif_isp10_device {
+ 	struct v4l2_device v4l2_dev;
+ 	enum cif_isp10_pm_state pm_state;
+ 	enum cif_isp10_img_src_state img_src_state;
++	enum cif_isp10_ispstate isp_state;
+ 
+ 	spinlock_t vbq_lock;	/* spinlock for videobuf queues */
+ 	spinlock_t vbreq_lock;	/* spinlock for videobuf requeues */
++	spinlock_t iowrite32_verify_lock;
++	spinlock_t isp_state_lock;
++
++	wait_queue_head_t isp_stop_wait;	/* wait while isp stop */
++	unsigned int isp_stop_flags;
+ 
+ 	struct cif_isp10_img_src *img_src;
+ 	struct cif_isp10_img_src *img_src_array[CIF_ISP10_NUM_INPUTS];
+@@ -643,7 +655,7 @@ struct cif_isp10_device {
+ 	int   otf_zsl_mode;
+ 	struct flash_timeinfo_s flash_t;
+ 
+-	struct pltfrm_soc_cfg *soc_cfg;
++	struct pltfrm_soc_cfg soc_cfg;
+ 	void *nodes;
+ 
+ };
+@@ -705,6 +717,10 @@ int cif_isp10_streamoff(
+ 	struct cif_isp10_device *dev,
+ 	u32 stream_ids);
+ 
++int cif_isp10_g_input(
++	struct cif_isp10_device *dev,
++	enum cif_isp10_inp *inp);
++
+ int cif_isp10_s_input(
+ 	struct cif_isp10_device *dev,
+ 	enum cif_isp10_inp inp);
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
+index a85053909164..66d694ef8140 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.c
+@@ -1366,11 +1366,13 @@ int cif_isp10_pltfrm_soc_init(
+ 	if (!IS_ERR_OR_NULL(soc_cfg) && !IS_ERR_OR_NULL(soc_cfg->soc_cfg)) {
+ 		cfg_para.cmd = PLTFRM_SOC_INIT;
+ 		cfg_para.cfg_para = &init_para;
++		cfg_para.isp_config = &(soc_cfg->isp_config);
+ 		init_para.pdev = pdev;
+ 		init_para.isp_base = cif_isp10_dev->config.base_addr;
+ 		ret = soc_cfg->soc_cfg(&cfg_para);
+ 		if (ret == 0)
+-			cif_isp10_dev->soc_cfg = soc_cfg;
++			memcpy(&(cif_isp10_dev->soc_cfg), soc_cfg, sizeof(*soc_cfg));
++
+ 	}
+ 
+ 	return ret;
+@@ -1383,13 +1385,14 @@ int cif_isp10_pltfrm_mipi_dphy_config(
+ 	struct pltfrm_soc_cfg *soc_cfg;
+ 	int ret = 0;
+ 
+-	soc_cfg = cif_isp10_dev->soc_cfg;
++	soc_cfg = &(cif_isp10_dev->soc_cfg);
+ 	if (!IS_ERR_OR_NULL(soc_cfg) &&
+ 		!IS_ERR_OR_NULL(soc_cfg->soc_cfg)) {
+ 		cfg_para.cmd =
+ 			PLTFRM_MIPI_DPHY_CFG;
+ 		cfg_para.cfg_para =
+ 			(void *)(&cif_isp10_dev->config.cam_itf.cfg.mipi);
++		cfg_para.isp_config = &(soc_cfg->isp_config);
+ 		ret = soc_cfg->soc_cfg(&cfg_para);
+ 	}
+ 
+@@ -1402,7 +1405,7 @@ int cif_isp10_pltfrm_pm_set_state(
+ {
+ 	int ret;
+ 	struct cif_isp10_device *cif_isp10_dev = dev_get_drvdata(dev);
+-	struct pltfrm_soc_cfg *soc_cfg = cif_isp10_dev->soc_cfg;
++	struct pltfrm_soc_cfg *soc_cfg = &(cif_isp10_dev->soc_cfg);
+ 	struct pltfrm_soc_cfg_para cfg_para;
+ 
+ 	switch (pm_state) {
+@@ -1410,12 +1413,14 @@ int cif_isp10_pltfrm_pm_set_state(
+ 	case CIF_ISP10_PM_STATE_SUSPENDED:
+ 		cfg_para.cmd = PLTFRM_CLKDIS;
+ 		cfg_para.cfg_para = NULL;
++		cfg_para.isp_config = &(soc_cfg->isp_config);
+ 		ret = soc_cfg->soc_cfg(&cfg_para);
+ 		break;
+ 	case CIF_ISP10_PM_STATE_SW_STNDBY:
+ 	case CIF_ISP10_PM_STATE_STREAMING:
+ 		cfg_para.cmd = PLTFRM_CLKEN;
+ 		cfg_para.cfg_para = NULL;
++		cfg_para.isp_config = &(soc_cfg->isp_config);
+ 		ret = soc_cfg->soc_cfg(&cfg_para);
+ 		break;
+ 	default:
+@@ -1650,7 +1655,7 @@ int cif_isp10_pltfrm_get_img_src_device(
+ 		img_src_array[num_cameras] =
+ 			cif_isp10_img_src_to_img_src(
+ 				&client->dev,
+-				cif_isp10_dev->soc_cfg);
++				&(cif_isp10_dev->soc_cfg));
+ 		if (!IS_ERR_OR_NULL(img_src_array[num_cameras])) {
+ 			cif_isp10_pltfrm_pr_info(dev,
+ 				"%s attach to cif isp10 img_src_array[%d]\n",
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.h b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.h
+index cc4e4118a133..d61adc9c137a 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.h
++++ b/drivers/media/platform/rk-isp10/cif_isp10_pltfrm.h
+@@ -37,7 +37,6 @@ enum cif_isp10_pm_state;
+ #define CIF_ISP10_PLTFRM_MEM_IO_ADDR void __iomem *
+ #define CIF_ISP10_PLTFRM_EVENT wait_queue_head_t
+ 
+-extern spinlock_t iowrite32_verify_lock;
+ #ifdef CONFIG_CIF_ISP10_REG_TRACE
+ int
+ cif_isp10_pltfrm_rtrace_printf(
+@@ -117,7 +116,7 @@ u32 cif_isp10_pltfrm_read_reg(
+ 	{ \
+ 		unsigned int i = 0; \
+ 		unsigned long flags = 0; \
+-		spin_lock_irqsave(&iowrite32_verify_lock, flags); \
++		spin_lock_irqsave(&dev->iowrite32_verify_lock, flags); \
+ 		do { \
+ 			cif_iowrite32(d, a); \
+ 			udelay(1); \
+@@ -127,7 +126,7 @@ u32 cif_isp10_pltfrm_read_reg(
+ 					WARN_ON(1); \
+ 			} \
+ 		} while ((ioread32(a) & mask) != ((d) & mask)); \
+-		spin_unlock_irqrestore(&iowrite32_verify_lock, flags);\
++		spin_unlock_irqrestore(&dev->iowrite32_verify_lock, flags);\
+ 	}
+ #define cif_iowrite32OR_verify(d, a, mask) \
+ 	cif_iowrite32_verify((u32)(d) | cif_ioread32(a), a, mask)
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_rk3288.c b/drivers/media/platform/rk-isp10/cif_isp10_rk3288.c
+index b6160595448d..cb3859b79d66 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_rk3288.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_rk3288.c
+@@ -568,8 +568,7 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 	return err;
+ }
+ 
+-int pltfrm_rk3288_cfg(
+-		struct pltfrm_soc_cfg_para *cfg)
++int pltfrm_rk3288_cfg(struct pltfrm_soc_cfg_para *cfg)
+ {
+ 	switch (cfg->cmd) {
+ 	case PLTFRM_MCLK_CFG: {
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c b/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
+index 5a83729caa42..c19e68875fda 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_rk3399.c
+@@ -94,19 +94,19 @@
+ #define DSIHOST_PHY_TEST_CTRL1             (0x00b8)
+ 
+ #define write_cifisp_reg(addr, val)	\
+-		__raw_writel(val, (addr) + rk3399->isp_base)
++		__raw_writel(val, (addr) + isp_cfg->isp_base)
+ #define read_cifisp_reg(addr)	\
+-		__raw_readl((addr) + rk3399->isp_base)
++		__raw_readl((addr) + isp_cfg->isp_base)
+ 
+ #define write_grf_reg(addr, val)	\
+-		regmap_write(rk3399->regmap_grf, addr, val)
++		regmap_write(isp_cfg->regmap_grf, addr, val)
+ #define read_grf_reg(addr, val)	\
+-		regmap_read(rk3399->regmap_grf, addr, val)
++		regmap_read(isp_cfg->regmap_grf, addr, val)
+ 
+ #define write_dsihost_reg(addr, val)	\
+-		__raw_writel(val, (addr) + rk3399->dsihost_base)
++		__raw_writel(val, (addr) + isp_cfg->dsihost_base)
+ #define read_dsihost_reg(addr)	\
+-		__raw_readl((addr) + rk3399->dsihost_base)
++		__raw_readl((addr) + isp_cfg->dsihost_base)
+ 
+ enum cif_isp10_isp_idx {
+ 	CIF_ISP10_ISP0 = 0,
+@@ -190,8 +190,7 @@ static struct mipi_dphy_hsfreqrange mipi_dphy_hsfreq_range[] = {
+ 	{1450, 1500, 0x3c}
+ };
+ 
+-static struct cif_isp10_rk3399 *rk3399;
+-static int mipi_dphy0_wr_reg(unsigned char addr, unsigned char data)
++static int mipi_dphy0_wr_reg(struct cif_isp10_rk3399 *isp_cfg, unsigned char addr, unsigned char data)
+ {
+ 	/*
+ 	 * TESTCLK=1
+@@ -220,7 +219,7 @@ static int mipi_dphy0_wr_reg(unsigned char addr, unsigned char data)
+ 	return 0;
+ }
+ 
+-static int mipi_dphy0_rd_reg(unsigned char addr)
++static int mipi_dphy0_rd_reg(struct cif_isp10_rk3399 *isp_cfg, unsigned char addr)
+ {
+ 	int val = 0;
+ 	/*TESTCLK=1*/
+@@ -238,7 +237,7 @@ static int mipi_dphy0_rd_reg(unsigned char addr)
+ 	return val & 0xff;
+ }
+ 
+-static int mipi_dphy1_wr_reg(unsigned char addr, unsigned char data)
++static int mipi_dphy1_wr_reg(struct cif_isp10_rk3399 *isp_cfg, unsigned char addr, unsigned char data)
+ {
+ 	/*
+ 	 * TESTEN =1,TESTDIN=addr
+@@ -254,7 +253,7 @@ static int mipi_dphy1_wr_reg(unsigned char addr, unsigned char data)
+ 	return 0;
+ }
+ 
+-static int mipi_dphy1_rd_reg(unsigned char addr)
++static int mipi_dphy1_rd_reg(struct cif_isp10_rk3399 *isp_cfg, unsigned char addr)
+ {
+ 	/* TESTEN =1,TESTDIN=addr */
+ 	write_dsihost_reg(DSIHOST_PHY_TEST_CTRL1, (0x00010000 | addr));
+@@ -263,7 +262,7 @@ static int mipi_dphy1_rd_reg(unsigned char addr)
+ 	return ((read_dsihost_reg(DSIHOST_PHY_TEST_CTRL1) & 0xff00) >> 8);
+ }
+ 
+-static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
++static int mipi_dphy_cfg(struct cif_isp10_rk3399 *isp_cfg, struct pltfrm_cam_mipi_config *para)
+ {
+ 	unsigned char hsfreqrange = 0xff, i;
+ 	struct mipi_dphy_hsfreqrange *hsfreqrange_p;
+@@ -336,21 +335,21 @@ static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
+ 
+ 		/* set clock lane */
+ 		mipi_dphy0_wr_reg
+-			(0x34, 0);
++			(isp_cfg, 0x34, 0);
+ 		/* HS hsfreqrange & lane 0  settle bypass */
+-		mipi_dphy0_wr_reg(0x44, hsfreqrange);
+-		mipi_dphy0_wr_reg(0x54, 0);
+-		mipi_dphy0_wr_reg(0x84, 0);
+-		mipi_dphy0_wr_reg(0x94, 0);
+-		mipi_dphy0_wr_reg(0x75, 0x04);
+-		mipi_dphy0_rd_reg(0x75);
++		mipi_dphy0_wr_reg(isp_cfg, 0x44, hsfreqrange);
++		mipi_dphy0_wr_reg(isp_cfg, 0x54, 0);
++		mipi_dphy0_wr_reg(isp_cfg, 0x84, 0);
++		mipi_dphy0_wr_reg(isp_cfg, 0x94, 0);
++		mipi_dphy0_wr_reg(isp_cfg, 0x75, 0x04);
++		mipi_dphy0_rd_reg(isp_cfg, 0x75);
+ 
+ 		/* Normal operation */
+ 		/*
+ 		 * TESTCLK=1
+ 		 * TESTEN =0
+ 		 */
+-		mipi_dphy0_wr_reg(0x0, -1);
++		mipi_dphy0_wr_reg(isp_cfg, 0x0, -1);
+ 		write_grf_reg(GRF_SOC_CON25_OFFSET,
+ 			DPHY_RX0_TESTCLK_MASK | (1 << DPHY_RX0_TESTCLK_BIT));
+ 		write_grf_reg(GRF_SOC_CON25_OFFSET,
+@@ -406,14 +405,14 @@ static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
+ 		usleep_range(100, 150);
+ 
+ 		/* set clock lane */
+-		mipi_dphy1_wr_reg(0x34, 0x00);
+-		mipi_dphy1_wr_reg(0x44, hsfreqrange);
+-		mipi_dphy1_wr_reg(0x54, 0);
+-		mipi_dphy1_wr_reg(0x84, 0);
+-		mipi_dphy1_wr_reg(0x94, 0);
+-		mipi_dphy1_wr_reg(0x75, 0x04);
+-
+-		mipi_dphy1_rd_reg(0x0);
++		mipi_dphy1_wr_reg(isp_cfg, 0x34, 0x00);
++		mipi_dphy1_wr_reg(isp_cfg, 0x44, hsfreqrange);
++		mipi_dphy1_wr_reg(isp_cfg, 0x54, 0);
++		mipi_dphy1_wr_reg(isp_cfg, 0x84, 0);
++		mipi_dphy1_wr_reg(isp_cfg, 0x94, 0);
++		mipi_dphy1_wr_reg(isp_cfg, 0x75, 0x04);
++
++		mipi_dphy1_rd_reg(isp_cfg, 0x0);
+ 		/*
+ 		 * TESTCLK=1
+ 		 * TESTEN =0
+@@ -437,11 +436,11 @@ static int mipi_dphy_cfg(struct pltfrm_cam_mipi_config *para)
+ 	return -1;
+ }
+ 
+-static int soc_clk_enable(void)
++static int soc_clk_enable(struct cif_isp10_rk3399 *isp_cfg)
+ {
+-	struct cif_isp10_clk_rst_rk3399 *clk_rst = &rk3399->clk_rst;
++	struct cif_isp10_clk_rst_rk3399 *clk_rst = &isp_cfg->clk_rst;
+ 
+-	if (rk3399->isp_idx == CIF_ISP10_ISP0) {
++	if (isp_cfg->isp_idx == CIF_ISP10_ISP0) {
+ 		clk_prepare_enable(clk_rst->hclk_isp0_noc);
+ 		clk_prepare_enable(clk_rst->hclk_isp0_wrapper);
+ 		clk_prepare_enable(clk_rst->aclk_isp0_noc);
+@@ -467,11 +466,11 @@ static int soc_clk_enable(void)
+ 	return 0;
+ }
+ 
+-static int soc_clk_disable(void)
++static int soc_clk_disable(struct cif_isp10_rk3399 *isp_cfg)
+ {
+-	struct cif_isp10_clk_rst_rk3399 *clk_rst = &rk3399->clk_rst;
++	struct cif_isp10_clk_rst_rk3399 *clk_rst = &isp_cfg->clk_rst;
+ 
+-	if (rk3399->isp_idx == CIF_ISP10_ISP0) {
++	if (isp_cfg->isp_idx == CIF_ISP10_ISP0) {
+ 		clk_disable_unprepare(clk_rst->hclk_isp0_noc);
+ 		clk_disable_unprepare(clk_rst->hclk_isp0_wrapper);
+ 		clk_disable_unprepare(clk_rst->aclk_isp0_noc);
+@@ -503,19 +502,22 @@ static int soc_clk_disable(void)
+ 	return 0;
+ }
+ 
+-static int soc_init(struct pltfrm_soc_init_para *init)
++static int soc_init(struct cif_isp10_rk3399 **isp_cfg, struct pltfrm_soc_init_para *init)
+ {
+ 	struct cif_isp10_clk_rst_rk3399 *clk_rst;
+ 	struct platform_device *pdev = init->pdev;
+ 	struct device_node *np = pdev->dev.of_node, *node;
+ 	struct resource *res;
++	struct cif_isp10_rk3399 *isp_cfg_tmp;
+ 	int err;
+ 
+-	rk3399 = (struct cif_isp10_rk3399 *)devm_kzalloc(
++	*isp_cfg = NULL;
++
++	isp_cfg_tmp = (struct cif_isp10_rk3399 *)devm_kzalloc(
+ 				&pdev->dev,
+ 				sizeof(struct cif_isp10_rk3399),
+ 				GFP_KERNEL);
+-	if (!rk3399) {
++	if (!isp_cfg_tmp) {
+ 		dev_err(&pdev->dev, "Can't allocate cif_isp10_rk3399\n");
+ 		err = -ENOMEM;
+ 		goto alloc_failed;
+@@ -523,33 +525,15 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 
+ 	node = of_parse_phandle(np, "rockchip,grf", 0);
+ 	if (node) {
+-		rk3399->regmap_grf = syscon_node_to_regmap(node);
+-		if (IS_ERR(rk3399->regmap_grf)) {
++		isp_cfg_tmp->regmap_grf = syscon_node_to_regmap(node);
++		if (IS_ERR(isp_cfg_tmp->regmap_grf)) {
+ 			dev_err(&pdev->dev, "Can't allocate cif_isp10_rk3399\n");
+ 			err = -ENODEV;
+ 			goto regmap_failed;
+ 		}
+ 	}
+ 
+-	res = platform_get_resource_byname(pdev,
+-				IORESOURCE_MEM, "dsihost-register");
+-	if (!res) {
+-		dev_err(&pdev->dev,
+-			"platform_get_resource_byname dsihost-register failed\n");
+-		err = -ENODEV;
+-		goto regmap_failed;
+-	}
+-	rk3399->dsihost_base = devm_ioremap_resource(&pdev->dev, res);
+-	if (IS_ERR_OR_NULL(rk3399->dsihost_base)) {
+-		dev_err(&pdev->dev, "devm_ioremap_resource failed\n");
+-		if (IS_ERR(rk3399->dsihost_base))
+-			err = PTR_ERR(rk3399->dsihost_base);
+-		else
+-			err = -ENODEV;
+-		goto regmap_failed;
+-	}
+-
+-	clk_rst = &rk3399->clk_rst;
++	clk_rst = &isp_cfg_tmp->clk_rst;
+ 
+ 	if (strcmp(pdev->name, "ff910000.cif_isp") == 0) {
+ 		clk_rst->hclk_isp0_noc	   =
+@@ -585,8 +569,26 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 		}
+ 
+ 		clk_set_rate(clk_rst->clk_isp0, 420000000);
+-		rk3399->isp_idx = CIF_ISP10_ISP0;
++		isp_cfg_tmp->isp_idx = CIF_ISP10_ISP0;
+ 	} else {
++		res = platform_get_resource_byname(pdev,
++					IORESOURCE_MEM, "dsihost-register");
++		if (!res) {
++			dev_err(&pdev->dev,
++				"platform_get_resource_byname dsihost-register failed\n");
++			err = -ENODEV;
++			goto regmap_failed;
++		}
++		isp_cfg_tmp->dsihost_base = devm_ioremap_resource(&pdev->dev, res);
++		if (IS_ERR_OR_NULL(isp_cfg_tmp->dsihost_base)) {
++			dev_err(&pdev->dev, "devm_ioremap_resource failed\n");
++			if (IS_ERR(isp_cfg_tmp->dsihost_base))
++				err = PTR_ERR(isp_cfg_tmp->dsihost_base);
++			else
++				err = -ENODEV;
++			goto regmap_failed;
++		}
++
+ 		clk_rst->hclk_isp1_noc	   =
+ 			devm_clk_get(&pdev->dev, "hclk_isp1_noc");
+ 		clk_rst->hclk_isp1_wrapper =
+@@ -631,10 +633,11 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 		}
+ 
+ 		clk_set_rate(clk_rst->clk_isp1, 420000000);
+-		rk3399->isp_idx = CIF_ISP10_ISP1;
++		isp_cfg_tmp->isp_idx = CIF_ISP10_ISP1;
+ 	}
+ 
+-	rk3399->isp_base = init->isp_base;
++	isp_cfg_tmp->isp_base = init->isp_base;
++	*isp_cfg = isp_cfg_tmp;
+ 
+ 	return 0;
+ 
+@@ -697,9 +700,19 @@ static int soc_init(struct pltfrm_soc_init_para *init)
+ 	return err;
+ }
+ 
+-int pltfrm_rk3399_cfg(
+-		struct pltfrm_soc_cfg_para *cfg)
++int pltfrm_rk3399_cfg(struct pltfrm_soc_cfg_para *cfg)
+ {
++	int ret = -1;
++	struct cif_isp10_rk3399 *isp_cfg = NULL;
++
++	if (cfg->isp_config == NULL) {
++		return -1;
++	} else {
++		isp_cfg = (struct cif_isp10_rk3399 *)(*cfg->isp_config);
++		if (isp_cfg == NULL  && cfg->cmd != PLTFRM_SOC_INIT)
++			return -1;
++	}
++
+ 	switch (cfg->cmd) {
+ 	case PLTFRM_MCLK_CFG: {
+ 		struct pltfrm_soc_mclk_para *mclk_para;
+@@ -712,33 +725,35 @@ int pltfrm_rk3399_cfg(
+ 
+ 		write_grf_reg(GRF_GPIO2B_E_OFFSET,
+ 			CIF_CLKOUT_STRENGTH(mclk_para->drv_strength));
++		ret = 0;
+ 		break;
+ 	}
+ 	case PLTFRM_MIPI_DPHY_CFG:
+-		mipi_dphy_cfg((struct pltfrm_cam_mipi_config *)cfg->cfg_para);
++		ret = mipi_dphy_cfg(isp_cfg, (struct pltfrm_cam_mipi_config *)cfg->cfg_para);
+ 		break;
+ 
+ 	case PLTFRM_CLKEN:
+-		soc_clk_enable();
++		ret = soc_clk_enable(isp_cfg);
+ 		break;
+ 
+ 	case PLTFRM_CLKDIS:
+-		soc_clk_disable();
++		ret = soc_clk_disable(isp_cfg);
+ 		break;
+ 
+ 	case PLTFRM_CLKRST:
+ 		write_cifisp_reg(VI_IRCL, 0x80);
+ 		usleep_range(10, 15);
+ 		write_cifisp_reg(VI_IRCL, 0x00);
++		ret = 0;
+ 		break;
+ 
+ 	case PLTFRM_SOC_INIT:
+-		soc_init((struct pltfrm_soc_init_para *)cfg->cfg_para);
++		ret = soc_init((struct cif_isp10_rk3399 **)cfg->isp_config, (struct pltfrm_soc_init_para *)cfg->cfg_para);
+ 		break;
+ 
+ 	default:
+ 		break;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_v4l2.c b/drivers/media/platform/rk-isp10/cif_isp10_v4l2.c
+index 9d6720d377b8..0e02a5793923 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_v4l2.c
++++ b/drivers/media/platform/rk-isp10/cif_isp10_v4l2.c
+@@ -63,9 +63,6 @@ struct cif_isp10_v4l2_device {
+ 	struct cif_isp10_v4l2_node node[4];
+ };
+ 
+-/* spinlock define */
+-spinlock_t iowrite32_verify_lock;
+-
+ static struct cif_isp10_v4l2_fh *to_fh(struct file *file)
+ {
+ 	if (!file || !file->private_data)
+@@ -396,6 +393,76 @@ static enum cif_isp10_pix_fmt cif_isp10_v4l2_pix_fmt2cif_isp10_pix_fmt(
+ 	}
+ }
+ 
++static u32 cif_isp10_pix_fmt2v4l2_pix_fmt(
++		enum cif_isp10_pix_fmt pix_fmt, struct vb2_queue *queue)
++{
++/*struct cif_isp10_v4l2_node *node =
++ *	container_of(queue, struct cif_isp10_v4l2_node, buf_queue);
++ *	struct video_device *vdev =
++ *	&node->vdev;
++ */
++
++	switch (pix_fmt) {
++	case CIF_YUV400:
++		return V4L2_PIX_FMT_GREY;
++	case CIF_YUV420P:
++		return V4L2_PIX_FMT_YUV420;
++	case CIF_YVU420P:
++		return V4L2_PIX_FMT_YVU420;
++	case CIF_YUV420SP:
++		return V4L2_PIX_FMT_NV12;
++	case CIF_YVU420SP:
++		return V4L2_PIX_FMT_NV21;
++	case CIF_YUV422I:
++		return V4L2_PIX_FMT_YUYV;
++	case CIF_UYV422I:
++		return V4L2_PIX_FMT_UYVY;
++	case CIF_YUV422P:
++		return V4L2_PIX_FMT_YUV422P;
++	case CIF_YUV422SP:
++		return V4L2_PIX_FMT_NV16;
++	case CIF_YUV444P:
++		return V4L2_PIX_FMT_YUV444;
++	case CIF_YUV444SP:
++		return V4L2_PIX_FMT_NV24;
++	case CIF_RGB565:
++		return V4L2_PIX_FMT_RGB565;
++	case CIF_RGB888:
++		return V4L2_PIX_FMT_RGB24;
++	case CIF_BAYER_SBGGR8:
++		return V4L2_PIX_FMT_SBGGR8;
++	case CIF_BAYER_SGBRG8:
++		return V4L2_PIX_FMT_SGBRG8;
++	case CIF_BAYER_SGRBG8:
++		return V4L2_PIX_FMT_SGRBG8;
++	case CIF_BAYER_SRGGB8:
++		return V4L2_PIX_FMT_SRGGB8;
++	case CIF_BAYER_SBGGR10:
++		return V4L2_PIX_FMT_SBGGR10;
++	case CIF_BAYER_SGBRG10:
++		return V4L2_PIX_FMT_SGBRG10;
++	case CIF_BAYER_SGRBG10:
++		return V4L2_PIX_FMT_SGRBG10;
++	case CIF_BAYER_SRGGB10:
++		return V4L2_PIX_FMT_SRGGB10;
++	case CIF_BAYER_SBGGR12:
++		return V4L2_PIX_FMT_SBGGR12;
++	case CIF_BAYER_SGBRG12:
++		return V4L2_PIX_FMT_SGBRG12;
++	case CIF_BAYER_SGRBG12:
++		return V4L2_PIX_FMT_SGRBG12;
++	case CIF_BAYER_SRGGB12:
++		return V4L2_PIX_FMT_SRGGB12;
++	case CIF_JPEG:
++		return V4L2_PIX_FMT_JPEG;
++	default:
++		cif_isp10_pltfrm_pr_err(NULL,
++			"unknown or unsupported V4L2 pixel format %x\n",
++			pix_fmt);
++		return 0;
++	}
++}
++
+ static int cif_isp10_v4l2_register_video_device(
+ 	struct cif_isp10_device *dev,
+ 	struct video_device *vdev,
+@@ -676,31 +743,53 @@ static int cif_isp10_v4l2_g_fmt(
+ 	void *priv,
+ 	struct v4l2_format *f)
+ {
++	enum cif_isp10_pix_fmt pix_fmt;
+ 	struct vb2_queue *queue = to_vb2_queue(file);
+ 	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
+ 	enum cif_isp10_stream_id stream_id = to_cif_isp10_stream_id(queue);
+ 
+ 	switch (stream_id) {
+ 	case CIF_ISP10_STREAM_SP:
++		pix_fmt = dev->config.mi_config.sp.output.pix_fmt;
+ 		f->fmt.pix.width =
+ 			dev->config.mi_config.sp.output.width;
+ 		f->fmt.pix.height =
+ 			dev->config.mi_config.sp.output.height;
+-		f->fmt.pix.pixelformat =
+-			dev->config.mi_config.sp.output.pix_fmt;
++		f->fmt.pix.pixelformat = cif_isp10_pix_fmt2v4l2_pix_fmt(pix_fmt, queue);
+ 		break;
+ 	case CIF_ISP10_STREAM_MP:
++		pix_fmt = dev->config.mi_config.mp.output.pix_fmt;
+ 		f->fmt.pix.width =
+ 			dev->config.mi_config.mp.output.width;
+ 		f->fmt.pix.height =
+ 			dev->config.mi_config.mp.output.height;
+-		f->fmt.pix.pixelformat =
+-			dev->config.mi_config.mp.output.pix_fmt;
++		f->fmt.pix.pixelformat = cif_isp10_pix_fmt2v4l2_pix_fmt(pix_fmt, queue);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
++
++	return 0;
++}
++
++static int cif_isp10_v4l2_g_input(
++	struct file *file,
++	void *priv,
++	unsigned int *i)
++{
++	int ret;
++	struct vb2_queue *queue = to_vb2_queue(file);
++	struct cif_isp10_device *dev = to_cif_isp10_device(queue);
++
++	ret = cif_isp10_g_input(dev, i);
++	if (IS_ERR_VALUE(ret))
++		goto err;
++
+ 	return 0;
++err:
++	cif_isp10_pltfrm_pr_err(NULL,
++		"failed with error %d\n", ret);
++	return ret;
+ }
+ 
+ static int cif_isp10_v4l2_s_input(
+@@ -1248,6 +1337,14 @@ static long v4l2_default_ioctl(struct file *file, void *fh,
+ 	return ret;
+ }
+ 
++static int v4l2_g_parm(
++		struct file *file,
++		void *priv,
++		struct v4l2_streamparm *a)
++{
++	return 0;
++}
++
+ static int v4l2_s_parm(
+ 	struct file *file,
+ 	void *priv,
+@@ -1554,6 +1651,12 @@ int cif_isp10_v4l2_s_crop(
+ 	return 0;
+ }
+ 
++int cif_isp10_v4l2_try_fmt(struct file *file, void *fh,
++					struct v4l2_format *f)
++{
++	return 0;
++}
++
+ const struct v4l2_ioctl_ops cif_isp10_v4l2_sp_ioctlops = {
+ 	.vidioc_reqbufs = cif_isp10_v4l2_reqbufs,
+ 	.vidioc_querybuf = cif_isp10_v4l2_querybuf,
+@@ -1562,6 +1665,7 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_sp_ioctlops = {
+ 	.vidioc_dqbuf = cif_isp10_v4l2_dqbuf,
+ 	.vidioc_streamon = cif_isp10_v4l2_streamon,
+ 	.vidioc_streamoff = cif_isp10_v4l2_streamoff,
++	.vidioc_g_input = cif_isp10_v4l2_g_input,
+ 	.vidioc_s_input = cif_isp10_v4l2_s_input,
+ 	.vidioc_enum_input = v4l2_enum_input,
+ 	.vidioc_g_ctrl = v4l2_g_ctrl,
+@@ -1583,6 +1687,9 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_sp_ioctlops = {
+ 	.vidioc_subscribe_event = cif_isp10_v4l2_subscribe_event,
+ 	.vidioc_unsubscribe_event = cif_isp10_v4l2_unsubscribe_event,
+ 	.vidioc_default = v4l2_default_ioctl,
++	.vidioc_try_fmt_vid_cap = cif_isp10_v4l2_try_fmt,
++	.vidioc_s_parm = v4l2_s_parm,
++	.vidioc_g_parm = v4l2_g_parm,
+ };
+ 
+ const struct v4l2_ioctl_ops cif_isp10_v4l2_mp_ioctlops = {
+@@ -1592,6 +1699,7 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_mp_ioctlops = {
+ 	.vidioc_dqbuf = cif_isp10_v4l2_dqbuf,
+ 	.vidioc_streamon = cif_isp10_v4l2_streamon,
+ 	.vidioc_streamoff = cif_isp10_v4l2_streamoff,
++	.vidioc_g_input = cif_isp10_v4l2_g_input,
+ 	.vidioc_s_input = cif_isp10_v4l2_s_input,
+ 	.vidioc_enum_input = v4l2_enum_input,
+ 	.vidioc_g_ctrl = mainpath_g_ctrl,
+@@ -1607,6 +1715,8 @@ const struct v4l2_ioctl_ops cif_isp10_v4l2_mp_ioctlops = {
+ 	.vidioc_s_crop = cif_isp10_v4l2_s_crop,
+ 	.vidioc_g_crop = cif_isp10_v4l2_g_crop,
+ 	.vidioc_default = v4l2_default_ioctl,
++	.vidioc_try_fmt_vid_cap = cif_isp10_v4l2_try_fmt,
++	.vidioc_g_parm = v4l2_g_parm,
+ };
+ 
+ const struct v4l2_ioctl_ops cif_isp10_v4l2_dma_ioctlops = {
+@@ -1675,9 +1785,12 @@ static int cif_isp10_v4l2_drv_probe(struct platform_device *pdev)
+ 	dev->dev_id = cif_isp10_v4l2_dev_cnt;
+ 	dev->isp_dev.dev_id = &dev->dev_id;
+ 	dev->nodes = (void *)cif_isp10_v4l2_dev;
++	dev->isp_state = CIF_ISP10_STATE_IDLE;
+ 	spin_lock_init(&dev->vbq_lock);
+ 	spin_lock_init(&dev->vbreq_lock);
+-	spin_lock_init(&iowrite32_verify_lock);
++	spin_lock_init(&dev->iowrite32_verify_lock);
++	spin_lock_init(&dev->isp_state_lock);
++	init_waitqueue_head(&dev->isp_stop_wait);
+ 
+ 	ret = v4l2_device_register(dev->dev, &dev->v4l2_dev);
+ 	if (IS_ERR_VALUE(ret)) {
+diff --git a/drivers/media/platform/rk-isp10/cif_isp10_version.h b/drivers/media/platform/rk-isp10/cif_isp10_version.h
+index 100bffdd4625..eed15ff6c598 100644
+--- a/drivers/media/platform/rk-isp10/cif_isp10_version.h
++++ b/drivers/media/platform/rk-isp10/cif_isp10_version.h
+@@ -84,8 +84,15 @@
+  *2. Implement command VIDIOC_G_FMT.
+  *3. Set bytesused of each plane to its real size.
+  *4. Support io mode 'VB2_DMABUF'.
++ *
++ *v0.1.0xc
++ *1. support isp0 and isp1 run at the same time.
++ *2. support VIDIOC_G_INPUT command.
++ *3. support VIDIOC_G_PARM command.
++ *4. support VIDIOC_G_PARM command.
++ *5. add pix.bytesperline and pix.sizeimage in VIDIOC_G_FMT command.
+  */
+ 
+-#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 1, 0xa)
++#define CONFIG_CIFISP10_DRIVER_VERSION KERNEL_VERSION(0, 1, 0xc)
+ 
+ #endif
+diff --git a/include/linux/platform_data/rk_isp10_platform.h b/include/linux/platform_data/rk_isp10_platform.h
+index 515e11e920db..78762b192229 100644
+--- a/include/linux/platform_data/rk_isp10_platform.h
++++ b/include/linux/platform_data/rk_isp10_platform.h
+@@ -168,17 +168,18 @@ struct pltfrm_soc_mclk_para {
+ 
+ struct pltfrm_soc_cfg_para {
+ 	enum pltfrm_soc_cfg_cmd cmd;
++	void **isp_config;
+ 	void *cfg_para;
+ };
+ 
+ struct pltfrm_soc_cfg {
+ 	char name[32];
++	void *isp_config;
+ 	int (*soc_cfg)(struct pltfrm_soc_cfg_para *cfg);
+ };
+ 
+-int pltfrm_rk3288_cfg(
+-		struct pltfrm_soc_cfg_para *cfg);
+-int pltfrm_rk3399_cfg(
+-		struct pltfrm_soc_cfg_para *cfg);
++int pltfrm_rk3288_cfg(struct pltfrm_soc_cfg_para *cfg);
++int pltfrm_rk3399_cfg(struct pltfrm_soc_cfg_para *cfg);
++
+ 
+ #endif
+-- 
+2.35.3
+

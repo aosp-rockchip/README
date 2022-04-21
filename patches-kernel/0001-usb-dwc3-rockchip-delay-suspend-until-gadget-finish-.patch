@@ -1,0 +1,125 @@
+From 78c84e83bb530d10e7f811cd9fcbebbbd5eea87b Mon Sep 17 00:00:00 2001
+From: Meng Dongyang <daniel.meng@rock-chips.com>
+Date: Thu, 24 Nov 2016 15:59:40 +0800
+Subject: [PATCH] usb: dwc3-rockchip: delay suspend until gadget finish
+ transfer
+
+DWC3 controller still need to read or write memory after dwc3
+rockchip receive disconnect notify, the dwc3 controller will not
+suspend immediately and the clock is still enabled even if we put
+dwc_rockchip sync. So if we reconnect to PC quickly, the transer
+will start before dwc3 rockchip receive connect notify and the dwc3
+controller will reset during normal transer which result in the gadget
+function break.
+
+In order to suspend dwc3 controller and disable clock when transfer
+finish immediately, this patch wait for usage_count of dwc3 controller
+change to 1 and disconnect interrupt occur then suspend dwc3 controller
+and disable clock, make the dwc3 continue transfer after dwc3 rockchip
+receive connect notify, otherwise do not reset and get or put dwc3
+controller if timeout.
+
+Change-Id: If65344557d77370e9b6cf4bfea84175c37f00057
+Signed-off-by: Meng Dongyang <daniel.meng@rock-chips.com>
+---
+ drivers/usb/dwc3/dwc3-rockchip.c | 45 ++++++++++++++++++++++++++------
+ 1 file changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-rockchip.c b/drivers/usb/dwc3/dwc3-rockchip.c
+index 1bb95df6e7d6..b9f4d6f53279 100644
+--- a/drivers/usb/dwc3/dwc3-rockchip.c
++++ b/drivers/usb/dwc3/dwc3-rockchip.c
+@@ -28,6 +28,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/extcon.h>
+ #include <linux/freezer.h>
++#include <linux/iopoll.h>
+ #include <linux/reset.h>
+ #include <linux/usb.h>
+ #include <linux/usb/hcd.h>
+@@ -37,10 +38,12 @@
+ #include "../host/xhci.h"
+ 
+ #define DWC3_ROCKCHIP_AUTOSUSPEND_DELAY  500 /* ms */
++#define PERIPHERAL_DISCONNECT_TIMEOUT 1000000 /* us */
+ 
+ struct dwc3_rockchip {
+ 	int			num_clocks;
+ 	bool			connected;
++	bool			skip_suspend;
+ 	bool			suspended;
+ 	struct device		*dev;
+ 	struct clk		**clks;
+@@ -87,6 +90,7 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 	struct xhci_hcd		*xhci;
+ 	unsigned long		flags;
+ 	int			ret;
++	int			val;
+ 	u32			reg, count;
+ 
+ 	mutex_lock(&rockchip->lock);
+@@ -115,12 +119,16 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 		 * the dwc3 core code could at least in theory access chip
+ 		 * registers while the reset is asserted, with unknown impact.
+ 		 */
+-		reset_control_assert(rockchip->otg_rst);
+-		usleep_range(1000, 1200);
+-		reset_control_deassert(rockchip->otg_rst);
+-
+-		pm_runtime_get_sync(rockchip->dev);
+-		pm_runtime_get_sync(dwc->dev);
++		if (!rockchip->skip_suspend) {
++			reset_control_assert(rockchip->otg_rst);
++			usleep_range(1000, 1200);
++			reset_control_deassert(rockchip->otg_rst);
++
++			pm_runtime_get_sync(rockchip->dev);
++			pm_runtime_get_sync(dwc->dev);
++		} else {
++			rockchip->skip_suspend = false;
++		}
+ 
+ 		spin_lock_irqsave(&dwc->lock, flags);
+ 		dwc3_set_mode(dwc, DWC3_GCTL_PRTCAP_DEVICE);
+@@ -132,6 +140,12 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 		if (rockchip->connected)
+ 			goto out;
+ 
++		if (rockchip->skip_suspend) {
++			pm_runtime_put(dwc->dev);
++			pm_runtime_put(rockchip->dev);
++			rockchip->skip_suspend = false;
++		}
++
+ 		/*
+ 		 * If dr_mode is device only, never to
+ 		 * set the mode to the host mode.
+@@ -269,8 +283,23 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 			phy_power_off(dwc->usb3_generic_phy);
+ 		}
+ 
+-		pm_runtime_put_sync(rockchip->dev);
+-		pm_runtime_put_sync_suspend(dwc->dev);
++		if (DWC3_GCTL_PRTCAP(reg) == DWC3_GCTL_PRTCAP_DEVICE) {
++			ret = readx_poll_timeout(atomic_read,
++						 &dwc->dev->power.usage_count,
++						 val,
++						 val < 2 && !dwc->connected,
++						 1000,
++						 PERIPHERAL_DISCONNECT_TIMEOUT);
++			if (ret < 0) {
++				rockchip->skip_suspend = true;
++				dev_warn(rockchip->dev, "Peripheral disconnect timeout\n");
++			}
++		}
++
++		if (!rockchip->skip_suspend) {
++			pm_runtime_put_sync_suspend(dwc->dev);
++			pm_runtime_put_sync_suspend(rockchip->dev);
++		}
+ 
+ 		rockchip->connected = false;
+ 		dev_info(rockchip->dev, "USB unconnected\n");
+-- 
+2.35.3
+

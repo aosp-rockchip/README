@@ -1,0 +1,169 @@
+From 2a6f987d3ba206955b5b8636eddfdcaa2961a42b Mon Sep 17 00:00:00 2001
+From: Allon Huang <allon.huang@rock-chips.com>
+Date: Fri, 16 Aug 2019 17:11:33 +0800
+Subject: [PATCH] drivers: platform: rockchip: cif: fix dvp camera fails to
+ link with cif on rk1808
+
+support yuv format for cif and let dvp camera link to cif on rk1808
+
+Change-Id: Idb078a909522f0e98fdc5319411a923e818fc128
+Signed-off-by: Allon Huang <allon.huang@rock-chips.com>
+---
+ drivers/media/platform/rockchip/cif/capture.c | 26 ++++++------
+ drivers/media/platform/rockchip/cif/dev.c     | 41 +++++++++++++++----
+ drivers/media/platform/rockchip/cif/version.h |  1 +
+ 3 files changed, 45 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+index 96bf2e41537e..c2694c8b74e0 100644
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -409,6 +409,9 @@ static unsigned char get_data_type(u32 pixelformat, u8 cmd_mode_en)
+ 		return 0x2b;
+ 	/* csi uyvy 422 */
+ 	case MEDIA_BUS_FMT_UYVY8_2X8:
++	case MEDIA_BUS_FMT_VYUY8_2X8:
++	case MEDIA_BUS_FMT_YUYV8_2X8:
++	case MEDIA_BUS_FMT_YVYU8_2X8:
+ 		return 0x1e;
+ 	case MEDIA_BUS_FMT_RGB888_1X24: {
+ 		if (cmd_mode_en) /* dsi command mode*/
+@@ -996,7 +999,7 @@ static void rkcif_stop_streaming(struct vb2_queue *queue)
+ 	struct rkcif_vdev_node *node = &stream->vnode;
+ 	struct rkcif_device *dev = stream->cifdev;
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+-	struct rkcif_buffer *buf;
++	struct rkcif_buffer *buf = NULL;
+ 	int ret;
+ 
+ 	stream->stopping = true;
+@@ -1016,21 +1019,16 @@ static void rkcif_stop_streaming(struct vb2_queue *queue)
+ 			 ret);
+ 
+ 	/* release buffers */
+-	if (stream->curr_buf) {
++	if (stream->curr_buf)
+ 		list_add_tail(&stream->curr_buf->queue, &stream->buf_head);
+-		stream->curr_buf = NULL;
+-	}
+-	if (stream->next_buf) {
++
++	if (stream->next_buf &&
++	    stream->next_buf != stream->curr_buf)
+ 		list_add_tail(&stream->next_buf->queue, &stream->buf_head);
+-		stream->next_buf = NULL;
+-	}
+ 
+-	if (stream->next_buf)
+-		vb2_buffer_done(&stream->next_buf->vb.vb2_buf,
+-				VB2_BUF_STATE_QUEUED);
+-	if (stream->curr_buf)
+-		vb2_buffer_done(&stream->curr_buf->vb.vb2_buf,
+-				VB2_BUF_STATE_QUEUED);
++	stream->curr_buf = NULL;
++	stream->next_buf = NULL;
++
+ 	while (!list_empty(&stream->buf_head)) {
+ 		buf = list_first_entry(&stream->buf_head,
+ 				       struct rkcif_buffer, queue);
+@@ -2179,7 +2177,7 @@ void rkcif_irq_pingpong(struct rkcif_device *cif_dev)
+ 		intstat = read_cif_reg(base, CIF_INTSTAT);
+ 		cif_frmst = read_cif_reg(base, CIF_FRAME_STATUS);
+ 		lastline = CIF_FETCH_Y_LAST_LINE(read_cif_reg(base, CIF_LAST_LINE));
+-		lastpix = read_cif_reg(base, CIF_LAST_PIX);
++		lastpix =  CIF_FETCH_Y_LAST_LINE(read_cif_reg(base, CIF_LAST_PIX));
+ 		ctl = read_cif_reg(base, CIF_CTRL);
+ 
+ 		if (cif_dev->chip_id == CHIP_RK1808_CIF)
+diff --git a/drivers/media/platform/rockchip/cif/dev.c b/drivers/media/platform/rockchip/cif/dev.c
+index f8c64c3e33ab..4ddfee032538 100644
+--- a/drivers/media/platform/rockchip/cif/dev.c
++++ b/drivers/media/platform/rockchip/cif/dev.c
+@@ -203,8 +203,9 @@ static int rkcif_pipeline_set_stream(struct rkcif_pipeline *p, bool on)
+ /***************************** media controller *******************************/
+ static int rkcif_create_links(struct rkcif_device *dev)
+ {
+-	unsigned int s, pad, id, stream_num = 0;
+ 	int ret;
++	u32 flags;
++	unsigned int s, pad, id, stream_num = 0;
+ 
+ 	if (dev->chip_id == CHIP_RK1808_CIF)
+ 		stream_num = RKCIF_MULTI_STREAMS_NUM;
+@@ -214,31 +215,53 @@ static int rkcif_create_links(struct rkcif_device *dev)
+ 	/* sensor links(or mipi-phy) */
+ 	for (s = 0; s < dev->num_sensors; ++s) {
+ 		struct rkcif_sensor_info *sensor = &dev->sensors[s];
++		struct media_entity *source_entity, *sink_entity;
+ 
+ 		for (pad = 0; pad < sensor->sd->entity.num_pads; pad++) {
+ 			if (sensor->sd->entity.pads[pad].flags &
+-					MEDIA_PAD_FL_SOURCE) {
++				MEDIA_PAD_FL_SOURCE) {
+ 				if (pad == sensor->sd->entity.num_pads) {
+ 					dev_err(dev->dev,
+ 						"failed to find src pad for %s\n",
+ 						sensor->sd->name);
+ 
+-					return -ENXIO;
++					break;
++				}
++
++				if ((sensor->mbus.type == V4L2_MBUS_BT656 ||
++				     sensor->mbus.type == V4L2_MBUS_PARALLEL) &&
++				    dev->chip_id == CHIP_RK1808_CIF) {
++					source_entity = &sensor->sd->entity;
++					sink_entity = &dev->stream[RKCIF_STREAM_DVP].vnode.vdev.entity;
++
++					ret = media_entity_create_link(source_entity,
++								       pad,
++								       sink_entity,
++								       0,
++								       MEDIA_LNK_FL_ENABLED);
++					if (ret)
++						dev_err(dev->dev, "failed to create link for %s\n",
++							sensor->sd->name);
++					break;
+ 				}
+ 
+ 				for (id = 0; id < stream_num; id++) {
+-					ret = media_entity_create_link(&sensor->sd->entity,
++					source_entity = &sensor->sd->entity;
++					sink_entity = &dev->stream[id].vnode.vdev.entity;
++
++					(dev->chip_id != CHIP_RK1808_CIF) | (id == pad - 1) ?
++					(flags = MEDIA_LNK_FL_ENABLED) : (flags = 0);
++
++					ret = media_entity_create_link(source_entity,
+ 								       pad,
+-								       &dev->stream[id].vnode.vdev.entity,
++								       sink_entity,
+ 								       0,
+-								       (dev->chip_id != CHIP_RK1808_CIF) |
+-								       (id == pad - 1) ?
+-								       MEDIA_LNK_FL_ENABLED : 0);
++								       flags);
+ 					if (ret) {
+ 						dev_err(dev->dev,
+ 							"failed to create link for %s\n",
+ 							sensor->sd->name);
+-						return ret;
++						break;
+ 					}
+ 				}
+ 			}
+diff --git a/drivers/media/platform/rockchip/cif/version.h b/drivers/media/platform/rockchip/cif/version.h
+index d5f93385fba4..c37c5220b96d 100644
+--- a/drivers/media/platform/rockchip/cif/version.h
++++ b/drivers/media/platform/rockchip/cif/version.h
+@@ -20,6 +20,7 @@
+  *5. Support sampling raw data for cif
+  *6. fix the bug that dummpy buffer size is error
+  *7. Add framesizes and frmintervals callback
++ *8. fix dvp camera fails to link with cif on rk1808
+  */
+ 
+ #define RKCIF_DRIVER_VERSION KERNEL_VERSION(0, 1, 0x2)
+-- 
+2.35.3
+

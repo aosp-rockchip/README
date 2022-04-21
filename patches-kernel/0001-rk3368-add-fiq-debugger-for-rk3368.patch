@@ -1,0 +1,540 @@
+From 9c1d1c45dd9b09a0303af76a47753b0280605b49 Mon Sep 17 00:00:00 2001
+From: Huibin Hong <huibin.hong@rock-chips.com>
+Date: Tue, 1 Sep 2015 19:10:42 +0800
+Subject: [PATCH] rk3368: add fiq debugger for rk3368
+
+It is also for the later soc based on arch v8
+
+Change-Id: I5e4fef1fa4176ea371b1653ead8cef87e4ac0e6f
+Signed-off-by: Huibin Hong <huibin.hong@rock-chips.com>
+---
+ arch/arm/mach-rockchip/rk_fiq_debugger.c      | 139 ++++++++++++++++--
+ arch/arm/mach-rockchip/rk_fiq_debugger.h      |  11 +-
+ arch/arm64/mach-rockchip/Makefile             |   1 +
+ drivers/irqchip/irq-gic.c                     |  14 +-
+ drivers/staging/android/fiq_debugger/Kconfig  |   7 +
+ .../android/fiq_debugger/fiq_debugger.c       |  58 +++++++-
+ .../android/fiq_debugger/fiq_debugger.h       |   8 +-
+ 7 files changed, 214 insertions(+), 24 deletions(-)
+
+diff --git a/arch/arm/mach-rockchip/rk_fiq_debugger.c b/arch/arm/mach-rockchip/rk_fiq_debugger.c
+index 3b4cd8623fd4..56e4d7471b32 100755
+--- a/arch/arm/mach-rockchip/rk_fiq_debugger.c
++++ b/arch/arm/mach-rockchip/rk_fiq_debugger.c
+@@ -38,6 +38,10 @@
+ #include <linux/clk.h>
+ #include "rk_fiq_debugger.h"
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++#include "linux/rockchip/psci.h"
++#endif
++
+ #define UART_USR	0x1f	/* In: UART Status Register */
+ #define UART_USR_RX_FIFO_FULL		0x10 /* Receive FIFO full */
+ #define UART_USR_RX_FIFO_NOT_EMPTY	0x08 /* Receive FIFO not empty */
+@@ -46,6 +50,8 @@
+ #define UART_USR_BUSY			0x01 /* UART busy indicator */
+ 
+ struct rk_fiq_debugger {
++	int irq;
++	int baudrate;
+ 	struct fiq_debugger_pdata pdata;
+ 	void __iomem *debug_port_base;
+ 	bool break_seen;
+@@ -79,11 +85,30 @@ static inline unsigned int rk_fiq_read_lsr(struct rk_fiq_debugger *t)
+ 
+ static int debug_port_init(struct platform_device *pdev)
+ {
++	int dll = 0, dlm = 0;
+ 	struct rk_fiq_debugger *t;
++
+ 	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
+ 
+ 	if (rk_fiq_read(t, UART_LSR) & UART_LSR_DR)
+ 		(void)rk_fiq_read(t, UART_RX);
++
++	switch (t->baudrate) {
++	case 1500000:
++		dll = 0x1;
++		break;
++	case 115200:
++	default:
++		dll = 0xd;
++		break;
++	}
++
++	rk_fiq_write(t, 0x83, UART_LCR);
++	/* set baud rate */
++	rk_fiq_write(t, dll, UART_DLL);
++	rk_fiq_write(t, dlm, UART_DLM);
++	rk_fiq_write(t, 0x03, UART_LCR);
++
+ 	/* enable rx and lsr interrupt */
+ 	rk_fiq_write(t, UART_IER_RLSI | UART_IER_RDI, UART_IER);
+ 	/* interrupt on every character when receive,but we can enable fifo for TX
+@@ -101,6 +126,7 @@ static int debug_getc(struct platform_device *pdev)
+ {
+ 	unsigned int lsr;
+ 	struct rk_fiq_debugger *t;
++
+ 	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
+ 
+ 	lsr = rk_fiq_read_lsr(t);
+@@ -119,6 +145,7 @@ static int debug_getc(struct platform_device *pdev)
+ static void debug_putc(struct platform_device *pdev, unsigned int c)
+ {
+ 	struct rk_fiq_debugger *t;
++
+ 	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
+ 
+ 	while (!(rk_fiq_read(t, UART_USR) & UART_USR_TX_FIFO_NOT_FULL))
+@@ -209,14 +236,59 @@ static void fiq_enable(struct platform_device *pdev, unsigned int irq, bool on)
+ 		disable_irq(irq);
+ }
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++static struct pt_regs fiq_pt_regs;
++
++static void rk_fiq_debugger_switch_cpu(struct platform_device *pdev,
++				       unsigned int cpu)
++{
++	psci_fiq_debugger_switch_cpu(cpu);
++}
++
++static void rk_fiq_debugger_enable_debug(struct platform_device *pdev, bool val)
++{
++	psci_fiq_debugger_enable_debug(val);
++}
++
++static void fiq_debugger_uart_irq_tf(void *reg_base, u64 sp_el1)
++{
++	memcpy(&fiq_pt_regs, reg_base, 8*31);
++
++	memcpy(&fiq_pt_regs.pstate, reg_base + 0x110, 8);
++	if (fiq_pt_regs.pstate & 0x10)
++		memcpy(&fiq_pt_regs.sp, reg_base + 0xf8, 8);
++	else
++		fiq_pt_regs.sp = sp_el1;
++
++	memcpy(&fiq_pt_regs.pc, reg_base + 0x118, 8);
++
++	fiq_debugger_fiq(&fiq_pt_regs);
++}
++
++static int fiq_debugger_uart_dev_resume(struct platform_device *pdev)
++{
++	struct rk_fiq_debugger *t;
++
++	t = container_of(dev_get_platdata(&pdev->dev), typeof(*t), pdata);
++	psci_fiq_debugger_uart_irq_tf_init(t->irq, fiq_debugger_uart_irq_tf);
++	return 0;
++}
++#endif
++
+ static int rk_fiq_debugger_id;
+ 
+-void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeup_irq)
++void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq,
++			  int wakeup_irq, unsigned int baudrate)
+ {
+ 	struct rk_fiq_debugger *t = NULL;
+ 	struct platform_device *pdev = NULL;
+ 	struct resource *res = NULL;
+ 	int res_count = 0;
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++	/* tf means trust firmware*/
++	int tf_ver = 0;
++	bool tf_fiq_sup = false;
++#endif
+ 
+ 	if (!base) {
+ 		pr_err("Invalid fiq debugger uart base\n");
+@@ -229,6 +301,8 @@ void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeu
+ 		return;
+ 	}
+ 
++	t->irq = irq;
++	t->baudrate = baudrate;
+ 	t->pdata.uart_init = debug_port_init;
+ 	t->pdata.uart_getc = debug_getc;
+ 	t->pdata.uart_putc = debug_putc;
+@@ -251,11 +325,43 @@ void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeu
+ 		goto out3;
+ 	};
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++	tf_ver = rockchip_psci_smc_get_tf_ver();
++
++	if (tf_ver >= 0x00010005)
++		tf_fiq_sup = true;
++	else
++		tf_fiq_sup = false;
++
++	if (tf_fiq_sup && (signal_irq > 0)) {
++		t->pdata.switch_cpu = rk_fiq_debugger_switch_cpu;
++		t->pdata.enable_debug = rk_fiq_debugger_enable_debug;
++		t->pdata.uart_dev_resume = fiq_debugger_uart_dev_resume;
++		psci_fiq_debugger_uart_irq_tf_init(irq,
++						   fiq_debugger_uart_irq_tf);
++	} else {
++		t->pdata.switch_cpu = NULL;
++		t->pdata.enable_debug = NULL;
++	}
++#endif
++
+ 	if (irq > 0) {
+ 		res[0].flags = IORESOURCE_IRQ;
+ 		res[0].start = irq;
+ 		res[0].end = irq;
+-		res[0].name = "fiq";
++#if defined(CONFIG_FIQ_GLUE)
++		if (signal_irq > 0)
++			res[0].name = "fiq";
++		else
++			res[0].name = "uart_irq";
++#elif defined(CONFIG_FIQ_DEBUGGER_EL3_TO_EL1)
++		if (tf_fiq_sup && (signal_irq > 0))
++			res[0].name = "fiq";
++		else
++			res[0].name = "uart_irq";
++#else
++		res[0].name = "uart_irq";
++#endif
+ 		res_count++;
+ 	}
+ 
+@@ -310,7 +416,8 @@ static int __init rk_fiq_debugger_init(void) {
+ 	void __iomem *base;
+ 	struct device_node *np;
+ 	unsigned int i, id, serial_id, ok = 0;
+-	u32 irq, signal_irq = 0, wake_irq = 0;
++	unsigned int irq, signal_irq = 0, wake_irq = 0;
++	unsigned int baudrate = 0, irq_mode = 0;
+ 	struct clk *clk;
+ 	struct clk *pclk;
+ 
+@@ -326,17 +433,22 @@ static int __init rk_fiq_debugger_init(void) {
+ 		return -ENODEV;
+ 	}
+ 
+-	if (of_property_read_u32(np, "rockchip,serial-id", &serial_id)) {
+-		return -EINVAL;	
+-	}
++	if (of_property_read_u32(np, "rockchip,serial-id", &serial_id))
++		return -EINVAL;
++
++	if (of_property_read_u32(np, "rockchip,irq-mode-enable", &irq_mode))
++		irq_mode = -1;
+ 
+-	if (of_property_read_u32(np, "rockchip,signal-irq", &signal_irq)) {
++	if (irq_mode == 1)
+ 		signal_irq = -1;
+-	}
++	else if (of_property_read_u32(np, "rockchip,signal-irq", &signal_irq))
++			signal_irq = -1;
+ 
+-	if (of_property_read_u32(np, "rockchip,wake-irq", &wake_irq)) {
++	if (of_property_read_u32(np, "rockchip,wake-irq", &wake_irq))
+ 		wake_irq = -1;
+-	}
++
++	if (of_property_read_u32(np, "rockchip,baudrate", &baudrate))
++		baudrate = -1;
+ 
+ 	np = NULL;
+ 	for (i = 0; i < 5; i++) {
+@@ -368,9 +480,12 @@ static int __init rk_fiq_debugger_init(void) {
+ 
+ 	base = of_iomap(np, 0);
+ 	if (base)
+-		rk_serial_debug_init(base, irq, signal_irq, wake_irq);
++		rk_serial_debug_init(base, irq, signal_irq, wake_irq, baudrate);
+ 
+ 	return 0;
+ }
+-
++#ifdef CONFIG_FIQ_GLUE
+ postcore_initcall_sync(rk_fiq_debugger_init);
++#else
++arch_initcall_sync(rk_fiq_debugger_init);
++#endif
+diff --git a/arch/arm/mach-rockchip/rk_fiq_debugger.h b/arch/arm/mach-rockchip/rk_fiq_debugger.h
+index 5c85c0794123..f519fa8cc3bb 100644
+--- a/arch/arm/mach-rockchip/rk_fiq_debugger.h
++++ b/arch/arm/mach-rockchip/rk_fiq_debugger.h
+@@ -2,11 +2,18 @@
+ #define __PLAT_RK_FIQ_DEBUGGER_H
+ 
+ #ifdef CONFIG_FIQ_DEBUGGER
+-void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeup_irq);
++void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq,
++			  int wakeup_irq, unsigned int baudrate);
+ #else
+-static inline void rk_serial_debug_init(void __iomem *base, int irq, int signal_irq, int wakeup_irq)
++static inline void
++rk_serial_debug_init(void __iomem *base, int irq, int signal_irq,
++		     int wakeup_irq, unsigned int baudrate)
+ {
+ }
+ #endif
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++void fiq_debugger_fiq(void *regs);
++#endif
++
+ #endif
+diff --git a/arch/arm64/mach-rockchip/Makefile b/arch/arm64/mach-rockchip/Makefile
+index 2b2435be89a7..49e62d0fad53 100644
+--- a/arch/arm64/mach-rockchip/Makefile
++++ b/arch/arm64/mach-rockchip/Makefile
+@@ -5,6 +5,7 @@ obj-y += ../../arm/mach-rockchip/pvtm.o
+ obj-y += ../../arm/mach-rockchip/rk_system_status.o
+ obj-y += ../../arm/mach-rockchip/ddr_freq.o
+ obj-y += ../../arm/mach-rockchip/psci.o
++obj-$(CONFIG_FIQ_DEBUGGER) += ../../arm/mach-rockchip/rk_fiq_debugger.o
+ obj-$(CONFIG_PM) += ../../arm/mach-rockchip/rockchip_pm.o pm-rk3368.o
+ obj-$(CONFIG_RK_LAST_LOG) += ../../arm/mach-rockchip/last_log.o
+ obj-$(CONFIG_DVFS) += ../../arm/mach-rockchip/dvfs.o
+diff --git a/drivers/irqchip/irq-gic.c b/drivers/irqchip/irq-gic.c
+index ce24a7e86349..4f17379851a6 100644
+--- a/drivers/irqchip/irq-gic.c
++++ b/drivers/irqchip/irq-gic.c
+@@ -226,7 +226,7 @@ static int gic_retrigger(struct irq_data *d)
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ /*
+  * 	ICDISR each bit   0 -- Secure   1--Non-Secure
+  */
+@@ -401,7 +401,7 @@ static void __init gic_dist_init(struct gic_chip_data *gic)
+ 
+ 	gic_dist_config(base, gic_irqs, NULL);
+ 
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	// set all the interrupt to non-secure state
+ 	for (i = 0; i < gic_irqs; i += 32) {
+ 		writel_relaxed(0xffffffff, base + GIC_DIST_IGROUP + i * 4 / 32);
+@@ -438,7 +438,7 @@ static void __cpuinit gic_cpu_init(struct gic_chip_data *gic)
+ 	gic_cpu_config(dist_base, NULL);
+ 
+ 	writel_relaxed(0xf0, base + GIC_CPU_PRIMASK);
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	writel_relaxed(0x0f, base + GIC_CPU_CTRL);
+ #else
+ 	writel_relaxed(1, base + GIC_CPU_CTRL);
+@@ -526,7 +526,7 @@ static void gic_dist_restore(unsigned int gic_nr)
+ 		writel_relaxed(gic_data[gic_nr].saved_spi_enable[i],
+ 			dist_base + GIC_DIST_ENABLE_SET + i * 4);
+ 
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	writel_relaxed(3, dist_base + GIC_DIST_CTRL);
+ #else
+ 	writel_relaxed(1, dist_base + GIC_DIST_CTRL);
+@@ -587,7 +587,7 @@ static void gic_cpu_restore(unsigned int gic_nr)
+ 		writel_relaxed(0xa0a0a0a0, dist_base + GIC_DIST_PRI + i * 4);
+ 
+ 	writel_relaxed(0xf0, cpu_base + GIC_CPU_PRIMASK);
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	writel_relaxed(0x0f, cpu_base + GIC_CPU_CTRL);
+ #else
+ 	writel_relaxed(1, cpu_base + GIC_CPU_CTRL);
+@@ -669,7 +669,7 @@ static void gic_raise_softirq(const struct cpumask *mask, unsigned int irq)
+ 	dmb(ishst);
+ 
+ 	/* this always happens on GIC0 */
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	/* enable non-secure SGI for GIC with security extensions */
+ 	writel_relaxed(map << 16 | irq | 0x8000, gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
+ #else
+@@ -882,7 +882,7 @@ static int __cpuinit gic_secondary_init(struct notifier_block *nfb,
+ {
+ 	if (action == CPU_STARTING || action == CPU_STARTING_FROZEN)
+ 		gic_cpu_init(&gic_data[0]);
+-#ifdef CONFIG_FIQ_DEBUGGER
++#ifdef CONFIG_FIQ_GLUE
+ 	if (action == CPU_STARTING || action == CPU_STARTING_FROZEN) {
+ 		/*set SGI to none secure state*/
+ 		writel_relaxed(0xffffffff, gic_data_dist_base(&gic_data[0]) + GIC_DIST_IGROUP);
+diff --git a/drivers/staging/android/fiq_debugger/Kconfig b/drivers/staging/android/fiq_debugger/Kconfig
+index 56f7f999377e..ed562294560c 100644
+--- a/drivers/staging/android/fiq_debugger/Kconfig
++++ b/drivers/staging/android/fiq_debugger/Kconfig
+@@ -47,3 +47,10 @@ config FIQ_WATCHDOG
+ 	select FIQ_DEBUGGER
+ 	select PSTORE_RAM
+ 	default n
++
++config FIQ_DEBUGGER_EL3_TO_EL1
++	bool "Uart FIQ is captured by EL3, then passed to EL1"
++	depends on FIQ_DEBUGGER && ARM64
++	default n
++	help
++	  It is for ARM V8 arch.
+diff --git a/drivers/staging/android/fiq_debugger/fiq_debugger.c b/drivers/staging/android/fiq_debugger/fiq_debugger.c
+index d2b069f0b4c6..970388c2d605 100755
+--- a/drivers/staging/android/fiq_debugger/fiq_debugger.c
++++ b/drivers/staging/android/fiq_debugger/fiq_debugger.c
+@@ -142,6 +142,10 @@ static bool initial_debug_enable;
+ static bool initial_console_enable;
+ #endif
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++static struct fiq_debugger_state *state_tf;
++#endif
++
+ static bool fiq_kgdb_enable;
+ 
+ static unsigned long jif = 0, recv_count0 = 0, recv_count1 = 0;
+@@ -185,13 +189,15 @@ static inline bool fiq_debugger_have_fiq(struct fiq_debugger_state *state)
+ 	return (state->fiq >= 0);
+ }
+ 
+-#ifdef CONFIG_FIQ_GLUE
++#if defined(CONFIG_FIQ_GLUE) || defined(CONFIG_FIQ_DEBUGGER_EL3_TO_EL1)
+ static void fiq_debugger_force_irq(struct fiq_debugger_state *state)
+ {
+ 	unsigned int irq = state->signal_irq;
+ 
+ 	if (WARN_ON(!fiq_debugger_have_fiq(state)))
+ 		return;
++	if (irq < 0)
++		return;
+ 	if (state->pdata->force_irq) {
+ 		state->pdata->force_irq(state->pdev, irq);
+ 	} else {
+@@ -650,6 +656,10 @@ static void fiq_debugger_switch_cpu(struct fiq_debugger_state *state, int cpu)
+ 				false);
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 	else {
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++		if (state->pdata->switch_cpu)
++			state->pdata->switch_cpu(state->pdev, cpu);
++#else
+ 		struct cpumask cpumask;
+ 
+ 		if (!cpu_online(cpu)) {
+@@ -662,6 +672,7 @@ static void fiq_debugger_switch_cpu(struct fiq_debugger_state *state, int cpu)
+ 
+ 		irq_set_affinity(state->fiq, &cpumask);
+ 		irq_set_affinity(state->uart_irq, &cpumask);
++#endif
+ 	}
+ #endif
+ 	state->current_cpu = cpu;
+@@ -714,6 +725,10 @@ static bool fiq_debugger_fiq_exec(struct fiq_debugger_state *state,
+ 		fiq_debugger_printf(&state->output, "console mode\n");
+ 		fiq_debugger_uart_flush(state);
+ 		state->console_enable = true;
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++		if (state->pdata->enable_debug)
++			state->pdata->enable_debug(state->pdev, false);
++#endif
+ 	} else if (!strcmp(cmd, "cpu")) {
+ 		fiq_debugger_printf(&state->output, "cpu %d\n", state->current_cpu);
+ 	} else if (!strncmp(cmd, "cpu ", 4)) {
+@@ -988,7 +1003,13 @@ static bool fiq_debugger_handle_uart_interrupt(struct fiq_debugger_state *state,
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 			fiq_debugger_puts(state, "\nWelcome to ");
+ #endif
+-			fiq_debugger_puts(state, "fiq debugger mode\n");
++			if (fiq_debugger_have_fiq(state))
++				fiq_debugger_puts(state,
++						  "fiq debugger mode\n");
++			else
++				fiq_debugger_puts(state,
++						  "irq debugger mode\n");
++
+ 			state->debug_count = 0;
+ #ifdef CONFIG_ARCH_ROCKCHIP
+ 			fiq_debugger_puts(state, "Enter ? to get command help\n");
+@@ -996,6 +1017,11 @@ static bool fiq_debugger_handle_uart_interrupt(struct fiq_debugger_state *state,
+ 			state->current_pointer = CMD_COUNT;
+ 			memset(state->cmd_buf, 0, (CMD_COUNT+1)*DEBUG_MAX);
+ #endif
++
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++			if (state->pdata->enable_debug)
++				state->pdata->enable_debug(state->pdev, true);
++#endif
+ 			fiq_debugger_prompt(state);
+ #ifdef CONFIG_FIQ_DEBUGGER_CONSOLE
+ 		} else if (state->console_enable && state->tty_rbuf) {
+@@ -1130,6 +1156,22 @@ static irqreturn_t fiq_debugger_uart_irq(int irq, void *dev)
+ 	return IRQ_HANDLED;
+ }
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++void fiq_debugger_fiq(void *regs)
++{
++	struct fiq_debugger_state *state = state_tf;
++	bool need_irq;
++
++	if (!state)
++		return;
++	need_irq = fiq_debugger_handle_uart_interrupt(state, smp_processor_id(),
++						      regs,
++						      current_thread_info());
++	if (need_irq)
++		fiq_debugger_force_irq(state);
++}
++#endif
++
+ /*
+  * If FIQs are used, not everything can happen in fiq context.
+  * FIQ handler does what it can and then signals this interrupt to finish the
+@@ -1442,7 +1484,15 @@ static int fiq_debugger_probe(struct platform_device *pdev)
+ 	state->console_enable = initial_console_enable;
+ 
+ 	state->fiq = fiq;
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++	if (fiq > 0)
++		state->uart_irq = fiq;
++	else
++		state->uart_irq = uart_irq;
++#else
+ 	state->uart_irq = uart_irq;
++#endif
++
+ 	state->signal_irq = platform_get_irq_byname(pdev, "signal");
+ 	state->wakeup_irq = platform_get_irq_byname(pdev, "wakeup");
+ 
+@@ -1544,6 +1594,10 @@ static int fiq_debugger_probe(struct platform_device *pdev)
+ 	if (state->no_sleep)
+ 		fiq_debugger_handle_wakeup(state);
+ 
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++	state_tf = state;
++#endif
++
+ #if defined(CONFIG_FIQ_DEBUGGER_CONSOLE)
+ 	spin_lock_init(&state->console_lock);
+ 	state->console = fiq_debugger_console;
+diff --git a/drivers/staging/android/fiq_debugger/fiq_debugger.h b/drivers/staging/android/fiq_debugger/fiq_debugger.h
+index 49dda808aa31..b16e016669f4 100644
+--- a/drivers/staging/android/fiq_debugger/fiq_debugger.h
++++ b/drivers/staging/android/fiq_debugger/fiq_debugger.h
+@@ -61,7 +61,13 @@ struct fiq_debugger_pdata {
+ 	void (*force_irq_ack)(struct platform_device *pdev, unsigned int irq);
+ 
+ #ifdef CONFIG_RK_CONSOLE_THREAD
+-	void (*console_write)(struct platform_device *pdev, const char *s, unsigned int count);
++	void (*console_write)(struct platform_device *pdev, const char *s,
++			      unsigned int count);
++#endif
++
++#ifdef CONFIG_FIQ_DEBUGGER_EL3_TO_EL1
++	void (*switch_cpu)(struct platform_device *pdev, u32 cpu);
++	void (*enable_debug)(struct platform_device *pdev, bool val);
+ #endif
+ };
+ 
+-- 
+2.35.3
+

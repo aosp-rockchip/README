@@ -1,0 +1,195 @@
+From 49b5c0d29f37c0bdf8fdd650b86cf57e9f2220e2 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Thu, 30 Jul 2020 11:51:17 +0800
+Subject: [PATCH] usb: dwc3: gadget: fix ep init for unequal num of in/out eps
+
+Some SoCs have different number of endpoints between the EP-IN
+and EP-OUT (e.g. RK3399/RV1126 have 7 in endpoints and 6 out
+endpoints), it will fail to init all of the endpoints.
+
+In my test case, I use RV1126 dwc3 to support 3 UVC functions
+at the same time, and each UVC function need one in endpoint
+for control interface and one in endpoint for streaming interface,
+so it needs to init 7 in endpoints (include ep0-in) in this case.
+Without this patch, it will fail to init the ep7-in because
+it set the wrong DWC3_DEP_BASE for ep7-in.
+
+According to dwc3 databook, the register DALEPENA and the "USB
+Endpoint Number" field of Parameter1 are doing 1:1 mapping for
+endpoints, meaning physical endpoints 2 maps to logical endpoint
+2:
+Bit[0]: USB EP0-OUT
+Bit[1]: USB EP0-IN
+Bit[2]: USB EP1-OUT
+Bit[3]: USB EP1-IN
+...
+Bit[13]: USB EP7-IN
+
+The dwc3 driver use dep->number to index endpoint number and init
+the DALEPENA and the "USB Endpoint Number" field of Parameter1.
+For RV1126, it should set dep->number to 13 for EP7-IN.
+
+But the registers DEPCMDPAR2(#n),DEPCMDPAR1(#n), DEPCMDPAR0(#n),
+and DEPCMD(#n) don't 1:1 mapping for endpoints. For RV1126, it
+should set #n to 12 for EP7-IN. And the event->endpoint_number
+in the dwc3_endpoint_interrupt() is equal to 12 for EP7-IN.
+
+Fixes: c2185009e263 ("usb: dwc3: gadget: fix init endpoints and resize tx fifos")
+Change-Id: I0898306196f4dacf09b0de3cf4d76d9026b6315c
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc3/ep0.c    | 32 +++++++++++++++++++---------
+ drivers/usb/dwc3/gadget.c | 44 +++++++++++++++++++--------------------
+ 2 files changed, 43 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/usb/dwc3/ep0.c b/drivers/usb/dwc3/ep0.c
+index 49f6ed23e8b3..d101eb706e4e 100644
+--- a/drivers/usb/dwc3/ep0.c
++++ b/drivers/usb/dwc3/ep0.c
+@@ -283,21 +283,33 @@ void dwc3_ep0_out_start(struct dwc3 *dwc)
+ 
+ static struct dwc3_ep *dwc3_wIndex_to_dep(struct dwc3 *dwc, __le16 wIndex_le)
+ {
+-	struct dwc3_ep		*dep;
++	struct dwc3_ep		*dep = NULL;
+ 	u32			windex = le16_to_cpu(wIndex_le);
+-	u32			epnum;
++	u32			epnum, ep_index;
++	u8			num, direction;
++
++	epnum = windex & USB_ENDPOINT_NUMBER_MASK;
++	direction = windex & USB_ENDPOINT_DIR_MASK;
++	ep_index = 0;
++
++	for (num = 0; num < dwc->num_eps; num++) {
++		dep = dwc->eps[num];
++		if (!dep) {
++			dev_warn(dwc->dev, "dep is NULL, num %d, windex 0x%08x\n",
++				 num, windex);
++			return NULL;
++		}
+ 
+-	epnum = (windex & USB_ENDPOINT_NUMBER_MASK) << 1;
+-	if ((windex & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN)
+-		epnum |= 1;
++		if ((direction == USB_DIR_IN && dep->direction) ||
++		    (direction == USB_DIR_OUT && !dep->direction))
++			ep_index++;
+ 
+-	dep = dwc->eps[epnum];
+-	if (!dep) {
+-		dev_warn(dwc->dev, "epnum %d, windex 0x%08x\n", epnum, windex);
+-		return NULL;
++		if (ep_index == epnum + 1)
++			break;
+ 	}
+ 
+-	if (dep->flags & DWC3_EP_ENABLED)
++
++	if (dep && (dep->flags & DWC3_EP_ENABLED))
+ 		return dep;
+ 
+ 	return NULL;
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 840aef9d165c..c217c0e87018 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -162,27 +162,26 @@ static int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc)
+ 	int		last_fifo_depth;
+ 	int		fifo_size;
+ 	int		mdwidth;
+-	u8		num, num_in_eps;
++	u8		num, fifo_number;
+ 
+ 	if (!dwc->needs_fifo_resize)
+ 		return 0;
+ 
+-	num_in_eps = DWC3_NUM_IN_EPS(&dwc->hwparams);
+ 	mdwidth = DWC3_MDWIDTH(dwc->hwparams.hwparams0);
+ 	/* MDWIDTH is represented in bits, we need it in bytes */
+ 	mdwidth >>= 3;
+-
++	fifo_number = 0;
+ 	fifo_size = dwc3_readl(dwc->regs, DWC3_GTXFIFOSIZ(0));
+ 	last_fifo_depth = DWC3_GTXFIFOSIZ_TXFSTADDR(fifo_size) >> 16;
+ 
+-	for (num = 0; num < num_in_eps; num++) {
+-		u8	epnum = (num << 1) | 1;
+-		struct dwc3_ep  *dep = dwc->eps[epnum];
+-		int	fifo_number = dep->number >> 1;
++	for (num = 0; num < dwc->num_eps; num++) {
++		struct dwc3_ep  *dep = dwc->eps[num];
+ 		int	mult = 1;
+ 		int	tmp;
+ 
+-		if (!(dep->flags & DWC3_EP_ENABLED))
++		/* Skip out endpoints */
++		if (!dep || !dep->direction ||
++		    !(dep->flags & DWC3_EP_ENABLED))
+ 			continue;
+ 
+ 		if (usb_endpoint_xfer_bulk(dep->endpoint.desc)) {
+@@ -217,6 +216,7 @@ static int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc)
+ 			    fifo_size);
+ 
+ 		last_fifo_depth += (fifo_size & 0xffff);
++		fifo_number++;
+ 	}
+ 
+ 	return 0;
+@@ -2360,13 +2360,24 @@ static int dwc3_gadget_init_endpoint(struct dwc3 *dwc, u8 epnum)
+ 	bool				direction = epnum & 1;
+ 	int				ret;
+ 	u8				num = epnum >> 1;
++	u8				num_in_eps, num_out_eps;
++
++	num_in_eps = DWC3_NUM_IN_EPS(&dwc->hwparams);
++	num_out_eps = dwc->num_eps - num_in_eps;
+ 
+ 	dep = kzalloc(sizeof(*dep), GFP_KERNEL);
+ 	if (!dep)
+ 		return -ENOMEM;
+ 
++	/* reconfig direction and num if num_out_eps != num_in_eps */
++	if ((!direction && ((epnum >> 1) + 1) > num_out_eps) ||
++	    (direction && ((epnum >> 1) + 1) > num_in_eps)) {
++		direction = !direction;
++		num = num + (epnum & 1);
++	}
++
+ 	dep->dwc = dwc;
+-	dep->number = epnum;
++	dep->number = num << 1 | direction;
+ 	dep->direction = direction;
+ 	dep->regs = dwc->regs + DWC3_DEP_BASE(epnum);
+ 	dwc->eps[epnum] = dep;
+@@ -2407,25 +2418,12 @@ static int dwc3_gadget_init_endpoint(struct dwc3 *dwc, u8 epnum)
+ 
+ static int dwc3_gadget_init_endpoints(struct dwc3 *dwc, u8 total)
+ {
+-	u8				epnum, num;
+-	u8				num_in_eps, num_out_eps;
+-	bool				direction;
+-
+-	num_in_eps = DWC3_NUM_IN_EPS(&dwc->hwparams);
+-	num_out_eps = total - num_in_eps;
++	u8				epnum;
+ 
+ 	INIT_LIST_HEAD(&dwc->gadget.ep_list);
+ 
+ 	for (epnum = 0; epnum < total; epnum++) {
+ 		int			ret;
+-		direction = epnum & 1;
+-		num = (epnum >> 1) + 1;
+-
+-		if ((!direction && num > num_out_eps) ||
+-		    (direction && num > num_in_eps)) {
+-			total++;
+-			continue;
+-		}
+ 
+ 		ret = dwc3_gadget_init_endpoint(dwc, epnum);
+ 		if (ret)
+-- 
+2.35.3
+

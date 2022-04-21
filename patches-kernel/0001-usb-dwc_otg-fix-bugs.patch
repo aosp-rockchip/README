@@ -1,0 +1,124 @@
+From bd1b1fd8d6e0838719a98a75b84a2a33e6828bbe Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Fri, 10 Apr 2015 15:58:49 +0800
+Subject: [PATCH] usb: dwc_otg: fix bugs
+
+1.Cancel usb vbus detect work in driver shutdown rountine
+2.Check empty list
+3.Disable usb interrupt before usb mode change
+
+TEST:
+
+1.reboot test
+2.while true; do
+    echo 1 > force_usb_mode;busybox sleep 5;
+    echo 2 > force_usb_mode;busybox sleep 5;
+  done
+
+Signed-off-by: lyz <lyz@rock-chips.com>
+---
+ drivers/usb/dwc_otg_310/dwc_otg_driver.c   | 11 +++++++----
+ drivers/usb/dwc_otg_310/dwc_otg_hcd.c      | 11 +++++++----
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_intr.c |  6 ++++++
+ 3 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_driver.c b/drivers/usb/dwc_otg_310/dwc_otg_driver.c
+index 3aa41733671f..4e064c6ac1a8 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_driver.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_driver.c
+@@ -1158,18 +1158,16 @@ static void dwc_otg_driver_shutdown(struct platform_device *_dev)
+ 	dwc_otg_core_if_t *core_if = otg_dev->core_if;
+ 	struct dwc_otg_platform_data *pldata = otg_dev->pldata;
+ 	dctl_data_t dctl = {.d32 = 0 };
++	dwc_otg_pcd_t *pcd = core_if->otg_dev->pcd;
+ 
+ 	DWC_PRINTF("%s: disconnect USB %s mode\n", __func__,
+ 		   dwc_otg_is_host_mode(core_if) ? "host" : "device");
+ 
+-	if (pldata->dwc_otg_uart_mode != NULL)
+-		pldata->dwc_otg_uart_mode(pldata, PHY_USB_MODE);
+-	if (pldata->phy_suspend != NULL)
+-		pldata->phy_suspend(pldata, USB_PHY_ENABLED);
+ 	if (dwc_otg_is_host_mode(core_if)) {
+ 		if (core_if->hcd_cb && core_if->hcd_cb->stop)
+ 			core_if->hcd_cb->stop(core_if->hcd_cb_p);
+ 	} else {
++		cancel_delayed_work_sync(&pcd->check_vbus_work);
+ 		/* soft disconnect */
+ 		dctl.d32 =
+ 		    DWC_READ_REG32(&core_if->dev_if->dev_global_regs->dctl);
+@@ -1180,6 +1178,11 @@ static void dwc_otg_driver_shutdown(struct platform_device *_dev)
+ 	/* Clear any pending interrupts */
+ 	DWC_WRITE_REG32(&core_if->core_global_regs->gintsts, 0xFFFFFFFF);
+ 
++	if (pldata->dwc_otg_uart_mode != NULL)
++		pldata->dwc_otg_uart_mode(pldata, PHY_USB_MODE);
++	if (pldata->phy_suspend != NULL)
++		pldata->phy_suspend(pldata, USB_PHY_ENABLED);
++
+ }
+ 
+ /**
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+index ff123682de68..4f2e7ac8a1b7 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+@@ -174,6 +174,8 @@ static void kill_urbs_in_qh_list(dwc_otg_hcd_t *hcd, dwc_list_link_t *qh_list)
+ 		qh = DWC_LIST_ENTRY(qh_item, dwc_otg_qh_t, qh_list_entry);
+ 		DWC_CIRCLEQ_FOREACH_SAFE(qtd, qtd_tmp,
+ 					 &qh->qtd_list, qtd_list_entry) {
++			if (DWC_CIRCLEQ_EMPTY(&qh->qtd_list))
++				return;
+ 			qtd = DWC_CIRCLEQ_FIRST(&qh->qtd_list);
+ 			if (qtd->urb != NULL) {
+ 				hcd->fops->complete(hcd, qtd->urb->priv,
+@@ -478,6 +480,9 @@ void dwc_otg_hcd_stop(dwc_otg_hcd_t *hcd)
+ 	pldata = hcd->core_if->otg_dev->pldata;
+ 	DWC_DEBUGPL(DBG_HCD, "DWC OTG HCD STOP\n");
+ 
++	/* Turn off all host-specific interrupts. */
++	dwc_otg_disable_host_interrupts(hcd->core_if);
++
+ 	/*
+ 	 * The root hub should be disconnected before this function is called.
+ 	 * The disconnect will clear the QTD lists (via ..._hcd_urb_dequeue)
+@@ -493,9 +498,6 @@ void dwc_otg_hcd_stop(dwc_otg_hcd_t *hcd)
+ 	hcd->flags.b.port_connect_status_change = 1;
+ 	hcd->flags.b.port_connect_status = 0;
+ 
+-	/* Turn off all host-specific interrupts. */
+-	dwc_otg_disable_host_interrupts(hcd->core_if);
+-
+ 	/* Turn off the vbus power */
+ 	DWC_PRINTF("PortPower off\n");
+ 	hprt0.b.prtpwr = 0;
+@@ -1349,7 +1351,8 @@ static int queue_transaction(dwc_otg_hcd_t *hcd,
+ 			     dwc_hc_t *hc, uint16_t fifo_dwords_avail)
+ {
+ 	int retval;
+-
++	if (!hc || !(hc->qh))
++		return -ENODEV;
+ 	if (hcd->core_if->dma_enable) {
+ 		if (hcd->core_if->dma_desc_enable) {
+ 			if (!hc->xfer_started
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_intr.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd_intr.c
+index a7bbaaeeeacd..22a118efeae7 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_intr.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_intr.c
+@@ -2101,6 +2101,12 @@ int32_t dwc_otg_hcd_handle_hc_n_intr(dwc_otg_hcd_t *dwc_otg_hcd, uint32_t num)
+ 
+ 	hc = dwc_otg_hcd->hc_ptr_array[num];
+ 	hc_regs = dwc_otg_hcd->core_if->host_if->hc_regs[num];
++	if (DWC_CIRCLEQ_EMPTY(&hc->qh->qtd_list)) {
++		/* All transfer had been killed, clear panding interrupts */
++		hcint.d32 = DWC_READ_REG32(&hc_regs->hcint);
++		DWC_WRITE_REG32(&hc_regs->hcint, hcint.d32);
++		return retval;
++	}
+ 	qtd = DWC_CIRCLEQ_FIRST(&hc->qh->qtd_list);
+ 
+ 	hcint.d32 = DWC_READ_REG32(&hc_regs->hcint);
+-- 
+2.35.3
+

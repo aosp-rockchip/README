@@ -1,0 +1,169 @@
+From 503cd7b1b7c6c0d048ceb139d4c74ef033baf87a Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Wed, 13 Nov 2019 17:56:14 +0800
+Subject: [PATCH] usb: dwc3: gadget: support to resize TxFIFOs dynamically
+
+We need to dynamically resize the TxFIFOs for some cases
+where the default values don't match.
+
+Test on RK1808-stick board, configurate the usb with four
+functions "rndis, ntb, mass_storage, acm", the default
+values of TxFIFOs is:
+
+GTXFIFOSIZ(0) = 0x00000042
+GTXFIFOSIZ(1) = 0x00420184
+GTXFIFOSIZ(2) = 0x01c60184
+GTXFIFOSIZ(3) = 0x034a0184
+GTXFIFOSIZ(4) = 0x04ce0184
+GTXFIFOSIZ(5) = 0x06520184
+GTXFIFOSIZ(6) = 0x07d6002a
+
+The ep6-in is used for acm ep-in which maxpacket is 1024B,
+but the default fifo size of ep6-in is only 336B, less than
+the length of the ep maxpacket, it cause acm works abnormally.
+
+This patch creates a simple function to allocate enough TxFIFO
+space for each of the enabled endpoints.
+
+Change-Id: I389ffdba4f3721ed6ef192f0c85f41fdeff645ce
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc3/core.c   |  2 +
+ drivers/usb/dwc3/core.h   |  2 +
+ drivers/usb/dwc3/gadget.c | 80 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 84 insertions(+)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 8e01b27114d6..ba4f6830978e 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1310,6 +1310,8 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 
+ 	dwc->dis_metastability_quirk = device_property_read_bool(dev,
+ 				"snps,dis_metastability_quirk");
++	dwc->needs_fifo_resize = device_property_read_bool(dev,
++				"snps,tx-fifo-resize");
+ 
+ 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
+ 	dwc->tx_de_emphasis = tx_de_emphasis;
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 1b301a9a529d..24ae6796bd08 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1037,6 +1037,7 @@ struct dwc3_scratchpad_array {
+  * 	2	- No de-emphasis
+  * 	3	- Reserved
+  * @dis_metastability_quirk: set to disable metastability quirk.
++ * @needs_fifo_resize: set if we want to resize TXFIFO.
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *                 increments or 0 to disable.
+  */
+@@ -1226,6 +1227,7 @@ struct dwc3 {
+ 	unsigned		tx_de_emphasis:2;
+ 
+ 	unsigned		dis_metastability_quirk:1;
++	unsigned		needs_fifo_resize:1;
+ 
+ 	u16			imod_interval;
+ };
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 4c7d05e99887..9d9d5a0b765d 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -136,6 +136,84 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state)
+ 	return -ETIMEDOUT;
+ }
+ 
++/**
++ * dwc3_gadget_resize_tx_fifos - reallocate fifo spaces for current use-case
++ * @dwc: pointer to our context structure
++ *
++ * This function will a best effort FIFO allocation in order
++ * to improve FIFO usage and throughput, while still allowing
++ * us to enable as many endpoints as possible.
++ *
++ * Keep in mind that this operation will be highly dependent
++ * on the configured size for RAM1 - which contains TxFifo -,
++ * the amount of endpoints enabled on coreConsultant tool, and
++ * the width of the Master Bus.
++ *
++ * In the ideal world, we would always be able to satisfy the
++ * following equation:
++ *
++ * ((512 + 2 * MDWIDTH-Bytes) + (Number of IN Endpoints - 1) * \
++ * (3 * (1024 + MDWIDTH-Bytes) + MDWIDTH-Bytes)) / MDWIDTH-Bytes
++ *
++ * Unfortunately, due to many variables that's not always the case.
++ */
++static int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc)
++{
++	int		last_fifo_depth = 0;
++	int		fifo_size;
++	int		mdwidth;
++	u8		num, num_in_eps;
++
++	if (!dwc->needs_fifo_resize)
++		return 0;
++
++	num_in_eps = DWC3_NUM_IN_EPS(&dwc->hwparams);
++	mdwidth = DWC3_MDWIDTH(dwc->hwparams.hwparams0);
++	/* MDWIDTH is represented in bits, we need it in bytes */
++	mdwidth >>= 3;
++
++	for (num = 0; num < num_in_eps; num++) {
++		u8	epnum = (num << 1) | 1;
++		struct dwc3_ep  *dep = dwc->eps[epnum];
++		int	fifo_number = dep->number >> 1;
++		int	mult = 1;
++		int	tmp;
++
++		if (!(dep->flags & DWC3_EP_ENABLED))
++			continue;
++
++		if (usb_endpoint_xfer_bulk(dep->endpoint.desc) ||
++		    usb_endpoint_xfer_isoc(dep->endpoint.desc))
++			mult = 3;
++
++		/*
++		 * REVISIT: the following assumes we will always have enough
++		 * space available on the FIFO RAM for all possible use cases.
++		 * Make sure that's true somehow and change FIFO allocation
++		 * accordingly.
++		 * If we have Bulk or Isochronous endpoints, we want
++		 * them to be able to be very, very fast. So we're giving
++		 * those endpoints a fifo_size which is enough for 3 full
++		 * packets
++		 */
++		tmp = mult * (dep->endpoint.maxpacket + mdwidth);
++		tmp += mdwidth;
++
++		fifo_size = DIV_ROUND_UP(tmp, mdwidth);
++		fifo_size |= (last_fifo_depth << 16);
++
++		dev_dbg(dwc->dev, "%s: FIFO Addr %04x Size %d\n",
++			dep->name, last_fifo_depth, fifo_size & 0xffff);
++
++		dwc3_writel(dwc->regs, DWC3_GTXFIFOSIZ(fifo_number),
++			    fifo_size);
++
++		last_fifo_depth += (fifo_size & 0xffff);
++	}
++
++	return 0;
++}
++
+ /**
+  * dwc3_ep_inc_trb - increment a trb index.
+  * @index: Pointer to the TRB index to increment.
+@@ -785,6 +863,8 @@ static int dwc3_gadget_ep_enable(struct usb_ep *ep,
+ 	ret = __dwc3_gadget_ep_enable(dep, DWC3_DEPCFG_ACTION_INIT);
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++	dwc3_gadget_resize_tx_fifos(dwc);
++
+ 	return ret;
+ }
+ 
+-- 
+2.35.3
+

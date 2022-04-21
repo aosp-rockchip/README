@@ -1,0 +1,94 @@
+From 67e6de73b6b9336ef515c4d5a075251fb94ff6dc Mon Sep 17 00:00:00 2001
+From: David Wu <wdc@rock-chips.com>
+Date: Thu, 29 Oct 2015 07:25:37 +0800
+Subject: [PATCH] i2c: rockchip: fix power off issue for rk818
+
+The power off sequence is behind of i2c bus shutdown func,
+it would prevent the rk818 to do power off action. The irq was
+disabled when rk818 power off, it could let rk818 to power off
+through i2c bus.
+
+Change-Id: Ia6155f137ab2fa36dbe19e06878b0228670b1398
+Signed-off-by: David Wu <wdc@rock-chips.com>
+---
+ drivers/i2c/busses/i2c-rockchip.c | 30 +++++++++++++++++++-----------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-rockchip.c b/drivers/i2c/busses/i2c-rockchip.c
+index 1745f78ee1ba..78bb407f1586 100644
+--- a/drivers/i2c/busses/i2c-rockchip.c
++++ b/drivers/i2c/busses/i2c-rockchip.c
+@@ -627,12 +627,6 @@ static int rockchip_i2c_doxfer(struct rockchip_i2c *i2c,
+ 	int msleep_time = 400 * 1000 / i2c->scl_rate;	// ms
+ 	int can_sleep = !(in_atomic() || irqs_disabled());
+ 
+-	mutex_lock(&i2c->suspend_lock);
+-	if (i2c->suspended) {
+-		dev_err(i2c->dev, "i2c is suspended\n");
+-		return -EIO;
+-	}
+-
+ 	spin_lock_irqsave(&i2c->lock, flags);
+ 	i2c->addr = msgs[0].addr;
+ 	if (msgs[0].flags & I2C_M_TEN) {
+@@ -724,7 +718,6 @@ static int rockchip_i2c_doxfer(struct rockchip_i2c *i2c,
+ 	if (error == -EAGAIN)
+ 		i2c_dbg(i2c->dev, "No ack(complete_what: 0x%x), Maybe slave(addr: 0x%04x) not exist or abnormal power-on\n",
+ 			i2c->complete_what, i2c->addr);
+-	mutex_unlock(&i2c->suspend_lock);
+ 
+ 	return error;
+ }
+@@ -741,6 +734,16 @@ static int rockchip_i2c_xfer(struct i2c_adapter *adap,
+ 	int ret;
+ 	struct rockchip_i2c *i2c = i2c_get_adapdata(adap);
+ 	unsigned long scl_rate = i2c->scl_rate;
++	int can_sleep = !(in_atomic() || irqs_disabled());
++
++	if (can_sleep) {
++		mutex_lock(&i2c->suspend_lock);
++		if (i2c->suspended) {
++			dev_err(i2c->dev, "i2c is suspended\n");
++			mutex_unlock(&i2c->suspend_lock);
++			return -EIO;
++		}
++	}
+ 
+ 	clk_enable(i2c->clk);
+ 	if (i2c->check_idle) {
+@@ -749,15 +752,16 @@ static int rockchip_i2c_xfer(struct i2c_adapter *adap,
+ 			state = rockchip_i2c_check_idle(i2c);
+ 			if (state == I2C_IDLE)
+ 				break;
+-			if (in_atomic() || irqs_disabled())
+-				mdelay(10);
+-			else
++			if (can_sleep)
+ 				msleep(10);
++			else
++				mdelay(10);
+ 			retry--;
+ 		}
+ 		if (retry == 0) {
+ 			dev_err(i2c->dev, "i2c is not in idle(state = %d)\n", state);
+-			return -EIO;
++			ret = -EIO;
++			goto out;
+ 		}
+ 	}
+ 
+@@ -781,7 +785,11 @@ static int rockchip_i2c_xfer(struct i2c_adapter *adap,
+ 	ret = rockchip_i2c_doxfer(i2c, msgs, num);
+ 	i2c_dbg(i2c->dev, "i2c transfer stop: addr: 0x%04x, state: %d, ret: %d\n", msgs[0].addr, ret, i2c->state);
+ 
++out:
+ 	clk_disable(i2c->clk);
++	if (can_sleep)
++		mutex_unlock(&i2c->suspend_lock);
++
+ 	return (ret < 0) ? ret : num;
+ }
+ 
+-- 
+2.35.3
+

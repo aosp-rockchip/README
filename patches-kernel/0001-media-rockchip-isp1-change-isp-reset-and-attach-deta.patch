@@ -1,0 +1,221 @@
+From 272fe27439071c4701c56f02c5c74c4d7d2018be Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Thu, 9 Aug 2018 20:04:06 +0800
+Subject: [PATCH] media: rockchip: isp1: change isp reset and attach/detach
+ iommu
+
+1. change isp reset to "asynchronous system reset"
+If some errors is happened, isp can not return to normal state
+without "asynchronous system reset".
+
+2. change the way of attach/detach iommu
+As the modification of 1), isp will be reset by "asynchronous system reset"
+when isp subdev is stop, so iommu is need to detach and reattach.
+
+Now we detach/attach iommu not only when suspend/resume system, but also after isp is reset.
+To handle the two cases together, we remove the function of detach/attach iommu
+when suspend/resume system, add the function of attach iommu when first stream is opened
+and detach iommu when last stream is closed.
+
+Change-Id: If1aa191c9cf6a7f0b7e97da481922ffbae1fd87d
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 63 ++++++++++++++++++-
+ drivers/media/platform/rockchip/isp1/dev.c    | 36 +----------
+ drivers/media/platform/rockchip/isp1/dev.h    |  1 +
+ drivers/media/platform/rockchip/isp1/rkisp1.c |  4 +-
+ 4 files changed, 66 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index 5cf6bd7f98d2..6a6e9705e7d5 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -40,6 +40,7 @@
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-subdev.h>
+ #include <media/videobuf2-dma-contig.h>
++#include <linux/dma-iommu.h>
+ #include "dev.h"
+ #include "regs.h"
+ 
+@@ -1379,6 +1380,64 @@ static void rkisp1_set_fmt(struct rkisp1_stream *stream,
+ 	}
+ }
+ 
++static int rkisp1_dma_attach_device(struct rkisp1_device *rkisp1_dev)
++{
++	struct iommu_domain *domain = rkisp1_dev->domain;
++	struct device *dev = rkisp1_dev->dev;
++	int ret;
++
++	ret = iommu_attach_device(domain, dev);
++	if (ret) {
++		dev_err(dev, "Failed to attach iommu device\n");
++		return ret;
++	}
++
++	if (!common_iommu_setup_dma_ops(dev, 0x10000000, SZ_2G, domain->ops)) {
++		dev_err(dev, "Failed to set dma_ops\n");
++		iommu_detach_device(domain, dev);
++		ret = -ENODEV;
++	}
++
++	return ret;
++}
++
++static void rkisp1_dma_detach_device(struct rkisp1_device *rkisp1_dev)
++{
++	struct iommu_domain *domain = rkisp1_dev->domain;
++	struct device *dev = rkisp1_dev->dev;
++
++	iommu_detach_device(domain, dev);
++}
++
++static int rkisp1_fh_open(struct file *filp)
++{
++	struct rkisp1_stream *stream = video_drvdata(filp);
++	struct rkisp1_device *dev = stream->ispdev;
++	int ret;
++
++	ret = v4l2_fh_open(filp);
++	if (!ret) {
++		if (atomic_inc_return(&dev->open_cnt) == 1)
++			rkisp1_dma_attach_device(dev);
++	}
++
++	return ret;
++}
++
++static int rkisp1_fop_release(struct file *file)
++{
++	struct rkisp1_stream *stream = video_drvdata(file);
++	struct rkisp1_device *dev = stream->ispdev;
++	int ret;
++
++	ret = vb2_fop_release(file);
++
++	if (atomic_dec_return(&dev->open_cnt) == 0)
++		rkisp1_dma_detach_device(dev);
++
++	return ret;
++}
++
+ /************************* v4l2_file_operations***************************/
+ void rkisp1_stream_init(struct rkisp1_device *dev, u32 id)
+ {
+@@ -1415,8 +1474,8 @@ void rkisp1_stream_init(struct rkisp1_device *dev, u32 id)
+ }
+ 
+ static const struct v4l2_file_operations rkisp1_fops = {
+-	.open = v4l2_fh_open,
+-	.release = vb2_fop_release,
++	.open = rkisp1_fh_open,
++	.release = rkisp1_fop_release,
+ 	.unlocked_ioctl = video_ioctl2,
+ 	.poll = vb2_fop_poll,
+ 	.mmap = vb2_fop_mmap,
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 2670285b9671..86bb038720fd 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -636,16 +636,6 @@ static int rkisp1_iommu_init(struct rkisp1_device *rkisp1_dev)
+ 			goto err;
+ 	}
+ 
+-	ret = iommu_attach_device(rkisp1_dev->domain, rkisp1_dev->dev);
+-	if (ret)
+-		goto err;
+-	if (!common_iommu_setup_dma_ops(rkisp1_dev->dev, 0x10000000,
+-					SZ_2G, rkisp1_dev->domain->ops)) {
+-		iommu_detach_device(rkisp1_dev->domain, rkisp1_dev->dev);
+-		ret = -ENODEV;
+-		goto err;
+-	}
+-
+ 	return 0;
+ 
+ err:
+@@ -656,7 +646,6 @@ static int rkisp1_iommu_init(struct rkisp1_device *rkisp1_dev)
+ 
+ static void rkisp1_iommu_cleanup(struct rkisp1_device *rkisp1_dev)
+ {
+-	iommu_detach_device(rkisp1_dev->domain, rkisp1_dev->dev);
+ 	iommu_domain_free(rkisp1_dev->domain);
+ }
+ 
+@@ -712,6 +701,7 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 
+ 	atomic_set(&isp_dev->pipe.power_cnt, 0);
+ 	atomic_set(&isp_dev->pipe.stream_cnt, 0);
++	atomic_set(&isp_dev->open_cnt, 0);
+ 	isp_dev->pipe.open = rkisp1_pipeline_open;
+ 	isp_dev->pipe.close = rkisp1_pipeline_close;
+ 	isp_dev->pipe.set_stream = rkisp1_pipeline_set_stream;
+@@ -774,27 +764,6 @@ static int rkisp1_plat_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int __maybe_unused rkisp1_suspend(struct device *dev)
+-{
+-	struct rkisp1_device *isp_dev = dev_get_drvdata(dev);
+-
+-	if (isp_dev->domain)
+-		iommu_detach_device(isp_dev->domain, isp_dev->dev);
+-
+-	return 0;
+-}
+-
+-static int __maybe_unused rkisp1_resume(struct device *dev)
+-{
+-	struct rkisp1_device *isp_dev = dev_get_drvdata(dev);
+-	int ret = 0;
+-
+-	if (isp_dev->domain)
+-		ret = iommu_attach_device(isp_dev->domain, isp_dev->dev);
+-
+-	return ret;
+-}
+-
+ static int __maybe_unused rkisp1_runtime_suspend(struct device *dev)
+ {
+ 	struct rkisp1_device *isp_dev = dev_get_drvdata(dev);
+@@ -817,7 +786,8 @@ static int __maybe_unused rkisp1_runtime_resume(struct device *dev)
+ }
+ 
+ static const struct dev_pm_ops rkisp1_plat_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(rkisp1_suspend, rkisp1_resume)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				pm_runtime_force_resume)
+ 	SET_RUNTIME_PM_OPS(rkisp1_runtime_suspend, rkisp1_runtime_resume, NULL)
+ };
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index 36b2eac5cea9..8d117bfecdd9 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -125,6 +125,7 @@ struct rkisp1_device {
+ 	enum rkisp1_isp_ver isp_ver;
+ 	const unsigned int *clk_rate_tbl;
+ 	int num_clk_rate_tbl;
++	atomic_t open_cnt;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index 20e826711254..54f2e04f51cf 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -421,9 +421,7 @@ static int rkisp1_isp_stop(struct rkisp1_device *dev)
+ 		 readl(base + CIF_ISP_CTRL),
+ 		 readl(base + CIF_MIPI_CTRL));
+ 
+-	writel(CIF_IRCL_MIPI_SW_RST | CIF_IRCL_ISP_SW_RST | CIF_IRCL_MI_SW_RST,
+-	       base + CIF_IRCL);
+-	writel(0x0, base + CIF_IRCL);
++	writel(CIF_IRCL_CIF_SW_RST, base + CIF_IRCL);
+ 
+ 	return 0;
+ }
+-- 
+2.35.3
+

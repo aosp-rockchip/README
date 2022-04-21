@@ -1,0 +1,199 @@
+From bd8164da477f75616e21e37eec3fc3ca6c03a92c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Mon, 13 Jan 2014 10:51:01 +0800
+Subject: [PATCH] ARM: rockchip: rk3188 add pie init
+
+---
+ arch/arm/boot/dts/rk3188.dtsi       |  3 +-
+ arch/arm/configs/rockchip_defconfig |  1 +
+ arch/arm/mach-rockchip/common.c     | 26 +++++++++++++++
+ arch/arm/mach-rockchip/rk3188.c     | 31 ++++++++++++++++++
+ arch/arm/mach-rockchip/sram.h       | 49 +++++++++++++++++++++++++++++
+ 5 files changed, 109 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/mach-rockchip/sram.h
+
+diff --git a/arch/arm/boot/dts/rk3188.dtsi b/arch/arm/boot/dts/rk3188.dtsi
+index e811e255d421..df2c7066fd01 100755
+--- a/arch/arm/boot/dts/rk3188.dtsi
++++ b/arch/arm/boot/dts/rk3188.dtsi
+@@ -6,6 +6,7 @@
+ / {
+ 	compatible = "rockchip,rk3188";
+ 	interrupt-parent = <&gic>;
++	rockchip,sram = <&sram>;
+ 
+ 	aliases {
+ 		serial0 = &uart0;
+@@ -143,7 +144,7 @@
+ 		reg = <0x10080000 0x20>; /* 32 bytes */
+ 	};
+ 
+-	sram@10080020 {
++	sram: sram@10080020 {
+ 		compatible = "mmio-sram";
+ 		reg = <0x10080020 (0x8000 - 0x20)>; /* 32k - 32 */
+ 		map-exec;
+diff --git a/arch/arm/configs/rockchip_defconfig b/arch/arm/configs/rockchip_defconfig
+index 83a1e3ed628f..bbb5d9790b47 100644
+--- a/arch/arm/configs/rockchip_defconfig
++++ b/arch/arm/configs/rockchip_defconfig
+@@ -196,6 +196,7 @@ CONFIG_RFKILL=y
+ CONFIG_CMA=y
+ CONFIG_BLK_DEV_LOOP=y
+ CONFIG_UID_STAT=y
++CONFIG_SRAM=y
+ CONFIG_SCSI=y
+ CONFIG_SCSI_TGT=y
+ CONFIG_BLK_DEV_SD=y
+diff --git a/arch/arm/mach-rockchip/common.c b/arch/arm/mach-rockchip/common.c
+index c84f65543198..93adf5dadcf0 100644
+--- a/arch/arm/mach-rockchip/common.c
++++ b/arch/arm/mach-rockchip/common.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/genalloc.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+@@ -20,6 +21,7 @@
+ #include <linux/of_platform.h>
+ #include <asm/hardware/cache-l2x0.h>
+ #include "cpu_axi.h"
++#include "sram.h"
+ 
+ static int __init rockchip_cpu_axi_init(void)
+ {
+@@ -104,3 +106,27 @@ static int __init rockchip_pl330_l2_cache_init(void)
+ 	return 0;
+ }
+ early_initcall(rockchip_pl330_l2_cache_init);
++
++struct gen_pool *rockchip_sram_pool = NULL;
++struct pie_chunk *rockchip_pie_chunk = NULL;
++void *rockchip_sram_virt = NULL;
++size_t rockchip_sram_size = 0;
++char *rockchip_sram_stack = NULL;
++
++int __init rockchip_pie_init(void)
++{
++	struct device_node *np;
++
++	np = of_find_node_by_path("/");
++	if (!np)
++		return -ENODEV;
++
++	rockchip_sram_pool = of_get_named_gen_pool(np, "rockchip,sram", 0);
++	if (!rockchip_sram_pool) {
++		pr_err("%s: failed to get sram pool\n", __func__);
++		return -ENODEV;
++	}
++	rockchip_sram_size = gen_pool_size(rockchip_sram_pool);
++
++	return 0;
++}
+diff --git a/arch/arm/mach-rockchip/rk3188.c b/arch/arm/mach-rockchip/rk3188.c
+index 46b0a2198566..30ede5ab86ab 100644
+--- a/arch/arm/mach-rockchip/rk3188.c
++++ b/arch/arm/mach-rockchip/rk3188.c
+@@ -28,6 +28,7 @@
+ #include "cpu_axi.h"
+ #include "grf.h"
+ #include "iomap.h"
++#include "sram.h"
+ 
+ #define RK3188_DEVICE(name) \
+ 	{ \
+@@ -116,3 +117,33 @@ DT_MACHINE_START(RK3188_DT, "Rockchip RK3188 (Flattened Device Tree)")
+ 	.init_time	= rk3188_dt_init_timer,
+ 	.dt_compat	= rk3188_dt_compat,
+ MACHINE_END
++
++#define CPU 3188
++char PIE_DATA(sram_stack)[1024];
++EXPORT_PIE_SYMBOL(DATA(sram_stack));
++
++static int __init rk3188_pie_init(void)
++{
++	int err;
++
++	if (!cpu_is_rk3188())
++		return 0;
++
++	err = rockchip_pie_init();
++	if (err)
++		return err;
++
++	rockchip_pie_chunk = pie_load_sections(rockchip_sram_pool, rk3188);
++	if (IS_ERR(rockchip_pie_chunk)) {
++		err = PTR_ERR(rockchip_pie_chunk);
++		pr_err("%s: failed to load section %d\n", __func__, err);
++		rockchip_pie_chunk = NULL;
++		return err;
++	}
++
++	rockchip_sram_virt = kern_to_pie(rockchip_pie_chunk, &__pie_common_start[0]);
++	rockchip_sram_stack = kern_to_pie(rockchip_pie_chunk, (char *) DATA(sram_stack) + sizeof(DATA(sram_stack)));
++
++	return 0;
++}
++arch_initcall(rk3188_pie_init);
+diff --git a/arch/arm/mach-rockchip/sram.h b/arch/arm/mach-rockchip/sram.h
+new file mode 100644
+index 000000000000..d4c7d7437921
+--- /dev/null
++++ b/arch/arm/mach-rockchip/sram.h
+@@ -0,0 +1,49 @@
++#ifndef __MACH_ROCKCHIP_SRAM_H
++#define __MACH_ROCKCHIP_SRAM_H
++
++#include <linux/pie.h>
++#include <asm/pie.h>
++
++extern char __pie_common_start[];
++extern char __pie_common_end[];
++extern char __pie_overlay_start[];
++
++extern struct gen_pool *rockchip_sram_pool;
++extern struct pie_chunk *rockchip_pie_chunk;
++extern void *rockchip_sram_virt;
++extern size_t rockchip_sram_size;
++extern char *rockchip_sram_stack;
++extern char __pie_data(rk3188) __pie_rk3188_sram_stack[1024];
++
++#define RK_PIE_DATA3(x) __pie_data(rk##x)
++#define RK_PIE_DATA2(x) RK_PIE_DATA3(x)
++#define RK_PIE_DATA RK_PIE_DATA2(CPU)
++
++#define DATA3(x, y) __pie_rk##y##_##x
++#define DATA2(x, y) DATA3(x, y)
++#define DATA(x) DATA2(x, CPU)
++
++#define RK_PIE3(x) __pie(rk##x)
++#define RK_PIE2(x) RK_PIE3(x)
++#define RK_PIE RK_PIE2(CPU)
++
++#define FUNC3(x, y) __pie_rk##y##_##x
++#define FUNC2(x, y) FUNC3(x, y)
++#define FUNC(x) FUNC2(x, CPU)
++
++#define PIE_FUNC(x) RK_PIE FUNC(x)
++#define PIE_DATA(x) RK_PIE_DATA DATA(x)
++
++#define DEFINE_PIE_DATA(x) PIE_DATA(x); EXPORT_PIE_SYMBOL(DATA(x));
++
++/* Tag variables with this */
++#define __sramdata RK_PIE_DATA
++/* Tag functions inside SRAM called from outside SRAM with this */
++#define __sramfunc RK_PIE noinline
++/* Tag function inside SRAM called from inside SRAM  with this */
++#define __sramlocalfunc RK_PIE
++
++extern void call_with_stack(void (*fn)(void *), void *arg, void *sp);
++extern int __init rockchip_pie_init(void);
++
++#endif
+-- 
+2.35.3
+

@@ -1,0 +1,108 @@
+From 837ec24cb1c2df4ee7519a2d23616fb3d048129c Mon Sep 17 00:00:00 2001
+From: Algea Cao <algea.cao@rock-chips.com>
+Date: Mon, 25 Dec 2017 17:15:05 +0800
+Subject: [PATCH] UPSTREAM: [media] cec: improve flushing queue
+
+When the adapter is unloaded or unconfigured, then all transmits and
+pending waits should be flushed.
+
+Move this code into its own function and improve the code that cancels
+delayed work to avoid having to unlock adap->lock.
+
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+(cherry picked from commit b39f93efc698fadc94a5fa273798f9e317089c72)
+
+Change-Id: Idc609583c55cba910b215ac3fe127583510ee08c
+Signed-off-by: Algea Cao <algea.cao@rock-chips.com>
+---
+ drivers/media/cec/cec-adap.c | 66 +++++++++++++++++++-----------------
+ 1 file changed, 35 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/media/cec/cec-adap.c b/drivers/media/cec/cec-adap.c
+index ccda41c2c9e4..421472b492ee 100644
+--- a/drivers/media/cec/cec-adap.c
++++ b/drivers/media/cec/cec-adap.c
+@@ -299,6 +299,40 @@ static void cec_data_cancel(struct cec_data *data)
+ 	cec_data_completed(data);
+ }
+ 
++/*
++ * Flush all pending transmits and cancel any pending timeout work.
++ *
++ * This function is called with adap->lock held.
++ */
++static void cec_flush(struct cec_adapter *adap)
++{
++	struct cec_data *data, *n;
++
++	/*
++	 * If the adapter is disabled, or we're asked to stop,
++	 * then cancel any pending transmits.
++	 */
++	while (!list_empty(&adap->transmit_queue)) {
++		data = list_first_entry(&adap->transmit_queue,
++					struct cec_data, list);
++		cec_data_cancel(data);
++	}
++	if (adap->transmitting)
++		cec_data_cancel(adap->transmitting);
++
++	/* Cancel the pending timeout work. */
++	list_for_each_entry_safe(data, n, &adap->wait_queue, list) {
++		if (cancel_delayed_work(&data->work))
++			cec_data_cancel(data);
++		/*
++		 * If cancel_delayed_work returned false, then
++		 * the cec_wait_timeout function is running,
++		 * which will call cec_data_completed. So no
++		 * need to do anything special in that case.
++		 */
++	}
++}
++
+ /*
+  * Main CEC state machine
+  *
+@@ -350,37 +384,7 @@ int cec_thread_func(void *_adap)
+ 
+ 		if ((!adap->is_configured && !adap->is_configuring) ||
+ 		    kthread_should_stop()) {
+-			/*
+-			 * If the adapter is disabled, or we're asked to stop,
+-			 * then cancel any pending transmits.
+-			 */
+-			while (!list_empty(&adap->transmit_queue)) {
+-				data = list_first_entry(&adap->transmit_queue,
+-							struct cec_data, list);
+-				cec_data_cancel(data);
+-			}
+-			if (adap->transmitting)
+-				cec_data_cancel(adap->transmitting);
+-
+-			/*
+-			 * Cancel the pending timeout work. We have to unlock
+-			 * the mutex when flushing the work since
+-			 * cec_wait_timeout() will take it. This is OK since
+-			 * no new entries can be added to wait_queue as long
+-			 * as adap->transmitting is NULL, which it is due to
+-			 * the cec_data_cancel() above.
+-			 */
+-			while (!list_empty(&adap->wait_queue)) {
+-				data = list_first_entry(&adap->wait_queue,
+-							struct cec_data, list);
+-
+-				if (!cancel_delayed_work(&data->work)) {
+-					mutex_unlock(&adap->lock);
+-					flush_scheduled_work();
+-					mutex_lock(&adap->lock);
+-				}
+-				cec_data_cancel(data);
+-			}
++			cec_flush(adap);
+ 			goto unlock;
+ 		}
+ 
+-- 
+2.35.3
+

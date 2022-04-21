@@ -1,0 +1,261 @@
+From eba5bf0b2ba6efa95c5d38a16e26e8ec0f9b8320 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Tue, 25 Aug 2020 20:56:52 +0800
+Subject: [PATCH] media: rockchip: isp: add more clk rate for rv1126
+
+Change-Id: Icdf8ea47535d80e80e2f309bbbc4110c27495b62
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  |  6 ++-
+ drivers/media/platform/rockchip/isp/dev.c     | 41 +++++++++++++------
+ drivers/media/platform/rockchip/isp/hw.c      | 41 +++++++++++--------
+ drivers/media/platform/rockchip/isp/hw.h      |  7 +++-
+ .../media/platform/rockchip/isp/isp_ispp.h    |  2 +
+ drivers/media/platform/rockchip/isp/rkisp.c   |  2 +-
+ 6 files changed, 68 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 83a429f5972f..17e374d1060f 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -680,12 +680,16 @@ static long bridge_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ {
+ 	struct rkisp_bridge_device *dev = v4l2_get_subdevdata(sd);
+ 	struct rkisp_ispp_mode *mode;
++	struct max_input *max_in;
+ 	long ret = 0;
+ 
+ 	switch (cmd) {
++	case RKISP_ISPP_CMD_SET_FMT:
++		max_in = arg;
++		dev->ispdev->hw_dev->max_in = *max_in;
++		break;
+ 	case RKISP_ISPP_CMD_SET_MODE:
+ 		mode = arg;
+-		dev->ispdev->hw_dev->max_in = mode->max_in;
+ 		dev->work_mode = mode->work_mode;
+ 		dev->buf_num = mode->buf_num;
+ 		ret = config_mode(dev);
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index ca5bef93bab7..bbca4b1a04e3 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -59,6 +59,10 @@ int rkisp_debug;
+ module_param_named(debug, rkisp_debug, int, 0644);
+ MODULE_PARM_DESC(debug, "Debug level (0-1)");
+ 
++static bool rkisp_clk_dbg;
++module_param_named(clk_dbg, rkisp_clk_dbg, bool, 0644);
++MODULE_PARM_DESC(clk_dbg, "rkisp clk set by user");
++
+ static char rkisp_version[RKISP_VERNO_LEN];
+ module_param_string(version, rkisp_version, RKISP_VERNO_LEN, 0444);
+ MODULE_PARM_DESC(version, "version number");
+@@ -139,17 +143,31 @@ static int __isp_pipeline_prepare(struct rkisp_pipeline *p,
+ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
+ {
+ 	struct rkisp_device *dev = container_of(p, struct rkisp_device, pipe);
++	struct rkisp_hw_dev *hw_dev = dev->hw_dev;
++	u32 w = hw_dev->max_in.w ? hw_dev->max_in.w : dev->isp_sdev.in_frm.width;
+ 	struct v4l2_subdev *sd;
+ 	struct v4l2_ctrl *ctrl;
+ 	u64 data_rate;
+ 	int i;
+ 
+-	if (!dev->hw_dev->is_single)
++	if (rkisp_clk_dbg)
+ 		return 0;
+ 
+-	if (!(dev->isp_inp & (INP_CSI | INP_DVP | INP_LVDS))) {
++	if (dev->isp_inp & (INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2)) {
++		for (i = 0; i < hw_dev->num_clk_rate_tbl; i++) {
++			if (w <= hw_dev->clk_rate_tbl[i].refer_data)
++				break;
++		}
++		if (!hw_dev->is_single)
++			i++;
++		if (i > hw_dev->num_clk_rate_tbl - 1)
++			i = hw_dev->num_clk_rate_tbl - 1;
++		goto end;
++	}
++
++	if (dev->isp_inp == INP_DMARX_ISP) {
+ 		if (dev->hw_dev->clks[0])
+-			clk_set_rate(dev->hw_dev->clks[0], 500 * 1000000UL);
++			clk_set_rate(hw_dev->clks[0], 400 * 1000000UL);
+ 		return 0;
+ 	}
+ 
+@@ -162,13 +180,13 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
+ 	}
+ 
+ 	if (i == p->num_subdevs) {
+-		v4l2_warn(sd, "No active sensor\n");
++		v4l2_warn(&dev->v4l2_dev, "No active sensor\n");
+ 		return -EPIPE;
+ 	}
+ 
+ 	ctrl = v4l2_ctrl_find(sd->ctrl_handler, V4L2_CID_PIXEL_RATE);
+ 	if (!ctrl) {
+-		v4l2_warn(sd, "No pixel rate control in subdev\n");
++		v4l2_warn(&dev->v4l2_dev, "No pixel rate control in subdev\n");
+ 		return -EPIPE;
+ 	}
+ 
+@@ -182,16 +200,15 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
+ 	data_rate += data_rate >> 2;
+ 
+ 	/* compare with isp clock adjustment table */
+-	for (i = 0; i < dev->hw_dev->num_clk_rate_tbl; i++)
+-		if (data_rate <= dev->hw_dev->clk_rate_tbl[i])
++	for (i = 0; i < hw_dev->num_clk_rate_tbl; i++)
++		if (data_rate <= hw_dev->clk_rate_tbl[i].clk_rate)
+ 			break;
+-	if (i == dev->hw_dev->num_clk_rate_tbl)
++	if (i == hw_dev->num_clk_rate_tbl)
+ 		i--;
+-
++end:
+ 	/* set isp clock rate */
+-	clk_set_rate(dev->hw_dev->clks[0], dev->hw_dev->clk_rate_tbl[i] * 1000000UL);
+-	v4l2_dbg(1, rkisp_debug, sd, "set isp clk = %luHz\n",
+-		 clk_get_rate(dev->hw_dev->clks[0]));
++	clk_set_rate(hw_dev->clks[0], hw_dev->clk_rate_tbl[i].clk_rate * 1000000UL);
++	dev_info(hw_dev->dev, "set isp clk = %luHz\n", clk_get_rate(hw_dev->clks[0]));
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/rockchip/isp/hw.c b/drivers/media/platform/rockchip/isp/hw.c
+index 3717c296af0c..9d5d2527752a 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -40,7 +40,7 @@ struct isp_match_data {
+ 	const char * const *clks;
+ 	int num_clks;
+ 	enum rkisp_isp_ver isp_ver;
+-	const unsigned int *clk_rate_tbl;
++	const struct isp_clk_info  *clk_rate_tbl;
+ 	int num_clk_rate_tbl;
+ 	struct isp_irqs_data *irqs;
+ 	int num_irqs;
+@@ -308,32 +308,44 @@ static const char * const rv1126_isp_clks[] = {
+ };
+ 
+ /* isp clock adjustment table (MHz) */
+-static const unsigned int rk1808_isp_clk_rate[] = {
+-	300, 400, 500, 600
++static const struct isp_clk_info rk1808_isp_clk_rate[] = {
++	{300, }, {400, }, {500, }, {600, }
+ };
+ 
+ /* isp clock adjustment table (MHz) */
+-static const unsigned int rk3288_isp_clk_rate[] = {
+-	150, 384, 500, 594
++static const struct isp_clk_info rk3288_isp_clk_rate[] = {
++	{150, }, {384, }, {500, }, {594, }
+ };
+ 
+ /* isp clock adjustment table (MHz) */
+-static const unsigned int rk3326_isp_clk_rate[] = {
+-	300, 347, 400, 520, 600
++static const struct isp_clk_info rk3326_isp_clk_rate[] = {
++	{300, }, {347, }, {400, }, {520, }, {600, }
+ };
+ 
+ /* isp clock adjustment table (MHz) */
+-static const unsigned int rk3368_isp_clk_rate[] = {
+-	300, 400, 600
++static const struct isp_clk_info rk3368_isp_clk_rate[] = {
++	{300, }, {400, }, {600, }
+ };
+ 
+ /* isp clock adjustment table (MHz) */
+-static const unsigned int rk3399_isp_clk_rate[] = {
+-	300, 400, 600
++static const struct isp_clk_info rk3399_isp_clk_rate[] = {
++	{300, }, {400, }, {600, }
+ };
+ 
+-static const unsigned int rv1126_isp_clk_rate[] = {
+-	400, 500
++static const struct isp_clk_info rv1126_isp_clk_rate[] = {
++	{
++		.clk_rate = 300,
++		.refer_data = 1920, //width
++	}, {
++		.clk_rate = 400,
++		.refer_data = 2688,
++	}, {
++		.clk_rate = 500,
++		.refer_data = 3072,
++	}, {
++		.clk_rate = 600,
++		.refer_data = 3840,
++	}
+ };
+ 
+ static struct isp_irqs_data rk1808_isp_irqs[] = {
+@@ -550,9 +562,6 @@ static int enable_sys_clk(struct rkisp_hw_dev *dev)
+ 		}
+ 	}
+ 
+-	if (!dev->is_single)
+-		clk_set_rate(dev->clks[0], 500 * 1000000UL);
+-
+ 	if (!dev->is_thunderboot) {
+ 		rkisp_soft_reset(dev);
+ 		isp_config_clk(dev, true);
+diff --git a/drivers/media/platform/rockchip/isp/hw.h b/drivers/media/platform/rockchip/isp/hw.h
+index 0a0e3fd6b435..6849fc458203 100644
+--- a/drivers/media/platform/rockchip/isp/hw.h
++++ b/drivers/media/platform/rockchip/isp/hw.h
+@@ -8,6 +8,11 @@
+ 
+ #define RKISP_MAX_BUS_CLK 8
+ 
++struct isp_clk_info {
++	u32 clk_rate;
++	u32 refer_data;
++};
++
+ struct rkisp_hw_dev {
+ 	const struct isp_match_data *match_data;
+ 	struct platform_device *pdev;
+@@ -16,7 +21,7 @@ struct rkisp_hw_dev {
+ 	void __iomem *base_addr;
+ 	struct clk *clks[RKISP_MAX_BUS_CLK];
+ 	int num_clks;
+-	const unsigned int *clk_rate_tbl;
++	const struct isp_clk_info *clk_rate_tbl;
+ 	int num_clk_rate_tbl;
+ 	struct reset_control *reset;
+ 	int mipi_irq;
+diff --git a/drivers/media/platform/rockchip/isp/isp_ispp.h b/drivers/media/platform/rockchip/isp/isp_ispp.h
+index ecc1473d9741..9f9473b4c2e5 100644
+--- a/drivers/media/platform/rockchip/isp/isp_ispp.h
++++ b/drivers/media/platform/rockchip/isp/isp_ispp.h
+@@ -12,6 +12,8 @@
+ 
+ #define RKISP_ISPP_CMD_SET_MODE \
+ 	_IOW('V', BASE_VIDIOC_PRIVATE + 0, struct rkisp_ispp_mode)
++#define RKISP_ISPP_CMD_SET_FMT \
++	_IOW('V', BASE_VIDIOC_PRIVATE + 1, struct max_input)
+ 
+ enum rkisp_ispp_dev {
+ 	DEV_ID0 = 0,
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 5fcea1f894f0..d2d331a93093 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -918,7 +918,7 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
+ 		/* normal case */
+ 		/* check the isp_clk before isp reset operation */
+ 		old_rate = clk_get_rate(dev->hw_dev->clks[0]);
+-		safe_rate = dev->hw_dev->clk_rate_tbl[0] * 1000000UL;
++		safe_rate = dev->hw_dev->clk_rate_tbl[0].clk_rate * 1000000UL;
+ 		if (old_rate > safe_rate) {
+ 			clk_set_rate(dev->hw_dev->clks[0], safe_rate);
+ 			udelay(100);
+-- 
+2.35.3
+

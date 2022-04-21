@@ -1,0 +1,1160 @@
+From 758952fbac675d6a6381f1ccc8c2e5214d6c60a8 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Fri, 14 Feb 2020 08:45:54 +0800
+Subject: [PATCH] media: rockchip: ispp: fix some iq params error
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: Ib45a8ee9588406bb049944787d9c64fedc84dd04
+---
+ drivers/media/platform/rockchip/ispp/Makefile |   3 +-
+ drivers/media/platform/rockchip/ispp/dev.c    |  18 +-
+ drivers/media/platform/rockchip/ispp/dev.h    |   2 +
+ drivers/media/platform/rockchip/ispp/ispp.c   |   1 +
+ drivers/media/platform/rockchip/ispp/ispp.h   |   1 +
+ drivers/media/platform/rockchip/ispp/params.c | 149 ++++++--
+ drivers/media/platform/rockchip/ispp/params.h |   1 +
+ drivers/media/platform/rockchip/ispp/regs.h   |  12 +
+ drivers/media/platform/rockchip/ispp/stats.c  | 360 ++++++++++++++++++
+ drivers/media/platform/rockchip/ispp/stats.h  |  54 +++
+ drivers/media/platform/rockchip/ispp/stream.c |  11 +-
+ include/uapi/linux/rkispp-config.h            | 184 +++++----
+ 12 files changed, 695 insertions(+), 101 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/ispp/stats.c
+ create mode 100644 drivers/media/platform/rockchip/ispp/stats.h
+
+diff --git a/drivers/media/platform/rockchip/ispp/Makefile b/drivers/media/platform/rockchip/ispp/Makefile
+index 8b324bb7dd3c..915e3a763d2a 100644
+--- a/drivers/media/platform/rockchip/ispp/Makefile
++++ b/drivers/media/platform/rockchip/ispp/Makefile
+@@ -5,4 +5,5 @@ video_rkispp-objs += dev.o \
+ 		common.o \
+ 		ispp.o \
+ 		stream.o \
+-		params.o
++		params.o \
++		stats.o
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index a612328c85b1..67dc8bc72460 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -142,6 +142,15 @@ static int rkispp_create_links(struct rkispp_device *ispp_dev)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* stats links */
++	flags = MEDIA_LNK_FL_ENABLED;
++	source = &ispp_dev->ispp_sdev.sd.entity;
++	sink = &ispp_dev->stats_vdev.vnode.vdev.entity;
++	ret = media_create_pad_link(source, RKISPP_PAD_SOURCE_STATS,
++				    sink, 0, flags);
++	if (ret < 0)
++		return ret;
++
+ 	/* output stream links */
+ 	stream = &stream_vdev->stream[STREAM_MB];
+ 	stream->linked = flags;
+@@ -197,16 +206,22 @@ static int rkispp_register_platform_subdevs(struct rkispp_device *ispp_dev)
+ 	if (ret < 0)
+ 		goto err_unreg_stream_vdevs;
+ 
+-	ret = rkispp_register_subdev(ispp_dev, &ispp_dev->v4l2_dev);
++	ret = rkispp_register_stats_vdev(ispp_dev);
+ 	if (ret < 0)
+ 		goto err_unreg_params_vdev;
+ 
++	ret = rkispp_register_subdev(ispp_dev, &ispp_dev->v4l2_dev);
++	if (ret < 0)
++		goto err_unreg_stats_vdev;
++
+ 	ret = rkispp_create_links(ispp_dev);
+ 	if (ret < 0)
+ 		goto err_unreg_ispp_subdev;
+ 	return ret;
+ err_unreg_ispp_subdev:
+ 	rkispp_unregister_subdev(ispp_dev);
++err_unreg_stats_vdev:
++	rkispp_unregister_stats_vdev(ispp_dev);
+ err_unreg_params_vdev:
+ 	rkispp_unregister_params_vdev(ispp_dev);
+ err_unreg_stream_vdevs:
+@@ -410,6 +425,7 @@ static int rkispp_plat_remove(struct platform_device *pdev)
+ 	pm_runtime_disable(&pdev->dev);
+ 
+ 	rkispp_unregister_subdev(ispp_dev);
++	rkispp_unregister_stats_vdev(ispp_dev);
+ 	rkispp_unregister_params_vdev(ispp_dev);
+ 	rkispp_unregister_stream_vdevs(ispp_dev);
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/dev.h b/drivers/media/platform/rockchip/ispp/dev.h
+index d082ed42a150..dc69bdbc2415 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.h
++++ b/drivers/media/platform/rockchip/ispp/dev.h
+@@ -7,6 +7,7 @@
+ #include "ispp.h"
+ #include "params.h"
+ #include "stream.h"
++#include "stats.h"
+ 
+ #define DRIVER_NAME			"rkispp"
+ #define II_VDEV_NAME DRIVER_NAME	"_input_image"
+@@ -52,6 +53,7 @@ struct rkispp_device {
+ 	struct rkispp_subdev ispp_sdev;
+ 	struct rkispp_stream_vdev stream_vdev;
+ 	struct rkispp_params_vdev params_vdev;
++	struct rkispp_stats_vdev stats_vdev;
+ 
+ 	enum rkispp_ver	ispp_ver;
+ 	/* mutex to serialize the calls from user */
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index 5aceda9eb380..69dede8adf85 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -286,6 +286,7 @@ int rkispp_register_subdev(struct rkispp_device *dev,
+ 		MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
+ 	ispp_sdev->pads[RKISPP_PAD_SINK_PARAMS].flags = MEDIA_PAD_FL_SINK;
+ 	ispp_sdev->pads[RKISPP_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	ispp_sdev->pads[RKISPP_PAD_SOURCE_STATS].flags = MEDIA_PAD_FL_SOURCE;
+ 
+ 	ret = media_entity_pads_init(&sd->entity, RKISPP_PAD_MAX,
+ 				     ispp_sdev->pads);
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.h b/drivers/media/platform/rockchip/ispp/ispp.h
+index fe6b1129ec7e..0ec459f9ff30 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.h
++++ b/drivers/media/platform/rockchip/ispp/ispp.h
+@@ -12,6 +12,7 @@ enum rkispp_pad {
+ 	RKISPP_PAD_SINK,
+ 	RKISPP_PAD_SINK_PARAMS,
+ 	RKISPP_PAD_SOURCE,
++	RKISPP_PAD_SOURCE_STATS,
+ 	RKISPP_PAD_MAX
+ };
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/params.c b/drivers/media/platform/rockchip/ispp/params.c
+index 8975bd299206..359956ebe9f0 100644
+--- a/drivers/media/platform/rockchip/ispp/params.c
++++ b/drivers/media/platform/rockchip/ispp/params.c
+@@ -24,6 +24,12 @@
+ #define ISPP_PACK_2SHORT(a, b) \
+ 	(((a) & 0xFFFF) << 0 | ((b) & 0xFFFF) << 16)
+ 
++#define ISPP_PARAM_UD_CK \
++	(ISPP_MODULE_TNR | \
++	 ISPP_MODULE_NR | \
++	 ISPP_MODULE_SHP | \
++	 ISPP_MODULE_ORB)
++
+ static void tnr_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_tnr_config *arg)
+ {
+@@ -47,19 +53,18 @@ static void tnr_config(struct rkispp_params_vdev *params_vdev,
+ 
+ 	for (i = 0; i < TNR_SIGMA_CURVE_SIZE - 1; i += 2)
+ 		rkispp_write(base + RKISPP_TNR_CORE_SIG_Y01 + i * 2,
+-			ISPP_PACK_2SHORT(arg->sigma_curve[i].y,
+-				arg->sigma_curve[i + 1].y));
+-	rkispp_write(base + RKISPP_TNR_CORE_SIG_Y10, arg->sigma_curve[16].y);
++			ISPP_PACK_2SHORT(arg->sigma_y[i], arg->sigma_y[i + 1]));
++	rkispp_write(base + RKISPP_TNR_CORE_SIG_Y10, arg->sigma_y[16]);
+ 	rkispp_write(base + RKISPP_TNR_CORE_SIG_X18,
+-		ISPP_PACK_4BIT(arg->sigma_curve[0].x, arg->sigma_curve[1].x,
+-			arg->sigma_curve[2].x, arg->sigma_curve[3].x,
+-			arg->sigma_curve[4].x, arg->sigma_curve[5].x,
+-			arg->sigma_curve[6].x, arg->sigma_curve[7].x));
++		ISPP_PACK_4BIT(arg->sigma_x[0], arg->sigma_x[1],
++			arg->sigma_x[2], arg->sigma_x[3],
++			arg->sigma_x[4], arg->sigma_x[5],
++			arg->sigma_x[6], arg->sigma_x[7]));
+ 	rkispp_write(base + RKISPP_TNR_CORE_SIG_X910,
+-		ISPP_PACK_4BIT(arg->sigma_curve[8].x, arg->sigma_curve[9].x,
+-			arg->sigma_curve[10].x, arg->sigma_curve[11].x,
+-			arg->sigma_curve[12].x, arg->sigma_curve[13].x,
+-			arg->sigma_curve[14].x, arg->sigma_curve[15].x));
++		ISPP_PACK_4BIT(arg->sigma_x[8], arg->sigma_x[9],
++			arg->sigma_x[10], arg->sigma_x[11],
++			arg->sigma_x[12], arg->sigma_x[13],
++			arg->sigma_x[14], arg->sigma_x[15]));
+ 
+ 	for (i = 0; i < TNR_LUMA_CURVE_SIZE; i += 2) {
+ 		val = ISPP_PACK_2SHORT(arg->luma_curve[i], arg->luma_curve[i + 1]);
+@@ -273,8 +278,8 @@ static void nr_config(struct rkispp_params_vdev *params_vdev,
+ 	}
+ 
+ 	for (i = 0; i < NR_YNR_HGRAD_Y_SIZE; i += 4) {
+-		val = ISPP_PACK_4BYTE(arg->ynr_hgrad_y[0], arg->ynr_hgrad_y[1],
+-			arg->ynr_hgrad_y[2], arg->ynr_hgrad_y[3]);
++		val = ISPP_PACK_4BYTE(arg->ynr_hgrad_y[i], arg->ynr_hgrad_y[i + 1],
++			arg->ynr_hgrad_y[i + 2], arg->ynr_hgrad_y[i + 3]);
+ 		rkispp_write(base + RKISPP_NR_YNR_HGRAD_Y0 + i, val);
+ 	}
+ 
+@@ -283,7 +288,7 @@ static void nr_config(struct rkispp_params_vdev *params_vdev,
+ 	val = ISPP_PACK_2SHORT(arg->ynr_hweit[2], arg->ynr_hweit[3]);
+ 	rkispp_write(base + RKISPP_NR_YNR_HWEIT_3_4, val);
+ 
+-	rkispp_write(base + RKISPP_NR_YNR_HADJUST_EXGAIN, arg->ynr_hmax_adjust);
++	rkispp_write(base + RKISPP_NR_YNR_HMAX_ADJUST, arg->ynr_hmax_adjust);
+ 	rkispp_write(base + RKISPP_NR_YNR_HSTRENGTH, arg->ynr_hstrength);
+ 
+ 	val = ISPP_PACK_4BYTE(arg->ynr_lweit_cmp[0], arg->ynr_lweit_cmp[1], 0, 0);
+@@ -314,6 +319,12 @@ static void shp_config(struct rkispp_params_vdev *params_vdev,
+ 	void __iomem *base = params_vdev->dev->base_addr;
+ 	u32 i, val;
+ 
++	rkispp_write(base + RKISPP_SHARP_SC_DOWN,
++		(arg->scl_down_v & 0x1) << 1 | (arg->scl_down_h & 0x1));
++
++	rkispp_write(base + RKISPP_SHARP_TILE_IDX,
++		(arg->tile_ycnt & 0x1F) << 8 | (arg->tile_xcnt & 0xFF));
++
+ 	val = arg->alpha_adp_en << 1 | arg->yin_flt_en << 3 |
+ 		arg->edge_avg_en << 4;
+ 	rkispp_set_bits(base + RKISPP_SHARP_CORE_CTRL,
+@@ -433,10 +444,61 @@ static void shp_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 		       struct rkispp_fec_config *arg)
+ {
++	struct rkispp_device *dev = params_vdev->dev;
++	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
++	void __iomem *base = dev->base_addr;
++	struct rkispp_dummy_buffer *buf;
++	u32 val;
++
++	if (arg->mesh_size > vdev->fec_buf.mesh_xint.size) {
++		v4l2_err(&dev->v4l2_dev,
++			 "Input mesh size too large. mesh size 0x%x, 0x%x\n",
++			 arg->mesh_size, vdev->fec_buf.mesh_xint.size);
++		return;
++	}
++
++	val = 0;
++	if (arg->mesh_density)
++		val = SW_MESH_DDENSITY;
++	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_MESH_DDENSITY, val);
++
++	rkispp_write(base + RKISPP_FEC_MESH_SIZE, arg->mesh_size);
++
++	val = (arg->crop_height & 0x1FFFF) << 14 |
++	      (arg->crop_width & 0x1FFFF) << 1 | (arg->crop_en & 0x01);
++	rkispp_write(base + RKISPP_FEC_CROP, val);
++
++	buf = &vdev->fec_buf.mesh_xint;
++	memcpy(buf->vaddr, &arg->meshxi[0], arg->mesh_size * sizeof(u16));
++	buf = &vdev->fec_buf.mesh_yint;
++	memcpy(buf->vaddr, &arg->meshyi[0], arg->mesh_size * sizeof(u16));
++	buf = &vdev->fec_buf.mesh_xfra;
++	memcpy(buf->vaddr, &arg->meshxf[0], arg->mesh_size * sizeof(u8));
++	buf = &vdev->fec_buf.mesh_yfra;
++	memcpy(buf->vaddr, &arg->meshyf[0], arg->mesh_size * sizeof(u8));
+ }
+ 
+ static void fec_enable(struct rkispp_params_vdev *params_vdev, bool en)
+ {
++	void __iomem *base = params_vdev->dev->base_addr;
++
++	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_FEC_EN, en);
++}
++
++static void orb_config(struct rkispp_params_vdev *params_vdev,
++		       struct rkispp_orb_config *arg)
++{
++	void __iomem *base = params_vdev->dev->base_addr;
++
++	rkispp_write(base + RKISPP_ORB_LIMIT_VALUE, arg->limit_value & 0xFF);
++	rkispp_write(base + RKISPP_ORB_MAX_FEATURE, arg->max_feature & 0x1FFFFF);
++}
++
++static void orb_enable(struct rkispp_params_vdev *params_vdev, bool en)
++{
++	void __iomem *base = params_vdev->dev->base_addr;
++
++	rkispp_set_bits(base + RKISPP_ORB_CORE_CTRL, SW_ORB_EN, en);
+ }
+ 
+ static int rkispp_params_enum_fmt_meta_out(struct file *file, void *priv,
+@@ -659,40 +721,62 @@ void rkispp_params_isr(struct rkispp_params_vdev *params_vdev, u32 mis)
+ 	module_ens = new_params->module_ens;
+ 
+ 	if (module_cfg_update & ISPP_MODULE_TNR &&
+-	    mis & TNR_INT)
++	    mis & TNR_INT) {
+ 		tnr_config(params_vdev,
+ 			   &new_params->tnr_cfg);
++		module_cfg_update &= ~ISPP_MODULE_TNR;
++	}
+ 	if (module_en_update & ISPP_MODULE_TNR &&
+-	    mis & TNR_INT)
++	    mis & TNR_INT) {
+ 		tnr_enable(params_vdev,
+ 			   !!(module_ens & ISPP_MODULE_TNR));
++		module_en_update &= ~ISPP_MODULE_TNR;
++	}
+ 
+ 	if (module_cfg_update & ISPP_MODULE_NR &&
+-	    mis & NR_INT)
++	    mis & NR_INT) {
+ 		nr_config(params_vdev,
+ 			  &new_params->nr_cfg);
++		module_cfg_update &= ~ISPP_MODULE_NR;
++	}
+ 	if (module_en_update & ISPP_MODULE_NR &&
+-	    mis & NR_INT)
++	    mis & NR_INT) {
+ 		nr_enable(params_vdev,
+ 			  !!(module_ens & ISPP_MODULE_NR));
++		module_en_update &= ~ISPP_MODULE_NR;
++	}
+ 
+ 	if (module_cfg_update & ISPP_MODULE_SHP &&
+-	    mis & SHP_INT)
++	    mis & SHP_INT) {
+ 		shp_config(params_vdev,
+ 			   &new_params->shp_cfg);
++		module_cfg_update &= ~ISPP_MODULE_SHP;
++	}
+ 	if (module_en_update & ISPP_MODULE_SHP &&
+-	    mis & SHP_INT)
++	    mis & SHP_INT) {
+ 		shp_enable(params_vdev,
+ 			   !!(module_ens & ISPP_MODULE_SHP));
++		module_en_update &= ~ISPP_MODULE_SHP;
++	}
+ 
+-	if (module_cfg_update & ISPP_MODULE_FEC)
+-		fec_config(params_vdev,
+-			   &new_params->fec_cfg);
+-	if (module_en_update & ISPP_MODULE_FEC)
+-		fec_enable(params_vdev,
+-			   !!(module_ens & ISPP_MODULE_FEC));
+-	//TODO diff mode to release buf
+-	if (mis & SHP_INT) {
++	if (module_cfg_update & ISPP_MODULE_ORB &&
++	    mis & ORB_INT) {
++		orb_config(params_vdev,
++			   &new_params->orb_cfg);
++		module_cfg_update &= ~ISPP_MODULE_ORB;
++	}
++	if (module_en_update & ISPP_MODULE_ORB &&
++	    mis & ORB_INT) {
++		orb_enable(params_vdev,
++			   !!(module_ens & ISPP_MODULE_ORB));
++		module_en_update &= ~ISPP_MODULE_ORB;
++	}
++
++	new_params->module_en_update = module_en_update;
++	new_params->module_cfg_update = module_cfg_update;
++
++	if (!(module_en_update & ISPP_PARAM_UD_CK) &&
++	    !(module_cfg_update & ISPP_PARAM_UD_CK)) {
+ 		vb2_buffer_done(&params_vdev->cur_buf->vb.vb2_buf,
+ 				VB2_BUF_STATE_DONE);
+ 		params_vdev->cur_buf = NULL;
+@@ -733,6 +817,13 @@ void rkispp_params_configure(struct rkispp_params_vdev *params_vdev)
+ 	if (module_en_update & ISPP_MODULE_FEC)
+ 		fec_enable(params_vdev,
+ 			   !!(module_ens & ISPP_MODULE_FEC));
++
++	if (module_cfg_update & ISPP_MODULE_ORB)
++		orb_config(params_vdev,
++			   &params_vdev->cur_params.orb_cfg);
++	if (module_en_update & ISPP_MODULE_ORB)
++		orb_enable(params_vdev,
++			   !!(module_ens & ISPP_MODULE_ORB));
+ }
+ 
+ int rkispp_register_params_vdev(struct rkispp_device *dev)
+@@ -775,10 +866,12 @@ int rkispp_register_params_vdev(struct rkispp_device *dev)
+ 		goto err_cleanup_media_entity;
+ 	}
+ 	return 0;
++
+ err_cleanup_media_entity:
+ 	media_entity_cleanup(&vdev->entity);
+ err_release_queue:
+ 	vb2_queue_release(vdev->queue);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/params.h b/drivers/media/platform/rockchip/ispp/params.h
+index 254339ddcade..33e7cdaa48ac 100644
+--- a/drivers/media/platform/rockchip/ispp/params.h
++++ b/drivers/media/platform/rockchip/ispp/params.h
+@@ -22,6 +22,7 @@ struct rkispp_params_vdev {
+ 	struct list_head params;
+ 	struct rkispp_params_cfg cur_params;
+ 	struct rkispp_buffer *cur_buf;
++
+ 	struct v4l2_format vdev_fmt;
+ 	bool streamon;
+ 	bool first_params;
+diff --git a/drivers/media/platform/rockchip/ispp/regs.h b/drivers/media/platform/rockchip/ispp/regs.h
+index c8bce32d2c7a..d573c79bfacc 100644
+--- a/drivers/media/platform/rockchip/ispp/regs.h
++++ b/drivers/media/platform/rockchip/ispp/regs.h
+@@ -208,6 +208,7 @@
+ #define RKISPP_SHARP_TMP_YUV_BASE	(RKISPP_SHARP + 0x0014)
+ #define RKISPP_SHARP_WR_Y_BASE_SHD	(RKISPP_SHARP + 0x0024)
+ #define RKISPP_SHARP_WR_UV_BASE_SHD	(RKISPP_SHARP + 0x0028)
++#define RKISPP_SHARP_TILE_IDX		(RKISPP_SHARP + 0x0030)
+ #define RKISPP_SHARP_CORE_CTRL		(RKISPP_SHARP + 0x0080)
+ #define RKISPP_SHARP_HBF_FACTOR		(RKISPP_SHARP + 0x0084)
+ #define RKISPP_SHARP_EDGE_TH		(RKISPP_SHARP + 0x0088)
+@@ -280,6 +281,14 @@
+ #define RKISPP_SCL2_CUR_UV_BASE_SHD	(RKISPP_SCL2 + 0x0014)
+ #define RKISPP_SCL2_FACTOR		(RKISPP_SCL2 + 0x0018)
+ 
++#define RKISPP_ORB			0x0B00
++#define RKISPP_ORB_WR_BASE		(RKISPP_ORB + 0x0004)
++#define RKISPP_ORB_WR_BASE_SHD		(RKISPP_ORB + 0x0008)
++#define RKISPP_ORB_TOTAL_NUM		(RKISPP_ORB + 0x000c)
++#define RKISPP_ORB_CORE_CTRL		(RKISPP_ORB + 0x0080)
++#define RKISPP_ORB_LIMIT_VALUE		(RKISPP_ORB + 0x0084)
++#define RKISPP_ORB_MAX_FEATURE		(RKISPP_ORB + 0x0088)
++
+ #define RKISPP_FEC			0x0C00
+ #define RKISPP_FEC_CTRL			(RKISPP_FEC + 0x0000)
+ #define RKISPP_FEC_RD_VIR_STRIDE	(RKISPP_FEC + 0x0004)
+@@ -458,6 +467,9 @@
+ #define SW_FEC2DDR_DIS			BIT(1)
+ #define SW_FEC_EN			BIT(0)
+ 
++/* ORB_CORE_CTRL */
++#define SW_ORB_EN			BIT(0)
++
+ static inline void rkispp_soft_reset(void __iomem *base)
+ {
+ 	writel(GLB_SOFT_RST_ALL, base + RKISPP_CTRL_RESET);
+diff --git a/drivers/media/platform/rockchip/ispp/stats.c b/drivers/media/platform/rockchip/ispp/stats.c
+new file mode 100644
+index 000000000000..571f6fa62849
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/stats.c
+@@ -0,0 +1,360 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd. */
++
++#include <linux/kfifo.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-core.h>
++#include <media/videobuf2-vmalloc.h>	/* for ISP statistics */
++#include <media/videobuf2-dma-contig.h>
++#include "dev.h"
++#include "regs.h"
++#include "stats.h"
++
++#define RKISPP_STATS_REQ_BUFS_MIN 2
++#define RKISPP_STATS_REQ_BUFS_MAX 8
++
++static void update_addr(struct rkispp_stats_vdev *stats_vdev)
++{
++	void __iomem *base = stats_vdev->dev->base_addr;
++	struct rkispp_dummy_buffer *dummy_buf;
++	u32 addr;
++
++	if (stats_vdev->next_buf) {
++		addr = stats_vdev->next_buf->buff_addr[0];
++		writel(addr, base + RKISPP_ORB_WR_BASE);
++	}
++
++	if (!stats_vdev->next_buf) {
++		dummy_buf = &stats_vdev->dummy_buf;
++		if (!dummy_buf->vaddr)
++			return;
++
++		writel(dummy_buf->dma_addr, base + RKISPP_ORB_WR_BASE);
++	}
++}
++
++static int rkispp_stats_frame_end(struct rkispp_stats_vdev *stats_vdev)
++{
++	void __iomem *base = stats_vdev->dev->base_addr;
++	struct rkispp_device *dev = stats_vdev->dev;
++	struct rkispp_buffer *curr_buf;
++	struct rkispp_stats_buffer *cur_stat_buf;
++	unsigned long lock_flags = 0;
++
++	if (stats_vdev->curr_buf) {
++		u64 ns = ktime_get_ns();
++		u32 total_num = readl(base + RKISPP_ORB_TOTAL_NUM);
++		u32 cur_frame_id = atomic_read(&dev->ispp_sdev.frm_sync_seq) - 1;
++		void *vaddr;
++
++		curr_buf = stats_vdev->curr_buf;
++		vaddr = vb2_plane_vaddr(&curr_buf->vb.vb2_buf, 0);
++		cur_stat_buf = (struct rkispp_stats_buffer *)vaddr;
++
++		cur_stat_buf->total_num = total_num;
++		cur_stat_buf->meas_type = ISPP_MODULE_ORB;
++		cur_stat_buf->frame_id = cur_frame_id;
++		curr_buf->vb.vb2_buf.timestamp = ns;
++		curr_buf->vb.sequence = cur_frame_id;
++		vb2_set_plane_payload(&curr_buf->vb.vb2_buf, 0,
++					      sizeof(struct rkispp_stats_buffer));
++
++		vb2_buffer_done(&curr_buf->vb.vb2_buf,
++				VB2_BUF_STATE_DONE);
++		stats_vdev->curr_buf = NULL;
++	}
++
++	stats_vdev->curr_buf = stats_vdev->next_buf;
++	stats_vdev->next_buf = NULL;
++	spin_lock_irqsave(&stats_vdev->irq_lock, lock_flags);
++	if (!list_empty(&stats_vdev->stat)) {
++		stats_vdev->next_buf = list_first_entry(&stats_vdev->stat,
++					struct rkispp_buffer, queue);
++		list_del(&stats_vdev->next_buf->queue);
++	}
++	spin_unlock_irqrestore(&stats_vdev->irq_lock, lock_flags);
++
++	update_addr(stats_vdev);
++	return 0;
++}
++
++static int rkispp_stats_enum_fmt_meta_cap(struct file *file, void *priv,
++					  struct v4l2_fmtdesc *f)
++{
++	struct video_device *video = video_devdata(file);
++	struct rkispp_stats_vdev *stats_vdev = video_get_drvdata(video);
++
++	if (f->index > 0 || f->type != video->queue->type)
++		return -EINVAL;
++
++	f->pixelformat = stats_vdev->vdev_fmt.fmt.meta.dataformat;
++	return 0;
++}
++
++static int rkispp_stats_g_fmt_meta_cap(struct file *file, void *priv,
++				       struct v4l2_format *f)
++{
++	struct video_device *video = video_devdata(file);
++	struct rkispp_stats_vdev *stats_vdev = video_get_drvdata(video);
++	struct v4l2_meta_format *meta = &f->fmt.meta;
++
++	if (f->type != video->queue->type)
++		return -EINVAL;
++
++	memset(meta, 0, sizeof(*meta));
++	meta->dataformat = stats_vdev->vdev_fmt.fmt.meta.dataformat;
++	meta->buffersize = stats_vdev->vdev_fmt.fmt.meta.buffersize;
++
++	return 0;
++}
++
++static int rkispp_stats_querycap(struct file *file,
++				 void *priv, struct v4l2_capability *cap)
++{
++	struct video_device *vdev = video_devdata(file);
++	struct rkispp_stats_vdev *stats_vdev = video_get_drvdata(vdev);
++
++	strcpy(cap->driver, DRIVER_NAME);
++	snprintf(cap->driver, sizeof(cap->driver),
++		 "%s_v%d", DRIVER_NAME,
++		 stats_vdev->dev->ispp_ver >> 4);
++	strlcpy(cap->card, vdev->name, sizeof(cap->card));
++	strlcpy(cap->bus_info, "platform: " DRIVER_NAME, sizeof(cap->bus_info));
++
++	return 0;
++}
++
++/* ISP video device IOCTLs */
++static const struct v4l2_ioctl_ops rkispp_stats_ioctl = {
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++	.vidioc_enum_fmt_meta_cap = rkispp_stats_enum_fmt_meta_cap,
++	.vidioc_g_fmt_meta_cap = rkispp_stats_g_fmt_meta_cap,
++	.vidioc_s_fmt_meta_cap = rkispp_stats_g_fmt_meta_cap,
++	.vidioc_try_fmt_meta_cap = rkispp_stats_g_fmt_meta_cap,
++	.vidioc_querycap = rkispp_stats_querycap
++};
++
++struct v4l2_file_operations rkispp_stats_fops = {
++	.mmap = vb2_fop_mmap,
++	.unlocked_ioctl = video_ioctl2,
++	.poll = vb2_fop_poll,
++	.open = v4l2_fh_open,
++	.release = vb2_fop_release
++};
++
++static int rkispp_stats_vb2_queue_setup(struct vb2_queue *vq,
++					unsigned int *num_buffers,
++					unsigned int *num_planes,
++					unsigned int sizes[],
++					struct device *alloc_ctxs[])
++{
++	struct rkispp_stats_vdev *stats_vdev = vq->drv_priv;
++
++	*num_planes = 1;
++
++	*num_buffers = clamp_t(u32, *num_buffers, RKISPP_STATS_REQ_BUFS_MIN,
++			       RKISPP_STATS_REQ_BUFS_MAX);
++
++	sizes[0] = sizeof(struct rkispp_stats_buffer);
++
++	INIT_LIST_HEAD(&stats_vdev->stat);
++
++	return 0;
++}
++
++static void rkispp_stats_vb2_buf_queue(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct rkispp_buffer *buf = to_rkispp_buffer(vbuf);
++	struct vb2_queue *vq = vb->vb2_queue;
++	struct rkispp_stats_vdev *stats_dev = vq->drv_priv;
++	unsigned long lock_flags = 0;
++
++	buf->buff_addr[0] = vb2_dma_contig_plane_dma_addr(vb, 0);
++	spin_lock_irqsave(&stats_dev->irq_lock, lock_flags);
++	if (stats_dev->streamon &&
++	    !stats_dev->next_buf) {
++		stats_dev->next_buf = buf;
++		update_addr(stats_dev);
++	} else {
++		list_add_tail(&buf->queue, &stats_dev->stat);
++	}
++	spin_unlock_irqrestore(&stats_dev->irq_lock, lock_flags);
++}
++
++static void destroy_buf_queue(struct rkispp_stats_vdev *stats_vdev,
++			      enum vb2_buffer_state state)
++{
++	struct rkispp_buffer *buf;
++
++	if (stats_vdev->curr_buf) {
++		list_add_tail(&stats_vdev->curr_buf->queue, &stats_vdev->stat);
++		stats_vdev->curr_buf = NULL;
++	}
++	if (stats_vdev->next_buf) {
++		list_add_tail(&stats_vdev->next_buf->queue, &stats_vdev->stat);
++		stats_vdev->next_buf = NULL;
++	}
++	while (!list_empty(&stats_vdev->stat)) {
++		buf = list_first_entry(&stats_vdev->stat,
++			struct rkispp_buffer, queue);
++		list_del(&buf->queue);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++}
++
++static void rkispp_stats_vb2_stop_streaming(struct vb2_queue *vq)
++{
++	struct rkispp_stats_vdev *stats_vdev = vq->drv_priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&stats_vdev->irq_lock, flags);
++	stats_vdev->streamon = false;
++	destroy_buf_queue(stats_vdev, VB2_BUF_STATE_ERROR);
++	spin_unlock_irqrestore(&stats_vdev->irq_lock, flags);
++	rkispp_free_buffer(stats_vdev->dev, &stats_vdev->dummy_buf);
++}
++
++static int
++rkispp_stats_vb2_start_streaming(struct vb2_queue *queue,
++				 unsigned int count)
++{
++	struct rkispp_stats_vdev *stats_vdev = queue->drv_priv;
++	unsigned long flags;
++	int ret;
++
++	if (stats_vdev->streamon)
++		return -EBUSY;
++
++	stats_vdev->dummy_buf.size = sizeof(struct rkispp_stats_buffer);
++	ret = rkispp_allow_buffer(stats_vdev->dev, &stats_vdev->dummy_buf);
++	if (ret < 0)
++		goto free_dummy_buf;
++
++	/* config first buf */
++	rkispp_stats_frame_end(stats_vdev);
++
++	spin_lock_irqsave(&stats_vdev->irq_lock, flags);
++	stats_vdev->streamon = true;
++	spin_unlock_irqrestore(&stats_vdev->irq_lock, flags);
++
++	return 0;
++
++free_dummy_buf:
++	rkispp_free_buffer(stats_vdev->dev, &stats_vdev->dummy_buf);
++	return ret;
++}
++
++static struct vb2_ops rkispp_stats_vb2_ops = {
++	.queue_setup = rkispp_stats_vb2_queue_setup,
++	.buf_queue = rkispp_stats_vb2_buf_queue,
++	.wait_prepare = vb2_ops_wait_prepare,
++	.wait_finish = vb2_ops_wait_finish,
++	.stop_streaming = rkispp_stats_vb2_stop_streaming,
++	.start_streaming = rkispp_stats_vb2_start_streaming,
++};
++
++static int rkispp_stats_init_vb2_queue(struct vb2_queue *q,
++				       struct rkispp_stats_vdev *stats_vdev)
++{
++	q->type = V4L2_BUF_TYPE_META_CAPTURE;
++	q->io_modes = VB2_MMAP | VB2_USERPTR;
++	q->drv_priv = stats_vdev;
++	q->ops = &rkispp_stats_vb2_ops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->buf_struct_size = sizeof(struct rkispp_buffer);
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	q->lock = &stats_vdev->dev->apilock;
++	q->dev = stats_vdev->dev->dev;
++
++	return vb2_queue_init(q);
++}
++
++void rkispp_stats_isr(struct rkispp_stats_vdev *stats_vdev, u32 mis)
++{
++	spin_lock(&stats_vdev->irq_lock);
++	if (!stats_vdev->streamon) {
++		spin_unlock(&stats_vdev->irq_lock);
++		return;
++	}
++	spin_unlock(&stats_vdev->irq_lock);
++
++	if (mis & ORB_INT)
++		rkispp_stats_frame_end(stats_vdev);
++}
++
++static void rkispp_init_stats_vdev(struct rkispp_stats_vdev *stats_vdev)
++{
++	stats_vdev->vdev_fmt.fmt.meta.dataformat =
++		V4L2_META_FMT_RK_ISP1_STAT_3A;
++	stats_vdev->vdev_fmt.fmt.meta.buffersize =
++		sizeof(struct rkispp_stats_buffer);
++}
++
++int rkispp_register_stats_vdev(struct rkispp_device *dev)
++{
++	struct rkispp_stats_vdev *stats_vdev = &dev->stats_vdev;
++	struct rkispp_vdev_node *node = &stats_vdev->vnode;
++	struct video_device *vdev = &node->vdev;
++	int ret;
++
++	stats_vdev->dev = dev;
++	INIT_LIST_HEAD(&stats_vdev->stat);
++	spin_lock_init(&stats_vdev->irq_lock);
++
++	strlcpy(vdev->name, "rkispp-stats", sizeof(vdev->name));
++
++	video_set_drvdata(vdev, stats_vdev);
++	vdev->ioctl_ops = &rkispp_stats_ioctl;
++	vdev->fops = &rkispp_stats_fops;
++	vdev->release = video_device_release_empty;
++	vdev->lock = &dev->apilock;
++	vdev->v4l2_dev = &dev->v4l2_dev;
++	vdev->queue = &node->buf_queue;
++	vdev->device_caps = V4L2_CAP_META_CAPTURE | V4L2_CAP_STREAMING;
++	vdev->vfl_dir =  VFL_DIR_RX;
++	rkispp_stats_init_vb2_queue(vdev->queue, stats_vdev);
++	rkispp_init_stats_vdev(stats_vdev);
++	video_set_drvdata(vdev, stats_vdev);
++
++	node->pad.flags = MEDIA_PAD_FL_SINK;
++	ret = media_entity_pads_init(&vdev->entity, 1, &node->pad);
++	if (ret < 0)
++		goto err_release_queue;
++
++	ret = video_register_device(vdev, VFL_TYPE_GRABBER, -1);
++	if (ret < 0) {
++		dev_err(&vdev->dev,
++			"could not register Video for Linux device\n");
++		goto err_cleanup_media_entity;
++	}
++
++	return 0;
++
++err_cleanup_media_entity:
++	media_entity_cleanup(&vdev->entity);
++err_release_queue:
++	vb2_queue_release(vdev->queue);
++	return ret;
++}
++
++void rkispp_unregister_stats_vdev(struct rkispp_device *dev)
++{
++	struct rkispp_stats_vdev *stats_vdev = &dev->stats_vdev;
++	struct rkispp_vdev_node *node = &stats_vdev->vnode;
++	struct video_device *vdev = &node->vdev;
++
++	video_unregister_device(vdev);
++	media_entity_cleanup(&vdev->entity);
++	vb2_queue_release(vdev->queue);
++}
++
+diff --git a/drivers/media/platform/rockchip/ispp/stats.h b/drivers/media/platform/rockchip/ispp/stats.h
+new file mode 100644
+index 000000000000..c2163a95883f
+--- /dev/null
++++ b/drivers/media/platform/rockchip/ispp/stats.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd. */
++
++#ifndef _RKISPP_STATS_H
++#define _RKISPP_STATS_H
++
++#include <linux/rkispp-config.h>
++#include <linux/interrupt.h>
++#include <linux/kfifo.h>
++#include "common.h"
++
++#define RKISPP_STATS_READOUT_WORK_SIZE	\
++	(9 * sizeof(struct rkispp_stats_readout_work))
++
++struct rkispp_stats_vdev;
++
++enum rkispp_stats_readout_cmd {
++	RKISPP_READOUT_STATS,
++};
++
++struct rkispp_stats_readout_work {
++	enum rkispp_stats_readout_cmd readout;
++	unsigned long long timestamp;
++	unsigned int meas_type;
++	unsigned int frame_id;
++};
++
++/*
++ * struct rkispp_stats_vdev - ISPP Statistics device
++ *
++ * @irq_lock: buffer queue lock
++ * @stat: stats buffer list
++ * @readout_wq: workqueue for statistics information read
++ */
++struct rkispp_stats_vdev {
++	struct rkispp_vdev_node vnode;
++	struct rkispp_device *dev;
++
++	spinlock_t irq_lock;
++	struct list_head stat;
++	struct rkispp_buffer *curr_buf;
++	struct rkispp_buffer *next_buf;
++	struct rkispp_dummy_buffer dummy_buf;
++	struct v4l2_format vdev_fmt;
++	bool streamon;
++};
++
++void rkispp_stats_isr(struct rkispp_stats_vdev *stats_vdev, u32 mis);
++
++int rkispp_register_stats_vdev(struct rkispp_device *dev);
++
++void rkispp_unregister_stats_vdev(struct rkispp_device *dev);
++
++#endif /* _RKISPP_STATS_H */
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 8fc7e6a837fd..e5df5e3deaac 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -656,7 +656,13 @@ static int config_modules(struct rkispp_device *dev)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	return config_fec(dev);
++	ret = config_fec(dev);
++	if (ret < 0)
++		return ret;
++
++	rkispp_params_configure(&dev->params_vdev);
++
++	return ret;
+ }
+ 
+ static int start_ii(struct rkispp_stream *stream)
+@@ -1393,6 +1399,9 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 	if (mis_val & (CMD_TNR_ST_DONE | CMD_NR_SHP_ST_DONE))
+ 		atomic_inc(&dev->ispp_sdev.frm_sync_seq);
+ 
++	rkispp_params_isr(&dev->params_vdev, mis_val);
++	rkispp_stats_isr(&dev->stats_vdev, mis_val);
++
+ 	if (mis_val & TNR_INT) {
+ 		if (readl(base + RKISPP_TNR_CTRL) & SW_TNR_1ST_FRM)
+ 			rkispp_clear_bits(base + RKISPP_TNR_CTRL,
+diff --git a/include/uapi/linux/rkispp-config.h b/include/uapi/linux/rkispp-config.h
+index 7f03acd424ef..968ace1ce71d 100644
+--- a/include/uapi/linux/rkispp-config.h
++++ b/include/uapi/linux/rkispp-config.h
+@@ -9,64 +9,66 @@
+ #include <linux/types.h>
+ #include <linux/v4l2-controls.h>
+ 
+-#define ISPP_MODULE_TNR	BIT(0)
+-#define ISPP_MODULE_NR	BIT(1)
+-#define ISPP_MODULE_SHP	BIT(2)
+-#define ISPP_MODULE_FEC	BIT(3)
+-
+-#define TNR_SIGMA_CURVE_SIZE 17
+-#define TNR_LUMA_CURVE_SIZE 6
+-#define TNR_GFCOEF5_SIZE 6
+-#define TNR_GFCOEF3_SIZE 3
+-#define TNR_SCALE_YG_SIZE 4
+-#define TNR_SCALE_YL_SIZE 3
+-#define TNR_SCALE_CG_SIZE 3
+-#define TNR_SCALE_Y2CG_SIZE 3
+-#define TNR_SCALE_CL_SIZE 2
+-#define TNR_SCALE_Y2CL_SIZE 3
+-#define TNR_WEIGHT_Y_SIZE 3
+-
+-#define NR_UVNR_UVGAIN_SIZE 2
+-#define NR_UVNR_T1FLT_WTQ_SIZE 8
+-#define NR_UVNR_T2GEN_WTQ_SIZE 4
+-#define NR_UVNR_T2FLT_WT_SIZE 3
+-#define NR_YNR_SGM_DX_SIZE 16
+-#define NR_YNR_SGM_Y_SIZE 17
+-#define NR_YNR_HWEIT_D_SIZE 20
+-#define NR_YNR_HGRAD_Y_SIZE 24
+-#define NR_YNR_HSTV_Y_SIZE 17
+-#define NR_YNR_CI_SIZE 4
+-#define NR_YNR_LGAIN_MIN_SIZE 4
+-#define NR_YNR_LWEIT_FLT_SIZE 4
+-#define NR_YNR_HGAIN_SGM_SIZE 4
+-#define NR_YNR_HWEIT_SIZE 4
+-#define NR_YNR_LWEIT_CMP_SIZE 2
+-#define NR_YNR_ST_SCALE_SIZE 3
+-
+-#define SHP_PBF_KERNEL_SIZE 3
+-#define SHP_MRF_KERNEL_SIZE 6
+-#define SHP_MBF_KERNEL_SIZE 12
+-#define SHP_HRF_KERNEL_SIZE 6
+-#define SHP_HBF_KERNEL_SIZE 3
+-#define SHP_EDGE_COEF_SIZE 3
+-#define SHP_EDGE_SMOTH_SIZE 3
+-#define SHP_EDGE_GAUS_SIZE 6
+-#define SHP_DOG_KERNEL_SIZE 6
+-#define SHP_LUM_POINT_SIZE 6
+-#define SHP_SIGMA_SIZE 8
+-#define SHP_LUM_CLP_SIZE 8
+-#define SHP_LUM_MIN_SIZE 8
+-#define SHP_EDGE_LUM_THED_SIZE 8
+-#define SHP_CLAMP_SIZE 8
+-#define SHP_DETAIL_ALPHA_SIZE 8
+-
+-struct tnr_sigma_curve {
+-	u8 x;
+-	u16 y;
+-} __attribute__ ((packed));
++#define ISPP_MODULE_TNR			BIT(0)
++#define ISPP_MODULE_NR			BIT(1)
++#define ISPP_MODULE_SHP			BIT(2)
++#define ISPP_MODULE_FEC			BIT(3)
++#define ISPP_MODULE_ORB			BIT(4)
++
++#define TNR_SIGMA_CURVE_SIZE		17
++#define TNR_LUMA_CURVE_SIZE		6
++#define TNR_GFCOEF6_SIZE		6
++#define TNR_GFCOEF3_SIZE		3
++#define TNR_SCALE_YG_SIZE		4
++#define TNR_SCALE_YL_SIZE		3
++#define TNR_SCALE_CG_SIZE		3
++#define TNR_SCALE_Y2CG_SIZE		3
++#define TNR_SCALE_CL_SIZE		2
++#define TNR_SCALE_Y2CL_SIZE		3
++#define TNR_WEIGHT_Y_SIZE		3
++
++#define NR_UVNR_UVGAIN_SIZE		2
++#define NR_UVNR_T1FLT_WTQ_SIZE		8
++#define NR_UVNR_T2GEN_WTQ_SIZE		4
++#define NR_UVNR_T2FLT_WT_SIZE		3
++#define NR_YNR_SGM_DX_SIZE		16
++#define NR_YNR_SGM_Y_SIZE		17
++#define NR_YNR_HWEIT_D_SIZE		20
++#define NR_YNR_HGRAD_Y_SIZE		24
++#define NR_YNR_HSTV_Y_SIZE		17
++#define NR_YNR_CI_SIZE			4
++#define NR_YNR_LGAIN_MIN_SIZE		4
++#define NR_YNR_LWEIT_FLT_SIZE		4
++#define NR_YNR_HGAIN_SGM_SIZE		4
++#define NR_YNR_HWEIT_SIZE		4
++#define NR_YNR_LWEIT_CMP_SIZE		2
++#define NR_YNR_ST_SCALE_SIZE		3
++
++#define SHP_PBF_KERNEL_SIZE		3
++#define SHP_MRF_KERNEL_SIZE		6
++#define SHP_MBF_KERNEL_SIZE		12
++#define SHP_HRF_KERNEL_SIZE		6
++#define SHP_HBF_KERNEL_SIZE		3
++#define SHP_EDGE_COEF_SIZE		3
++#define SHP_EDGE_SMOTH_SIZE		3
++#define SHP_EDGE_GAUS_SIZE		6
++#define SHP_DOG_KERNEL_SIZE		6
++#define SHP_LUM_POINT_SIZE		6
++#define SHP_SIGMA_SIZE			8
++#define SHP_LUM_CLP_SIZE		8
++#define SHP_LUM_MIN_SIZE		8
++#define SHP_EDGE_LUM_THED_SIZE		8
++#define SHP_CLAMP_SIZE			8
++#define SHP_DETAIL_ALPHA_SIZE		8
++
++#define ORB_DATA_NUM			10000
++#define ORB_BRIEF_NUM			15
++#define ORB_DUMMY_NUM			13
++
++#define FEC_MESH_XY_POINT_SIZE		6
++#define FEC_MESH_XY_NUM			5120
+ 
+ struct rkispp_tnr_config {
+-	u8 en;
+ 	u8 opty_en;
+ 	u8 optc_en;
+ 	u8 gain_en;
+@@ -81,7 +83,8 @@ struct rkispp_tnr_config {
+ 	u16 glb_gain_cur_div;
+ 	u8 glb_gain_cur_sqrt;
+ 
+-	struct tnr_sigma_curve sigma_curve[TNR_SIGMA_CURVE_SIZE];
++	u8 sigma_x[TNR_SIGMA_CURVE_SIZE - 1];
++	u16 sigma_y[TNR_SIGMA_CURVE_SIZE];
+ 
+ 	u16 luma_curve[TNR_LUMA_CURVE_SIZE];
+ 
+@@ -92,25 +95,25 @@ struct rkispp_tnr_config {
+ 	u16 txt_thy_dlt;
+ 	u16 txt_thc_dlt;
+ 
+-	u8 gfcoef_y0[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_y0[TNR_GFCOEF6_SIZE];
+ 	u8 gfcoef_y1[TNR_GFCOEF3_SIZE];
+-	u8 gfcoef_y2[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_y2[TNR_GFCOEF3_SIZE];
+ 	u8 gfcoef_y3[TNR_GFCOEF3_SIZE];
+ 
+-	u8 gfcoef_yg0[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_yg0[TNR_GFCOEF6_SIZE];
+ 	u8 gfcoef_yg1[TNR_GFCOEF3_SIZE];
+ 	u8 gfcoef_yg2[TNR_GFCOEF3_SIZE];
+ 	u8 gfcoef_yg3[TNR_GFCOEF3_SIZE];
+ 
+-	u8 gfcoef_yl0[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_yl0[TNR_GFCOEF6_SIZE];
+ 	u8 gfcoef_yl1[TNR_GFCOEF3_SIZE];
+ 	u8 gfcoef_yl2[TNR_GFCOEF3_SIZE];
+ 
+-	u8 gfcoef_cg0[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_cg0[TNR_GFCOEF6_SIZE];
+ 	u8 gfcoef_cg1[TNR_GFCOEF3_SIZE];
+ 	u8 gfcoef_cg2[TNR_GFCOEF3_SIZE];
+ 
+-	u8 gfcoef_cl0[TNR_GFCOEF5_SIZE];
++	u8 gfcoef_cl0[TNR_GFCOEF6_SIZE];
+ 	u8 gfcoef_cl1[TNR_GFCOEF3_SIZE];
+ 
+ 	u16 scale_yg[TNR_SCALE_YG_SIZE];
+@@ -124,7 +127,6 @@ struct rkispp_tnr_config {
+ } __attribute__ ((packed));
+ 
+ struct rkispp_nr_config {
+-	u8 nr_en;
+ 	u8 uvnr_step1_en;
+ 	u8 uvnr_step2_en;
+ 	u8 nr_gain_en;
+@@ -177,7 +179,12 @@ struct rkispp_nr_config {
+ } __attribute__ ((packed));
+ 
+ struct rkispp_sharp_config {
+-	u8 en;
++	u8 scl_down_v;
++	u8 scl_down_h;
++
++	u8 tile_ycnt;
++	u8 tile_xcnt;
++
+ 	u8 alpha_adp_en;
+ 	u8 yin_flt_en;
+ 	u8 edge_avg_en;
+@@ -188,7 +195,7 @@ struct rkispp_sharp_config {
+ 
+ 	u8 edge_thed;
+ 	u8 dir_min;
+-	u8 smoth_th4;
++	u16 smoth_th4;
+ 
+ 	u16 l_alpha;
+ 	u16 g_alpha;
+@@ -199,10 +206,10 @@ struct rkispp_sharp_config {
+ 	u8 hrf_k[SHP_HRF_KERNEL_SIZE];
+ 	u8 hbf_k[SHP_HBF_KERNEL_SIZE];
+ 
+-	u8 eg_coef[SHP_EDGE_COEF_SIZE];
++	s8 eg_coef[SHP_EDGE_COEF_SIZE];
+ 	u8 eg_smoth[SHP_EDGE_SMOTH_SIZE];
+ 	u8 eg_gaus[SHP_EDGE_GAUS_SIZE];
+-	u8 dog_k[SHP_DOG_KERNEL_SIZE];
++	s8 dog_k[SHP_DOG_KERNEL_SIZE];
+ 	u8 lum_point[SHP_LUM_POINT_SIZE];
+ 
+ 	u8 pbf_shf_bits;
+@@ -211,7 +218,7 @@ struct rkispp_sharp_config {
+ 
+ 	u8 pbf_sigma[SHP_SIGMA_SIZE];
+ 	u8 lum_clp_m[SHP_LUM_CLP_SIZE];
+-	u8 lum_min_m[SHP_LUM_MIN_SIZE];
++	s8 lum_min_m[SHP_LUM_MIN_SIZE];
+ 	u8 mbf_sigma[SHP_SIGMA_SIZE];
+ 	u8 lum_clp_h[SHP_LUM_CLP_SIZE];
+ 	u8 hbf_sigma[SHP_SIGMA_SIZE];
+@@ -228,8 +235,21 @@ struct rkispp_sharp_config {
+ } __attribute__ ((packed));
+ 
+ struct rkispp_fec_config {
+-	u8 en;
+ 	u8 mesh_density;
++	u32 mesh_size;
++	u8 crop_en;
++	u16 crop_width;
++	u16 crop_height;
++
++	u16 meshxi[FEC_MESH_XY_NUM];
++	u8 meshxf[FEC_MESH_XY_NUM];
++	u16 meshyi[FEC_MESH_XY_NUM];
++	u8 meshyf[FEC_MESH_XY_NUM];
++} __attribute__ ((packed));
++
++struct rkispp_orb_config {
++	u8 limit_value;
++	u32 max_feature;
+ } __attribute__ ((packed));
+ 
+ /**
+@@ -249,6 +269,30 @@ struct rkispp_params_cfg {
+ 	struct rkispp_nr_config nr_cfg;
+ 	struct rkispp_sharp_config shp_cfg;
+ 	struct rkispp_fec_config fec_cfg;
++	struct rkispp_orb_config orb_cfg;
++} __attribute__ ((packed));
++
++struct rkispp_orb_data {
++	u8 brief[ORB_BRIEF_NUM];
++	u32 y : 13;
++	u32 x : 13;
++	u32 dmy1 : 6;
++	u8 dmy2[ORB_DUMMY_NUM];
++} __attribute__ ((packed));
++
++/**
++ * struct rkispp_stats_buffer - Rockchip ISPP Statistics
++ *
++ * @meas_type: measurement types
++ * @frame_id: frame ID for sync
++ * @data: statistics data
++ */
++struct rkispp_stats_buffer {
++	struct rkispp_orb_data data[ORB_DATA_NUM];
++	unsigned int total_num;
++
++	unsigned int meas_type;
++	unsigned int frame_id;
+ } __attribute__ ((packed));
+ 
+ #endif
+-- 
+2.35.3
+

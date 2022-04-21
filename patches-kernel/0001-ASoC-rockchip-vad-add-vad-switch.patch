@@ -1,0 +1,211 @@
+From 108ca254dcbeb32b5589bfc38078de6b58679e18 Mon Sep 17 00:00:00 2001
+From: Sugar Zhang <sugar.zhang@rock-chips.com>
+Date: Tue, 28 Aug 2018 10:33:44 +0800
+Subject: [PATCH] ASoC: rockchip: vad: add vad switch
+
+This patch add the vad switch control for on/off vad function.
+
+/ # amixer contents
+numid=47,iface=MIXER,name='vad switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+
+/ # amixer cset numid=47 1
+numid=47,iface=MIXER,name='vad switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=on
+/ #
+/ # amixer cset numid=47 0
+numid=47,iface=MIXER,name='vad switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+
+Change-Id: Id50c021cc581a8371c680b9d180e56ac6a12cf4e
+Signed-off-by: Sugar Zhang <sugar.zhang@rock-chips.com>
+---
+ sound/soc/rockchip/rockchip_vad.c | 115 +++++++++++++++++++++++++++---
+ 1 file changed, 104 insertions(+), 11 deletions(-)
+
+diff --git a/sound/soc/rockchip/rockchip_vad.c b/sound/soc/rockchip/rockchip_vad.c
+index a1e34a195296..1c95688b923b 100644
+--- a/sound/soc/rockchip/rockchip_vad.c
++++ b/sound/soc/rockchip/rockchip_vad.c
+@@ -57,6 +57,8 @@ struct rockchip_vad {
+ 	struct vad_buf vbuf;
+ 	struct vad_params params;
+ 	struct vad_uparams uparams;
++	struct snd_soc_dai *cpu_dai;
++	struct snd_pcm_substream *substream;
+ 	int mode;
+ 	u32 audio_src;
+ 	u32 audio_src_addr;
+@@ -66,6 +68,7 @@ struct rockchip_vad {
+ 	struct dentry *debugfs_dir;
+ 	void *buf;
+ 	bool acodec_cfg;
++	bool vswitch;
+ };
+ 
+ struct audio_src_addr_map {
+@@ -315,7 +318,10 @@ bool snd_pcm_vad_attached(struct snd_pcm_substream *substream)
+ 	if (vad_substream == substream)
+ 		vad = substream_get_drvdata(substream);
+ 
+-	return vad ? true : false;
++	if (vad && vad->vswitch)
++		return true;
++	else
++		return false;
+ }
+ EXPORT_SYMBOL(snd_pcm_vad_attached);
+ 
+@@ -535,6 +541,8 @@ static void rockchip_vad_params_fixup(struct snd_pcm_substream *substream,
+ 	int i;
+ 
+ 	cpu_dai = rtd->cpu_dai;
++	vad->cpu_dai = cpu_dai;
++	vad->substream = substream;
+ 	np = cpu_dai->dev->of_node;
+ 	if (of_device_is_compatible(np, "rockchip,multi-dais")) {
+ 		audio_src_dai = rockchip_vad_find_dai(vad->audio_node);
+@@ -627,18 +635,17 @@ static int rockchip_vad_hw_params(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
+-static int rockchip_vad_enable_cpudai(struct snd_pcm_substream *substream)
++static int rockchip_vad_enable_cpudai(struct rockchip_vad *vad)
+ {
+-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	struct snd_soc_dai *cpu_dai;
++	struct snd_pcm_substream *substream;
+ 	int ret = 0;
+ 
+-	if (PCM_RUNTIME_CHECK(substream))
+-		return -EFAULT;
+-	if (!rtd)
+-		return -EFAULT;
++	cpu_dai = vad->cpu_dai;
++	substream = vad->substream;
+ 
+-	cpu_dai = rtd->cpu_dai;
++	if (!cpu_dai || !substream)
++		return 0;
+ 
+ 	pm_runtime_get_sync(cpu_dai->dev);
+ 
+@@ -650,6 +657,29 @@ static int rockchip_vad_enable_cpudai(struct snd_pcm_substream *substream)
+ 	return ret;
+ }
+ 
++static int rockchip_vad_disable_cpudai(struct rockchip_vad *vad)
++{
++	struct snd_soc_dai *cpu_dai;
++	struct snd_pcm_substream *substream;
++	int ret = 0;
++
++	cpu_dai = vad->cpu_dai;
++	substream = vad->substream;
++
++	if (!cpu_dai || !substream)
++		return 0;
++
++	pm_runtime_get_sync(cpu_dai->dev);
++
++	if (cpu_dai->driver->ops && cpu_dai->driver->ops->trigger)
++		ret = cpu_dai->driver->ops->trigger(substream,
++						    SNDRV_PCM_TRIGGER_STOP,
++						    cpu_dai);
++
++	pm_runtime_put(cpu_dai->dev);
++	return ret;
++}
++
+ static int rockchip_vad_pcm_startup(struct snd_pcm_substream *substream,
+ 				    struct snd_soc_dai *dai)
+ {
+@@ -670,8 +700,10 @@ static void rockchip_vad_pcm_shutdown(struct snd_pcm_substream *substream,
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+ 		return;
+ 
+-	rockchip_vad_enable_cpudai(substream);
+-	rockchip_vad_setup(vad);
++	if (vad->vswitch) {
++		rockchip_vad_enable_cpudai(vad);
++		rockchip_vad_setup(vad);
++	}
+ 
+ 	vad_substream = NULL;
+ }
+@@ -727,7 +759,68 @@ static struct snd_soc_dai_driver vad_dai = {
+ 	.ops = &rockchip_vad_dai_ops,
+ };
+ 
+-static struct snd_soc_codec_driver soc_vad_codec;
++static int rockchip_vad_switch_info(struct snd_kcontrol *kcontrol,
++				    struct snd_ctl_elem_info *uinfo)
++{
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
++	uinfo->count = 1;
++	uinfo->value.integer.min = 0;
++	uinfo->value.integer.max = 1;
++
++	return 0;
++}
++
++static int rockchip_vad_switch_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct rockchip_vad *vad = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = vad->vswitch;
++
++	return 0;
++}
++
++static int rockchip_vad_switch_put(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct rockchip_vad *vad = snd_soc_component_get_drvdata(component);
++	int val;
++
++	val = ucontrol->value.integer.value[0];
++	if (val && !vad->vswitch) {
++		vad->vswitch = true;
++	} else if (!val && vad->vswitch) {
++		vad->vswitch = false;
++
++		regmap_read(vad->regmap, VAD_CTRL, &val);
++		if ((val & VAD_EN_MASK) == VAD_DISABLE)
++			return 0;
++		rockchip_vad_stop(vad);
++		rockchip_vad_disable_cpudai(vad);
++		/* this case we don't need vad data */
++		vad->vbuf.size = 0;
++	}
++
++	return 0;
++}
++
++#define SOC_ROCKCHIP_VAD_SWITCH_DECL(xname) \
++{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, \
++	.info = rockchip_vad_switch_info, .get = rockchip_vad_switch_get, \
++	.put = rockchip_vad_switch_put, }
++
++static const struct snd_kcontrol_new rockchip_vad_dapm_controls[] = {
++	SOC_ROCKCHIP_VAD_SWITCH_DECL("vad switch"),
++};
++
++static struct snd_soc_codec_driver soc_vad_codec = {
++	.component_driver = {
++		.controls = rockchip_vad_dapm_controls,
++		.num_controls = ARRAY_SIZE(rockchip_vad_dapm_controls),
++	},
++};
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ #include <linux/fs.h>
+-- 
+2.35.3
+

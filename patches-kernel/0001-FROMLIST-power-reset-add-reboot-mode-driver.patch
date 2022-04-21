@@ -1,0 +1,266 @@
+From c9d9b8082821668dfacb4c7a3fe9f8569acb29e1 Mon Sep 17 00:00:00 2001
+From: Andy Yan <andy.yan@rock-chips.com>
+Date: Tue, 1 Mar 2016 20:12:18 +0800
+Subject: [PATCH] FROMLIST: power: reset: add reboot mode driver
+
+This driver parse the reboot commands like "reboot loader"
+and "reboot recovery" to get a boot mode described in the
+device tree , then call the write interfae to store the boot
+mode in some place like special register or sram , which can
+be read by the bootloader after system reboot, then the bootloader
+can take different action according to the mode stored.
+
+This is commonly used on Android based devices, in order to
+reboot the device into fastboot or recovery mode.
+
+Change-Id: Ifce5a22493a52f3e15332bbf3c94ce7217d7d17c
+Reviewed-by: Matthias Brugger <matthias.bgg@gmail.com>
+Reviewed-by: Moritz Fischer <moritz.fischer@ettus.com>
+Signed-off-by: Andy Yan <andy.yan@rock-chips.com>
+Tested-by: John Stultz <john.stultz@linaro.org>
+Acked-by: John Stultz <john.stultz@linaro.org>
+---
+ drivers/power/reset/Kconfig              |  16 ++++
+ drivers/power/reset/Makefile             |   2 +
+ drivers/power/reset/reboot-mode.c        | 106 +++++++++++++++++++++++
+ drivers/power/reset/reboot-mode.h        |   6 ++
+ drivers/power/reset/syscon-reboot-mode.c |  65 ++++++++++++++
+ 5 files changed, 195 insertions(+)
+ create mode 100644 drivers/power/reset/reboot-mode.c
+ create mode 100644 drivers/power/reset/reboot-mode.h
+ create mode 100644 drivers/power/reset/syscon-reboot-mode.c
+
+diff --git a/drivers/power/reset/Kconfig b/drivers/power/reset/Kconfig
+index 1131cf75acc6..61a8cd4b37f3 100644
+--- a/drivers/power/reset/Kconfig
++++ b/drivers/power/reset/Kconfig
+@@ -173,5 +173,21 @@ config POWER_RESET_ZX
+ 	help
+ 	  Reboot support for ZTE SoCs.
+ 
++config REBOOT_MODE
++	tristate
++	help
++	  This driver will help to pass the system reboot mode
++	  to bootloader
++
++config SYSCON_REBOOT_MODE
++	bool "Generic SYSCON regmap reboot mode driver"
++	depends on OF
++	select REBOOT_MODE
++	help
++	  Say y here will enable reboot mode driver. This will
++	  get reboot mode arguments and store it in SYSCON mapped
++	  register, then the bootloader can read it to take different
++	  action according to the mode.
++
+ endif
+ 
+diff --git a/drivers/power/reset/Makefile b/drivers/power/reset/Makefile
+index 096fa67047f6..a63865ba8532 100644
+--- a/drivers/power/reset/Makefile
++++ b/drivers/power/reset/Makefile
+@@ -20,3 +20,5 @@ obj-$(CONFIG_POWER_RESET_SYSCON) += syscon-reboot.o
+ obj-$(CONFIG_POWER_RESET_SYSCON_POWEROFF) += syscon-poweroff.o
+ obj-$(CONFIG_POWER_RESET_RMOBILE) += rmobile-reset.o
+ obj-$(CONFIG_POWER_RESET_ZX) += zx-reboot.o
++obj-$(CONFIG_REBOOT_MODE) += reboot-mode.o
++obj-$(CONFIG_SYSCON_REBOOT_MODE) += syscon-reboot-mode.o
+diff --git a/drivers/power/reset/reboot-mode.c b/drivers/power/reset/reboot-mode.c
+new file mode 100644
+index 000000000000..9aa7b809972c
+--- /dev/null
++++ b/drivers/power/reset/reboot-mode.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright (c) 2016, Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/device.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/reboot.h>
++#include "reboot-mode.h"
++
++#define PREFIX "mode-"
++
++struct mode_info {
++	char mode[32];
++	unsigned int magic;
++	struct list_head list;
++};
++
++struct reboot_mode_driver {
++	struct list_head head;
++	int (*write)(int magic);
++	struct notifier_block reboot_notifier;
++};
++
++static int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
++				 const char *cmd)
++{
++	const char *normal = "normal";
++	int magic = 0;
++	struct mode_info *info;
++
++	if (!cmd)
++		cmd = normal;
++
++	list_for_each_entry(info, &reboot->head, list) {
++		if (!strcmp(info->mode, cmd)) {
++			magic = info->magic;
++			break;
++		}
++	}
++
++	return magic;
++}
++
++static int reboot_mode_notify(struct notifier_block *this,
++			      unsigned long mode, void *cmd)
++{
++	struct reboot_mode_driver *reboot;
++	int magic;
++
++	reboot = container_of(this, struct reboot_mode_driver, reboot_notifier);
++	magic = get_reboot_mode_magic(reboot, cmd);
++	if (magic)
++		reboot->write(magic);
++
++	return NOTIFY_DONE;
++}
++
++int reboot_mode_register(struct device *dev, int (*write)(int))
++{
++	struct reboot_mode_driver *reboot;
++	struct mode_info *info;
++	struct property *prop;
++	size_t len = strlen(PREFIX);
++	int ret;
++
++	reboot = devm_kzalloc(dev, sizeof(*reboot), GFP_KERNEL);
++	if (!reboot)
++		return -ENOMEM;
++
++	reboot->write = write;
++	INIT_LIST_HEAD(&reboot->head);
++	for_each_property_of_node(dev->of_node, prop) {
++		if (len > strlen(prop->name) || strncmp(prop->name, PREFIX, len))
++			continue;
++		info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
++		if (!info)
++			return -ENOMEM;
++		strcpy(info->mode, prop->name + len);
++		if (of_property_read_u32(dev->of_node, prop->name, &info->magic)) {
++			dev_err(dev, "reboot mode %s without magic number\n",
++				info->mode);
++			devm_kfree(dev, info);
++			continue;
++		}
++		list_add_tail(&info->list, &reboot->head);
++	}
++	reboot->reboot_notifier.notifier_call = reboot_mode_notify;
++	ret = register_reboot_notifier(&reboot->reboot_notifier);
++	if (ret)
++		dev_err(dev, "can't register reboot notifier\n");
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(reboot_mode_register);
++
++MODULE_AUTHOR("Andy Yan <andy.yan@rock-chips.com");
++MODULE_DESCRIPTION("System reboot mode driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/power/reset/reboot-mode.h b/drivers/power/reset/reboot-mode.h
+new file mode 100644
+index 000000000000..44ed34fc56a0
+--- /dev/null
++++ b/drivers/power/reset/reboot-mode.h
+@@ -0,0 +1,6 @@
++#ifndef __REBOOT_MODE_H__
++#define __REBOOT_MODE_H__
++
++int reboot_mode_register(struct device *dev, int (*write)(int));
++
++#endif
+diff --git a/drivers/power/reset/syscon-reboot-mode.c b/drivers/power/reset/syscon-reboot-mode.c
+new file mode 100644
+index 000000000000..d1521d810ea2
+--- /dev/null
++++ b/drivers/power/reset/syscon-reboot-mode.c
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2016, Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
++#include "reboot-mode.h"
++
++static struct regmap *map;
++static u32 offset;
++static u32 mask = 0xffffffff;
++
++static int syscon_reboot_mode_write(int magic)
++{
++	regmap_update_bits(map, offset, mask, magic);
++
++	return 0;
++}
++
++static int syscon_reboot_mode_probe(struct platform_device *pdev)
++{
++	int ret;
++
++	map = syscon_node_to_regmap(pdev->dev.parent->of_node);
++	if (IS_ERR(map))
++		return PTR_ERR(map);
++	if (of_property_read_u32(pdev->dev.of_node, "offset", &offset))
++		return -EINVAL;
++	of_property_read_u32(pdev->dev.of_node, "mask", &mask);
++	ret = reboot_mode_register(&pdev->dev, syscon_reboot_mode_write);
++	if (ret)
++		dev_err(&pdev->dev, "can't register reboot mode\n");
++
++	return ret;
++}
++
++static const struct of_device_id syscon_reboot_mode_of_match[] = {
++	{ .compatible = "syscon-reboot-mode" },
++	{}
++};
++
++static struct platform_driver syscon_reboot_mode_driver = {
++	.probe = syscon_reboot_mode_probe,
++	.driver = {
++		.name = "syscon-reboot-mode",
++		.of_match_table = syscon_reboot_mode_of_match,
++	},
++};
++module_platform_driver(syscon_reboot_mode_driver);
++
++MODULE_AUTHOR("Andy Yan <andy.yan@rock-chips.com");
++MODULE_DESCRIPTION("SYSCON reboot mode driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.35.3
+

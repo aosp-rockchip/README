@@ -1,0 +1,322 @@
+From 4a44a24fd287b09d906fbbead41fc8281cbb2c6d Mon Sep 17 00:00:00 2001
+From: Shunqian Zheng <zhengsq@rock-chips.com>
+Date: Fri, 29 Dec 2017 17:55:02 +0800
+Subject: [PATCH] CHROMIUM: media: rockchip/isp1: fixup for different media/v4l
+ API
+
+Fixup for differences of the previous FROMLIST patches for
+rockchip isp1 driver as following,
+ - regression of UPSTREAM commits
+   + d6dd645eae76: ("[media] media: videobuf2: Move timestamp to vb2_buffer")
+   + 36c0f8b32c4b: ("[media] vb2: replace void *alloc_ctxs by struct device *alloc_devs")
+   + df9ecb0cad14: ("[media] vb2: drop v4l2_format argument from queue_setup")
+ - API changes of (4.4 v.s. UPSTREAM)
+   + media_entity_pipeline_start/stop() v.s. media_pipeline_start/stop()
+   + media_entity_init() v.s. media_entity_pads_init()
+   + media_entity_create_link() v.s. media_create_pad_link()
+   + media_device_init()
+   + entity function flags: MEDIA_ENT_F_IO_V4L and MEDIA_ENT_F_V4L2_SUBDEV_UNKNOWN
+
+BUG=b:36227021
+TEST=Camera works on Scarlet with the whole series
+
+Change-Id: I4d9c9f784210fda2165ac5372baea09a9c01a30d
+Signed-off-by: Shunqian Zheng <zhengsq@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 31 +++++++++++++------
+ drivers/media/platform/rockchip/isp1/dev.c    | 12 +++----
+ .../media/platform/rockchip/isp1/isp_params.c |  6 ++--
+ .../media/platform/rockchip/isp1/isp_stats.c  | 11 ++++---
+ .../platform/rockchip/isp1/mipi_dphy_sy.c     |  6 ++--
+ drivers/media/platform/rockchip/isp1/rkisp1.c |  5 ++-
+ 6 files changed, 41 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index a187ec0fb341..5f2b9bafc721 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -930,6 +930,8 @@ static int mi_frame_end(struct rkisp1_stream *stream)
+ 	int i = 0;
+ 
+ 	if (stream->curr_buf) {
++		u64 ns = ktime_get_ns();
++
+ 		/* Dequeue a filled buffer */
+ 		for (i = 0; i < isp_fmt->mplanes; i++) {
+ 			u32 payload_size =
+@@ -940,7 +942,7 @@ static int mi_frame_end(struct rkisp1_stream *stream)
+ 		}
+ 		stream->curr_buf->vb.sequence =
+ 				atomic_read(&isp_sd->frm_sync_seq) - 1;
+-		stream->curr_buf->vb.vb2_buf.timestamp = ktime_get_ns();
++		stream->curr_buf->vb.timestamp = ns_to_timeval(ns);
+ 		vb2_buffer_done(&stream->curr_buf->vb.vb2_buf,
+ 				VB2_BUF_STATE_DONE);
+ 	}
+@@ -1030,17 +1032,27 @@ static int rkisp1_start(struct rkisp1_stream *stream)
+ }
+ 
+ static int rkisp1_queue_setup(struct vb2_queue *queue,
++			      const void *parg,
+ 			      unsigned int *num_buffers,
+ 			      unsigned int *num_planes,
+ 			      unsigned int sizes[],
+-			      struct device *alloc_devs[])
++			      void *alloc_ctxs[])
+ {
+ 	struct rkisp1_stream *stream = queue->drv_priv;
+ 	struct rkisp1_device *dev = stream->ispdev;
+-	const struct v4l2_pix_format_mplane *pixm = &stream->out_fmt;
+-	const struct capture_fmt *isp_fmt = &stream->out_isp_fmt;
++	const struct v4l2_format *pfmt = parg;
++	const struct v4l2_pix_format_mplane *pixm = NULL;
++	const struct capture_fmt *isp_fmt = NULL;
+ 	u32 i;
+ 
++	if (pfmt) {
++		pixm = &pfmt->fmt.pix_mp;
++		isp_fmt = find_fmt(stream, pixm->pixelformat);
++	} else {
++		pixm = &stream->out_fmt;
++		isp_fmt = &stream->out_isp_fmt;
++	}
++
+ 	*num_planes = isp_fmt->mplanes;
+ 
+ 	for (i = 0; i < isp_fmt->mplanes; i++) {
+@@ -1048,6 +1060,7 @@ static int rkisp1_queue_setup(struct vb2_queue *queue,
+ 
+ 		plane_fmt = &pixm->plane_fmt[i];
+ 		sizes[i] = plane_fmt->sizeimage;
++		alloc_ctxs[i] = dev->alloc_ctx;
+ 	}
+ 
+ 	v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev, "%s count %d, size %d\n",
+@@ -1142,7 +1155,7 @@ static void rkisp1_stop_streaming(struct vb2_queue *queue)
+ 
+ 	rkisp1_stream_stop(stream);
+ 	/* call to the other devices */
+-	media_pipeline_stop(&node->vdev.entity);
++	media_entity_pipeline_stop(&node->vdev.entity);
+ 	ret = dev->pipe.set_stream(&dev->pipe, false);
+ 	if (ret < 0)
+ 		v4l2_err(v4l2_dev, "pipeline stream-off failed error:%d\n",
+@@ -1169,7 +1182,6 @@ static void rkisp1_stop_streaming(struct vb2_queue *queue)
+ 	ret = dev->pipe.close(&dev->pipe);
+ 	if (ret < 0)
+ 		v4l2_err(v4l2_dev, "pipeline close failed error:%d\n", ret);
+-
+ 	rkisp1_destroy_dummy_buf(stream);
+ }
+ 
+@@ -1238,7 +1250,7 @@ rkisp1_start_streaming(struct vb2_queue *queue, unsigned int count)
+ 	if (ret < 0)
+ 		goto stop_stream;
+ 
+-	ret = media_pipeline_start(&node->vdev.entity, &dev->pipe.pipe);
++	ret = media_entity_pipeline_start(&node->vdev.entity, &dev->pipe.pipe);
+ 	if (ret < 0) {
+ 		v4l2_err(&dev->v4l2_dev, "start pipeline failed %d\n", ret);
+ 		goto pipe_stream_off;
+@@ -1284,7 +1296,6 @@ static int rkisp_init_vb2_queue(struct vb2_queue *q,
+ 	q->min_buffers_needed = CIF_ISP_REQ_BUFS_MIN;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+ 	q->lock = &node->vlock;
+-	q->dev = stream->ispdev->dev;
+ 
+ 	return vb2_queue_init(q);
+ }
+@@ -1650,6 +1661,7 @@ static int rkisp1_register_stream_vdev(struct rkisp1_stream *stream)
+ 	vdev->vfl_dir = VFL_DIR_RX;
+ 	node->pad.flags = MEDIA_PAD_FL_SINK;
+ 
++	dev->alloc_ctx = vb2_dma_contig_init_ctx(v4l2_dev->dev);
+ 	rkisp_init_vb2_queue(&node->buf_queue, stream,
+ 			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+ 	vdev->queue = &node->buf_queue;
+@@ -1661,8 +1673,7 @@ static int rkisp1_register_stream_vdev(struct rkisp1_stream *stream)
+ 		return ret;
+ 	}
+ 
+-	vdev->entity.function = MEDIA_ENT_F_IO_V4L;
+-	ret = media_entity_pads_init(&vdev->entity, 1, &node->pad);
++	ret = media_entity_init(&vdev->entity, 1, &node->pad, 0);
+ 	if (ret < 0)
+ 		goto unreg;
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/dev.c b/drivers/media/platform/rockchip/isp1/dev.c
+index 39b52f4e3b12..dd0050392c15 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.c
++++ b/drivers/media/platform/rockchip/isp1/dev.c
+@@ -230,7 +230,7 @@ static int rkisp1_create_links(struct rkisp1_device *dev)
+ 			return -ENXIO;
+ 		}
+ 
+-		ret = media_create_pad_link(
++		ret = media_entity_create_link(
+ 				&sensor->sd->entity, pad,
+ 				&dev->isp_sdev.sd.entity,
+ 				RKISP1_ISP_PAD_SINK + s,
+@@ -247,7 +247,7 @@ static int rkisp1_create_links(struct rkisp1_device *dev)
+ 	source = &dev->params_vdev.vnode.vdev.entity;
+ 	sink = &dev->isp_sdev.sd.entity;
+ 	flags = MEDIA_LNK_FL_ENABLED;
+-	ret = media_create_pad_link(source, 0, sink,
++	ret = media_entity_create_link(source, 0, sink,
+ 				       RKISP1_ISP_PAD_SINK_PARAMS, flags);
+ 	if (ret < 0)
+ 		return ret;
+@@ -256,7 +256,7 @@ static int rkisp1_create_links(struct rkisp1_device *dev)
+ 	/* SP links */
+ 	source = &dev->isp_sdev.sd.entity;
+ 	sink = &dev->stream[RKISP1_STREAM_SP].vnode.vdev.entity;
+-	ret = media_create_pad_link(source, RKISP1_ISP_PAD_SOURCE_PATH,
++	ret = media_entity_create_link(source, RKISP1_ISP_PAD_SOURCE_PATH,
+ 				       sink, 0, flags);
+ 	if (ret < 0)
+ 		return ret;
+@@ -264,7 +264,7 @@ static int rkisp1_create_links(struct rkisp1_device *dev)
+ 	/* MP links */
+ 	source = &dev->isp_sdev.sd.entity;
+ 	sink = &dev->stream[RKISP1_STREAM_MP].vnode.vdev.entity;
+-	ret = media_create_pad_link(source, RKISP1_ISP_PAD_SOURCE_PATH,
++	ret = media_entity_create_link(source, RKISP1_ISP_PAD_SOURCE_PATH,
+ 				       sink, 0, flags);
+ 	if (ret < 0)
+ 		return ret;
+@@ -272,7 +272,7 @@ static int rkisp1_create_links(struct rkisp1_device *dev)
+ 	/* 3A stats links */
+ 	source = &dev->isp_sdev.sd.entity;
+ 	sink = &dev->stats_vdev.vnode.vdev.entity;
+-	return media_create_pad_link(source, RKISP1_ISP_PAD_SOURCE_STATS,
++	return media_entity_create_link(source, RKISP1_ISP_PAD_SOURCE_STATS,
+ 					sink, 0, flags);
+ }
+ 
+@@ -560,8 +560,6 @@ static int rkisp1_plat_probe(struct platform_device *pdev)
+ 	strlcpy(isp_dev->media_dev.model, "rkisp1",
+ 		sizeof(isp_dev->media_dev.model));
+ 	isp_dev->media_dev.dev = &pdev->dev;
+-	media_device_init(&isp_dev->media_dev);
+-
+ 	v4l2_dev = &isp_dev->v4l2_dev;
+ 	v4l2_dev->mdev = &isp_dev->media_dev;
+ 	strlcpy(v4l2_dev->name, "rkisp1", sizeof(v4l2_dev->name));
+diff --git a/drivers/media/platform/rockchip/isp1/isp_params.c b/drivers/media/platform/rockchip/isp1/isp_params.c
+index 7a90965f20a6..2530cc604114 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_params.c
++++ b/drivers/media/platform/rockchip/isp1/isp_params.c
+@@ -1352,10 +1352,11 @@ static const struct v4l2_ioctl_ops rkisp1_params_ioctl = {
+ };
+ 
+ static int rkisp1_params_vb2_queue_setup(struct vb2_queue *vq,
++					 const void *parg,
+ 					 unsigned int *num_buffers,
+ 					 unsigned int *num_planes,
+ 					 unsigned int sizes[],
+-					 struct device *alloc_devs[])
++					 void *alloc_ctxs[])
+ {
+ 	struct rkisp1_isp_params_vdev *params_vdev = vq->drv_priv;
+ 
+@@ -1524,8 +1525,7 @@ int rkisp1_register_params_vdev(struct rkisp1_isp_params_vdev *params_vdev,
+ 	video_set_drvdata(vdev, params_vdev);
+ 
+ 	node->pad.flags = MEDIA_PAD_FL_SOURCE;
+-	vdev->entity.function = MEDIA_ENT_F_IO_V4L;
+-	ret = media_entity_pads_init(&vdev->entity, 1, &node->pad);
++	ret = media_entity_init(&vdev->entity, 1, &node->pad, 0);
+ 	if (ret < 0)
+ 		goto err_release_queue;
+ 	ret = video_register_device(vdev, VFL_TYPE_GRABBER, -1);
+diff --git a/drivers/media/platform/rockchip/isp1/isp_stats.c b/drivers/media/platform/rockchip/isp1/isp_stats.c
+index dd30ebe95721..815f96184d25 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_stats.c
++++ b/drivers/media/platform/rockchip/isp1/isp_stats.c
+@@ -111,12 +111,14 @@ struct v4l2_file_operations rkisp1_stats_fops = {
+ };
+ 
+ static int rkisp1_stats_vb2_queue_setup(struct vb2_queue *vq,
++					const void *parg,
+ 					unsigned int *num_buffers,
+ 					unsigned int *num_planes,
+ 					unsigned int sizes[],
+-					struct device *alloc_devs[])
++					void *alloc_ctxs[])
+ {
+ 	struct rkisp1_isp_stats_vdev *stats_vdev = vq->drv_priv;
++	struct rkisp1_device *dev = stats_vdev->dev;
+ 
+ 	*num_planes = 1;
+ 
+@@ -125,6 +127,8 @@ static int rkisp1_stats_vb2_queue_setup(struct vb2_queue *vq,
+ 
+ 	sizes[0] = sizeof(struct rkisp1_stat_buffer);
+ 
++	alloc_ctxs[0] = dev->alloc_ctx;
++
+ 	INIT_LIST_HEAD(&stats_vdev->stat);
+ 
+ 	return 0;
+@@ -365,7 +369,7 @@ rkisp1_stats_send_measurement(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	vb2_set_plane_payload(&cur_buf->vb.vb2_buf, 0,
+ 			      sizeof(struct rkisp1_stat_buffer));
+ 	cur_buf->vb.sequence = cur_frame_id;
+-	cur_buf->vb.vb2_buf.timestamp = ktime_get_ns();
++	cur_buf->vb.timestamp = ns_to_timeval(ktime_get_ns());
+ 	vb2_buffer_done(&cur_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+ }
+ 
+@@ -479,8 +483,7 @@ int rkisp1_register_stats_vdev(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	video_set_drvdata(vdev, stats_vdev);
+ 
+ 	node->pad.flags = MEDIA_PAD_FL_SINK;
+-	vdev->entity.function = MEDIA_ENT_F_IO_V4L;
+-	ret = media_entity_pads_init(&vdev->entity, 1, &node->pad);
++	ret = media_entity_init(&vdev->entity, 1, &node->pad, 0);
+ 	if (ret < 0)
+ 		goto err_release_queue;
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/mipi_dphy_sy.c b/drivers/media/platform/rockchip/isp1/mipi_dphy_sy.c
+index 942118366f49..bdbd0c68944d 100644
+--- a/drivers/media/platform/rockchip/isp1/mipi_dphy_sy.c
++++ b/drivers/media/platform/rockchip/isp1/mipi_dphy_sy.c
+@@ -585,7 +585,7 @@ rockchip_mipidphy_notifier_bound(struct v4l2_async_notifier *notifier,
+ 		return -ENXIO;
+ 	}
+ 
+-	ret = media_create_pad_link(
++	ret = media_entity_create_link(
+ 			&sensor->sd->entity, pad,
+ 			&priv->sd.entity, MIPI_DPHY_SY_PAD_SINK,
+ 			priv->num_sensors != 1 ? 0 : MEDIA_LNK_FL_ENABLED);
+@@ -670,8 +670,8 @@ static int rockchip_mipidphy_media_init(struct mipidphy_priv *priv)
+ 	priv->pads[MIPI_DPHY_SY_PAD_SINK].flags =
+ 		MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
+ 
+-	ret = media_entity_pads_init(&priv->sd.entity,
+-				 MIPI_DPHY_SY_PADS_NUM, priv->pads);
++	ret = media_entity_init(&priv->sd.entity,
++				 MIPI_DPHY_SY_PADS_NUM, priv->pads, 0);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index 2656c5e77e2b..8e0f012ae5b5 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -1066,9 +1066,8 @@ int rkisp1_register_isp_subdev(struct rkisp1_device *isp_dev,
+ 	isp_sdev->pads[RKISP1_ISP_PAD_SINK_PARAMS].flags = MEDIA_PAD_FL_SINK;
+ 	isp_sdev->pads[RKISP1_ISP_PAD_SOURCE_PATH].flags = MEDIA_PAD_FL_SOURCE;
+ 	isp_sdev->pads[RKISP1_ISP_PAD_SOURCE_STATS].flags = MEDIA_PAD_FL_SOURCE;
+-	sd->entity.function = MEDIA_ENT_F_V4L2_SUBDEV_UNKNOWN;
+-	ret = media_entity_pads_init(&sd->entity, RKISP1_ISP_PAD_MAX,
+-				     isp_sdev->pads);
++	ret = media_entity_init(&sd->entity, RKISP1_ISP_PAD_MAX,
++				isp_sdev->pads, 0);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-- 
+2.35.3
+

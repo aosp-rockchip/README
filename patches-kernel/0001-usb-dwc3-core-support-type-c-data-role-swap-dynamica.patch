@@ -1,0 +1,86 @@
+From 7df26530646751397c930b5604602d47cd497815 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Thu, 12 Mar 2020 17:28:14 +0800
+Subject: [PATCH] usb: dwc3: core: support type-c data role swap dynamically
+
+This patch supports fusb302 to do data role swap for
+Type-C Dongle with PD adapter.
+
+The test case is:
+
+ - Use a Type-C Dongle (PD adapter & USB & HDMI)
+ - Plug a PD adapter into Type-C Dongle first, then
+   connect the Dongle with RK3399 Type-C0 port.
+ - Check if Type-C Dongle can fetch 5V with the following log:
+   "fusb302 4-0022: PD connected as UFP, fetching 5V"
+ - Wait for the data role swap completion (hundreds of
+   milliseconds), then check if the Type-C USB can work
+   in DFP mode.
+
+Without this patch, the DWC3 can't switch to DFP mode
+after the data role swap completion. It's because that
+when the fusb302 do data role swap, it only sends extcon
+notifier with EXTCON_USB true or EXTCON_USB_HOST true.
+Generally, the sequence of the extcon notifier sent from
+fusb302 is:
+
+- send "EXTCON_USB = true" and "EXTCON_USB_HOST=false"
+  to DWC3 driver, then DWC3 switch to UFP, and set the
+  connected flag to true.
+
+- After swap completion, send "EXTCON_USB = false" and
+  "EXTCON_USB_HOST = true" to DWC3 driver. Because the
+  connected flag is true, the DWC3 is unable to switch
+  to DFP mode.
+
+This patch forces DWC3 to do disconnection if it detects
+the connected flag is true and the DWC3 mode is UFP.
+
+This patch can also fix a bug if we use command to force
+DWC3 mode to DFP (host mode) when the DWC3 is working on
+UFP mode and connecting to USB Host.
+
+Change-Id: I5b3a17957ef720eb90664186033ef91269ecbc38
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc3/core.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 9555b9899e32..cbf6001c778a 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -199,8 +199,20 @@ static void __dwc3_set_mode(struct work_struct *work)
+ runtime:
+ 	if (extcon_get_state(dwc->edev, EXTCON_USB) ||
+ 	    extcon_get_state(dwc->edev, EXTCON_USB_HOST)) {
+-		if (dwc->drd_connected)
+-			return;
++		if (dwc->drd_connected) {
++			/*
++			 *  If the connected flag is true, and the DWC3 is
++			 *  in device mode, it means that the Type-C cable
++			 *  is doing data role swap (UFP -> DFP), so we need
++			 *  to disconnect UFP first, and then switch DWC3 to
++			 *  DFP depends on the next extcon notifier.
++			 */
++			if (extcon_get_state(dwc->edev, EXTCON_USB_HOST) &&
++			    dwc->current_dr_role == DWC3_GCTL_PRTCAP_DEVICE)
++				goto disconnect;
++			else
++				return;
++		}
+ 
+ 		dwc->current_dr_role = dwc->desired_dr_role;
+ 		pm_runtime_get_sync(dwc->dev);
+@@ -247,6 +259,7 @@ static void __dwc3_set_mode(struct work_struct *work)
+ 			break;
+ 		}
+ 	} else {
++disconnect:
+ 		switch (dwc->current_dr_role) {
+ 		case DWC3_GCTL_PRTCAP_HOST:
+ 			phy_power_off(dwc->usb3_generic_phy);
+-- 
+2.35.3
+

@@ -1,0 +1,130 @@
+From 6423a7e1a9c760c8245209e1ab98af696ffe441f Mon Sep 17 00:00:00 2001
+From: zhangyunlong <dalon.zhang@rock-chips.com>
+Date: Wed, 31 May 2017 11:56:14 +0800
+Subject: [PATCH] camera: rockchip: camsys driver v0.0x22.0
+
+delete node in irqpool list when thread disconnect
+
+Change-Id: I5602e138ab9bce751e24f6dc0a0f7348755be97a
+Signed-off-by: zhangyunlong <dalon.zhang@rock-chips.com>
+---
+ drivers/media/video/rk_camsys/camsys_drv.c    | 29 ++++++++++++-------
+ .../media/video/rk_camsys/camsys_internal.h   |  4 ++-
+ drivers/media/video/rk_camsys/camsys_marvin.c | 12 +++++++-
+ 3 files changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/media/video/rk_camsys/camsys_drv.c b/drivers/media/video/rk_camsys/camsys_drv.c
+index 915f92154b34..cd04f06895cd 100644
+--- a/drivers/media/video/rk_camsys/camsys_drv.c
++++ b/drivers/media/video/rk_camsys/camsys_drv.c
+@@ -548,7 +548,8 @@ static int camsys_irq_connect(camsys_irqcnnt_t *irqcnnt, camsys_dev_t
+ 	*camsys_dev)
+ {
+ 	int err = 0, i;
+-	camsys_irqpool_t *irqpool;
++	bool find_pool = false;
++	camsys_irqpool_t *irqpool, *n;
+ 	unsigned long int flags;
+ 
+ 	if ((irqcnnt->mis != MRV_ISP_MIS) &&
+@@ -567,18 +568,26 @@ static int camsys_irq_connect(camsys_irqcnnt_t *irqcnnt, camsys_dev_t
+ 
+ 	spin_lock_irqsave(&camsys_dev->irq.lock, flags);
+ 	if (!list_empty(&camsys_dev->irq.irq_pool)) {
+-		list_for_each_entry(irqpool, &camsys_dev->irq.irq_pool, list) {
+-			if (irqpool->pid == irqcnnt->pid) {
+-				camsys_warn("this thread(pid: %d) had been connect irq!",
+-					     current->pid);
+-				spin_unlock_irqrestore(&camsys_dev->irq.lock,
+-						       flags);
+-				goto end;
++		list_for_each_entry_safe(irqpool, n,
++					&camsys_dev->irq.irq_pool, list) {
++			if (irqpool->pid == -1) {
++				list_del_init(&irqpool->list);
++				kfree(irqpool);
++				irqpool = NULL;
++			} else {
++				if (irqpool->pid == irqcnnt->pid)
++					find_pool = true;
+ 			}
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&camsys_dev->irq.lock, flags);
+ 
++	if (find_pool) {
++		camsys_warn("this thread(pid: %d) had been connect irq!",
++						     irqcnnt->pid);
++		goto end;
++	}
++
+ 	irqpool = kzalloc(sizeof(camsys_irqpool_t), GFP_KERNEL);
+ 	if (!irqpool) {
+ 		err = -ENOMEM;
+@@ -712,7 +721,7 @@ static int camsys_irq_disconnect(camsys_irqcnnt_t *irqcnnt, camsys_dev_t
+ 		list_for_each_entry(irqpool, &camsys_dev->irq.irq_pool, list) {
+ 			if (irqpool->pid == irqcnnt->pid) {
+ 				find_pool = true;
+-				irqpool->pid = 0;
++				irqpool->pid = -1;
+ 				break;
+ 			}
+ 		}
+@@ -723,7 +732,7 @@ static int camsys_irq_disconnect(camsys_irqcnnt_t *irqcnnt, camsys_dev_t
+ 		camsys_err(
+ 			"this thread(pid: %d) have not been connect irq!"
+ 			"disconnect failed",
+-			current->pid);
++			irqcnnt->pid);
+ 	} else {
+ 		wake_up_all(&irqpool->done);
+ 	}
+diff --git a/drivers/media/video/rk_camsys/camsys_internal.h b/drivers/media/video/rk_camsys/camsys_internal.h
+index 7bb1a2821b4b..43f6c8d9f20e 100644
+--- a/drivers/media/video/rk_camsys/camsys_internal.h
++++ b/drivers/media/video/rk_camsys/camsys_internal.h
+@@ -164,8 +164,10 @@
+ 	2) add csi-phy timing setting for 3368.
+ *v0.0x21.0xf:
+ 	1) add reference count for marvin.
++*v0.0x22.0:
++	1) delete node in irqpool list when thread disconnect.
+ */
+-#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0, 0x21, 0xf)
++#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0, 0x22, 0)
+ 
+ #define CAMSYS_PLATFORM_DRV_NAME                "RockChip-CamSys"
+ #define CAMSYS_PLATFORM_MARVIN_NAME             "Platform_MarvinDev"
+diff --git a/drivers/media/video/rk_camsys/camsys_marvin.c b/drivers/media/video/rk_camsys/camsys_marvin.c
+index fa3475fe3f9a..bc388414b71f 100644
+--- a/drivers/media/video/rk_camsys/camsys_marvin.c
++++ b/drivers/media/video/rk_camsys/camsys_marvin.c
+@@ -405,6 +405,16 @@ static int camsys_mrv_drm_iommu_cb(void *ptr, camsys_sysctrl_t *devctl)
+ 			attach = camsys_dev->dma_buf[index].attach;
+ 			dma_buf = camsys_dev->dma_buf[index].dma_buf;
+ 			sgt = camsys_dev->dma_buf[index].sgt;
++			camsys_trace
++			(
++			2,
++			"exist mapped buf, release it before map: attach %p,"
++			"dma_buf %p,sgt %p,fd %d,index %d",
++			attach,
++			dma_buf,
++			sgt,
++			iommu->map_fd,
++			index);
+ 			dma_buf_unmap_attachment
+ 				(attach,
+ 				sgt,
+@@ -477,7 +487,7 @@ static int camsys_mrv_drm_iommu_cb(void *ptr, camsys_sysctrl_t *devctl)
+ 		}
+ 		if (index == camsys_dev->dma_buf_cnt) {
+ 			camsys_warn("can't find map fd %d", iommu->map_fd);
+-			return 0;
++			return -EINVAL;
+ 		}
+ 		attach = camsys_dev->dma_buf[index].attach;
+ 		dma_buf = camsys_dev->dma_buf[index].dma_buf;
+-- 
+2.35.3
+

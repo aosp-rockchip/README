@@ -1,0 +1,165 @@
+From e4ae32ab8d576e0ab6ff0bd31059fdcd975d7b05 Mon Sep 17 00:00:00 2001
+From: Huang Jiachai <hjc@rock-chips.com>
+Date: Thu, 25 Aug 2016 18:01:27 +0800
+Subject: [PATCH] video: rockchip: fb: add car_reversing for px5
+
+if userspace set car_reversing 1, rk fb will ignore
+buffer from hwc.
+
+Change-Id: Ib3bb9a105a8d6b7a2cc0e71c21bf8cc208b4ffd3
+Signed-off-by: Huang Jiachai <hjc@rock-chips.com>
+---
+ drivers/video/rockchip/rk_fb.c      | 45 +++++++++++++++++++++++++++--
+ drivers/video/rockchip/rkfb_sysfs.c | 19 ++++++++++++
+ include/linux/rk_fb.h               |  1 +
+ 3 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index e047ea223047..2ff4f79af12c 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -90,6 +90,12 @@ module_param(rk_fb_iommu_debug, int, S_IRUGO | S_IWUSR);
+ static int rk_fb_config_debug(struct rk_lcdc_driver *dev_drv,
+ 			      struct rk_fb_win_cfg_data *win_data,
+ 			      struct rk_fb_reg_data *regs, u32 cmd);
++static int car_reversing;
++
++static int is_car_camcap(void) {
++	return car_reversing && strcmp("camcap", current->comm);
++}
++
+ int support_uboot_display(void)
+ {
+ 	return uboot_logo_on;
+@@ -1374,7 +1380,7 @@ static int rk_fb_pan_display(struct fb_var_screeninfo *var,
+ 	u16 uv_x_off, uv_y_off, uv_y_act;
+ 	u8 is_pic_yuv = 0;
+ 
+-	if (dev_drv->suspend_flag)
++	if (dev_drv->suspend_flag || is_car_camcap())
+ 		return 0;
+ 	win_id = dev_drv->ops->fb_get_win_id(dev_drv, info->fix.id);
+ 	if (win_id < 0)
+@@ -2979,6 +2985,15 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,
+ 			if (cfgdone_index >= 10)
+ 				cfgdone_index = 0;
+ 		}
++		if (is_car_camcap()) {
++			int i = 0;
++
++			for (i = 0; i < RK_MAX_BUF_NUM; i++)
++				win_data.rel_fence_fd[i] = -1;
++
++			win_data.ret_fence_fd = -1;
++			goto cam_exit;
++		}
+ 		if (copy_from_user(&win_data,
+ 				   (struct rk_fb_win_cfg_data __user *)argp,
+ 				   sizeof(win_data))) {
+@@ -2989,6 +3004,7 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,
+ 		dev_drv->wait_fs = win_data.wait_fs;
+ 		ret = rk_fb_set_win_config(info, &win_data);
+ 
++cam_exit:
+ 		if (copy_to_user((struct rk_fb_win_cfg_data __user *)arg,
+ 				 &win_data, sizeof(win_data))) {
+ 			ret = -EFAULT;
+@@ -3018,6 +3034,8 @@ static int rk_fb_blank(int blank_mode, struct fb_info *info)
+ 	struct rk_fb *rk_fb = dev_get_drvdata(info->device);
+ #endif
+ 
++	if (is_car_camcap())
++		return 0;
+ 	win_id = dev_drv->ops->fb_get_win_id(dev_drv, fix->id);
+ 	if (win_id < 0)
+ 		return -ENODEV;
+@@ -3229,7 +3247,7 @@ static int rk_fb_set_par(struct fb_info *info)
+ 	u16 uv_x_off, uv_y_off, uv_y_act;
+ 	u8 is_pic_yuv = 0;
+ 	/*var->pixclock = dev_drv->pixclock;*/
+-	if (dev_drv->suspend_flag)
++	if (dev_drv->suspend_flag || is_car_camcap())
+ 		return 0;
+ 	win_id = dev_drv->ops->fb_get_win_id(dev_drv, info->fix.id);
+ 	if (win_id < 0)
+@@ -4511,6 +4529,29 @@ int rk_fb_unregister(struct rk_lcdc_driver *dev_drv)
+ 	return 0;
+ }
+ 
++int rk_fb_set_car_reverse_status(struct rk_lcdc_driver *dev_drv,
++				 int status)
++{
++	char *envp[3] = {"Request", "FORCE UPDATE", NULL};
++
++	if (status) {
++		car_reversing = 1;
++		flush_kthread_worker(&dev_drv->update_regs_worker);
++		dev_drv->timeline_max++;
++#ifdef H_USE_FENCE
++		sw_sync_timeline_inc(dev_drv->timeline, 1);
++#endif
++		pr_debug("%s: camcap reverse start...\n", __func__);
++	} else {
++		car_reversing = 0;
++		kobject_uevent_env(&dev_drv->dev->kobj,
++				   KOBJ_CHANGE, envp);
++		pr_debug("%s: camcap reverse finish...\n", __func__);
++	}
++
++	return 0;
++}
++
+ static int rk_fb_probe(struct platform_device *pdev)
+ {
+ 	struct rk_fb *rk_fb = NULL;
+diff --git a/drivers/video/rockchip/rkfb_sysfs.c b/drivers/video/rockchip/rkfb_sysfs.c
+index c375577888dd..e66f0ddfc1ef 100644
+--- a/drivers/video/rockchip/rkfb_sysfs.c
++++ b/drivers/video/rockchip/rkfb_sysfs.c
+@@ -1211,6 +1211,24 @@ static ssize_t show_win_property(struct device *dev,
+ 			dev_drv->win[win_id]->property.max_input_y);
+ }
+ 
++static ssize_t set_car_reverse(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_fb_par *fb_par = (struct rk_fb_par *)fbi->par;
++	struct rk_lcdc_driver *dev_drv = fb_par->lcdc_drv;
++	u32 status;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &status);
++	if (ret)
++		return ret;
++	rk_fb_set_car_reverse_status(dev_drv, status);
++
++	return count;
++}
++
+ static struct device_attribute rkfb_attrs[] = {
+ 	__ATTR(phys_addr, S_IRUGO, show_phys, NULL),
+ 	__ATTR(virt_addr, S_IRUGO, show_virt, NULL),
+@@ -1231,6 +1249,7 @@ static struct device_attribute rkfb_attrs[] = {
+ 	__ATTR(scale, S_IRUGO | S_IWUSR, show_scale, set_scale),
+ 	__ATTR(lcdcid, S_IRUGO, show_lcdc_id, NULL),
+ 	__ATTR(win_property, S_IRUGO, show_win_property, NULL),
++	__ATTR(car_reverse, S_IWUSR, NULL, set_car_reverse),
+ };
+ 
+ int rkfb_create_sysfs(struct fb_info *fbi)
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 302330efb29a..2374664e6dfe 100755
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -830,5 +830,6 @@ int rk_fb_get_display_policy(void);
+ int rk_fb_pixel_width(int data_format);
+ void trace_buffer_dump(struct device *dev,
+ 			      struct rk_lcdc_driver *dev_drv);
++int rk_fb_set_car_reverse_status(struct rk_lcdc_driver *dev_drv, int status);
+ extern int rockchip_get_screen_type(void);
+ #endif
+-- 
+2.35.3
+

@@ -1,0 +1,266 @@
+From d4795f4b66c510cb2d74510afdcb5234389afa8a Mon Sep 17 00:00:00 2001
+From: Yandong Lin <yandong.lin@rock-chips.com>
+Date: Mon, 25 Jan 2021 10:21:13 +0800
+Subject: [PATCH] video: rockchip: mpp: Fix rk3368 page fault
+
+Workaround patch for rk3368:
+Need to reset iommu for rk3368, when grf changed.
+
+[   64.542569] rk_iommu ff9a0440.iommu: Page fault at 0x00000000fcbdd800
+of type write
+[   64.542586] rk_iommu ff9a0440.iommu: iova = 0x00000000fcbdd800:
+dte_index: 0x3f2 pte_index: 0x3dd page_offset: 0x800
+[   64.542599] rk_iommu ff9a0440.iommu: mmu_dte_addr: 0x000000007ad53000
+dte@0x000000007ad53fc8: 0x367c9001 valid: 1 pte@0x00000000367c9f74:
+0x2a93c007 valid: 1 page@0x000000002a93c800 flags: 0x6
+[   64.542627] mpp_rkvdec ff9a0000.hevc_service: fault addr 0xfcbdd800
+status 6b
+
+Signed-off-by: Yandong Lin <yandong.lin@rock-chips.com>
+Change-Id: I52f3cff4f8a55c2fac3d33f6468024b46eabde41
+---
+ drivers/video/rockchip/mpp/mpp_common.c | 51 +++++++++----------------
+ drivers/video/rockchip/mpp/mpp_common.h |  1 +
+ drivers/video/rockchip/mpp/mpp_iommu.c  | 26 +++++++++++++
+ drivers/video/rockchip/mpp/mpp_iommu.h  |  1 +
+ drivers/video/rockchip/mpp/mpp_rkvdec.c | 33 +++++++++++++++-
+ 5 files changed, 79 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 3d222965b2f4..41086c2bbb18 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -392,32 +392,6 @@ static int mpp_process_task(struct mpp_session *session,
+ 	return 0;
+ }
+ 
+-static int mpp_refresh_pm_runtime(struct mpp_iommu_info *info,
+-				  struct device *dev)
+-{
+-	int i;
+-	int usage_count;
+-	struct device_link *link;
+-	struct device *iommu_dev = &info->pdev->dev;
+-
+-	rcu_read_lock();
+-
+-	usage_count = atomic_read(&iommu_dev->power.usage_count);
+-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
+-		for (i = 0; i < usage_count; i++)
+-			pm_runtime_put_sync(link->supplier);
+-	}
+-
+-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
+-		for (i = 0; i < usage_count; i++)
+-			pm_runtime_get_sync(link->supplier);
+-	}
+-
+-	rcu_read_unlock();
+-
+-	return 0;
+-}
+-
+ struct reset_control *
+ mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char *name)
+ {
+@@ -499,7 +473,7 @@ int mpp_dev_reset(struct mpp_dev *mpp)
+ 	 * as an empty operation. Therefore, force to close and then open,
+ 	 * will be update the domain. In this way, domain can really attach.
+ 	 */
+-	mpp_refresh_pm_runtime(mpp->iommu_info, mpp->dev);
++	mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+ 
+ 	mpp_iommu_attach(mpp->iommu_info);
+ 	mpp_reset_up_write(mpp->reset_group);
+@@ -881,7 +855,7 @@ static __u32 mpp_get_cmd_butt(__u32 cmd)
+ 		mask = MPP_CMD_CONTROL_BUTT;
+ 		break;
+ 	default:
+-		mpp_err("unknow dev cmd 0x%x\n", cmd);
++		mpp_err("unknown dev cmd 0x%x\n", cmd);
+ 		break;
+ 	}
+ 
+@@ -1430,8 +1404,7 @@ int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
+ 		return -EINVAL;
+ 	}
+ 	if (copy_from_user(&off_inf->elem[off_inf->cnt],
+-				req->data,
+-				req->size)) {
++			   req->data, req->size)) {
+ 		mpp_err("copy_from_user failed\n");
+ 		return -EINVAL;
+ 	}
+@@ -1755,7 +1728,6 @@ int mpp_dev_remove(struct mpp_dev *mpp)
+ 
+ irqreturn_t mpp_dev_irq(int irq, void *param)
+ {
+-
+ 	struct mpp_dev *mpp = param;
+ 	struct mpp_task *task = mpp->cur_task;
+ 	irqreturn_t irq_ret = IRQ_NONE;
+@@ -1769,7 +1741,8 @@ irqreturn_t mpp_dev_irq(int irq, void *param)
+ 			 * isr should not to response, and handle it in delayed work
+ 			 */
+ 			if (test_and_set_bit(TASK_STATE_HANDLE, &task->state)) {
+-				mpp_err("error, task has been handled, irq_status %08x\n", mpp->irq_status);
++				mpp_err("error, task has been handled, irq_status %08x\n",
++					mpp->irq_status);
+ 				irq_ret = IRQ_HANDLED;
+ 				goto done;
+ 			}
+@@ -1814,6 +1787,20 @@ u32 mpp_get_grf(struct mpp_grf_info *grf_info)
+ 	return (val & MPP_GRF_VAL_MASK);
+ }
+ 
++bool mpp_grf_is_changed(struct mpp_grf_info *grf_info)
++{
++	bool changed = false;
++
++	if (grf_info && grf_info->grf && grf_info->val) {
++		u32 grf_status = mpp_get_grf(grf_info);
++		u32 grf_val = grf_info->val & MPP_GRF_VAL_MASK;
++
++		changed = (grf_status == grf_val) ? false : true;
++	}
++
++	return changed;
++}
++
+ int mpp_set_grf(struct mpp_grf_info *grf_info)
+ {
+ 	if (grf_info && grf_info->grf && grf_info->val)
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index c7327f02d844..677208ebcc21 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -520,6 +520,7 @@ struct reset_control *mpp_reset_control_get(struct mpp_dev *mpp,
+ 					    const char *name);
+ 
+ u32 mpp_get_grf(struct mpp_grf_info *grf_info);
++bool mpp_grf_is_changed(struct mpp_grf_info *grf_info);
+ int mpp_set_grf(struct mpp_grf_info *grf_info);
+ 
+ int mpp_time_record(struct mpp_task *task);
+diff --git a/drivers/video/rockchip/mpp/mpp_iommu.c b/drivers/video/rockchip/mpp/mpp_iommu.c
+index 019d5956e79a..aa4603c96017 100644
+--- a/drivers/video/rockchip/mpp/mpp_iommu.c
++++ b/drivers/video/rockchip/mpp/mpp_iommu.c
+@@ -19,6 +19,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/kref.h>
+ #include <linux/slab.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "mpp_debug.h"
+ #include "mpp_iommu.h"
+@@ -556,3 +557,28 @@ int mpp_iommu_disable(struct mpp_rk_iommu *iommu)
+ 
+ 	return 0;
+ }
++
++int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev)
++{
++	int i;
++	int usage_count;
++	struct device_link *link;
++	struct device *iommu_dev = &info->pdev->dev;
++
++	rcu_read_lock();
++
++	usage_count = atomic_read(&iommu_dev->power.usage_count);
++	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
++		for (i = 0; i < usage_count; i++)
++			pm_runtime_put_sync(link->supplier);
++	}
++
++	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node) {
++		for (i = 0; i < usage_count; i++)
++			pm_runtime_get_sync(link->supplier);
++	}
++
++	rcu_read_unlock();
++
++	return 0;
++}
+diff --git a/drivers/video/rockchip/mpp/mpp_iommu.h b/drivers/video/rockchip/mpp/mpp_iommu.h
+index f9b195e91217..e2a738d5d988 100644
+--- a/drivers/video/rockchip/mpp/mpp_iommu.h
++++ b/drivers/video/rockchip/mpp/mpp_iommu.h
+@@ -101,5 +101,6 @@ bool mpp_iommu_is_paged(struct mpp_rk_iommu *iommu);
+ u32 mpp_iommu_get_dte_addr(struct mpp_rk_iommu *iommu);
+ int mpp_iommu_enable(struct mpp_rk_iommu *iommu);
+ int mpp_iommu_disable(struct mpp_rk_iommu *iommu);
++int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
+ 
+ #endif
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index 952b8b7b89d8..6c13313c6675 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -188,6 +188,7 @@ struct rkvdec_dev {
+ 	/* record last infos */
+ 	u32 last_fmt;
+ 	bool had_reset;
++	bool grf_changed;
+ };
+ 
+ /*
+@@ -1449,6 +1450,16 @@ static int rkvdec_3368_get_freq(struct mpp_dev *mpp,
+ 	return 0;
+ }
+ 
++static int rkvdec_3368_set_grf(struct mpp_dev *mpp)
++{
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++
++	dec->grf_changed = mpp_grf_is_changed(mpp->grf_info);
++	mpp_set_grf(mpp->grf_info);
++
++	return 0;
++}
++
+ static int rkvdec_set_freq(struct mpp_dev *mpp,
+ 			   struct mpp_task *mpp_task)
+ {
+@@ -1463,6 +1474,25 @@ static int rkvdec_set_freq(struct mpp_dev *mpp,
+ 	return 0;
+ }
+ 
++static int rkvdec_3368_set_freq(struct mpp_dev *mpp, struct mpp_task *mpp_task)
++{
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++	struct rkvdec_task *task =  to_rkvdec_task(mpp_task);
++
++	/* if grf changed, need reset iommu for rk3368 */
++	if (dec->grf_changed) {
++		mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
++		dec->grf_changed = false;
++	}
++
++	mpp_clk_set_rate(&dec->aclk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->core_clk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->cabac_clk_info, task->clk_mode);
++	mpp_clk_set_rate(&dec->hevc_cabac_clk_info, task->clk_mode);
++
++	return 0;
++}
++
+ static int rkvdec_3328_set_freq(struct mpp_dev *mpp,
+ 				struct mpp_task *mpp_task)
+ {
+@@ -1617,9 +1647,10 @@ static struct mpp_hw_ops rkvdec_3368_hw_ops = {
+ 	.clk_on = rkvdec_clk_on,
+ 	.clk_off = rkvdec_clk_off,
+ 	.get_freq = rkvdec_3368_get_freq,
+-	.set_freq = rkvdec_set_freq,
++	.set_freq = rkvdec_3368_set_freq,
+ 	.reduce_freq = rkvdec_reduce_freq,
+ 	.reset = rkvdec_reset,
++	.set_grf = rkvdec_3368_set_grf,
+ };
+ 
+ static struct mpp_dev_ops rkvdec_v1_dev_ops = {
+-- 
+2.35.3
+

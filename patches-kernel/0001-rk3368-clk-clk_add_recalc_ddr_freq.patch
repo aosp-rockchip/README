@@ -1,0 +1,156 @@
+From 9f7e4c2ef697a4c7d2415471cda84a344a886a9f Mon Sep 17 00:00:00 2001
+From: zhangqing <zhangqing@rock-chips.com>
+Date: Fri, 3 Apr 2015 06:54:08 -0700
+Subject: [PATCH] rk3368: clk: clk_add_recalc_ddr_freq.
+
+	Get ddr frequency correctly.
+
+Signed-off-by: zhangqing <zhangqing@rock-chips.com>
+---
+ arch/arm/mach-rockchip/common.c        |  1 +
+ arch/arm64/boot/dts/rk3368-clocks.dtsi |  2 +-
+ drivers/clk/rockchip/clk-ops.c         | 63 +++++++++++++++++++++++++-
+ include/dt-bindings/clock/rockchip.h   |  1 +
+ include/linux/rockchip/common.h        |  1 +
+ 5 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/mach-rockchip/common.c b/arch/arm/mach-rockchip/common.c
+index 684180eb9988..84f736595179 100755
+--- a/arch/arm/mach-rockchip/common.c
++++ b/arch/arm/mach-rockchip/common.c
+@@ -277,6 +277,7 @@ void (*ddr_bandwidth_get)(struct ddr_bw_info *ddr_bw_ch0,
+ int (*ddr_change_freq)(uint32_t nMHz) = NULL;
+ long (*ddr_round_rate)(uint32_t nMHz) = NULL;
+ void (*ddr_set_auto_self_refresh)(bool en) = NULL;
++int (*ddr_recalc_rate)(void) = NULL;
+ 
+ extern struct ion_platform_data ion_pdata;
+ extern void __init ion_reserve(struct ion_platform_data *data);
+diff --git a/arch/arm64/boot/dts/rk3368-clocks.dtsi b/arch/arm64/boot/dts/rk3368-clocks.dtsi
+index ced3d18b0120..4093fa6ad188 100644
+--- a/arch/arm64/boot/dts/rk3368-clocks.dtsi
++++ b/arch/arm64/boot/dts/rk3368-clocks.dtsi
+@@ -784,7 +784,7 @@
+ 						rockchip,flags = <(CLK_GET_RATE_NOCACHE |
+ 									CLK_SET_RATE_NO_REPARENT)>;
+ 						rockchip,clkops-idx =
+-							<CLKOPS_RATE_DDR_DIV4>;
++							<CLKOPS_RATE_RK3368_DDR>;
+ 					};
+ 
+ 					/* 3:2 reserved */
+diff --git a/drivers/clk/rockchip/clk-ops.c b/drivers/clk/rockchip/clk-ops.c
+index c303239c3f1c..f2cb1c657216 100644
+--- a/drivers/clk/rockchip/clk-ops.c
++++ b/drivers/clk/rockchip/clk-ops.c
+@@ -438,7 +438,7 @@ static long clk_ddr_determine_rate(struct clk_hw *hw, unsigned long rate,
+ }
+ 
+ static long clk_ddr_round_rate(struct clk_hw *hw, unsigned long rate,
+-		unsigned long *prate)
++		 unsigned long *prate)
+ {
+ 	return clk_ddr_determine_rate(hw, rate, prate, NULL);
+ }
+@@ -836,6 +836,66 @@ const struct clk_ops clkops_rate_3368_dclk_lcdc = {
+ 	.recalc_rate	= clk_divider_recalc_rate,
+ };
+ 
++static unsigned long clk_rk3368_ddr_recalc_rate(struct clk_hw *hw,
++		unsigned long parent_rate)
++{
++	if (!ddr_recalc_rate)
++		return (clk_core_recalc_rate(hw, parent_rate)/2);
++	else
++		return ddr_recalc_rate();
++}
++
++static long clk_ddr_determine_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long *best_parent_rate,
++			struct clk **best_parent_p)
++{
++	long best = 0;
++
++	if (!ddr_round_rate) {
++		/* Do nothing before ddr init */
++		best = rate;
++	} else {
++		/* Func provided by ddr driver */
++		best = ddr_round_rate(rate/MHZ) * MHZ;
++	}
++	clk_debug("%s: from %lu to %lu\n", __func__, rate, best);
++	return best;
++}
++static long clk_ddr_round_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long *prate)
++{
++	return clk_ddr_determine_rate(hw, rate, prate, NULL);
++}
++static int clk_ddr_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	struct clk *parent = __clk_get_parent(hw->clk);
++	struct clk *grand_p = __clk_get_parent(parent);
++
++	/* Do nothing before ddr init */
++	if (!ddr_change_freq)
++		return 0;
++	if (IS_ERR_OR_NULL(parent) || IS_ERR_OR_NULL(grand_p)) {
++		clk_err("fail to get parent or grand_parent!\n");
++		return -EINVAL;
++	}
++	clk_debug("%s: will set rate = %lu\n", __func__, rate);
++	/* Func provided by ddr driver */
++	ddr_change_freq(rate/MHZ);
++	parent->rate = parent->ops->recalc_rate(parent->hw,
++	__clk_get_rate(grand_p));
++	return 0;
++}
++
++const struct clk_ops clkops_rate_rk3368_ddr = {
++	.recalc_rate	= clk_rk3368_ddr_recalc_rate,
++	.round_rate	= clk_ddr_round_rate,
++	.set_rate	= clk_ddr_set_rate,
++	.determine_rate = clk_ddr_determine_rate,
++};
++
++
++
+ struct clk_ops_table rk_clkops_rate_table[] = {
+ 	{.index = CLKOPS_RATE_MUX_DIV,		.clk_ops = &clkops_rate_auto_parent},
+ 	{.index = CLKOPS_RATE_EVENDIV,		.clk_ops = &clkops_rate_evendiv},
+@@ -853,6 +913,7 @@ struct clk_ops_table rk_clkops_rate_table[] = {
+ 	{.index = CLKOPS_RATE_DDR_DIV4,		.clk_ops = NULL},
+ 	{.index = CLKOPS_RATE_RK3368_MUX_DIV_NPLL,   .clk_ops = &clkops_rate_3368_auto_parent},
+ 	{.index = CLKOPS_RATE_RK3368_DCLK_LCDC, .clk_ops = &clkops_rate_3368_dclk_lcdc},
++	{.index = CLKOPS_RATE_RK3368_DDR,   .clk_ops = &clkops_rate_rk3368_ddr},
+ 	{.index = CLKOPS_RATE_I2S,		.clk_ops = NULL},
+ 	{.index = CLKOPS_RATE_CIFOUT,		.clk_ops = NULL},
+ 	{.index = CLKOPS_RATE_UART,		.clk_ops = NULL},
+diff --git a/include/dt-bindings/clock/rockchip.h b/include/dt-bindings/clock/rockchip.h
+index 4f8a6d4ea601..a7c8c5cc42ba 100644
+--- a/include/dt-bindings/clock/rockchip.h
++++ b/include/dt-bindings/clock/rockchip.h
+@@ -70,6 +70,7 @@
+ #define CLKOPS_RATE_DDR_DIV4		19
+ #define CLKOPS_RATE_RK3368_MUX_DIV_NPLL 20
+ #define CLKOPS_RATE_RK3368_DCLK_LCDC	21
++#define CLKOPS_RATE_RK3368_DDR		22
+ 
+ #define CLKOPS_TABLE_END		(~0)
+ 
+diff --git a/include/linux/rockchip/common.h b/include/linux/rockchip/common.h
+index 34d6a928cc5b..006d52d8df04 100644
+--- a/include/linux/rockchip/common.h
++++ b/include/linux/rockchip/common.h
+@@ -36,6 +36,7 @@ extern void (*ddr_bandwidth_get)(struct ddr_bw_info *ddr_bw_ch0,
+ extern int (*ddr_change_freq)(uint32_t mhz);
+ extern long (*ddr_round_rate)(uint32_t mhz);
+ extern void (*ddr_set_auto_self_refresh)(bool en);
++extern int (*ddr_recalc_rate)(void);
+ 
+ int rockchip_cpu_kill(unsigned int cpu);
+ void rockchip_cpu_die(unsigned int cpu);
+-- 
+2.35.3
+

@@ -1,0 +1,286 @@
+From 93323021f51847589ec5aa9b0e0c353f4fddd181 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Tue, 11 Mar 2014 16:29:35 +0800
+Subject: [PATCH] add rk32 lvds support
+
+---
+ arch/arm/boot/dts/rk3288.dtsi                 |   5 +-
+ drivers/video/rockchip/transmitter/Kconfig    |   4 +
+ drivers/video/rockchip/transmitter/Makefile   |   1 +
+ .../video/rockchip/transmitter/rk32_lvds.c    | 167 ++++++++++++++++++
+ .../video/rockchip/transmitter/rk32_lvds.h    |  42 +++++
+ 5 files changed, 218 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/video/rockchip/transmitter/rk32_lvds.c
+ create mode 100644 drivers/video/rockchip/transmitter/rk32_lvds.h
+
+diff --git a/arch/arm/boot/dts/rk3288.dtsi b/arch/arm/boot/dts/rk3288.dtsi
+index 974388867b40..5624d49be968 100755
+--- a/arch/arm/boot/dts/rk3288.dtsi
++++ b/arch/arm/boot/dts/rk3288.dtsi
+@@ -192,11 +192,14 @@
+ 		status = "disabled";
+ 	};
+ 
++	lvds: lvds@ff96c000 {
++		compatible = "rockchip, rk32-lvds";
++		reg = <0xff960000 0x20000>;
++	}
+ 	edp: edp@ff970000 {
+ 		compatible = "rockchip,rk32-edp";
+ 		reg = <0xff970000 0x4000>;
+ 		interrupts = <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>;
+-		status = "disabled";
+         };
+ 
+ 	hdmi: hdmi@ff980000 {
+diff --git a/drivers/video/rockchip/transmitter/Kconfig b/drivers/video/rockchip/transmitter/Kconfig
+index 23f5f07a471c..9b4fa99e2c1b 100644
+--- a/drivers/video/rockchip/transmitter/Kconfig
++++ b/drivers/video/rockchip/transmitter/Kconfig
+@@ -16,6 +16,10 @@ config RK319x_LVDS
+ 	bool "RK319x lvds transmitter support"
+ 	depends on ARCH_RK319X && RK_TRSM
+ 
++config RK32_LVDS
++	bool "RK32 lvds transmitter support"
++	depends on RK_TRSM
++
+ config RK610_LVDS
+ 	bool "RK610(Jetta) lvds transmitter support"
+ 	depends on MFD_RK610 && RK_TRSM 
+diff --git a/drivers/video/rockchip/transmitter/Makefile b/drivers/video/rockchip/transmitter/Makefile
+index 63b085a72693..63eee2b40e47 100644
+--- a/drivers/video/rockchip/transmitter/Makefile
++++ b/drivers/video/rockchip/transmitter/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_RK3026_LVDS)       += rk3026_lvds.o
+ obj-$(CONFIG_RK610_LVDS)	+= rk610_lcd.o
+ obj-$(CONFIG_RK616_LVDS)        += rk616_lvds.o
+ obj-$(CONFIG_RK319x_LVDS)       += rk319x_lvds.o
++obj-$(CONFIG_RK32_LVDS)         += rk32_lvds.o
+ obj-$(CONFIG_DP_ANX6345)        += dp_anx6345.o
+ obj-$(CONFIG_DP501)          	+= dp501.o
+ obj-$(CONFIG_RK32_DP)		+= rk32_dp.o rk32_dp_reg.o
+diff --git a/drivers/video/rockchip/transmitter/rk32_lvds.c b/drivers/video/rockchip/transmitter/rk32_lvds.c
+new file mode 100644
+index 000000000000..c77e22402d9a
+--- /dev/null
++++ b/drivers/video/rockchip/transmitter/rk32_lvds.c
+@@ -0,0 +1,167 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <linux/clk.h>
++#include <linux/rk_fb.h>
++#include <linux/rockchip/iomap.h>
++#include <linux/rockchip/grf.h>
++#include "rk32_lvds.h"
++
++
++static int rk32_lvds_disable(struct rk32_lvds *lvds)
++{
++	writel_relaxed(0x80008000, RK_GRF_VIRT + RK3288_GRF_SOC_CON7);
++	writel_relaxed(0x00, lvds->regs + LVDS_CFG_REG_21); /*disable tx*/
++	writel_relaxed(0xff, lvds->regs + LVDS_CFG_REG_c); /*disable pll*/
++	return 0;
++}
++
++static int rk32_lvds_en(struct rk32_lvds *lvds)
++{
++	struct rk_screen *screen = &lvds->screen;
++	u32 h_bp = screen->mode.hsync_len + screen->mode.left_margin;
++	u32 val ;
++
++	if (screen->lcdc_id == 0)
++		val = LVDS_SEL_VOP_LIT | (LVDS_SEL_VOP_LIT << 16);
++	else
++		val = LVDS_SEL_VOP_LIT << 16;
++	writel_relaxed(val, RK_GRF_VIRT + RK3288_GRF_SOC_CON6);
++
++	val = screen->lvds_format;
++	if (screen->type == SCREEN_DUAL_LVDS)
++		val |= LVDS_DUAL | LVDS_CH0_EN | LVDS_CH1_EN;
++	else 
++		val |= LVDS_CH0_EN;
++
++	if (screen->type == SCREEN_RGB)
++		val |= LVDS_TTL_EN;
++
++	if (h_bp & 0x01)
++		val |= LVDS_START_PHASE_RST_1;
++
++	val |= (screen->pin_dclk << 8) | (screen->pin_hsync << 9) |
++		(screen->pin_den << 10);
++	val |= 0xffff << 16;
++	writel_relaxed(val, RK_GRF_VIRT + RK3288_GRF_SOC_CON7);
++
++	
++	if (screen->type == SCREEN_RGB)
++		val = 0xbf;
++	else
++		val = 0x7f;
++	lvds_writel(lvds, LVDS_CH0_REG_0, val);
++	lvds_writel(lvds, LVDS_CH0_REG_1, 0x3f);
++	lvds_writel(lvds, LVDS_CH0_REG_2, 0x7e);
++
++	if (screen->type == SCREEN_RGB)
++		val = 0x1f;
++	else
++		val = 0x00;
++	lvds_writel(lvds, LVDS_CH0_REG_4, val);
++	lvds_writel(lvds, LVDS_CH0_REG_5, val);
++	lvds_writel(lvds, LVDS_CH0_REG_3, 0x46);
++	lvds_writel(lvds, LVDS_CH0_REG_d, 0x05);
++	lvds_writel(lvds, LVDS_CH0_REG_20,0x44);
++	writel_relaxed(0x00, lvds->regs + LVDS_CFG_REG_c); /*eanble pll*/
++	writel_relaxed(0x92, lvds->regs + LVDS_CFG_REG_21); /*enable tx*/
++
++	return 0;
++}
++
++
++static int rk32_lvds_init(struct rk32_lvds *lvds, bool enable)
++{
++	
++	if (enable) 
++		rk32_lvds_en(lvds);
++	else
++		rk32_lvds_disable(lvds);
++
++	return 0;
++}
++
++static int rk32_lvds_probe(struct platform_device *pdev)
++{
++	struct rk32_lvds *lvds;
++	struct resource *res;
++	struct device_node *np = pdev->dev.of_node;
++
++	if (!np) {
++		dev_err(&pdev->dev, "Missing device tree node.\n");
++		return -EINVAL;
++	}
++
++	lvds = devm_kzalloc(&pdev->dev, sizeof(struct rk32_lvds), GFP_KERNEL);
++	if (!lvds) {
++		dev_err(&pdev->dev, "no memory for state\n");
++		return -ENOMEM;
++	}
++	lvds->dev = &pdev->dev;
++	rk_fb_get_prmry_screen(&lvds->screen);
++	if ((lvds->screen.type != SCREEN_RGB) && 
++		(lvds->screen.type != SCREEN_LVDS) &&
++		(lvds->screen.type != SCREEN_DUAL_LVDS)) {
++		dev_err(&pdev->dev, "screen is not lvds/rgb!\n");
++		return -EINVAL;
++	}
++	platform_set_drvdata(pdev, lvds);
++	dev_set_name(lvds->dev, "rk32-lvds");
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	lvds->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(lvds->regs)) {
++		dev_err(&pdev->dev, "ioremap reg failed\n");
++		return PTR_ERR(lvds->regs);
++	}
++	rk32_lvds_init(lvds, true);
++	dev_info(&pdev->dev, "rk32 lvds driver probe success\n");
++
++	return 0;
++}
++
++static void rk32_lvds_shutdown(struct platform_device *pdev)
++{
++
++}
++
++#if defined(CONFIG_OF)
++static const struct of_device_id rk32_lvds_dt_ids[] = {
++	{.compatible = "rockchip, rk32-lvds",},
++	{}
++};
++
++MODULE_DEVICE_TABLE(of, rk32_lvds_dt_ids);
++#endif
++
++static struct platform_driver rk32_lvds_driver = {
++	.probe = rk32_lvds_probe,
++	.driver = {
++		   .name = "rk32-lvds",
++		   .owner = THIS_MODULE,
++#if defined(CONFIG_OF)
++		   .of_match_table = of_match_ptr(rk32_lvds_dt_ids),
++#endif
++	},
++	.shutdown = rk32_lvds_shutdown,
++};
++
++static int __init rk32_lvds_module_init(void)
++{
++	return platform_driver_register(&rk32_lvds_driver);
++}
++
++static void __exit rk32_lvds_module_exit(void)
++{
++
++}
++
++fs_initcall(rk32_lvds_module_init);
++module_exit(rk32_lvds_module_exit);
++
+diff --git a/drivers/video/rockchip/transmitter/rk32_lvds.h b/drivers/video/rockchip/transmitter/rk32_lvds.h
+new file mode 100644
+index 000000000000..b7bbe5552e46
+--- /dev/null
++++ b/drivers/video/rockchip/transmitter/rk32_lvds.h
+@@ -0,0 +1,42 @@
++#ifndef __RK32_LVDS__
++#define __RK32_LVDS__
++
++#define LVDS_CH0_REG_0			0x00
++#define LVDS_CH0_REG_1			0x04
++#define LVDS_CH0_REG_2			0x08
++#define LVDS_CH0_REG_3			0x0c
++#define LVDS_CH0_REG_4			0x10
++#define LVDS_CH0_REG_5			0x14
++#define LVDS_CFG_REG_c			0x30
++#define LVDS_CH0_REG_d			0x34
++#define LVDS_CH0_REG_20			0x80
++#define LVDS_CFG_REG_21			0x84
++
++#define LVDS_SEL_VOP_LIT		(1 << 3)
++
++#define LVDS_FMT_MASK			(0x07 << 16)
++#define LVDS_MSB			(0x01 << 3)
++#define LVDS_DUAL			(0x01 << 4)
++#define LVDS_FMT_1			(0x01 << 5)
++#define LVDS_TTL_EN			(0x01 << 6)
++#define LVDS_START_PHASE_RST_1		(0x01 << 7)
++#define LVDS_DCLK_INV			(0x01 << 8)
++#define LVDS_CH0_EN			(0x01 << 11)
++#define LVDS_CH1_EN			(0x01 << 12)
++#define LVDS_PWRDN			(0x01 << 15)
++
++struct rk32_lvds {
++	struct device 		*dev;
++	void __iomem  		*regs;
++	struct clk    		*clk; /*phb clk*/
++	struct rk_screen	screen;
++};
++
++static int inline lvds_writel(struct rk32_lvds *lvds, u32 offset, u32 val)
++{
++	writel_relaxed(val, lvds->regs + offset);
++	if (lvds->screen.type == SCREEN_DUAL_LVDS)
++		writel_relaxed(val, lvds->regs + offset + 0x100);
++	return 0;
++}
++#endif
+-- 
+2.35.3
+

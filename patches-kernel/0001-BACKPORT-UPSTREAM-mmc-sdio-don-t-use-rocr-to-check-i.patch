@@ -1,0 +1,86 @@
+From fcb45dce598e7ad86023b91becad8856712a7212 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Mon, 26 Feb 2018 17:29:11 +0800
+Subject: [PATCH] BACKPORT: UPSTREAM: mmc: sdio: don't use rocr to check if the
+ card could support UHS mode
+
+Per SDIO Simplified Specification V3, section 3.1.2, A host that
+supports UHS-I sets S18R to 1 in the argument of CMD5 to request a
+change of the signal voltage to 1.8V. If the card supports UHS-I and
+the current signal voltage is 3.3V, S18A is set to 1 in the R4 response.
+If the signal voltage is already 1.8V, the card sets S18A to 0 so that
+host maintains the current signal voltage. UHS-I is supported in SD mode
+and S18A is always 0 in SPI mode.
+
+For the current code, if the signalingvoltage is fixed 1.8v, so
+the card will set S18A to 0 for rocr and thus we would clear the
+R4_18V_PRESENT from ocr, which make core won't try to use uhs mode.
+
+To fix it, we expect sdio_read_cccr would fail if the uhs mode won't
+work at all. Note that it's interesting that some sdio cards still
+response S18A even the voltage is fixed to 1.8v and the CMD11 will
+also accepted and finish enabling UHS mode successfully.I guess this
+is why folks didn't notice this problem. Anyway, fix it.
+
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Change-Id: I81305f076a663d04c3ff93e78492daf091bc6311
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+(cherry picked from 5fc3d80ef496c3bc3e8c09f056e3586fb681de56)
+---
+ drivers/mmc/core/sdio.c | 24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/mmc/core/sdio.c b/drivers/mmc/core/sdio.c
+index 3e1881ce08c3..c586b11a40b5 100644
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -641,7 +641,11 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+ 	 * to switch to 1.8V signaling level.  No 1.8v signalling if
+ 	 * UHS mode is not enabled to maintain compatibility and some
+ 	 * systems that claim 1.8v signalling in fact do not support
+-	 * it.
++	 * it. Per SDIO spec v3, section 3.1.2, if the voltage is already
++	 * 1.8v, the card sets S18A to 0 in the R4 response. So it will
++	 * fails to check rocr & R4_18V_PRESENT,  but we still need to
++	 * try to init uhs card. sdio_read_cccr will take over this task
++	 * to make sure which speed mode should work.
+ 	 */
+ 	if (!powered_resume && (rocr & ocr & R4_18V_PRESENT)) {
+ 		err = mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_180,
+@@ -653,9 +657,6 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+ 		} else if (err) {
+ 			ocr &= ~R4_18V_PRESENT;
+ 		}
+-		err = 0;
+-	} else {
+-		ocr &= ~R4_18V_PRESENT;
+ 	}
+ 
+ 	/*
+@@ -717,11 +718,20 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+ 	else {
+ #endif
+ 		/*
+-		 * Read the common registers.
++		 * Read the common registers. Note that we should try to
++		 * validate whether UHS would work or not.
+ 		 */
+ 		err = sdio_read_cccr(card,  ocr);
+-		if (err)
+-			goto remove;
++		if (err) {
++			mmc_sdio_resend_if_cond(host, card);
++			if (ocr & R4_18V_PRESENT) {
++				/* Retry init sequence, but without R4_18V_PRESENT. */
++				retries = 0;
++				goto try_again;
++			} else {
++				goto remove;
++			}
++		}
+ #ifdef CONFIG_MMC_EMBEDDED_SDIO
+ 	}
+ #endif
+-- 
+2.35.3
+

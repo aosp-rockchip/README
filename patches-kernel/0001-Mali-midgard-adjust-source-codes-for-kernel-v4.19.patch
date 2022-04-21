@@ -1,0 +1,251 @@
+From 89ad87fb8eed12761217168bd39a6fe14d4c871f Mon Sep 17 00:00:00 2001
+From: Zhen Chen <chenzhen@rock-chips.com>
+Date: Mon, 10 Jun 2019 15:06:45 +0800
+Subject: [PATCH] Mali: midgard: adjust source codes for kernel v4.19
+
+Parts of the modifications are borrowed from Mali Bifrost DDK r13.
+
+Change-Id: I82c68041a3185063ae2d8a40a7a7c17feaab0733
+Signed-off-by: Zhen Chen <chenzhen@rock-chips.com>
+---
+ .../mali400/mali/linux/mali_osk_specific.h    |  1 +
+ drivers/gpu/arm/midgard/mali_kbase.h          |  2 +-
+ drivers/gpu/arm/midgard/mali_kbase_context.c  |  4 +--
+ drivers/gpu/arm/midgard/mali_kbase_fence.h    | 11 +++++++-
+ drivers/gpu/arm/midgard/mali_kbase_mem.c      |  1 +
+ drivers/gpu/arm/midgard/mali_kbase_mem.h      |  2 +-
+ .../gpu/arm/midgard/mali_kbase_mem_linux.c    |  6 +++++
+ drivers/gpu/arm/midgard/mali_kbase_softjobs.c |  4 +--
+ drivers/gpu/arm/midgard/mali_kbase_sync.h     |  2 +-
+ .../gpu/arm/midgard/mali_kbase_sync_file.c    | 27 +++++++++++++++----
+ drivers/gpu/arm/midgard/mali_kbase_tlstream.c | 10 +++----
+ 11 files changed, 52 insertions(+), 18 deletions(-)
+ mode change 100755 => 100644 drivers/gpu/arm/mali400/mali/linux/mali_osk_specific.h
+
+diff --git a/drivers/gpu/arm/mali400/mali/linux/mali_osk_specific.h b/drivers/gpu/arm/mali400/mali/linux/mali_osk_specific.h
+old mode 100755
+new mode 100644
+index 8c2862631870..54f764c2226b
+--- a/drivers/gpu/arm/mali400/mali/linux/mali_osk_specific.h
++++ b/drivers/gpu/arm/mali400/mali/linux/mali_osk_specific.h
+@@ -22,6 +22,7 @@
+ #include <linux/gfp.h>
+ #include <linux/hardirq.h>
+ #include <linux/uaccess.h>
++#include <linux/syscalls.h>
+ 
+ 
+ #include "mali_osk_types.h"
+diff --git a/drivers/gpu/arm/midgard/mali_kbase.h b/drivers/gpu/arm/midgard/mali_kbase.h
+index baefe8a07b93..0ea633c1c04a 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase.h
++++ b/drivers/gpu/arm/midgard/mali_kbase.h
+@@ -208,7 +208,7 @@ int kbase_soft_event_update(struct kbase_context *kctx,
+ 
+ bool kbase_replay_process(struct kbase_jd_atom *katom);
+ 
+-void kbasep_soft_job_timeout_worker(unsigned long data);
++void kbasep_soft_job_timeout_worker(struct timer_list *t);
+ void kbasep_complete_triggered_soft_events(struct kbase_context *kctx, u64 evt);
+ 
+ /* api used internally for register access. Contains validation and tracing */
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_context.c b/drivers/gpu/arm/midgard/mali_kbase_context.c
+index 4e802bc8ea83..6338a7e221ed 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_context.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_context.c
+@@ -153,9 +153,9 @@ kbase_create_context(struct kbase_device *kbdev, bool is_compat)
+ 
+ 	mutex_init(&kctx->vinstr_cli_lock);
+ 
+-	setup_timer(&kctx->soft_job_timeout,
++	timer_setup(&kctx->soft_job_timeout,
+ 		    kbasep_soft_job_timeout_worker,
+-		    (uintptr_t)kctx);
++		    0);
+ 
+ 	return kctx;
+ 
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_fence.h b/drivers/gpu/arm/midgard/mali_kbase_fence.h
+index 8d392996f56e..639cc2ef4348 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_fence.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_fence.h
+@@ -134,7 +134,16 @@ static inline bool kbase_fence_out_is_ours(struct kbase_jd_atom *katom)
+ static inline int kbase_fence_out_signal(struct kbase_jd_atom *katom,
+ 					 int status)
+ {
+-	katom->dma_fence.fence->status = status;
++	if (status) {
++#if (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE && \
++	  KERNEL_VERSION(4, 9, 68) <= LINUX_VERSION_CODE)
++		fence_set_error(katom->dma_fence.fence, status);
++#elif (KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE)
++		dma_fence_set_error(katom->dma_fence.fence, status);
++#else
++		katom->dma_fence.fence->status = status;
++#endif
++	}
+ 	return dma_fence_signal(katom->dma_fence.fence);
+ }
+ 
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem.c b/drivers/gpu/arm/midgard/mali_kbase_mem.c
+index 4a223e8ee404..0e367e283d9d 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem.c
+@@ -31,6 +31,7 @@
+ #include <linux/bug.h>
+ #include <linux/compat.h>
+ #include <linux/version.h>
++#include <linux/sched/mm.h>
+ 
+ #include <mali_kbase_config.h>
+ #include <mali_kbase.h>
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem.h b/drivers/gpu/arm/midgard/mali_kbase_mem.h
+index e293577255da..75f3ad16bfc6 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem.h
+@@ -559,7 +559,7 @@ void kbase_mem_pool_free_pages(struct kbase_mem_pool *pool, size_t nr_pages,
+  */
+ static inline size_t kbase_mem_pool_size(struct kbase_mem_pool *pool)
+ {
+-	return ACCESS_ONCE(pool->cur_size);
++	return READ_ONCE(pool->cur_size);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c b/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+index eea429a8d590..f3cf53b4c383 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_mem_linux.c
+@@ -1788,8 +1788,14 @@ static void kbase_cpu_vm_close(struct vm_area_struct *vma)
+ KBASE_EXPORT_TEST_API(kbase_cpu_vm_close);
+ 
+ 
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0))
+ static int kbase_cpu_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ {
++#else
++static int kbase_cpu_vm_fault(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++#endif
+ 	struct kbase_cpu_mapping *map = vma->vm_private_data;
+ 	pgoff_t rel_pgoff;
+ 	size_t i;
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_softjobs.c b/drivers/gpu/arm/midgard/mali_kbase_softjobs.c
+index 72809f780261..1c72647975f4 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_softjobs.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_softjobs.c
+@@ -371,9 +371,9 @@ static void kbase_fence_debug_timeout(struct kbase_jd_atom *katom)
+ }
+ #endif /* CONFIG_MALI_FENCE_DEBUG */
+ 
+-void kbasep_soft_job_timeout_worker(unsigned long data)
++void kbasep_soft_job_timeout_worker(struct timer_list *t)
+ {
+-	struct kbase_context *kctx = (struct kbase_context *)data;
++	struct kbase_context *kctx = from_timer(kctx, t, soft_job_timeout);
+ 	u32 timeout_ms = (u32)atomic_read(
+ 			&kctx->kbdev->js_data.soft_job_timeout_ms);
+ 	struct timer_list *timer = &kctx->soft_job_timeout;
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_sync.h b/drivers/gpu/arm/midgard/mali_kbase_sync.h
+index de72147d67ad..33b580595563 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_sync.h
++++ b/drivers/gpu/arm/midgard/mali_kbase_sync.h
+@@ -156,7 +156,7 @@ void kbase_sync_fence_out_remove(struct kbase_jd_atom *katom);
+  */
+ static inline void kbase_sync_fence_close_fd(int fd)
+ {
+-	sys_close(fd);
++	ksys_close(fd);
+ }
+ 
+ /**
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_sync_file.c b/drivers/gpu/arm/midgard/mali_kbase_sync_file.c
+index 4e1621ca3eea..3ccd99afd1a4 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_sync_file.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_sync_file.c
+@@ -68,10 +68,14 @@ int kbase_sync_fence_out_create(struct kbase_jd_atom *katom, int stream_fd)
+ 	if (!fence)
+ 		return -ENOMEM;
+ 
+-	/* Take an extra reference to the fence on behalf of the katom.
+-	 * This is needed because sync_file_create() will take ownership of
+-	 * one of these refs */
++#if (KERNEL_VERSION(4, 9, 67) >= LINUX_VERSION_CODE)
++	/* Take an extra reference to the fence on behalf of the sync_file.
++	 * This is only needed on older kernels where sync_file_create()
++	 * does not take its own reference. This was changed in v4.9.68,
++	 * where sync_file_create() now takes its own reference.
++	 */
+ 	dma_fence_get(fence);
++#endif
+ 
+ 	/* create a sync_file fd representing the fence */
+ 	sync_file = sync_file_create(fence);
+@@ -161,7 +165,13 @@ static void kbase_fence_wait_callback(struct dma_fence *fence,
+ 	struct kbase_context *kctx = katom->kctx;
+ 
+ 	/* Cancel atom if fence is erroneous */
++#if (KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE || \
++	 (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE && \
++	  KERNEL_VERSION(4, 9, 68) <= LINUX_VERSION_CODE))
++	if (dma_fence_is_signaled(kcb->fence) && kcb->fence->error)
++#else
+ 	if (dma_fence_is_signaled(kcb->fence) && kcb->fence->status < 0)
++#endif
+ 		katom->event_code = BASE_JD_EVENT_JOB_CANCELLED;
+ 
+ 	if (kbase_fence_dep_count_dec_and_test(katom)) {
+@@ -273,8 +283,15 @@ static void kbase_sync_fence_info_get(struct dma_fence *fence,
+ 	 * 1 : signaled
+ 	 */
+ 	if (dma_fence_is_signaled(fence)) {
+-		if (fence->status < 0)
+-			info->status = fence->status; /* signaled with error */
++#if (KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE || \
++	 (KERNEL_VERSION(4, 10, 0) > LINUX_VERSION_CODE && \
++	  KERNEL_VERSION(4, 9, 68) <= LINUX_VERSION_CODE))
++		int status = fence->error;
++#else
++		int status = fence->status;
++#endif
++		if (status < 0)
++			info->status = status; /* signaled with error */
+ 		else
+ 			info->status = 1; /* signaled with success */
+ 	} else  {
+diff --git a/drivers/gpu/arm/midgard/mali_kbase_tlstream.c b/drivers/gpu/arm/midgard/mali_kbase_tlstream.c
+index c952993f3448..e86d04418cef 100644
+--- a/drivers/gpu/arm/midgard/mali_kbase_tlstream.c
++++ b/drivers/gpu/arm/midgard/mali_kbase_tlstream.c
+@@ -1042,12 +1042,12 @@ static void kbasep_tlstream_flush_stream(enum tl_stream_type stype)
+  * Timer is executed periodically to check if any of the stream contains
+  * buffer ready to be submitted to user space.
+  */
+-static void kbasep_tlstream_autoflush_timer_callback(unsigned long data)
++static void kbasep_tlstream_autoflush_timer_callback(struct timer_list *t)
+ {
+ 	enum tl_stream_type stype;
+ 	int                 rcode;
+ 
+-	CSTD_UNUSED(data);
++	CSTD_UNUSED(t);
+ 
+ 	for (stype = 0; stype < TL_STREAM_TYPE_COUNT; stype++) {
+ 		struct tl_stream *stream = tl_stream[stype];
+@@ -1371,9 +1371,9 @@ int kbase_tlstream_init(void)
+ 
+ 	/* Initialize autoflush timer. */
+ 	atomic_set(&autoflush_timer_active, 0);
+-	setup_timer(&autoflush_timer,
+-			kbasep_tlstream_autoflush_timer_callback,
+-			0);
++	timer_setup(&autoflush_timer,
++		    kbasep_tlstream_autoflush_timer_callback,
++		    0);
+ 
+ 	return 0;
+ }
+-- 
+2.35.3
+

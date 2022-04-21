@@ -1,0 +1,408 @@
+From bc28e06c4205a9e91050d3690a9f762b88cccc35 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Wed, 6 May 2020 08:57:54 +0800
+Subject: [PATCH] mmc: add thunder boot support
+
+Remove unnecessary initialization process from core as possible, such
+as remove some idle process, shorten delay, remove parsing ext_csd,
+remove post-delay for power and so on. All these stuffs are enabled
+by CONFIG_ROCKCHIP_THUNDER_BOOT.
+
+Change-Id: I0e2326dd79d938eb82c8cfac9db09e34d6c08987
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/core/core.c    |  4 ++
+ drivers/mmc/core/mmc.c     | 91 +++++++++++++++++++++++++++++++++++---
+ drivers/mmc/core/mmc_ops.c | 12 +++--
+ drivers/mmc/host/dw_mmc.c  | 60 ++++++++++++++++++++++++-
+ 4 files changed, 157 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 36e24687449c..9a640f133e74 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -2426,6 +2426,7 @@ int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
+ }
+ EXPORT_SYMBOL(mmc_set_blockcount);
+ 
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ static void mmc_hw_reset_for_init(struct mmc_host *host)
+ {
+ 	mmc_pwrseq_reset(host);
+@@ -2434,6 +2435,7 @@ static void mmc_hw_reset_for_init(struct mmc_host *host)
+ 		return;
+ 	host->ops->hw_reset(host);
+ }
++#endif
+ 
+ int mmc_hw_reset(struct mmc_host *host)
+ {
+@@ -2496,7 +2498,9 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 	 * Some eMMCs (with VCCQ always on) may not be reset after power up, so
+ 	 * do a hardware reset if possible.
+ 	 */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 	mmc_hw_reset_for_init(host);
++#endif
+ 
+ 	/*
+ 	 * sdio_reset sends CMD52 to reset card.  Since we do not know
+diff --git a/drivers/mmc/core/mmc.c b/drivers/mmc/core/mmc.c
+index d9d105d4a7d8..d2e44c293d80 100644
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -12,13 +12,15 @@
+ 
+ #include <linux/err.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/slab.h>
+ #include <linux/stat.h>
+ #include <linux/pm_runtime.h>
+-
++#include <linux/mm.h>
+ #include <linux/mmc/host.h>
+ #include <linux/mmc/card.h>
+ #include <linux/mmc/mmc.h>
++#include <linux/resource.h>
+ 
+ #include "core.h"
+ #include "card.h"
+@@ -68,6 +70,7 @@ static const unsigned int taac_mant[] = {
+ /*
+  * Given the decoded CSD structure, decode the raw CID to our CID structure.
+  */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ static int mmc_decode_cid(struct mmc_card *card)
+ {
+ 	u32 *resp = card->raw_cid;
+@@ -119,6 +122,7 @@ static int mmc_decode_cid(struct mmc_card *card)
+ 
+ 	return 0;
+ }
++#endif
+ 
+ static void mmc_set_erase_size(struct mmc_card *card)
+ {
+@@ -655,14 +659,72 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
+ 	return err;
+ }
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++static void *mmc_tb_map_ecsd(phys_addr_t start, size_t len)
++{
++	int i;
++	void *vaddr;
++	pgprot_t pgprot = PAGE_KERNEL;
++	phys_addr_t phys;
++	int npages = PAGE_ALIGN(len) / PAGE_SIZE;
++	struct page **p = vmalloc(sizeof(struct page *) * npages);
++
++	if (!p)
++		return NULL;
++
++	phys = start;
++	for (i = 0; i < npages; i++) {
++		p[i] = phys_to_page(phys);
++		phys += PAGE_SIZE;
++	}
++
++	vaddr = vmap(p, npages, VM_MAP, pgprot);
++	vfree(p);
++
++	return vaddr;
++}
++#endif
++
+ static int mmc_read_ext_csd(struct mmc_card *card)
+ {
+ 	u8 *ext_csd;
+ 	int err;
+-
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	void *ecsd;
++	bool valid_ecsd = false;
++	struct device_node *mem;
++	struct resource reg;
++	struct device *dev = card->host->parent;
++#endif
+ 	if (!mmc_can_ext_csd(card))
+ 		return 0;
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	mem = of_parse_phandle(dev->of_node, "memory-region-ecsd", 0);
++	if (mem) {
++		err = of_address_to_resource(mem, 0, &reg);
++		if (err < 0) {
++			dev_err(dev, "fail to get resource\n");
++			goto get_ecsd;
++		}
++
++		ecsd = mmc_tb_map_ecsd(reg.start, resource_size(&reg));
++		if (!ecsd)
++			goto get_ecsd;
++
++		if (readl(ecsd + SZ_512) == 0x55aa55aa) {
++			ext_csd = ecsd;
++			valid_ecsd = true;
++			goto decode;
++		} else {
++			dev_dbg(dev, "invalid ecsd tag!");
++		}
++	} else {
++		dev_info(dev, "not find \"memory-region\" property\n");
++	}
++
++get_ecsd:
++#endif
+ 	err = mmc_get_ext_csd(card, &ext_csd);
+ 	if (err) {
+ 		/* If the host or the card can't do the switch,
+@@ -687,12 +749,22 @@ static int mmc_read_ext_csd(struct mmc_card *card)
+ 
+ 		return err;
+ 	}
+-
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++decode:
++#endif
+ 	err = mmc_decode_ext_csd(card, ext_csd);
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	if (!valid_ecsd)
++		kfree(ext_csd);
++	else
++		vunmap(ecsd);
++#else
+ 	kfree(ext_csd);
++#endif
+ 	return err;
+ }
+ 
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ static int mmc_compare_ext_csds(struct mmc_card *card, unsigned bus_width)
+ {
+ 	u8 *bw_ext_csd;
+@@ -765,6 +837,7 @@ static int mmc_compare_ext_csds(struct mmc_card *card, unsigned bus_width)
+ 	kfree(bw_ext_csd);
+ 	return err;
+ }
++#endif
+ 
+ MMC_DEV_ATTR(cid, "%08x%08x%08x%08x\n", card->raw_cid[0], card->raw_cid[1],
+ 	card->raw_cid[2], card->raw_cid[3]);
+@@ -1031,11 +1104,12 @@ static int mmc_select_bus_width(struct mmc_card *card)
+ 		 * compare ext_csd previously read in 1 bit mode
+ 		 * against ext_csd at new bus width
+ 		 */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 		if (!(host->caps & MMC_CAP_BUS_WIDTH_TEST))
+ 			err = mmc_compare_ext_csds(card, bus_width);
+ 		else
+ 			err = mmc_bus_test(card, bus_width);
+-
++#endif
+ 		if (!err) {
+ 			err = bus_width;
+ 			break;
+@@ -1566,7 +1640,9 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 	 * respond.
+ 	 * mmc_go_idle is needed for eMMC that are asleep
+ 	 */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 	mmc_go_idle(host);
++#endif
+ 
+ 	/* The extra bit indicates that we support high capacity */
+ 	err = mmc_send_op_cond(host, ocr | (1 << 30), &rocr);
+@@ -1609,7 +1685,9 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 		card->ocr = ocr;
+ 		card->type = MMC_TYPE_MMC;
+ 		card->rca = 1;
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 		memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
++#endif
+ 	}
+ 
+ 	/*
+@@ -1640,9 +1718,11 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 		err = mmc_decode_csd(card);
+ 		if (err)
+ 			goto free_card;
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 		err = mmc_decode_cid(card);
+ 		if (err)
+ 			goto free_card;
++#endif
+ 	}
+ 
+ 	/*
+@@ -1773,6 +1853,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 	/*
+ 	 * Enable HPI feature (if supported)
+ 	 */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 	if (card->ext_csd.hpi) {
+ 		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+ 				EXT_CSD_HPI_MGMT, 1,
+@@ -1788,7 +1869,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
+ 			card->ext_csd.hpi_en = 1;
+ 		}
+ 	}
+-
++#endif
+ 	/*
+ 	 * If cache size is higher than 0, this indicates the existence of cache
+ 	 * and it can be turned on. Note that some eMMCs from Micron has been
+diff --git a/drivers/mmc/core/mmc_ops.c b/drivers/mmc/core/mmc_ops.c
+index e885fbd1b3e6..1f142a7e9fb4 100644
+--- a/drivers/mmc/core/mmc_ops.c
++++ b/drivers/mmc/core/mmc_ops.c
+@@ -147,24 +147,25 @@ int mmc_go_idle(struct mmc_host *host)
+ 	 * rules that must accommodate non-MMC slaves which this layer
+ 	 * won't even know about.
+ 	 */
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 	if (!mmc_host_is_spi(host)) {
+ 		mmc_set_chip_select(host, MMC_CS_HIGH);
+ 		mmc_delay(1);
+ 	}
+-
++#endif
+ 	cmd.opcode = MMC_GO_IDLE_STATE;
+ 	cmd.arg = 0;
+ 	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_NONE | MMC_CMD_BC;
+ 
+ 	err = mmc_wait_for_cmd(host, &cmd, 0);
+ 
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 	mmc_delay(1);
+-
+ 	if (!mmc_host_is_spi(host)) {
+ 		mmc_set_chip_select(host, MMC_CS_DONTCARE);
+ 		mmc_delay(1);
+ 	}
+-
++#endif
+ 	host->use_spi_crc = 0;
+ 
+ 	return err;
+@@ -198,8 +199,11 @@ int mmc_send_op_cond(struct mmc_host *host, u32 ocr, u32 *rocr)
+ 		}
+ 
+ 		err = -ETIMEDOUT;
+-
++#ifndef CONFIG_ROCKCHIP_THUNDER_BOOT
+ 		mmc_delay(1);
++#else
++		udelay(1);
++#endif
+ 	}
+ 
+ 	if (rocr && !mmc_host_is_spi(host))
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index cbb0b9c7bcb3..9988b3bd6757 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -22,6 +22,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/ioport.h>
+ #include <linux/module.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/seq_file.h>
+@@ -39,6 +40,7 @@
+ #include <linux/of.h>
+ #include <linux/of_gpio.h>
+ #include <linux/mmc/slot-gpio.h>
++#include <linux/soc/rockchip/rockchip_decompress.h>
+ 
+ #include "dw_mmc.h"
+ 
+@@ -234,6 +236,7 @@ static bool dw_mci_ctrl_reset(struct dw_mci *host, u32 reset)
+ static void dw_mci_wait_while_busy(struct dw_mci *host, u32 cmd_flags)
+ {
+ 	u32 status;
++	u32 delay = 10;
+ 
+ 	/*
+ 	 * Databook says that before issuing a new data transfer command
+@@ -243,12 +246,16 @@ static void dw_mci_wait_while_busy(struct dw_mci *host, u32 cmd_flags)
+ 	 * ...also allow sending for SDMMC_CMD_VOLT_SWITCH where busy is
+ 	 * expected.
+ 	 */
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	if (host->slot->mmc->restrict_caps & RESTRICT_CARD_TYPE_EMMC)
++		delay = 0;
++#endif
+ 	if ((cmd_flags & SDMMC_CMD_PRV_DAT_WAIT) &&
+ 	    !(cmd_flags & SDMMC_CMD_VOLT_SWITCH)) {
+ 		if (readl_poll_timeout_atomic(host->regs + SDMMC_STATUS,
+ 					      status,
+ 					      !(status & SDMMC_STATUS_BUSY),
+-					      10, 500 * USEC_PER_MSEC))
++					      delay, 500 * USEC_PER_MSEC))
+ 			dev_err(host->dev, "Busy; trying anyway\n");
+ 	}
+ }
+@@ -3280,6 +3287,57 @@ int dw_mci_probe(struct dw_mci *host)
+ 	int width, i, ret = 0;
+ 	u32 fifo_size;
+ 
++#if defined(CONFIG_ROCKCHIP_THUNDER_BOOT) && defined(CONFIG_ROCKCHIP_HW_DECOMPRESS)
++	struct resource idmac, ramdisk_src, ramdisk_dst;
++	struct device_node *dma, *rds, *rdd;
++	struct device *dev = host->dev;
++	u32 intr;
++
++	if (device_property_read_bool(host->dev, "supports-emmc")) {
++		if (readl_poll_timeout(host->regs + SDMMC_STATUS,
++				fifo_size,
++				!(fifo_size & (BIT(10) | GENMASK(7, 4))),
++				0, 500 * USEC_PER_MSEC))
++			dev_err(dev, "Controller is occupied!\n");
++
++		if (readl_poll_timeout(host->regs + SDMMC_IDSTS,
++				fifo_size, !(fifo_size & GENMASK(16, 13)),
++				0, 500 * USEC_PER_MSEC))
++			dev_err(dev, "DMA is still running!\n");
++
++		intr = mci_readl(host, RINTSTS);
++		if (intr & DW_MCI_CMD_ERROR_FLAGS || intr & DW_MCI_DATA_ERROR_FLAGS)
++			BUG_ON(1);
++
++		/* Release idmac descriptor */
++		dma = of_parse_phandle(dev->of_node, "memory-region-idamc", 0);
++		if (dma) {
++			ret = of_address_to_resource(dma, 0, &idmac);
++			if (ret >= 0)
++				free_reserved_area(phys_to_virt(idmac.start),
++					phys_to_virt(idmac.start) + resource_size(&idmac),
++					-1, NULL);
++		}
++
++		/* Parse ramdisk addr and help start decompressing */
++		rds = of_parse_phandle(dev->of_node, "memory-region-src", 0);
++		rdd = of_parse_phandle(dev->of_node, "memory-region-dst", 0);
++		if (rds && rdd) {
++			if (of_address_to_resource(rds, 0, &ramdisk_src) >= 0 &&
++				of_address_to_resource(rdd, 0, &ramdisk_dst) >= 0)
++				/*
++				 * Decompress HW driver will free reserved area of
++				 * memory-region-src.
++				 */
++				ret = rk_decom_start(GZIP_MOD, ramdisk_src.start,
++						     ramdisk_dst.start,
++						     resource_size(&ramdisk_dst));
++			if (ret < 0)
++				dev_err(dev, "fail to start decom\n");
++		}
++	}
++#endif
++
+ 	if (!host->pdata) {
+ 		host->pdata = dw_mci_parse_dt(host);
+ 		if (PTR_ERR(host->pdata) == -EPROBE_DEFER) {
+-- 
+2.35.3
+

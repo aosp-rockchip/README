@@ -1,0 +1,152 @@
+From 37ac53e7860cc83e3f82645035d2359c0569a6a9 Mon Sep 17 00:00:00 2001
+From: Luowei <lw@rock-chips.com>
+Date: Fri, 17 Oct 2014 11:26:01 +0800
+Subject: [PATCH] spi:improve spi dma burst
+
+---
+ drivers/spi/spi-rockchip-core.c | 23 +++++++++++++++++------
+ drivers/spi/spi-rockchip-core.h |  2 ++
+ drivers/spi/spi-rockchip-dma.c  | 11 +++++++----
+ drivers/spi/spi-rockchip-test.c | 10 ++++++----
+ 4 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/spi/spi-rockchip-core.c b/drivers/spi/spi-rockchip-core.c
+index 87b1df613aee..93cb1803d2af 100755
+--- a/drivers/spi/spi-rockchip-core.c
++++ b/drivers/spi/spi-rockchip-core.c
+@@ -569,7 +569,7 @@ static void pump_transfers(unsigned long data)
+ 	u32 speed = 0;
+ 	u32 cr0 = 0;	
+ 	u16 dma_ctrl = 0;
+-
++	int i = 0;
+ 
+ 	/* Get current state information */
+ 	message = dws->cur_msg;
+@@ -747,27 +747,38 @@ static void pump_transfers(unsigned long data)
+ 		/* setup DMA related registers */
+ 		if(dws->dma_mapped)
+ 		{
++			dws->dmatdlr = dws->n_bytes;
++			dws->dmardlr = dws->n_bytes - 1;
++			for(i=dws->n_bytes; i<=dws->fifo_len / 4; i++)
++			{
++				if((dws->len / dws->n_bytes) % i == 0)
++				dws->dmatdlr = i;
++			}
++
+ 			/* Set the interrupt mask, for poll mode just diable all int */
+ 			spi_mask_intr(dws, 0xff);		
+ 			if(dws->tx)
+ 			{
+ 				dma_ctrl |= SPI_DMACR_TX_ENABLE;		
+-				dw_writew(dws, SPIM_DMATDLR, 8);
++				dw_writew(dws, SPIM_DMATDLR, dws->dmatdlr);
+ 				dw_writew(dws, SPIM_CTRLR1, dws->len-1);	
+ 			}
++
++			dws->dmardlr = (dws->dmatdlr != dws->n_bytes)?(dws->dmatdlr-1):(dws->n_bytes-1);
+ 			
+ 			if (dws->rx)
+ 			{
+ 				dma_ctrl |= SPI_DMACR_RX_ENABLE;	
+-				dw_writew(dws, SPIM_DMARDLR, 0);			
+-				dw_writew(dws, SPIM_CTRLR1, dws->len-1);	
++				dw_writew(dws, SPIM_DMARDLR, dws->dmardlr);
++				dw_writew(dws, SPIM_CTRLR1, dws->len-1);
+ 			}
+ 			dw_writew(dws, SPIM_DMACR, dma_ctrl);
+ 
+-			DBG_SPI("%s:dma_ctrl=0x%x\n",__func__,dw_readw(dws, SPIM_DMACR));
++			DBG_SPI("%s:dma_ctrl=0x%x,dmatdlr=%d,dmardlr=%d\n",__func__,dw_readw(dws, SPIM_DMACR),dws->dmatdlr, dws->dmardlr);
+ 			
+ 		}
+-		
++
++		if((!dws->dma_mapped) || (dws->dma_mapped && dws->tx))
+ 		spi_enable_chip(dws, 1);
+ 
+ 		DBG_SPI("%s:ctrl0=0x%x\n",__func__,dw_readw(dws, SPIM_CTRLR0));
+diff --git a/drivers/spi/spi-rockchip-core.h b/drivers/spi/spi-rockchip-core.h
+index 9fa458c13cd3..bb07d58ba3e0 100755
+--- a/drivers/spi/spi-rockchip-core.h
++++ b/drivers/spi/spi-rockchip-core.h
+@@ -179,6 +179,8 @@ struct dw_spi {
+ 	u8			n_bytes;	/* current is a 1/2 bytes op */
+ 	u8			max_bits_per_word;	/* maxim is 16b */
+ 	u32			dma_width;
++	int			dmatdlr;
++	int			dmardlr;
+ 	int			cs_change;
+ 	void			*tx_buffer;
+ 	void			*rx_buffer;
+diff --git a/drivers/spi/spi-rockchip-dma.c b/drivers/spi/spi-rockchip-dma.c
+index 11468e04dbe3..cbd613a0c629 100755
+--- a/drivers/spi/spi-rockchip-dma.c
++++ b/drivers/spi/spi-rockchip-dma.c
+@@ -252,7 +252,7 @@ static int mid_spi_dma_transfer(struct dw_spi *dws, int cs_change)
+ 		/* 2. Prepare the TX dma transfer */
+ 		txconf.direction = DMA_MEM_TO_DEV;
+ 		txconf.dst_addr = dws->tx_dma_addr;
+-		txconf.dst_maxburst = dws->dma_width;
++		txconf.dst_maxburst = dws->dmatdlr;//dws->dma_width;
+ 		//txconf.src_addr_width = width;
+ 		txconf.dst_addr_width = width;
+ 		//txconf.device_fc = false;
+@@ -276,7 +276,7 @@ static int mid_spi_dma_transfer(struct dw_spi *dws, int cs_change)
+ 		txdesc->callback = dw_spi_dma_txcb;
+ 		txdesc->callback_param = dws;
+ 
+-		DBG_SPI("%s:dst_addr=0x%p,tx_dma=0x%p,len=%d,burst=%d,width=%d\n",__func__,(int *)dws->tx_dma_addr, (int *)dws->tx_dma, dws->len,dws->dma_width, width);
++		DBG_SPI("%s:dst_addr=0x%p,tx_dma=0x%p,len=%d,burst=%d,width=%d\n",__func__,(int *)dws->tx_dma_addr, (int *)dws->tx_dma, dws->len,txconf.dst_maxburst, width);
+ 	}
+ 
+ 	if (dws->rx)
+@@ -284,7 +284,7 @@ static int mid_spi_dma_transfer(struct dw_spi *dws, int cs_change)
+ 		/* 3. Prepare the RX dma transfer */
+ 		rxconf.direction = DMA_DEV_TO_MEM;
+ 		rxconf.src_addr = dws->rx_dma_addr;
+-		rxconf.src_maxburst = dws->dma_width; 
++		rxconf.src_maxburst = dws->dmardlr + 1;//dws->dma_width;
+ 		//rxconf.dst_addr_width = width;
+ 		rxconf.src_addr_width = width;
+ 		//rxconf.device_fc = false;
+@@ -307,8 +307,11 @@ static int mid_spi_dma_transfer(struct dw_spi *dws, int cs_change)
+ 		rxdesc->callback = dw_spi_dma_rxcb;
+ 		rxdesc->callback_param = dws;
+ 		
+-		DBG_SPI("%s:src_addr=0x%p,rx_dma=0x%p,len=%d,burst=%d,width=%d\n",__func__, (int *)dws->rx_dma_addr, (int *)dws->rx_dma, dws->len, dws->dma_width, width);
++		DBG_SPI("%s:src_addr=0x%p,rx_dma=0x%p,len=%d,burst=%d,width=%d\n",__func__, (int *)dws->rx_dma_addr, (int *)dws->rx_dma, dws->len, rxconf.src_maxburst, width);
+ 	}
++
++	if(!dws->tx)
++	spi_enable_chip(dws, 1);
+ 	
+ 	/* rx must be started before tx due to spi instinct */	
+ 	if (dws->rx)
+diff --git a/drivers/spi/spi-rockchip-test.c b/drivers/spi/spi-rockchip-test.c
+index 19aa7a12b6b9..58411e4279ac 100755
+--- a/drivers/spi/spi-rockchip-test.c
++++ b/drivers/spi/spi-rockchip-test.c
+@@ -81,12 +81,14 @@ static ssize_t spi_test_write(struct file *file,
+ 
+ 	spi = g_spi_test_data[nr]->spi;
+ 
+-	for(i=0; i<100; i++)
++	for(i=0; i<5000; i++)
+ 	{
+ 		ret = spi_write(spi, txbuf, 256);
+-		ret = spi_read(spi, rxbuf, 256);
+-		ret = spi_write_then_read(spi,txbuf,256,rxbuf,256);		
+-		ret = spi_write_and_read(spi,txbuf,rxbuf,256);
++		ret = spi_read(spi, rxbuf, 255);
++		ret = spi_write_then_read(spi,txbuf,254,rxbuf,253);
++		ret = spi_write_and_read(spi,txbuf,rxbuf,252);
++		ret = spi_write_and_read(spi,txbuf,rxbuf,251);
++		if(i%500==0)
+ 		printk("%s:test %d times\n\n",__func__,i+1);
+ 	}
+ 	
+-- 
+2.35.3
+

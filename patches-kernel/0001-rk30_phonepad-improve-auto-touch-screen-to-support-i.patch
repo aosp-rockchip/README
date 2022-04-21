@@ -1,0 +1,2019 @@
+From 1ff0d97d072d6e285b4d99db84d9f2605d2ca8c7 Mon Sep 17 00:00:00 2001
+From: luowei <lw@rock-chips.com>
+Date: Tue, 16 Oct 2012 15:02:37 +0800
+Subject: [PATCH] rk30_phonepad:improve auto touch screen to support
+ i2c,spi,uart interface
+
+---
+ drivers/input/ts/Kconfig        |  22 +-
+ drivers/input/ts/Makefile       |   8 +-
+ drivers/input/ts/chips/Kconfig  |  34 +-
+ drivers/input/ts/chips/ft5306.c |  78 ++---
+ drivers/input/ts/chips/gt8110.c |  63 ++--
+ drivers/input/ts/chips/gt828.c  | 189 ++++++++----
+ drivers/input/ts/ts-auto.c      | 531 ++++++++++++++++----------------
+ drivers/input/ts/ts-i2c.c       | 301 +++++++++---------
+ include/linux/ts-auto.h         |  73 +++--
+ 9 files changed, 706 insertions(+), 593 deletions(-)
+
+diff --git a/drivers/input/ts/Kconfig b/drivers/input/ts/Kconfig
+index e205cb125737..314a0aab9fac 100755
+--- a/drivers/input/ts/Kconfig
++++ b/drivers/input/ts/Kconfig
+@@ -1,15 +1,15 @@
+ #
+-# all auto touch screen drivers configuration
++# all auto touch screen drivers configuration
+ #
+-
+-menuconfig TS_AUTO
+-	bool "auto touch screen driver support"
++
++menuconfig TS_AUTO
++	bool "auto touch screen driver support"
+ 	default n	
+ 
+-if TS_AUTO
+-
+-source "drivers/input/ts/chips/Kconfig"
+-
+-endif
+-
+-
++if TS_AUTO
++
++source "drivers/input/ts/chips/Kconfig"
++
++endif
++
++
+diff --git a/drivers/input/ts/Makefile b/drivers/input/ts/Makefile
+index a92c9b671b1d..f13cb4a8c733 100755
+--- a/drivers/input/ts/Makefile
++++ b/drivers/input/ts/Makefile
+@@ -1,6 +1,6 @@
+ # auto touch screen drivers
++obj-$(CONFIG_TS_AUTO_I2C)		+= ts-i2c.o
++obj-$(CONFIG_TS_AUTO_SPI)		+= ts-spi.o
++obj-$(CONFIG_TS_AUTO_SERIAL)	+= ts-serial.o
+ obj-$(CONFIG_TS_AUTO)			+= chips/
+-
+-obj-$(CONFIG_TS_AUTO)			+= ts-i2c.o
+-obj-$(CONFIG_TS_AUTO)			+= ts-auto.o
+-
++obj-$(CONFIG_TS_AUTO)			+= ts-auto.o
+\ No newline at end of file
+diff --git a/drivers/input/ts/chips/Kconfig b/drivers/input/ts/chips/Kconfig
+index 8dbe1802670d..2854c91c437a 100755
+--- a/drivers/input/ts/chips/Kconfig
++++ b/drivers/input/ts/chips/Kconfig
+@@ -1,11 +1,35 @@
++menuconfig TS_AUTO_I2C
++	bool "Support auto touch screen with I2C"
++	default n	
++	
++if TS_AUTO_I2C
++
+ config TS_FT5306
+-  bool "touch screen ft5306"
+-	default n
++bool "touch screen ft5306"
++	default n
+  
+ config TS_GT8110
+-  bool "touch screen gt8110"
++	bool "touch screen gt8110"
+ 	default n	
+ 
+ config TS_GT828
+-  bool "touch screen gt828"
+-	default n
+\ No newline at end of file
++	bool "touch screen gt828"
++	default n
++	
++endif
++
++config TS_AUTO_SPI
++	bool "Support auto touch screen with SPI"
++	depends on SPI_MASTER
++
++if TS_AUTO_SPI
++	
++endif
++
++config TS_AUTO_SERIAL
++	bool "Support auto touch screen with UART"
++	
++if TS_AUTO_SERIAL
++	
++endif
++
+diff --git a/drivers/input/ts/chips/ft5306.c b/drivers/input/ts/chips/ft5306.c
+index 6e005d1adf50..bdf2952d2f28 100755
+--- a/drivers/input/ts/chips/ft5306.c
++++ b/drivers/input/ts/chips/ft5306.c
+@@ -48,10 +48,8 @@
+ 
+ /****************operate according to ts chip:start************/
+ 
+-static int ts_active(struct i2c_client *client, int enable)
+-{
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
++static int ts_active(struct ts_private_data *ts, int enable)
++{	
+ 	int result = 0;
+ 
+ 	if(enable)
+@@ -70,10 +68,8 @@ static int ts_active(struct i2c_client *client, int enable)
+ 	return result;
+ }
+ 
+-static int ts_init(struct i2c_client *client)
++static int ts_init(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+ 	int irq_pin = irq_to_gpio(ts->pdata->irq);
+ 	int result = 0;
+ 	
+@@ -89,17 +85,14 @@ static int ts_init(struct i2c_client *client)
+ }
+ 
+ 
+-static int ts_report_value(struct i2c_client *client)
++static int ts_report_value(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	struct ts_event *event = &ts->event;
+ 	unsigned char buf[32] = {0};
+ 	int result = 0 , i = 0, off = 0, id = 0;
+ 
+-	buf[0] = ts->ops->read_reg;
+-	result = ts_rx_data(client, buf, ts->ops->read_len);
++	result = ts_bulk_read(ts, (unsigned short)ts->ops->read_reg, ts->ops->read_len, (unsigned short *)buf);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -111,13 +104,20 @@ static int ts_report_value(struct i2c_client *client)
+ 	
+ 	event->touch_point = buf[2] & 0x07;// 0000 1111
+ 
++	for(i=0; i<ts->ops->max_point; i++)
++	{
++		event->point[i].status = 0;
++		event->point[i].x = 0;
++		event->point[i].y = 0;
++	}
++
+ 	if(event->touch_point == 0)
+ 	{	
+ 		for(i=0; i<ts->ops->max_point; i++)
+ 		{
+-			if(event->point[i].status != 0)
++			if(event->point[i].last_status != 0)
+ 			{
+-				event->point[i].status = 0;				
++				event->point[i].last_status = 0;				
+ 				input_mt_slot(ts->input_dev, event->point[i].id);				
+ 				input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, -1);
+ 				input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, false);
+@@ -130,7 +130,7 @@ static int ts_report_value(struct i2c_client *client)
+ 				
+ 		return 0;
+ 	}
+-	
++
+ 	for(i = 0; i<event->touch_point; i++)
+ 	{
+ 		off = i*6+3;
+@@ -147,41 +147,49 @@ static int ts_report_value(struct i2c_client *client)
+ 
+ 		if(ts->ops->x_revert)
+ 		{
+-			event->point[id].x = ts->ops->pixel.max_x - event->point[id].x;	
++			event->point[id].x = ts->ops->range[0] - event->point[id].x;	
+ 		}
+ 
+ 		if(ts->ops->y_revert)
+ 		{
+-			event->point[id].y = ts->ops->pixel.max_y - event->point[id].y;
+-		}
++			event->point[id].y = ts->ops->range[1] - event->point[id].y;
++		}	
++		
++	}
+ 
+-		if(event->point[id].status != 0)
++	for(i=0; i<ts->ops->max_point; i++)
++	{
++		if(event->point[i].status != 0)
+ 		{		
+-			input_mt_slot(ts->input_dev, event->point[id].id);
+-			input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, event->point[id].id);
++			input_mt_slot(ts->input_dev, event->point[i].id);
++			input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, event->point[i].id);
+ 			input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, 1);
+-			input_report_abs(ts->input_dev, ABS_MT_POSITION_X, event->point[id].x);
+-			input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, event->point[id].y);
++			input_report_abs(ts->input_dev, ABS_MT_POSITION_X, event->point[i].x);
++			input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, event->point[i].y);
+ 			input_report_abs(ts->input_dev, ABS_MT_WIDTH_MAJOR, 1);
+ 	   		DBG("%s:%s press down,id=%d,x=%d,y=%d\n",__func__,ts->ops->name, event->point[id].id, event->point[id].x,event->point[id].y);
+ 		}
+-		
+-		
++		else if ((event->point[i].status == 0) && (event->point[i].last_status != 0))
++		{				
++			input_mt_slot(ts->input_dev, event->point[i].id);				
++			input_report_abs(ts->input_dev, ABS_MT_TRACKING_ID, -1);
++			input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, false);
++			DBG("%s:%s press up1,id=%d\n",__func__,ts->ops->name, event->point[i].id);
++		}
++
++		event->point[i].last_status = event->point[i].status;
+ 	}
+-	
+ 	input_sync(ts->input_dev);
+ 
+ 	return 0;
+ }
+ 
+-static int ts_suspend(struct i2c_client *client)
++static int ts_suspend(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 0);
++		ts->ops->active(ts, 0);
+ 	
+ 	return 0;
+ }
+@@ -189,14 +197,12 @@ static int ts_suspend(struct i2c_client *client)
+ 
+ 
+ 
+-static int ts_resume(struct i2c_client *client)
++static int ts_resume(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 1);
++		ts->ops->active(ts, 1);
+ 	return 0;
+ }
+ 
+@@ -207,9 +213,9 @@ static int ts_resume(struct i2c_client *client)
+ struct ts_operate ts_ft5306_ops = {
+ 	.name				= "ft5306",
+ 	.slave_addr			= 0x3e,
+-	.id_i2c				= TS_ID_FT5306,			//i2c id number
++	.ts_id				= TS_ID_FT5306,			//i2c id number
++	.bus_type			= TS_BUS_TYPE_I2C,
+ 	.reg_size			= 1,
+-	.pixel				= {1024,768},
+ 	.id_reg				= FT5306_ID_REG,
+ 	.id_data			= TS_UNKNOW_DATA,
+ 	.version_reg			= TS_UNKNOW_DATA,
+diff --git a/drivers/input/ts/chips/gt8110.c b/drivers/input/ts/chips/gt8110.c
+index de04d89925e4..bc49cb40cda0 100755
+--- a/drivers/input/ts/chips/gt8110.c
++++ b/drivers/input/ts/chips/gt8110.c
+@@ -51,10 +51,8 @@
+ 
+ /****************operate according to ts chip:start************/
+ 
+-static int ts_active(struct i2c_client *client, int enable)
++static int ts_active(struct ts_private_data *ts, int enable)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+ 	unsigned char buf_suspend[2] = {0x38, 0x56};		//suspend cmd
+ 	int result = 0;
+ 
+@@ -67,7 +65,7 @@ static int ts_active(struct i2c_client *client, int enable)
+ 	}
+ 	else
+ 	{
+-		result = ts_tx_data(client, buf_suspend, 2);
++		result = ts_bulk_write(ts, (unsigned short )buf_suspend[0], 2, (unsigned short *)&buf_suspend[1]);
+ 		if(result < 0)
+ 		{
+ 			printk("%s:fail to init ts\n",__func__);
+@@ -81,10 +79,8 @@ static int ts_active(struct i2c_client *client, int enable)
+ 	return result;
+ }
+ 
+-static int ts_init(struct i2c_client *client)
++static int ts_init(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+ 	int irq_pin = irq_to_gpio(ts->pdata->irq);
+ 	char version_data[18] = {240};
+ 	char init_data[95] = {
+@@ -101,8 +97,8 @@ static int ts_init(struct i2c_client *client)
+         };
+ 	int result = 0, i = 0;
+ 
+-	//read version
+-	result = ts_rx_data(client, version_data, 17);
++	//read version	
++	result = ts_bulk_read(ts, (unsigned short)version_data[0], 16, (unsigned short *)&version_data[1]);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -113,14 +109,14 @@ static int ts_init(struct i2c_client *client)
+ 	printk("%s:%s version is %s\n",__func__,ts->ops->name, version_data);
+ #if 1
+ 	//init some register
+-	result = ts_tx_data(client, init_data, 95);
++	result = ts_bulk_write(ts, (unsigned short )init_data[0], 94, (unsigned short *)&init_data[1]);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+ 		return result;
+ 	}
+ #endif
+-	result = ts_rx_data(client, init_data, 95);
++	result = ts_bulk_read(ts, (unsigned short)init_data[0], 94, (unsigned short *)&init_data[1]);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -128,16 +124,16 @@ static int ts_init(struct i2c_client *client)
+ 	}
+ 
+ 	
+-	printk("%s:rx:",__func__);
++	DBG("%s:rx:",__func__);
+ 	for(i=0; i<95; i++)
+-	printk("0x%x,",init_data[i]);
++	DBG("0x%x,",init_data[i]);
+ 
+-	printk("\n");
++	DBG("\n");
+ 	
+ 	return result;
+ }
+ 
+-static bool goodix_get_status(char *p1,int*p2)
++static bool goodix_get_status(int *p1,int*p2)
+ {
+ 	bool status = PEN_DOWN;
+ 	if((*p2==PEN_DOWN) && (*p1==PEN_RELEASE))
+@@ -159,10 +155,8 @@ static bool goodix_get_status(char *p1,int*p2)
+ 
+ 
+ 
+-static int ts_check_irq(struct i2c_client *client)
++static int ts_check_irq(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;	
+ 	struct ts_event *event = &ts->event;
+ 	int gpio_level_no_int = GPIO_HIGH;
+@@ -190,26 +184,25 @@ static int ts_check_irq(struct i2c_client *client)
+ 		
+ 		input_sync(ts->input_dev);	
+ 		memset(event, 0x00, sizeof(struct ts_event));	
+-		enable_irq(ts->client->irq);
++		enable_irq(ts->irq);
+ 	}
+ 	else
+ 	schedule_delayed_work(&ts->delaywork, msecs_to_jiffies(ts->ops->poll_delay_ms));
++
++	return 0;
+ 	
+ }
+ 
+ 
+-static int ts_report_value(struct i2c_client *client)
++static int ts_report_value(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	struct ts_event *event = &ts->event;
+ 	unsigned char buf[54] = {0};
+ 	int result = 0 , i = 0, j = 0, off = 0, id = 0;
+ 	int temp = 0, num = 0;
+ 
+-	buf[0] = ts->ops->read_reg;
+-	result = ts_rx_data(client, buf, ts->ops->read_len);
++	result = ts_bulk_read(ts, ts->ops->read_reg, ts->ops->read_len, (unsigned short *)buf);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -261,12 +254,12 @@ static int ts_report_value(struct i2c_client *client)
+ 
+ 		if(ts->ops->x_revert)
+ 		{
+-			event->point[id].x = ts->ops->pixel.max_x - event->point[id].x;	
++			event->point[id].x = ts->ops->range[0] - event->point[id].x;	
+ 		}
+ 
+ 		if(ts->ops->y_revert)
+ 		{
+-			event->point[id].y = ts->ops->pixel.max_y - event->point[id].y;
++			event->point[id].y = ts->ops->range[1] - event->point[id].y;
+ 		}
+ 
+ 		
+@@ -299,27 +292,23 @@ static int ts_report_value(struct i2c_client *client)
+ 	return 0;
+ }
+ 
+-static int ts_suspend(struct i2c_client *client)
+-{
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
++static int ts_suspend(struct ts_private_data *ts)
++{	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 0);
++		ts->ops->active(ts, 0);
+ 	
+ 	return 0;
+ }
+ 
+ 
+-static int ts_resume(struct i2c_client *client)
++static int ts_resume(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 1);
++		ts->ops->active(ts, 1);
+ 	return 0;
+ }
+ 
+@@ -328,9 +317,9 @@ static int ts_resume(struct i2c_client *client)
+ struct ts_operate ts_gt8110_ops = {
+ 	.name				= "gt8110",
+ 	.slave_addr			= 0x5c,
+-	.id_i2c				= TS_ID_GT8110,			//i2c id number
++	.ts_id				= TS_ID_GT8110,			//i2c id number
++	.bus_type			= TS_BUS_TYPE_I2C,
+ 	.reg_size			= 1,
+-	.pixel				= {1280,800},
+ 	.id_reg				= GT8110_ID_REG,
+ 	.id_data			= TS_UNKNOW_DATA,
+ 	.version_reg			= TS_UNKNOW_DATA,
+diff --git a/drivers/input/ts/chips/gt828.c b/drivers/input/ts/chips/gt828.c
+index bee168e1fbd6..5a02355f48ba 100755
+--- a/drivers/input/ts/chips/gt828.c
++++ b/drivers/input/ts/chips/gt828.c
+@@ -48,16 +48,73 @@
+ #define GTP_REG_CONFIG_DATA   0x0F80
+ #define GTP_REG_VERSION       0x0F7D
+ 
++#define GTP_CONFIG_LENGTH	112
++#define TRIGGER_LOC		64
++
++//STEP_1(REQUIRED):Change config table.
++/*TODO: puts the config info corresponded to your TP here, the following is just
++a sample config, send this config should cause the chip cannot work normally*/
++//default or float
++
++u8 cfg_info_group[][GTP_CONFIG_LENGTH] = 
++{
++	{
++		0x00,0x0F,0x01,0x10,0x02,0x11,0x03,0x12,0x04,0x13,
++		0x05,0x14,0x06,0x15,0x07,0x16,0x08,0x17,0x09,0x18,
++		0x0A,0x19,0x0B,0x1A,0x0C,0x1B,0x0D,0x1C,0xFF,0xFF,
++		0x02,0x0C,0x03,0x0D,0x04,0x0E,0x05,0x0F,0x06,0x10,
++		0x07,0x11,0x08,0x12,0x09,0x13,0xFF,0x11,0x12,0x13,
++		0x0F,0x03,0x88,0x10,0x10,0x2A,0x00,0x00,0x00,0x00,
++		0x00,0x0E,0x45,0x30,0x58,0x03,0x00,0x05,0x00,0x02,
++		0x58,0x03,0x20,0x55,0x5E,0x50,0x58,0x27,0x00,0x05,
++		0x19,0x05,0x14,0x10,0x00,0x05,0x00,0x00,0x00,0x00,
++		0x00,0x00,0x40,0x30,0x30,0x3C,0x00,0x00,0x00,0x00,
++		0x0F,0x88,0x28,0x05,0x00,0x00,0x00,0x00,0x00,0x00,
++		0x00,0x01
++	},
++	{
++		0x00,0x0F,0x01,0x10,0x02,0x11,0x03,0x12,0x04,0x13,
++		0x05,0x14,0x06,0x15,0x07,0x16,0x08,0x17,0x09,0x18,
++		0x0A,0x19,0x0B,0x1A,0x0C,0x1B,0x0D,0x1C,0xFF,0xFF,
++		0x02,0x0C,0x03,0x0D,0x04,0x0E,0x05,0x0F,0x06,0x10,
++		0x07,0x11,0x08,0x12,0x09,0x13,0xFF,0x11,0x12,0x13,
++		0x0F,0x03,0x88,0x10,0x10,0x2A,0x00,0x00,0x00,0x00,
++		0x00,0x0E,0x45,0x30,0x58,0x03,0x00,0x05,0x00,0x02,
++		0x58,0x03,0x20,0x55,0x5E,0x50,0x58,0x27,0x00,0x05,
++		0x19,0x05,0x14,0x10,0x00,0x05,0x00,0x00,0x00,0x00,
++		0x00,0x00,0x40,0x30,0x30,0x3C,0x00,0x00,0x00,0x00,
++		0x0F,0x88,0x28,0x05,0x00,0x00,0x00,0x00,0x00,0x00,
++		0x00,0x01
++	},
++		
++	{
++		0x00,0x0F,0x01,0x10,0x02,0x11,0x03,0x12,0x04,0x13,
++		0x05,0x14,0x06,0x15,0x07,0x16,0x08,0x17,0x09,0x18,
++		0x0A,0x19,0x0B,0x1A,0x0C,0x1B,0x0D,0x1C,0xFF,0xFF,
++		0x02,0x0C,0x03,0x0D,0x04,0x0E,0x05,0x0F,0x06,0x10,
++		0x07,0x11,0x08,0x12,0x09,0x13,0xFF,0x11,0x12,0x13,
++		0x0F,0x03,0x88,0x10,0x10,0x2A,0x00,0x00,0x00,0x00,
++		0x00,0x0E,0x45,0x30,0x58,0x03,0x00,0x05,0x00,0x02,
++		0x58,0x03,0x20,0x55,0x5E,0x50,0x58,0x27,0x00,0x05,
++		0x19,0x05,0x14,0x10,0x00,0x05,0x00,0x00,0x00,0x00,
++		0x00,0x00,0x40,0x30,0x30,0x3C,0x00,0x00,0x00,0x00,
++		0x0F,0x88,0x28,0x05,0x00,0x00,0x00,0x00,0x00,0x00,
++		0x00,0x01
++	}
++
++};
++
++static u8 config[GTP_CONFIG_LENGTH+2] = {GTP_REG_CONFIG_DATA >> 8, GTP_REG_CONFIG_DATA & 0xff};
+ 
+ 
+ /****************operate according to ts chip:start************/
+ 
+-int ts_i2c_end_cmd(struct i2c_client *client)
++int ts_i2c_end_cmd(struct ts_private_data *ts)
+ {
+ 	int result  = -1;
+ 	char end_cmd_data[2]={0x80, 0x00};
+ 
+-	result = ts_tx_data(client, end_cmd_data, 2);
++	result = ts_reg_write(ts, end_cmd_data[0], end_cmd_data[1]);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -68,10 +125,8 @@ int ts_i2c_end_cmd(struct i2c_client *client)
+ }
+ 
+ 
+-static int ts_active(struct i2c_client *client, int enable)
+-{
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
++static int ts_active(struct ts_private_data *ts, int enable)
++{	
+ 	int result = 0;
+ 
+ 	if(enable)
+@@ -90,15 +145,59 @@ static int ts_active(struct i2c_client *client, int enable)
+ 	return result;
+ }
+ 
+-static int ts_init(struct i2c_client *client)
++static int ts_init(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+ 	int result = 0;
+-	char version_data[4] = {ts->ops->version_reg >> 8, ts->ops->version_reg & 0xff};
++	char version_data[5] = {ts->ops->version_reg >> 8, ts->ops->version_reg & 0xff};
++	u8 rd_cfg_buf[2];
+ 	
++	//init some register	
++	result = ts_bulk_read(ts, ts->ops->version_reg, 1, (unsigned short *)rd_cfg_buf);
++	if(result < 0)
++	{
++		printk("%s:fail to read rd_cfg_buf\n",__func__);
++		return result;
++	}
++
++	result = ts_i2c_end_cmd(ts);
++	if(result < 0)
++	{
++		printk("%s:fail to end cmd\n",__func__);	
++		rd_cfg_buf[0] = 0;
++		//return result;
++	}
++
++	rd_cfg_buf[0] &= 0x03;
++		
++	printk("%s:%s id is %d\n",__func__,ts->ops->name, rd_cfg_buf[0]);
++	
++	memcpy(&config[2], cfg_info_group[rd_cfg_buf[0]], GTP_CONFIG_LENGTH);
++
++	if((ts->ops->trig & IRQF_TRIGGER_FALLING) || (ts->ops->trig & IRQF_TRIGGER_LOW))  //FALLING
++	{
++		config[TRIGGER_LOC+2] &= 0xf7;
++	}
++	else if((ts->ops->trig & IRQF_TRIGGER_RISING) || (ts->ops->trig & IRQF_TRIGGER_HIGH))  //RISING
++	{
++		config[TRIGGER_LOC+2] |= 0x08;
++	}
++	
++	result = ts_bulk_write(ts, GTP_REG_CONFIG_DATA, GTP_CONFIG_LENGTH, (unsigned short *)config);
++	if(result < 0)
++	{
++		printk("%s:fail to send config data\n",__func__);
++		return result;
++	}
++
++	result = ts_i2c_end_cmd(ts);
++	if(result < 0)
++	{
++		printk("%s:fail to end cmd\n",__func__);	
++		//return result;
++	}
++
+ 	//read version
+-	result = ts_rx_data(client, version_data, 4);
++	result = ts_bulk_read(ts, ts->ops->version_reg, 4, (unsigned short *)version_data);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+@@ -106,26 +205,21 @@ static int ts_init(struct i2c_client *client)
+ 	}
+ 	version_data[4]='\0';
+ 	
+-	result = ts_i2c_end_cmd(client);
++	result = ts_i2c_end_cmd(ts);
+ 	if(result < 0)
+ 	{
+-		printk("%s:fail to end ts\n",__func__);
++		printk("%s:fail to end cmd\n",__func__);
+ 		//return result;
+ 	}
+ 	
+ 	printk("%s:%s version is %s\n",__func__,ts->ops->name, version_data);
+-
+-	//init some register
+-	//to do
+ 	
+ 	return result;
+ }
+ 
+ 
+-static int ts_report_value(struct i2c_client *client)
++static int ts_report_value(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	struct ts_event *event = &ts->event;
+ 	unsigned char buf[2 + 2 + 5 * 5 + 1] = {0};
+@@ -133,16 +227,14 @@ static int ts_report_value(struct i2c_client *client)
+ 	int finger = 0;
+ 	int checksum = 0;
+ 
+-	buf[0] = ts->ops->read_reg >> 8;
+-	buf[1] = ts->ops->read_reg & 0xff;
+-	result = ts_rx_data_word(client, buf, ts->ops->read_len);
++	result = ts_bulk_read(ts, ts->ops->read_reg, ts->ops->read_len, (unsigned short *)buf);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to init ts\n",__func__);
+ 		return result;
+ 	}
+ 
+-	result = ts_i2c_end_cmd(client);
++	result = ts_i2c_end_cmd(ts);
+ 	if(result < 0)
+ 	{
+ 		printk("%s:fail to end ts\n",__func__);
+@@ -152,32 +244,11 @@ static int ts_report_value(struct i2c_client *client)
+ 	//for(i=0; i<ts->ops->read_len; i++)
+ 	//DBG("buf[%d]=0x%x\n",i,buf[i]);
+ 	finger = buf[0];
+-	if((finger & 0xc0) != 0x80)
++	if((finger & 0x80) != 0x80)
+ 	{
+-		DBG("%s:data not ready!\n",__func__);
+-		return -1;
++		DBG("%s:data not ready!,finger=0x%x\n",__func__,finger);
++		//return -1;
+ 	}
+-
+-
+-#if 0	
+-	event->touch_point = 0;
+-	for(i=0; i<ts->ops->max_point; i++)
+-	{
+-		if(finger & (1<<i))
+-			event->touch_point++;
+-	}
+-
+-	check_sum = 0;
+-	for ( i = 0; i < 5 * event->touch_point; i++)
+-	{
+-		check_sum += buf[2+i];
+-	}
+-	if (check_sum != buf[5 * event->touch_point])
+-	{
+-		DBG("%s:check sum error!\n",__func__);
+-		return -1;
+-	}
+-#endif
+ 	
+ 	for(i = 0; i<ts->ops->max_point; i++)
+ 	{
+@@ -190,6 +261,8 @@ static int ts_report_value(struct i2c_client *client)
+ 		event->point[id].y = (buf[off+2]<<8) | buf[off+3];
+ 		event->point[id].press = buf[off+4];	
+ 		
++		DBG("data:0x%x,0x%x,0x%x,0x%x\n",buf[off+0],buf[off+1],buf[off+2],buf[off+3]);
++		
+ 		if(ts->ops->xy_swap)
+ 		{
+ 			swap(event->point[id].x, event->point[id].y);
+@@ -197,12 +270,12 @@ static int ts_report_value(struct i2c_client *client)
+ 
+ 		if(ts->ops->x_revert)
+ 		{
+-			event->point[id].x = ts->ops->pixel.max_x - event->point[id].x;	
++			event->point[id].x = ts->ops->range[0] - event->point[id].x;	
+ 		}
+ 
+ 		if(ts->ops->y_revert)
+ 		{
+-			event->point[id].y = ts->ops->pixel.max_y - event->point[id].y;
++			event->point[id].y = ts->ops->range[1] - event->point[id].y;
+ 		}
+ 
+ 		if(event->point[id].status != 0)
+@@ -232,14 +305,12 @@ static int ts_report_value(struct i2c_client *client)
+ 	return 0;
+ }
+ 
+-static int ts_suspend(struct i2c_client *client)
++static int ts_suspend(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 0);
++		ts->ops->active(ts, 0);
+ 	
+ 	return 0;
+ }
+@@ -247,14 +318,12 @@ static int ts_suspend(struct i2c_client *client)
+ 
+ 
+ 
+-static int ts_resume(struct i2c_client *client)
++static int ts_resume(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-		(struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_platform_data *pdata = ts->pdata;
+ 	
+ 	if(ts->ops->active)
+-		ts->ops->active(client, 1);
++		ts->ops->active(ts, 1);
+ 	return 0;
+ }
+ 
+@@ -265,9 +334,9 @@ static int ts_resume(struct i2c_client *client)
+ struct ts_operate ts_gt828_ops = {
+ 	.name				= "gt828",
+ 	.slave_addr			= 0x5d,
+-	.id_i2c				= TS_ID_GT828,			//i2c id number
++	.ts_id				= TS_ID_GT828,			//i2c id number
++	.bus_type			= TS_BUS_TYPE_I2C,
+ 	.reg_size			= 2,
+-	.pixel				= {1024,600},
+ 	.id_reg				= GTP_REG_SENSOR_ID,
+ 	.id_data			= TS_UNKNOW_DATA,
+ 	.version_reg			= 0x0F7D,
+@@ -280,7 +349,7 @@ struct ts_operate ts_gt828_ops = {
+ 	.xy_swap 			= 0,
+ 	.x_revert 			= 0,
+ 	.y_revert			= 0,
+-	.range				= {1024,600},
++	.range				= {800,1280},
+ 	.irq_enable			= 1,
+ 	.poll_delay_ms			= 0,
+ 	.active				= ts_active,	
+diff --git a/drivers/input/ts/ts-auto.c b/drivers/input/ts/ts-auto.c
+index fc305cb30ecd..2751d6de3f2e 100755
+--- a/drivers/input/ts/ts-auto.c
++++ b/drivers/input/ts/ts-auto.c
+@@ -46,10 +46,128 @@ struct ts_private_data *g_ts;
+ static struct class *g_ts_class;
+ static struct ts_operate *g_ts_ops[TS_NUM_ID]; 
+ 
+-static int ts_get_id(struct ts_operate *ops, struct i2c_client *client, int *value)
++
++/**
++ * ts_reg_read: Read a single ts register.
++ *
++ * @ts: Device to read from.
++ * @reg: Register to read.
++ */
++int ts_reg_read(struct ts_private_data *ts, unsigned short reg)
++{
++	unsigned short val;
++	int ret;
++
++	mutex_lock(&ts->io_lock);
++
++	ret = ts->read_dev(ts, reg, ts->ops->reg_size, &val, ts->ops->reg_size);
++
++	mutex_unlock(&ts->io_lock);
++
++	if (ret < 0)
++		return ret;
++	else
++		return val;
++}
++EXPORT_SYMBOL_GPL(ts_reg_read);
++
++/**
++ * ts_bulk_read: Read multiple ts registers
++ *
++ * @ts: Device to read from
++ * @reg: First register
++ * @count: Number of registers
++ * @buf: Buffer to fill.
++ */
++int ts_bulk_read(struct ts_private_data *ts, unsigned short reg,
++		     int count, u16 *buf)
++{
++	int ret;
++
++	mutex_lock(&ts->io_lock);
++
++	ret = ts->read_dev(ts, reg, count, buf, ts->ops->reg_size);
++
++	mutex_unlock(&ts->io_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ts_bulk_read);
++
++
++/**
++ * ts_reg_write: Write a single ts register.
++ *
++ * @ts: Device to write to.
++ * @reg: Register to write to.
++ * @val: Value to write.
++ */
++int ts_reg_write(struct ts_private_data *ts, unsigned short reg,
++		     unsigned short val)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
++	int ret;
++
++	mutex_lock(&ts->io_lock);
++
++	ret = ts->write_dev(ts, reg, ts->ops->reg_size, &val, ts->ops->reg_size);
++
++	mutex_unlock(&ts->io_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ts_reg_write);
++
++
++int ts_bulk_write(struct ts_private_data *ts, unsigned short reg,
++		     int count, u16 *buf)
++{
++	int ret;
++
++	mutex_lock(&ts->io_lock);
++
++	ret = ts->write_dev(ts, reg, count, buf, ts->ops->reg_size);
++
++	mutex_unlock(&ts->io_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ts_bulk_write);
++
++
++/**
++ * ts_set_bits: Set the value of a bitfield in a ts register
++ *
++ * @ts: Device to write to.
++ * @reg: Register to write to.
++ * @mask: Mask of bits to set.
++ * @val: Value to set (unshifted)
++ */
++int ts_set_bits(struct ts_private_data *ts, unsigned short reg,
++		    unsigned short mask, unsigned short val)
++{
++	int ret;
++	u16 r;
++
++	mutex_lock(&ts->io_lock);
++
++	ret = ts->read_dev(ts, reg, ts->ops->reg_size, &r, ts->ops->reg_size);
++	if (ret < 0)
++		goto out;
++
++	r &= ~mask;
++	r |= val;
++
++	ret = ts->write_dev(ts, reg, ts->ops->reg_size, &r, ts->ops->reg_size);
++
++out:
++	mutex_unlock(&ts->io_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(ts_set_bits);
++
++static int ts_get_id(struct ts_operate *ops, struct ts_private_data *ts, int *value)
++{	
+ 	int result = 0;
+ 	char temp[4] = {ops->id_reg & 0xff};
+ 	int i = 0;
+@@ -63,12 +181,12 @@ static int ts_get_id(struct ts_operate *ops, struct i2c_client *client, int *val
+ 			{
+ 				temp[0] = ops->id_reg >> 8;
+ 				temp[1] = ops->id_reg & 0xff;
+-				result = ts_rx_data_word(client, &temp, 2);
++				result = ts->read_dev(ts, ops->id_reg, 2, temp, ops->reg_size);
+ 				*value = (temp[0] << 8) | temp[1];
+ 			}
+ 			else
+ 			{
+-				result = ts_rx_data(client, &temp, 1);
++				result = ts->read_dev(ts, ops->id_reg, 1, temp, ops->reg_size);
+ 				*value = temp[0];
+ 			}
+ 			if(!result)
+@@ -92,10 +210,8 @@ static int ts_get_id(struct ts_operate *ops, struct i2c_client *client, int *val
+ }
+ 
+ 
+-static int ts_get_version(struct ts_operate *ops, struct i2c_client *client)
++static int ts_get_version(struct ts_operate *ops, struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
+ 	int result = 0;
+ 	char temp[TS_MAX_VER_LEN + 1] = {0};
+ 	int i = 0;
+@@ -106,20 +222,11 @@ static int ts_get_version(struct ts_operate *ops, struct i2c_client *client)
+ 	{
+ 		if((ops->version_len < 0) || (ops->version_len > TS_MAX_VER_LEN))
+ 		{
+-			printk("%s:version_len is error\n",__func__,ops->version_len);
++			printk("%s:version_len %d is error\n",__func__,ops->version_len);
+ 			ops->version_len = TS_MAX_VER_LEN;
+ 		}
+ 	
+-		if(ops->reg_size == 2)
+-		{
+-			result = ts_rx_data_word(client, temp, ops->version_len);
+-		}
+-		else
+-		{
+-			result = ts_rx_data(client, temp, ops->version_len);
+-		}
+-	
+-
++		result = ts->read_dev(ts, ops->version_reg, ops->version_len, temp, ops->reg_size);
+ 		if(result)
+ 			return result;
+ 		
+@@ -141,13 +248,17 @@ static int ts_get_version(struct ts_operate *ops, struct i2c_client *client)
+ }
+ 
+ 
+-static int ts_chip_init(struct i2c_client *client)
++static int ts_chip_init(struct ts_private_data *ts, int type)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
+ 	struct ts_operate *ops = NULL;
+ 	int result = 0;
+ 	int i = 0;
++
++	if((type <= TS_BUS_TYPE_INVALID) || (type >= TS_BUS_TYPE_NUM_ID))
++	{
++		printk("%s:type=%d is error\n",__func__,type);
++		return -1;	
++	}
+ 	
+ 	if(ts->pdata->init_platform_hw)
+ 		ts->pdata->init_platform_hw();
+@@ -162,59 +273,51 @@ static int ts_chip_init(struct i2c_client *client)
+ 			continue;
+ 		}
+ 		
+-		if(!ops->init || !ops->report)
+-		{
+-			printk("%s:error:%p,%p\n",__func__,ops->init,ops->report);
+-			result = -1;
+-			continue;
+-		}
+-
+-		client->addr = ops->slave_addr;	//use slave_addr of ops
+-#if 0		
+-		if(ops->active)
++		if(ops->bus_type == type)
+ 		{
+-			result = ops->active(client, TS_ENABLE);
+-			if(result < 0)
++		
++			if(!ops->init || !ops->report)
+ 			{
+-				printk("%s:fail to active ts\n",__func__);
++				printk("%s:error:%p,%p\n",__func__,ops->init,ops->report);
++				result = -1;
+ 				continue;
+ 			}
+-		}
+-#endif
+-		result = ts_get_id(ops, client, &ts->devid);//get id
+-		if(result < 0)
+-		{	
+-			printk("%s:fail to read %s devid:0x%x\n",__func__, ops->name, ts->devid);	
+-			continue;
+-		}
+-
+-		result = ts_get_version(ops, client);	//get version
+-		if(result < 0)
+-		{	
+-			printk("%s:fail to read %s version\n",__func__, ops->name);	
+-			continue;
+-		}
+-	
+-		ts->ops = ops;	//save ops
++				
++			ts->ops = ops;	//save ops
+ 
+-		result = ops->init(client);
+-		if(result < 0)
+-		{
+-			printk("%s:fail to init ts\n",__func__);	
+-			continue;
+-		}
+-
+-		if(ops->firmware)
+-		{
+-			result = ops->firmware(client);
++			result = ts_get_id(ops, ts, &ts->devid);//get id
+ 			if(result < 0)
++			{	
++				printk("%s:fail to read %s devid:0x%x\n",__func__, ops->name, ts->devid);	
++				continue;
++			}
++			
++			result = ts_get_version(ops, ts);	//get version
++			if(result < 0)
++			{	
++				printk("%s:fail to read %s version\n",__func__, ops->name);	
++				continue;
++			}
++			
++			result = ops->init(ts);
++			if(result < 0)
++			{
++				printk("%s:fail to init ts\n",__func__);	
++				continue;
++			}
++			
++			if(ops->firmware)
+ 			{
+-				printk("%s:fail to updata firmware ts\n",__func__);
+-				return result;
++				result = ops->firmware(ts);
++				if(result < 0)
++				{
++					printk("%s:fail to updata firmware ts\n",__func__);
++					return result;
++				}
+ 			}
++		
++			printk("%s:%s devid:0x%x\n",__func__, ts->ops->name, ts->devid);
+ 		}
+-	
+-		printk("%s:%s devid:0x%x\n",__func__, ts->ops->name, ts->devid);
+ 
+ 		break;
+ 					
+@@ -225,19 +328,9 @@ static int ts_chip_init(struct i2c_client *client)
+ 
+ }
+ 
+-
+-static int ts_get_data(struct i2c_client *client)
+-{
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
+-	int result = 0;
+-	
+-	result = ts->ops->report(client);
+-	if(result)
+-		goto error;
+-	
+-error:		
+-	return result;
++static int ts_get_data(struct ts_private_data *ts)
++{		
++	return ts->ops->report(ts);	
+ }
+ 
+ 
+@@ -245,10 +338,9 @@ static void  ts_delaywork_func(struct work_struct *work)
+ {
+ 	struct delayed_work *delaywork = container_of(work, struct delayed_work, work);
+ 	struct ts_private_data *ts = container_of(delaywork, struct ts_private_data, delaywork);
+-	struct i2c_client *client = ts->client;
+ 
+-	mutex_lock(&ts->ts_mutex);	
+-	if (ts_get_data(client) < 0) 
++	mutex_lock(&ts->ts_lock);	
++	if (ts_get_data(ts) < 0) 
+ 		DBG(KERN_ERR "%s: Get data failed\n",__func__);
+ 	
+ 	if(!ts->ops->irq_enable)//restart work while polling
+@@ -257,15 +349,15 @@ static void  ts_delaywork_func(struct work_struct *work)
+ 	{
+ 		if(ts->ops->check_irq)
+ 		{
+-			ts->ops->check_irq(client);		
++			ts->ops->check_irq(ts);		
+ 		}
+ 		else
+ 		{
+ 			if((ts->ops->trig & IRQF_TRIGGER_LOW) || (ts->ops->trig & IRQF_TRIGGER_HIGH))
+-			enable_irq(ts->client->irq);
++			enable_irq(ts->irq);
+ 		}
+ 	}
+-	mutex_unlock(&ts->ts_mutex);
++	mutex_unlock(&ts->ts_lock);
+ 	
+ 	DBG("%s:%s\n",__func__,ts->i2c_id->name);
+ }
+@@ -302,10 +394,8 @@ static irqreturn_t ts_interrupt(int irq, void *dev_id)
+ }
+ 
+ 
+-static int ts_irq_init(struct i2c_client *client)
++static int ts_irq_init(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);	
+ 	int result = 0;
+ 	int irq;
+ 	if((ts->ops->irq_enable)&&(ts->ops->trig != TS_UNKNOW_DATA))
+@@ -314,21 +404,21 @@ static int ts_irq_init(struct i2c_client *client)
+ 		if(ts->ops->poll_delay_ms < 0)
+ 			ts->ops->poll_delay_ms = 30;
+ 		
+-		result = gpio_request(client->irq, ts->i2c_id->name);
++		result = gpio_request(ts->irq, ts->i2c_id->name);
+ 		if (result)
+ 		{
+-			printk("%s:fail to request gpio :%d\n",__func__,client->irq);
++			printk("%s:fail to request gpio :%d\n",__func__,ts->irq);
+ 		}
+ 	
+-		gpio_pull_updown(client->irq, PullEnable);
+-		irq = gpio_to_irq(client->irq);
++		gpio_pull_updown(ts->irq, PullEnable);
++		irq = gpio_to_irq(ts->irq);
+ 		result = request_irq(irq, ts_interrupt, ts->ops->trig, ts->ops->name, ts);
+ 		//result = request_threaded_irq(irq, NULL, ts_interrupt, ts->ops->trig, ts->ops->name, ts);
+ 		if (result) {
+ 			printk(KERN_ERR "%s:fail to request irq = %d, ret = 0x%x\n",__func__, irq, result);	       
+ 			goto error;	       
+ 		}
+-		client->irq = irq;
++		ts->irq = irq;
+ 		printk("%s:use irq=%d\n",__func__,irq);
+ 	}
+ 	else if(!ts->ops->irq_enable)
+@@ -345,139 +435,46 @@ static int ts_irq_init(struct i2c_client *client)
+ 	return result;
+ }
+ 
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-static void ts_suspend(struct early_suspend *h)
+-{
+-	struct ts_private_data *ts = 
+-			container_of(h, struct ts_private_data, early_suspend);
+-	
+-	if(ts->ops->suspend)
+-		ts->ops->suspend(ts->client);
+-
+-	if(ts->ops->irq_enable)	
+-		disable_irq_nosync(ts->client->irq);
+-	else
+-		cancel_delayed_work_sync(&ts->delaywork);	
+-
+-}
+-
+-static void ts_resume(struct early_suspend *h)
+-{
+-	struct ts_private_data *ts = 
+-			container_of(h, struct ts_private_data, early_suspend);
+-
+-	if(ts->ops->resume)
+-		ts->ops->resume(ts->client);
+-
+-	if(ts->ops->irq_enable)	
+-		enable_irq(ts->client->irq);
+-	else
+-	{
+-		PREPARE_DELAYED_WORK(&ts->delaywork, ts_delaywork_func);
+-		schedule_delayed_work(&ts->delaywork, msecs_to_jiffies(ts->ops->poll_delay_ms));
+-	}
+-}
+-#endif
+-
+-
+-
+-int ts_register_slave(struct i2c_client *client,
+-			struct ts_platform_data *slave_pdata,
+-			struct ts_operate *(*get_ts_ops)(void))
+-{
+-	int result = 0;
+-	struct ts_operate *ops = get_ts_ops();
+-	if((ops->id_i2c >= TS_NUM_ID) || (ops->id_i2c <= TS_ID_INVALID))
+-	{	
+-		printk("%s:%s id is error %d\n", __func__, ops->name, ops->id_i2c);
+-		return -1;	
+-	}
+-	g_ts_ops[ops->id_i2c] = ops;
+-	printk("%s:%s,id=%d\n",__func__,g_ts_ops[ops->id_i2c]->name, ops->id_i2c);
+-	return result;
+-}
+-
+ 
+-int ts_unregister_slave(struct i2c_client *client,
+-			struct ts_platform_data *slave_pdata,
+-			struct ts_operate *(*get_ts_ops)(void))
+-{
+-	int result = 0;
+-	struct ts_operate *ops = get_ts_ops();
+-	if((ops->id_i2c >= TS_NUM_ID) || (ops->id_i2c <= TS_ID_INVALID))
+-	{	
+-		printk("%s:%s id is error %d\n", __func__, ops->name, ops->id_i2c);
+-		return -1;	
+-	}
+-	printk("%s:%s,id=%d\n",__func__,g_ts_ops[ops->id_i2c]->name, ops->id_i2c);
+-	g_ts_ops[ops->id_i2c] = NULL;	
+-	return result;
+-}
+ 
+-
+-int ts_probe(struct i2c_client *client, const struct i2c_device_id *devid)
++int ts_device_init(struct ts_private_data *ts, int type, int irq)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+-	struct ts_platform_data *pdata;
+-	int result = 0;
+-	dev_info(&client->adapter->dev, "%s: %s,0x%x\n", __func__, devid->name,(unsigned int)client);
++	struct ts_platform_data *pdata = ts->dev->platform_data;
++	int result = -1, i;
+ 
+-	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+-		result = -ENODEV;
+-		goto out_no_free;
+-	}
+-
+-	pdata = client->dev.platform_data;
+-	if (!pdata) {
+-		dev_err(&client->adapter->dev,
+-			"Missing platform data for slave %s\n", devid->name);
+-		result = -EFAULT;
+-		goto out_no_free;
+-	}
+-
+-	ts = kzalloc(sizeof(*ts), GFP_KERNEL);
+-	if (!ts) {
+-		result = -ENOMEM;
+-		goto out_no_free;
+-	}
+-	
+-	i2c_set_clientdata(client, ts);
+-	ts->client = client;	
+-	ts->pdata = pdata;	
+-	ts->i2c_id = (struct i2c_device_id *)devid;
+-
+-	mutex_init(&ts->data_mutex);	
+-	mutex_init(&ts->ts_mutex);
+-	mutex_init(&ts->i2c_mutex);
++	mutex_init(&ts->io_lock);
++	mutex_init(&ts->ts_lock);
++	dev_set_drvdata(ts->dev, ts);
+ 	
+-	result = ts_chip_init(ts->client);
++	ts->pdata = pdata;
++	result = ts_chip_init(ts, type);
+ 	if(result < 0)
++	{
++		printk("%s:touch screen with bus type %d is not exist\n",__func__,type);
+ 		goto out_free_memory;
+-	
+-	ts->client->addr = ts->ops->slave_addr;		
+-	
++	}
++
+ 	ts->input_dev = input_allocate_device();
+ 	if (!ts->input_dev) {
+ 		result = -ENOMEM;
+-		dev_err(&client->dev,
++		dev_err(ts->dev,
+ 			"Failed to allocate input device %s\n", ts->input_dev->name);
+ 		goto out_free_memory;
+ 	}	
+-
+-	ts->input_dev->dev.parent = &client->dev;
++	
++	ts->input_dev->dev.parent = ts->dev;
+ 	ts->input_dev->name = ts->ops->name;
+ 	
+ 	result = input_register_device(ts->input_dev);
+ 	if (result) {
+-		dev_err(&client->dev,
++		dev_err(ts->dev,
+ 			"Unable to register input device %s\n", ts->input_dev->name);
+ 		goto out_input_register_device_failed;
+ 	}
+ 	
+-	result = ts_irq_init(ts->client);
++	result = ts_irq_init(ts);
+ 	if (result) {
+-		dev_err(&client->dev,
++		dev_err(ts->dev,
+ 			"fail to init ts irq,ret=%d\n",result);
+ 		goto out_input_register_device_failed;
+ 	}
+@@ -496,10 +493,10 @@ int ts_probe(struct i2c_client *client, const struct i2c_device_id *devid)
+ 	
+ 	input_mt_init_slots(ts->input_dev, ts->ops->max_point);
+ 
+-	if((ts->ops->pixel.max_x <= 0) || (ts->ops->pixel.max_y <= 0))
++	if((ts->ops->range[0] <= 0) || (ts->ops->range[1] <= 0))
+ 	{
+-		ts->ops->pixel.max_x = 1024;
+-		ts->ops->pixel.max_y = 600;
++		ts->ops->range[0] = 1024;
++		ts->ops->range[1] = 600;
+ 	}
+ 	
+ 	input_set_abs_params(ts->input_dev,ABS_MT_POSITION_X, 0, ts->ops->range[0], 0, 0);
+@@ -509,16 +506,6 @@ int ts_probe(struct i2c_client *client, const struct i2c_device_id *devid)
+ 	
+ 	g_ts = ts;
+ 	
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-	if((ts->ops->suspend) && (ts->ops->resume))
+-	{
+-		ts->early_suspend.suspend = ts_suspend;
+-		ts->early_suspend.resume = ts_resume;
+-		ts->early_suspend.level = 0x02;
+-		register_early_suspend(&ts->early_suspend);
+-	}
+-#endif
+-
+ 	printk("%s:initialized ok,ts name:%s,devid=%d\n\n",__func__,ts->ops->name,ts->devid);
+ 
+ 	return result;
+@@ -529,76 +516,94 @@ int ts_probe(struct i2c_client *client, const struct i2c_device_id *devid)
+ 	input_free_device(ts->input_dev);	
+ out_free_memory:	
+ 	kfree(ts);
+-out_no_free:
+-	dev_err(&client->adapter->dev, "%s failed %d\n", __func__, result);
++	
++	printk("%s:line=%d\n",__func__,__LINE__);
+ 	return result;
+-
+ }
+ 
+-static void ts_shut_down(struct i2c_client *client)
+-{
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+-	if((ts->ops->suspend) && (ts->ops->resume))		
+-		unregister_early_suspend(&ts->early_suspend);
+-	DBG("%s:%s\n",__func__,ts->i2c_id->name);
+-#endif
+-}
+ 
+-static int ts_remove(struct i2c_client *client)
++void ts_device_exit(struct ts_private_data *ts)
+ {
+-	struct ts_private_data *ts =
+-	    (struct ts_private_data *) i2c_get_clientdata(client);
+-	int result = 0;
+-	
++	if(!ts->ops->irq_enable)	
+ 	cancel_delayed_work_sync(&ts->delaywork);
+ 	input_unregister_device(ts->input_dev);	
+ 	input_free_device(ts->input_dev);	
+-	kfree(ts);
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ 	if((ts->ops->suspend) && (ts->ops->resume))
+ 		unregister_early_suspend(&ts->early_suspend);
+ #endif  
+-	return result;
++	kfree(ts);	
+ }
+ 
+-static const struct i2c_device_id ts_id_table[] = {
+-	{"auto_ts", 0},
+-	{},
+-};
+ 
++int ts_device_suspend(struct ts_private_data *ts)
++{
++	if(ts->ops->suspend)
++		ts->ops->suspend(ts);
++
++	if(ts->ops->irq_enable)	
++		disable_irq_nosync(ts->irq);
++	else
++		cancel_delayed_work_sync(&ts->delaywork);
++
++	return 0;
++}
+ 
+-static struct i2c_driver ts_driver = {
+-	.probe = ts_probe,
+-	.remove = ts_remove,
+-	.shutdown = ts_shut_down,
+-	.id_table = ts_id_table,
+-	.driver = {
+-		   .owner = THIS_MODULE,
+-		   .name = "auto_ts",
+-		   },
+-};
+ 
+-static int __init ts_init(void)
++int ts_device_resume(struct ts_private_data *ts)
+ {
+-	int res = i2c_add_driver(&ts_driver);
+-	pr_info("%s: Probe name %s\n", __func__, ts_driver.driver.name);
+-	if (res)
+-		pr_err("%s failed\n", __func__);
+-	return res;
++	if(ts->ops->resume)
++		ts->ops->resume(ts);
++
++	if(ts->ops->irq_enable)	
++		enable_irq(ts->irq);
++	else
++	{
++		PREPARE_DELAYED_WORK(&ts->delaywork, ts_delaywork_func);
++		schedule_delayed_work(&ts->delaywork, msecs_to_jiffies(ts->ops->poll_delay_ms));
++	}
++	
++	return 0;
+ }
+ 
+-static void __exit ts_exit(void)
++
++
++int ts_register_slave(struct ts_private_data *ts,
++			struct ts_platform_data *slave_pdata,
++			struct ts_operate *(*get_ts_ops)(void))
+ {
+-	pr_info("%s\n", __func__);
+-	i2c_del_driver(&ts_driver);
++	int result = 0;
++	struct ts_operate *ops = get_ts_ops();
++	if((ops->ts_id >= TS_NUM_ID) || (ops->ts_id <= TS_ID_INVALID))
++	{	
++		printk("%s:%s id is error %d\n", __func__, ops->name, ops->ts_id);
++		return -1;	
++	}
++	g_ts_ops[ops->ts_id] = ops;
++	printk("%s:%s,id=%d\n",__func__,g_ts_ops[ops->ts_id]->name, ops->ts_id);
++	return result;
++}
++
++
++int ts_unregister_slave(struct ts_private_data *ts,
++			struct ts_platform_data *slave_pdata,
++			struct ts_operate *(*get_ts_ops)(void))
++{
++	int result = 0;
++	struct ts_operate *ops = get_ts_ops();
++	if((ops->ts_id >= TS_NUM_ID) || (ops->ts_id <= TS_ID_INVALID))
++	{	
++		printk("%s:%s id is error %d\n", __func__, ops->name, ops->ts_id);
++		return -1;	
++	}
++	printk("%s:%s,id=%d\n",__func__,g_ts_ops[ops->ts_id]->name, ops->ts_id);
++	g_ts_ops[ops->ts_id] = NULL;	
++	return result;
+ }
+ 
+-subsys_initcall_sync(ts_init);
+-module_exit(ts_exit);
+ 
+ MODULE_AUTHOR("ROCKCHIP Corporation:lw@rock-chips.com");
+-MODULE_DESCRIPTION("User space character device interface for tss");
++MODULE_DESCRIPTION("device interface for auto touch screen");
+ MODULE_LICENSE("GPL");
+ 
++
+diff --git a/drivers/input/ts/ts-i2c.c b/drivers/input/ts/ts-i2c.c
+index c7e4d9695098..e2031157157d 100755
+--- a/drivers/input/ts/ts-i2c.c
++++ b/drivers/input/ts/ts-i2c.c
+@@ -41,215 +41,216 @@
+ #define DBG(x...)
+ #endif
+ 
+-static int ts_i2c_write(struct i2c_adapter *i2c_adap,
+-			    unsigned char address,
+-			    unsigned int len, unsigned char const *data)
+-{
+-	struct i2c_msg msgs[1];
+-	int res;
+ 
+-	if (!data || !i2c_adap) {
++static int ts_i2c_read_device(struct ts_private_data *ts, unsigned short reg,
++				  int bytes, void *dest, int reg_size)
++{
++	const struct i2c_client *client = ts->control_data;
++	struct i2c_adapter *i2c_adap = client->adapter;
++	struct i2c_msg msgs[2];
++	int i,res;
++	
++	if (!dest || !i2c_adap) {
+ 		printk("%s:line=%d,error\n",__func__,__LINE__);
+ 		return -EINVAL;
+ 	}
+ 
+-	msgs[0].addr = address;
++	msgs[0].addr = client->addr;
+ 	msgs[0].flags = 0;	/* write */
+-	msgs[0].buf = (unsigned char *)data;
+-	msgs[0].len = len;
++	msgs[0].buf = (unsigned char *)&reg;
++	if(reg_size == 2)		
++	msgs[0].len = 2;
++	else	
++	msgs[0].len = 1;
+ 	msgs[0].scl_rate = TS_I2C_RATE;
++	
++	msgs[1].addr = client->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].buf = dest;
++	msgs[1].len = bytes;
++	msgs[1].scl_rate = TS_I2C_RATE; 
+ 
+-	res = i2c_transfer(i2c_adap, msgs, 1);
+-	if (res == 1)
++	res = i2c_transfer(i2c_adap, msgs, 2);
++	if (res == 2)
+ 		return 0;
+ 	else if(res == 0)
+ 		return -EBUSY;
+ 	else
+ 		return res;
++	
++#ifdef TS_DEBUG_ENABLE
++	DBG("%s:reg=0x%x,len=%d,rxdata:",__func__, reg, bytes);
++	for(i=0; i<bytes; i++)
++		DBG("0x%x,",(unsigned char *)dest[i]);
++	DBG("\n");
++#endif	
+ 
++	
+ }
+ 
+-static int senosr_i2c_read(struct i2c_adapter *i2c_adap,
+-			   unsigned char address, unsigned char reg,
+-			   unsigned int tx_len, unsigned int rx_len, unsigned char *data)
++/* Currently we allocate the write buffer on the stack; this is OK for
++ * small writes - if we need to do large writes this will need to be
++ * revised.
++ */
++static int ts_i2c_write_device(struct ts_private_data *ts, unsigned short reg,
++				   int bytes, void *src, int reg_size)
+ {
+-	struct i2c_msg msgs[2];
++	const struct i2c_client *client = ts->control_data;
++	struct i2c_adapter *i2c_adap = client->adapter;
++	struct i2c_msg msgs[1];
+ 	int res;
++	unsigned char buf[bytes + 2];
++	
++	if (!src || !i2c_adap) {
++		printk("%s:line=%d,error\n",__func__,__LINE__);
++		return -EINVAL;
++	}
++	
++	if(ts->ops->reg_size == 2)
++	{
++		buf[0] = (reg & 0xff00) >> 8;
++		buf[1] = (reg & 0x00ff) & 0xff;
++		memcpy(&buf[2], src, bytes);
++	}
++	else
++	{
++		buf[0] = reg & 0xff;
++		memcpy(&buf[1], src, bytes);
++	}
++
++#ifdef TS_DEBUG_ENABLE
++	int i = 0;
++	DBG("%s:reg=0x%x,len=%d,txdata:",__func__, reg, bytes);
++	for(i=0; i<length; i++)
++		DBG("0x%x,",buf[i]);
++	DBG("\n");
++#endif	
+ 
+-	if (!data || !i2c_adap) {
++	if (!src || !i2c_adap) {
+ 		printk("%s:line=%d,error\n",__func__,__LINE__);
+ 		return -EINVAL;
+ 	}
+ 
+-	msgs[0].addr = address;
++	msgs[0].addr = client->addr;
+ 	msgs[0].flags = 0;	/* write */
+-	msgs[0].buf = &reg;
+-	msgs[0].len = tx_len;
++	msgs[0].buf = buf;
++	msgs[0].len = bytes;
+ 	msgs[0].scl_rate = TS_I2C_RATE;
+-	
+-	msgs[1].addr = address;
+-	msgs[1].flags = I2C_M_RD;
+-	msgs[1].buf = data;
+-	msgs[1].len = rx_len;
+-	msgs[1].scl_rate = TS_I2C_RATE;	
+ 
+-	res = i2c_transfer(i2c_adap, msgs, 2);
+-	if (res == 2)
++	res = i2c_transfer(i2c_adap, msgs, 1);
++	if (res == 1)
+ 		return 0;
+ 	else if(res == 0)
+ 		return -EBUSY;
+ 	else
+ 		return res;
+-
+-}
+-
+-
+-int ts_rx_data(struct i2c_client *client, char *rxData, int length)
+-{
+-#ifdef TS_DEBUG_ENABLE
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	int i = 0;
+-#endif
+-	int ret = 0;
+-	char reg = rxData[0];
+-	ret = senosr_i2c_read(client->adapter, client->addr, reg, 1, length, rxData);
+-	
+-#ifdef TS_DEBUG_ENABLE
+-	DBG("addr=0x%x,len=%d,rxdata:",reg,length);
+-	for(i=0; i<length; i++)
+-		DBG("0x%x,",rxData[i]);
+-	DBG("\n");
+-#endif	
+-	return ret;
++			
+ }
+-EXPORT_SYMBOL(ts_rx_data);
+ 
+-int ts_rx_data_word(struct i2c_client *client, char *rxData, int length)
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void ts_suspend(struct early_suspend *h)
+ {
+-#ifdef TS_DEBUG_ENABLE
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	int i = 0;
+-#endif
+-	int ret = 0;
+-	char reg = rxData[0];
+-	ret = senosr_i2c_read(client->adapter, client->addr, reg, 2, length, rxData);
++	struct ts_private_data *ts = 
++			container_of(h, struct ts_private_data, early_suspend);
+ 	
+-#ifdef TS_DEBUG_ENABLE
+-	DBG("addr=0x%x,len=%d,rxdata:",reg,length);
+-	for(i=0; i<length; i++)
+-		DBG("0x%x,",rxData[i]);
+-	DBG("\n");
+-#endif	
+-	return ret;
++	return ts_device_suspend(ts);
+ }
+-EXPORT_SYMBOL(ts_rx_data_word);
+-
+ 
+-int ts_tx_data(struct i2c_client *client, char *txData, int length)
++static void ts_resume(struct early_suspend *h)
+ {
+-#ifdef TS_DEBUG_ENABLE	
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	int i = 0;
+-#endif
+-	int ret = 0;
+-#ifdef TS_DEBUG_ENABLE	
+-	DBG("addr=0x%x,len=%d,txdata:",txData[0],length);
+-	for(i=1; i<length; i++)
+-		DBG("0x%x,",txData[i]);
+-	DBG("\n");
+-#endif
+-	ret = ts_i2c_write(client->adapter, client->addr, length, txData);
+-	return ret;
++	struct ts_private_data *ts = 
++			container_of(h, struct ts_private_data, early_suspend);
+ 
++	return ts_device_resume(ts);
+ }
+-EXPORT_SYMBOL(ts_tx_data);
++#endif
+ 
+-int ts_write_reg(struct i2c_client *client, int addr, int value)
++static int ts_i2c_probe(struct i2c_client *i2c,
++			    const struct i2c_device_id *id)
+ {
+-	char buffer[2];
+-	int ret = 0;
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	
+-	mutex_lock(&ts->i2c_mutex);	
+-	buffer[0] = addr;
+-	buffer[1] = value;
+-	ret = ts_tx_data(client, &buffer[0], 2);	
+-	mutex_unlock(&ts->i2c_mutex);	
+-	return ret;
+-}
+-EXPORT_SYMBOL(ts_write_reg);
++	struct ts_private_data *ts;
++	int ret,gpio,irq;
++	int type = TS_BUS_TYPE_I2C;
+ 
+-int ts_read_reg(struct i2c_client *client, int addr)
+-{
+-	char tmp[1] = {0};
+-	int ret = 0;	
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
++	if (!i2c_check_functionality(i2c->adapter, I2C_FUNC_I2C)) {
++		dev_err(&i2c->adapter->dev, "%s failed\n", __func__);
++		return -ENODEV;
++	}
+ 	
+-	mutex_lock(&ts->i2c_mutex);	
+-	tmp[0] = addr;
+-	ret = ts_rx_data(client, tmp, 1);
+-	mutex_unlock(&ts->i2c_mutex);
++	ts = kzalloc(sizeof(struct ts_private_data), GFP_KERNEL);
++	if (ts == NULL)
++		return -ENOMEM;
++
++	i2c_set_clientdata(i2c, ts);
+ 	
+-	return tmp[0];
+-}
++	ts->irq = i2c->irq;
++	ts->dev = &i2c->dev;
++	ts->control_data = i2c;
++	ts->read_dev = ts_i2c_read_device;
++	ts->write_dev = ts_i2c_write_device;
+ 
+-EXPORT_SYMBOL(ts_read_reg);
++	ret = ts_device_init(ts, type, ts->irq);
++	if(ret)
++	{
++		printk("%s:fail to regist touch, type is %d\n",__func__, type);
++		return -1;
++	}
++	
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	if((ts->ops->suspend) && (ts->ops->resume))
++	{
++		ts->early_suspend.suspend = ts_suspend;
++		ts->early_suspend.resume = ts_resume;
++		ts->early_suspend.level = 0x02;
++		register_early_suspend(&ts->early_suspend);
++	}
++#endif
+ 
++	return 0;
++}
+ 
+-int ts_tx_data_normal(struct i2c_client *client, char *buf, int num)
++static int ts_i2c_remove(struct i2c_client *i2c)
+ {
+-	int ret = 0;
+-	ret = i2c_master_normal_send(client, buf, num, TS_I2C_RATE);
+-	
+-	return (ret == num) ? 0 : ret;
+-}
+-EXPORT_SYMBOL(ts_tx_data_normal);
++	struct ts_private_data *ts = i2c_get_clientdata(i2c);
+ 
++	ts_device_exit(ts);
+ 
+-int ts_rx_data_normal(struct i2c_client *client, char *buf, int num)
+-{
+-	int ret = 0;
+-	ret = i2c_master_normal_recv(client, buf, num, TS_I2C_RATE);
+-	
+-	return (ret == num) ? 0 : ret;
++	return 0;
+ }
+ 
+-EXPORT_SYMBOL(ts_rx_data_normal);
+ 
++static const struct i2c_device_id ts_i2c_id[] = {
++	{"auto_ts_i2c", 0},
++	{},
++};
++MODULE_DEVICE_TABLE(i2c, ts_i2c_id);
++
++static struct i2c_driver ts_i2c_driver = {
++	.driver = {
++		.name = "auto_ts_i2c",
++		.owner = THIS_MODULE,
++	},
++	.probe = ts_i2c_probe,
++	.remove = ts_i2c_remove,
++	.id_table = ts_i2c_id,
++};
+ 
+-int ts_write_reg_normal(struct i2c_client *client, char value)
++static int __init ts_i2c_init(void)
+ {
+-	char buffer[2];
+-	int ret = 0;
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	
+-	mutex_lock(&ts->i2c_mutex);	
+-	buffer[0] = value;
+-	ret = ts_tx_data_normal(client, &buffer[0], 1);	
+-	mutex_unlock(&ts->i2c_mutex);	
++	int ret;
++
++	printk("%s\n", __FUNCTION__);
++	ret = i2c_add_driver(&ts_i2c_driver);
++	if (ret != 0)
++		pr_err("Failed to register ts I2C driver: %d\n", ret);
++
+ 	return ret;
+ }
+-EXPORT_SYMBOL(ts_write_reg_normal);
++subsys_initcall_sync(ts_i2c_init);
+ 
+-int ts_read_reg_normal(struct i2c_client *client)
++static void __exit ts_i2c_exit(void)
+ {
+-	char tmp[1] = {0};
+-	int ret = 0;	
+-	struct ts_private_data* ts = 
+-		(struct ts_private_data *)i2c_get_clientdata(client);
+-	
+-	mutex_lock(&ts->i2c_mutex);	
+-	ret = ts_rx_data_normal(client, tmp, 1);
+-	mutex_unlock(&ts->i2c_mutex);
+-	
+-	return tmp[0];
++	i2c_del_driver(&ts_i2c_driver);
+ }
+-
+-EXPORT_SYMBOL(ts_read_reg_normal);
++module_exit(ts_i2c_exit);
+ 
+diff --git a/include/linux/ts-auto.h b/include/linux/ts-auto.h
+index 3d5661997d1a..3acd39865b15 100755
+--- a/include/linux/ts-auto.h
++++ b/include/linux/ts-auto.h
+@@ -8,6 +8,17 @@
+ #define	TS_MAX_POINT	20
+ #define	TS_MAX_VER_LEN	64
+ 
++struct ts_private_data;
++
++enum ts_bus_type{
++	TS_BUS_TYPE_INVALID = 0,
++		
++	TS_BUS_TYPE_I2C,
++	TS_BUS_TYPE_SPI,
++	TS_BUS_TYPE_SERIAL,
++	
++	TS_BUS_TYPE_NUM_ID,
++};
+ 
+ enum ts_id {
+ 	TS_ID_INVALID = 0,
+@@ -53,7 +64,8 @@ struct ts_max_pixel{
+ struct ts_operate {
+ 	char *name;
+ 	char slave_addr;
+-	int id_i2c;
++	int ts_id;
++	int bus_type;
+ 	struct ts_max_pixel pixel;
+ 	int reg_size;
+ 	int id_reg;
+@@ -72,20 +84,27 @@ struct ts_operate {
+ 	int irq_enable;         //if irq_enable=1 then use irq else use polling  
+ 	int poll_delay_ms;      //polling
+ 	int gpio_level_no_int;
+-	int (*active)(struct i2c_client *client, int enable);
+-	int (*init)(struct i2c_client *client);	
+-	int (*check_irq)(struct i2c_client *client);
+-	int (*report)(struct i2c_client *client);
+-	int (*firmware)(struct i2c_client *client);
+-	int (*suspend)(struct i2c_client *client);
+-	int (*resume)(struct i2c_client *client);	
++	int (*active)(struct ts_private_data *ts, int enable);
++	int (*init)(struct ts_private_data *ts);	
++	int (*check_irq)(struct ts_private_data *ts);
++	int (*report)(struct ts_private_data *ts);
++	int (*firmware)(struct ts_private_data *ts);
++	int (*suspend)(struct ts_private_data *ts);
++	int (*resume)(struct ts_private_data *ts);	
+ 	struct miscdevice *misc_dev;
+-
+ };
+ 
+ 
+ struct ts_private_data {
+-	struct i2c_client *client;	
++	struct mutex io_lock;
++	struct device *dev;
++	int (*read_dev)(struct ts_private_data *ts, unsigned short reg,
++			int bytes, void *dest, int reg_size);
++	int (*write_dev)(struct ts_private_data *ts, unsigned short reg,
++			 int bytes, void *src, int reg_size);
++	void *control_data;
++	int irq;
++	//struct i2c_client *client;	
+ 	struct input_dev *input_dev;
+ 	struct ts_event	event;
+ 	struct work_struct work;
+@@ -93,8 +112,7 @@ struct ts_private_data {
+ 	struct delayed_work poll_work;	/*poll at last*/	
+ 	char ts_data[40];		//max support40 bytes data
+ 	struct mutex data_mutex;
+-	struct mutex ts_mutex;
+-	struct mutex i2c_mutex;
++	struct mutex ts_lock;
+ 	int devid;
+ 	struct i2c_device_id *i2c_id;
+ 	struct ts_platform_data *pdata;
+@@ -106,24 +124,25 @@ struct ts_private_data {
+ #endif
+ };
+ 
+-
+-extern int ts_register_slave(struct i2c_client *client,
++extern int ts_device_init(struct ts_private_data *ts, int type, int irq);
++extern void ts_device_exit(struct ts_private_data *ts);
++extern int ts_register_slave(struct ts_private_data *ts,
+ 			struct ts_platform_data *slave_pdata,
+ 			struct ts_operate *(*get_ts_ops)(void));
+-
+-
+-extern int ts_unregister_slave(struct i2c_client *client,
++extern int ts_unregister_slave(struct ts_private_data *ts,
+ 			struct ts_platform_data *slave_pdata,
+ 			struct ts_operate *(*get_ts_ops)(void));
+-
+-extern int ts_rx_data(struct i2c_client *client, char *rxData, int length);
+-extern int ts_tx_data(struct i2c_client *client, char *txData, int length);
+-extern int ts_rx_data_word(struct i2c_client *client, char *rxData, int length);
+-extern int ts_write_reg(struct i2c_client *client, int addr, int value);
+-extern int ts_read_reg(struct i2c_client *client, int addr);
+-extern int ts_tx_data_normal(struct i2c_client *client, char *buf, int num);
+-extern int ts_rx_data_normal(struct i2c_client *client, char *buf, int num);
+-extern int ts_write_reg_normal(struct i2c_client *client, char value);
+-extern int ts_read_reg_normal(struct i2c_client *client);
++extern int ts_reg_read(struct ts_private_data *ts, unsigned short reg);
++extern int ts_reg_write(struct ts_private_data *ts, unsigned short reg,
++		     unsigned short val);
++extern int ts_bulk_read(struct ts_private_data *ts, unsigned short reg,
++		     int count, u16 *buf);
++extern int ts_bulk_write(struct ts_private_data *ts, unsigned short reg,
++		     int count, u16 *buf);
++extern int ts_set_bits(struct ts_private_data *ts, unsigned short reg,
++		    unsigned short mask, unsigned short val);
++extern int ts_device_suspend(struct ts_private_data *ts);
++
++extern int ts_device_resume(struct ts_private_data *ts);
+ 
+ #endif
+-- 
+2.35.3
+

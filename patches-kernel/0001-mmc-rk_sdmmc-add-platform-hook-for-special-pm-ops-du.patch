@@ -1,0 +1,259 @@
+From 4bb5de4aae7482f6d0b4d7dfc7c926aa14939616 Mon Sep 17 00:00:00 2001
+From: lintao <lintao@rock-chips.com>
+Date: Fri, 22 May 2015 10:54:34 +0800
+Subject: [PATCH] mmc: rk_sdmmc: add platform hook for special pm ops during
+ deepsleep
+
+  We register a platform hook and restore all of our regs if platform does
+need to cutoff controller's power-supply during deepsleep in period of time.
+Make sure your have added "controller-power-down" property AND comment out
+"keep-power-in-suspend" in related dts file.
+
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+Signed-off-by: Xiaoyao <xiaoyao@rock-chips.com>
+Reviewed-by: Chenjh <chenjh@rock-chips.com>
+Tested-by: Chenjh <chenjh@rock-chips.com>
+---
+ drivers/mmc/host/rk_sdmmc.c | 65 ++++++++++++++++++++++++++++-
+ drivers/mmc/host/rk_sdmmc.h | 81 +++++++++++++++++++------------------
+ include/linux/mmc/rk_mmc.h  |  8 ++++
+ 3 files changed, 113 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index 4382f3680f49..62e8c12ec0ee 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -79,6 +79,9 @@
+ #define SDMMC_CMD_RTO_MAX_HOLD  200
+ #define SDMMC_WAIT_FOR_UNBUSY	2500
+ 
++#define DW_REGS_SIZE	(0x0098 + 4)
++#define DW_REGS_NUM	(0x0098 / 4)
++
+ #ifdef CONFIG_MMC_DW_IDMAC
+ #define IDMAC_INT_CLR		(SDMMC_IDMAC_INT_AI | SDMMC_IDMAC_INT_NI | \
+ 				 SDMMC_IDMAC_INT_CES | SDMMC_IDMAC_INT_DU | \
+@@ -3778,6 +3781,43 @@ static inline bool dw_mci_ctrl_all_reset(struct dw_mci *host)
+ 				 SDMMC_CTRL_DMA_RESET);
+ }
+ 
++static void dw_mci_rst_pre_suspend(struct dw_mci *host)
++{
++	u32 index;
++	u32 *buffer;
++
++	buffer = host->regs_buffer;
++
++	for (index = 0; index < DW_REGS_NUM ; index++){
++		*buffer = mci_readreg(host, index*4);
++		MMC_DBG_INFO_FUNC(host->mmc, "[%s] :0x%08x.\n",
++			dw_mci_regs[index].name, *buffer);
++		buffer++;
++	}
++
++	*buffer = mci_readl(host,CDTHRCTL);
++	MMC_DBG_INFO_FUNC(host->mmc, "[%s] :0x%08x.\n", "CARDTHRCTL", *buffer);
++}
++
++static void dw_mci_rst_post_resume(struct dw_mci *host)
++{
++	u32 index;
++	u32 *buffer;
++
++	buffer = host->regs_buffer;
++
++	for (index = 0; index < DW_REGS_NUM; index++){
++		mci_writereg(host, index*4, *buffer);
++		buffer++;
++	}
++	mci_writel(host, CDTHRCTL, *buffer);
++}
++
++static const struct dw_mci_rst_ops dw_mci_pdrst_ops = {
++	.pre_suspend = dw_mci_rst_pre_suspend,
++	.post_resume = dw_mci_rst_post_resume,
++};
++
+ #ifdef CONFIG_OF
+ /*
+ static struct dw_mci_of_quirks {
+@@ -3861,7 +3901,20 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
+ 	if (of_get_property(np, "cd-inverted", NULL))
+ 		pdata->caps2 |= MMC_CAP2_CD_ACTIVE_HIGH;
+ 	if (of_get_property(np, "bootpart-no-access", NULL))
+-		pdata->caps2 |= MMC_CAP2_BOOTPART_NOACC;	
++		pdata->caps2 |= MMC_CAP2_BOOTPART_NOACC;
++
++	if (of_get_property(np, "controller-power-down", NULL)) {
++		host->regs_buffer = (u32 *)devm_kzalloc(host->dev,
++						DW_REGS_SIZE, GFP_KERNEL);
++		if (!host->regs_buffer) {
++			dev_err(host->dev,
++				"could not allocate memory for regs_buffer\n");
++			return ERR_PTR(-ENOMEM);
++		}
++
++		host->rst_ops = &dw_mci_pdrst_ops;
++		mmc_assume_removable = 0;
++	}
+ 
+ 	return pdata;
+ }
+@@ -4200,6 +4253,11 @@ int dw_mci_suspend(struct dw_mci *host)
+                         enable_irq_wake(host->mmc->slot.cd_irq);
+                 }
+         }
++
++        if (host->rst_ops &&
++		host->rst_ops->pre_suspend)
++		host->rst_ops->pre_suspend(host);
++
+         return 0;
+ }
+ EXPORT_SYMBOL(dw_mci_suspend);
+@@ -4211,6 +4269,11 @@ int dw_mci_resume(struct dw_mci *host)
+ 	struct dw_mci_slot *slot;
+ 	int present = dw_mci_get_cd(host->mmc);
+ 
++	if (host->rst_ops &&
++		host->rst_ops->post_resume)
++		host->rst_ops->post_resume(host);
++
++
+ 	if ((host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) &&
+ 		(get_wifi_chip_type() == WIFI_ESP8089 ||
+ 			get_wifi_chip_type() > WIFI_AP6XXX_SERIES))
+diff --git a/drivers/mmc/host/rk_sdmmc.h b/drivers/mmc/host/rk_sdmmc.h
+index f4ed8e440d1e..67654fa051a2 100755
+--- a/drivers/mmc/host/rk_sdmmc.h
++++ b/drivers/mmc/host/rk_sdmmc.h
+@@ -77,52 +77,50 @@ u32   addr;
+ char    *name;
+ };
+ 
+-#if 0
+ static struct sdmmc_reg dw_mci_regs[] =
+ {
+-  { 0x0000, "      CTRL" },
+-  { 0x0004, "     PWREN" },
+-  { 0x0008, "    CLKDIV" },
+-  { 0x000C, "    CLKSRC" },
+-  { 0x0010, "    CLKENA" },
+-  { 0x0014, "     TMOUT" },
+-  { 0x0018, "     CTYPE" },
+-  { 0x001C, "    BLKSIZ" },
+-  { 0x0020, "    BYTCNT" },
+-  { 0x0024, "   INTMASK" },
+-  { 0x0028, "    CMDARG" },
+-  { 0x002C, "       CMD" },
+-  { 0x0030, "     RESP0" },
+-  { 0x0034, "     RESP1" },
+-  { 0x0038, "     RESP2" },
+-  { 0x003C, "     RESP3" },
+-  { 0x0040, "    MINSTS" },
+-  { 0x0044, "   RINTSTS" },
+-  { 0x0048, "    STATUS" },
+-  { 0x004C, "    FIFOTH" },
+-  { 0x0050, "   CDETECT" },
+-  { 0x0054, "    WRTPRT" },
+-  { 0x0058, "      GPIO" },
+-  { 0x005C, "    TCBCNT" },
+-  { 0x0060, "    TBBCNT" },
+-  { 0x0064, "    DEBNCE" },
+-  { 0x0068, "     USRID" },
+-  { 0x006C, "     VERID" },
+-  { 0x0070, "      HCON" },
+-  { 0x0074, "   UHS_REG" },
+-  { 0x0078, "     RST_n" },
+-  { 0x0080, "      BMOD" },
+-  { 0x0084, "    PLDMND" },
+-  { 0x0088, "    DBADDR" },
+-  { 0x008C, "     IDSTS" },
+-  { 0x0090, "   IDINTEN" },
+-  { 0x0094, "   DSCADDR" },
+-  { 0x0098, "   BUFADDR" },
++  { 0x0000, "CTRL" },
++  { 0x0004, "PWREN" },
++  { 0x0008, "CLKDIV" },
++  { 0x000C, "CLKSRC" },
++  { 0x0010, "CLKENA" },
++  { 0x0014, "TMOUT" },
++  { 0x0018, "CTYPE" },
++  { 0x001C, "BLKSIZ" },
++  { 0x0020, "BYTCNT" },
++  { 0x0024, "INTMASK" },
++  { 0x0028, "CMDARG" },
++  { 0x002C, "CMD" },
++  { 0x0030, "RESP0" },
++  { 0x0034, "RESP1" },
++  { 0x0038, "RESP2" },
++  { 0x003C, "RESP3" },
++  { 0x0040, "MINSTS" },
++  { 0x0044, "RINTSTS" },
++  { 0x0048, "STATUS" },
++  { 0x004C, "FIFOTH" },
++  { 0x0050, "CDETECT" },
++  { 0x0054, "WRTPRT" },
++  { 0x0058, "GPIO" },
++  { 0x005C, "TCBCNT" },
++  { 0x0060, "TBBCNT" },
++  { 0x0064, "DEBNCE" },
++  { 0x0068, "USRID" },
++  { 0x006C, "VERID" },
++  { 0x0070, "HCON" },
++  { 0x0074, "UHS_REG" },
++  { 0x0078, "RST_n" },
++  { 0x0080, "BMOD" },
++  { 0x0084, "PLDMND" },
++  { 0x0088, "DBADDR" },
++  { 0x008C, "IDSTS" },
++  { 0x0090, "IDINTEN" },
++  { 0x0094, "DSCADDR" },
++  { 0x0098, "BUFADDR" },
+   { 0x0100, "CARDTHRCTL" },
+   { 0x0104, "BackEndPwr" },
+   { 0, 0 }
+ };
+-#endif
+ 
+ /* Control register defines */
+ #define SDMMC_CTRL_USE_IDMAC		BIT(25)
+@@ -233,6 +231,9 @@ static struct sdmmc_reg dw_mci_regs[] =
+ 	__raw_writel((value), (dev)->regs + SDMMC_##reg)
+ #define mci_readreg(dev, addr)			\
+         __raw_readl((dev)->regs + addr)
++#define mci_writereg(dev, addr, value)		\
++  __raw_writel((value), (dev)->regs + addr)
++
+ 
+ /* 16-bit FIFO access macros */
+ #define mci_readw(dev, reg)			\
+diff --git a/include/linux/mmc/rk_mmc.h b/include/linux/mmc/rk_mmc.h
+index e6a081d2906b..aa17cc7469e9 100755
+--- a/include/linux/mmc/rk_mmc.h
++++ b/include/linux/mmc/rk_mmc.h
+@@ -218,6 +218,8 @@ struct dw_mci {
+ 
+ 	u32	cid;
+ 	struct regmap	*grf;
++	u32 *regs_buffer;
++	const struct dw_mci_rst_ops *rst_ops;
+ };
+ 
+ /* DMA ops for Internal/External DMAC interface */
+@@ -231,6 +233,12 @@ struct dw_mci_dma_ops {
+ 	void (*exit)(struct dw_mci *host);
+ };
+ 
++/* Platform rst hook for pm ops before suspend and after resume */
++struct dw_mci_rst_ops {
++	void (*pre_suspend)(struct dw_mci *host);
++	void (*post_resume)(struct dw_mci *host);
++};
++
+ /* IP Quirks/flags. */
+ /* DTO fix for command transmission with IDMAC configured */
+ #define DW_MCI_QUIRK_IDMAC_DTO			BIT(0)
+-- 
+2.35.3
+

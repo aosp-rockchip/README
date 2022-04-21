@@ -1,0 +1,272 @@
+From 9f169f2e1a47a13c89333dc92b81cb66b6d68931 Mon Sep 17 00:00:00 2001
+From: Frank Wang <frank.wang@rock-chips.com>
+Date: Mon, 17 Aug 2015 11:25:03 +0800
+Subject: [PATCH] mailbox: rk3868: Added mailbox channel management function
+ and fixed the bug of mailbox timeout.
+
+Signed-off-by: Frank Wang <frank.wang@rock-chips.com>
+---
+ drivers/mailbox/rockchip_mailbox.c | 43 +++++++++++++----
+ drivers/mailbox/scpi_protocol.c    | 76 ++++++++++++++++++++++++++----
+ 2 files changed, 100 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/mailbox/rockchip_mailbox.c b/drivers/mailbox/rockchip_mailbox.c
+index 02b41415fd8d..db9943179476 100644
+--- a/drivers/mailbox/rockchip_mailbox.c
++++ b/drivers/mailbox/rockchip_mailbox.c
+@@ -65,6 +65,9 @@ struct rockchip_mbox {
+ 	struct rockchip_mbox_chan *chans;
+ };
+ 
++#define MBOX_CHAN_NUMS	4
++int idx_map_irq[MBOX_CHAN_NUMS] = {0, 0, 0, 0};
++
+ static inline int chan_to_idx(struct rockchip_mbox *mb,
+ 			      struct mbox_chan *chan)
+ {
+@@ -123,20 +126,38 @@ static struct mbox_chan_ops rockchip_mbox_chan_ops = {
+ 
+ static irqreturn_t rockchip_mbox_irq(int irq, void *dev_id)
+ {
++	int idx;
+ 	struct rockchip_mbox *mb = (struct rockchip_mbox *)dev_id;
+ 	u32 status = readl_relaxed(mb->mbox_base + MAILBOX_B2A_STATUS);
+-	int idx;
+ 
+ 	for (idx = 0; idx < mb->mbox.num_chans; idx++) {
+-		struct rockchip_mbox_msg *msg = mb->chans[idx].msg;
++		if ((status & (1 << idx)) && (irq == idx_map_irq[idx])) {
++			/* Clear mbox interrupt */
++			writel_relaxed(1 << idx,
++				       mb->mbox_base + MAILBOX_B2A_STATUS);
++			return IRQ_WAKE_THREAD;
++		}
++	}
++
++	return IRQ_NONE;
++}
+ 
+-	  /* Clear mbox interrupt */
+-		writel_relaxed(1 << idx, mb->mbox_base + MAILBOX_B2A_STATUS);
++static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
++{
++	int idx;
++	struct rockchip_mbox_msg *msg = NULL;
++	struct rockchip_mbox *mb = (struct rockchip_mbox *)dev_id;
+ 
+-		if (!(status & (1 << idx)))
++	for (idx = 0; idx < mb->mbox.num_chans; idx++) {
++		if (irq != idx_map_irq[idx])
+ 			continue;
+-		if (!msg)
+-			continue; /* spurious */
++
++		msg = mb->chans[idx].msg;
++		if (!msg) {
++			dev_err(mb->mbox.dev,
++				"Chan[%d]: B2A message is NULL\n", idx);
++			break; /* spurious */
++		}
+ 
+ 		if (msg->rx_buf)
+ 			memcpy(msg->rx_buf,
+@@ -148,6 +169,8 @@ static irqreturn_t rockchip_mbox_irq(int irq, void *dev_id)
+ 
+ 		dev_dbg(mb->mbox.dev, "Chan[%d]: B2A message, cmd 0x%08x\n",
+ 			idx, msg->cmd);
++
++		break;
+ 	}
+ 
+ 	return IRQ_HANDLED;
+@@ -262,8 +285,9 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 		if (irq < 0)
+ 			return irq;
+ 
+-		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
+-						rockchip_mbox_irq, IRQF_ONESHOT,
++		ret = devm_request_threaded_irq(&pdev->dev, irq,
++						rockchip_mbox_irq,
++						rockchip_mbox_isr, IRQF_ONESHOT,
+ 						dev_name(&pdev->dev), mb);
+ 		if (ret < 0)
+ 			return ret;
+@@ -271,6 +295,7 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 		mb->chans[i].idx = i;
+ 		mb->chans[i].mb = mb;
+ 		mb->chans[i].msg = NULL;
++		idx_map_irq[i] = irq;
+ 	}
+ 
+ 	/* Enable all B2A interrupts */
+diff --git a/drivers/mailbox/scpi_protocol.c b/drivers/mailbox/scpi_protocol.c
+index 51d8feb8b782..0404743fc617 100644
+--- a/drivers/mailbox/scpi_protocol.c
++++ b/drivers/mailbox/scpi_protocol.c
+@@ -48,6 +48,10 @@
+ #define DVFS_LATENCY(hdr)	((hdr) >> 16)
+ #define DVFS_OPP_COUNT(hdr)	(((hdr) >> 8) & 0xff)
+ 
++int max_chan_num = 0;
++static DECLARE_BITMAP(bm_mbox_chans, 4);
++static DEFINE_MUTEX(scpi_mtx);
++
+ struct scpi_data_buf {
+ 	int client_id;
+ 	struct rockchip_mbox_msg *data;
+@@ -89,7 +93,7 @@ static inline int scpi_to_linux_errno(int errno)
+ 	return -EIO;
+ }
+ 
+-static bool high_priority_chan_supported(int cmd)
++static bool __maybe_unused high_priority_chan_supported(int cmd)
+ {
+ 	int idx;
+ 
+@@ -99,6 +103,37 @@ static bool high_priority_chan_supported(int cmd)
+ 	return false;
+ }
+ 
++static int scpi_alloc_mbox_chan(void)
++{
++	int index;
++
++	mutex_lock(&scpi_mtx);
++
++	index = find_first_zero_bit(bm_mbox_chans, max_chan_num);
++	if (index >= max_chan_num) {
++		pr_err("alloc mailbox channel failed\n");
++		mutex_unlock(&scpi_mtx);
++		return -EBUSY;
++	}
++
++	set_bit(index, bm_mbox_chans);
++
++	mutex_unlock(&scpi_mtx);
++	return index;
++}
++
++static void scpi_free_mbox_chan(int chan)
++{
++	int index = chan;
++
++	mutex_lock(&scpi_mtx);
++
++	if (index < max_chan_num && index >= 0)
++		clear_bit(index, bm_mbox_chans);
++
++	mutex_unlock(&scpi_mtx);
++}
++
+ static void scpi_rx_callback(struct mbox_client *cl, void *msg)
+ {
+ 	struct rockchip_mbox_msg *data = (struct rockchip_mbox_msg *)msg;
+@@ -107,7 +142,7 @@ static void scpi_rx_callback(struct mbox_client *cl, void *msg)
+ 	complete(&scpi_buf->complete);
+ }
+ 
+-static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, bool high_priority)
++static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, int index)
+ {
+ 	struct mbox_chan *chan;
+ 	struct mbox_client cl;
+@@ -127,9 +162,11 @@ static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, bool high_priority)
+ 	cl.tx_block = false;
+ 	cl.knows_txdone = false;
+ 
+-	chan = mbox_request_channel(&cl, high_priority);
+-	if (IS_ERR(chan))
++	chan = mbox_request_channel(&cl, index);
++	if (IS_ERR(chan)) {
++		scpi_free_mbox_chan(index);
+ 		return PTR_ERR(chan);
++	}
+ 
+ 	init_completion(&scpi_buf->complete);
+ 	if (mbox_send_message(chan, (void *)data) < 0) {
+@@ -146,6 +183,7 @@ static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, bool high_priority)
+ 
+ free_channel:
+ 	mbox_free_channel(chan);
++	scpi_free_mbox_chan(index);
+ 
+ 	return scpi_to_linux_errno(status);
+ }
+@@ -167,18 +205,21 @@ do {						\
+ static int scpi_execute_cmd(struct scpi_data_buf *scpi_buf)
+ {
+ 	struct rockchip_mbox_msg *data;
+-	bool high_priority;
++	int index;
+ 
+ 	if (!scpi_buf || !scpi_buf->data)
+ 		return -EINVAL;
+ 
++	index = scpi_alloc_mbox_chan();
++	if (index < 0)
++		return -EBUSY;
++
+ 	data = scpi_buf->data;
+-	high_priority = high_priority_chan_supported(data->cmd);
+ 	data->cmd = PACK_SCPI_CMD(data->cmd, scpi_buf->client_id,
+ 				  data->tx_size);
+ 	data->cl_data = scpi_buf;
+ 
+-	return send_scpi_cmd(scpi_buf, high_priority);
++	return send_scpi_cmd(scpi_buf, index);
+ }
+ 
+ unsigned long scpi_clk_get_val(u16 clk_id)
+@@ -577,6 +618,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_get_clk_rate);
+ 
+ int scpi_thermal_get_temperature(void)
+ {
++	int ret;
+ 	struct scpi_data_buf sdata;
+ 	struct rockchip_mbox_msg mdata;
+ 	struct __packed1 {
+@@ -591,8 +633,12 @@ int scpi_thermal_get_temperature(void)
+ 	tx_buf.status = 0;
+ 	SCPI_SETUP_DBUF(sdata, mdata, SCPI_CL_THERMAL,
+ 			SCPI_THERMAL_GET_TSADC_DATA, tx_buf, rx_buf);
+-	if (scpi_execute_cmd(&sdata))
+-		return 0;
++
++	ret = scpi_execute_cmd(&sdata);
++	if (ret) {
++		pr_err("get temperature from MCU failed, ret=%d\n", ret);
++		return ret;
++	}
+ 
+ 	return rx_buf.tsadc_data;
+ }
+@@ -630,6 +676,7 @@ static int mobx_scpi_probe(struct platform_device *pdev)
+ 	int retry = 3;
+ 	u32 ver = 0;
+ 	int check_version = 0; /*0: not check version, 1: check version*/
++	int val = 0;
+ 
+ 	the_scpi_device = &pdev->dev;
+ 
+@@ -645,8 +692,17 @@ static int mobx_scpi_probe(struct platform_device *pdev)
+ 		goto exit;
+ 	}
+ 
++	/* try to get mboxes chan nums from DT */
++	if (of_property_read_u32((&pdev->dev)->of_node, "chan-nums", &val)) {
++		dev_err(&pdev->dev, "parse mboxes chan-nums failed\n");
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	max_chan_num = val;
++
+ 	dev_info(&pdev->dev,
+-		 "Scpi initialize, version: 0x%x\n", ver);
++		 "Scpi initialize, version: 0x%x, chan nums: %d\n", ver, val);
+ 	return 0;
+ exit:
+ 	the_scpi_device = NULL;
+-- 
+2.35.3
+

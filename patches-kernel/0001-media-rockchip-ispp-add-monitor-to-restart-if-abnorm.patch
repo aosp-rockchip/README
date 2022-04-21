@@ -1,0 +1,504 @@
+From c5a7b6cd720e64577572c7160c6a5cee7f5be43d Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Fri, 11 Sep 2020 18:53:05 +0800
+Subject: [PATCH] media: rockchip: ispp: add monitor to restart if abnormal
+
+enable monitor:
+add rockchip,restart-monitor-en to rkispp node on dts or
+echo Y > /sys/module/video_rkispp/parameters/monitor
+
+Change-Id: I481bb6021166a14dc8f115fe76fcfba092662a7a
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/common.c |  15 ++
+ drivers/media/platform/rockchip/ispp/common.h |   2 +
+ drivers/media/platform/rockchip/ispp/dev.c    |   5 +
+ drivers/media/platform/rockchip/ispp/hw.c     |   1 +
+ drivers/media/platform/rockchip/ispp/ispp.c   |   3 +
+ drivers/media/platform/rockchip/ispp/stream.c | 202 +++++++++++++++++-
+ drivers/media/platform/rockchip/ispp/stream.h |  30 +++
+ 7 files changed, 249 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index 3ad3ff34632f..f6066d9428b9 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -2,6 +2,8 @@
+ /* Copyright (C) 2019 Rockchip Electronics Co., Ltd */
+ 
+ #include <media/videobuf2-dma-contig.h>
++#include <linux/delay.h>
++#include <linux/iommu.h>
+ #include <linux/of_platform.h>
+ #include "dev.h"
+ #include "regs.h"
+@@ -283,3 +285,16 @@ int rkispp_event_handle(struct rkispp_device *ispp, u32 cmd, void *arg)
+ 
+ 	return ret;
+ }
++
++void rkispp_soft_reset(struct rkispp_device *ispp)
++{
++	struct rkispp_hw_dev *hw = ispp->hw_dev;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(hw->dev);
++
++	if (domain)
++		iommu_detach_device(domain, hw->dev);
++	writel(GLB_SOFT_RST_ALL, hw->base_addr + RKISPP_CTRL_RESET);
++	udelay(10);
++	if (domain)
++		iommu_attach_device(domain, hw->dev);
++}
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index b76f51803033..1da00ee14a3b 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -96,6 +96,7 @@ static inline struct vb2_queue *to_vb2_queue(struct file *file)
+ 
+ extern int rkispp_debug;
+ extern bool rkispp_clk_dbg;
++extern bool rkispp_monitor;
+ extern struct platform_driver rkispp_plat_drv;
+ 
+ void rkispp_write(struct rkispp_device *dev, u32 reg, u32 val);
+@@ -110,4 +111,5 @@ void rkispp_free_buffer(struct rkispp_device *dev,
+ 
+ int rkispp_attach_hw(struct rkispp_device *ispp);
+ int rkispp_event_handle(struct rkispp_device *ispp, u32 cmd, void *arg);
++void rkispp_soft_reset(struct rkispp_device *ispp);
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 0fb8a3f93186..47c197e4145b 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -31,6 +31,10 @@ bool rkispp_clk_dbg;
+ module_param_named(clk_dbg, rkispp_clk_dbg, bool, 0644);
+ MODULE_PARM_DESC(clk_dbg, "rkispp clk set by user");
+ 
++bool rkispp_monitor;
++module_param_named(monitor, rkispp_monitor, bool, 0644);
++MODULE_PARM_DESC(monitor, "rkispp abnormal restart monitor");
++
+ static int rkisp_ispp_mode = ISP_ISPP_FBC;
+ module_param_named(mode, rkisp_ispp_mode, int, 0644);
+ MODULE_PARM_DESC(mode, "isp->ispp mode: bit0 fbc, bit1 yuv422, bit2 quick");
+@@ -310,6 +314,7 @@ static int __maybe_unused rkispp_runtime_resume(struct device *dev)
+ 
+ 	ispp_dev->isp_mode = rkisp_ispp_mode;
+ 	ispp_dev->stream_sync = rkispp_stream_sync;
++	ispp_dev->stream_vdev.monitor.is_en = rkispp_monitor;
+ 	if (atomic_inc_return(&ispp_dev->hw_dev->power_cnt) > 1)
+ 		return 0;
+ 	return pm_runtime_get_sync(ispp_dev->hw_dev->dev);
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+index 601c2c193d35..21af9f27f971 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.c
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -225,6 +225,7 @@ static int rkispp_hw_probe(struct platform_device *pdev)
+ 		goto err;
+ 	}
+ 
++	rkispp_monitor = device_property_read_bool(dev, "rockchip,restart-monitor-en");
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_IRQ,
+ 					   match_data->irqs[0].name);
+ 	if (res) {
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index f4e2ef041163..38c30b91a628 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -258,6 +258,9 @@ static int rkispp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 			       video, s_stream, on);
+ 	if ((on && ret) || (!on && !ret)) {
+ 		ispp_sdev->state = ISPP_STOP;
++		if (dev->stream_vdev.monitor.is_en &&
++		    dev->stream_vdev.monitor.is_restart)
++			complete(&dev->stream_vdev.monitor.cmpl);
+ 		rkispp_event_handle(dev, CMD_STREAM, &ispp_sdev->state);
+ 		rkispp_event_handle(dev, CMD_FREE_POOL, NULL);
+ 	}
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index 8b45972530ba..62e0e8996a4a 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -962,6 +962,10 @@ static int config_modules(struct rkispp_device *dev)
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "stream module ens:0x%x\n", dev->stream_vdev.module_ens);
++	dev->stream_vdev.monitor.monitoring_module = 0;
++	dev->stream_vdev.monitor.restart_module = 0;
++	dev->stream_vdev.monitor.is_restart = false;
++	dev->stream_vdev.monitor.retry = 0;
+ 
+ 	ret = config_tnr(dev);
+ 	if (ret < 0)
+@@ -1935,16 +1939,127 @@ static int rkispp_register_stream_video(struct rkispp_stream *stream)
+ 	return ret;
+ }
+ 
++static void restart_module(struct rkispp_device *dev)
++{
++	struct rkispp_monitor *monitor = &dev->stream_vdev.monitor;
++	void __iomem *base = dev->hw_dev->base_addr;
++	u32 val = 0;
++
++	monitor->retry++;
++	if (dev->ispp_sdev.state == ISPP_STOP || monitor->retry > 3) {
++		monitor->is_en = false;
++		monitor->is_restart = false;
++		return;
++	}
++	if (monitor->monitoring_module)
++		wait_for_completion_timeout(&monitor->cmpl,
++					    msecs_to_jiffies(400));
++	if (dev->ispp_sdev.state == ISPP_STOP)
++		return;
++	rkispp_soft_reset(dev);
++	rkispp_update_regs(dev, RKISPP_CTRL_QUICK, RKISPP_FEC_CROP);
++	writel(ALL_FORCE_UPD, base + RKISPP_CTRL_UPDATE);
++	if (monitor->restart_module & MONITOR_TNR) {
++		val |= TNR_ST;
++		rkispp_write(dev, RKISPP_TNR_IIR_Y_BASE,
++			     rkispp_read(dev, RKISPP_TNR_WR_Y_BASE));
++		rkispp_write(dev, RKISPP_TNR_IIR_UV_BASE,
++			     rkispp_read(dev, RKISPP_TNR_WR_UV_BASE));
++		monitor->monitoring_module |= MONITOR_TNR;
++		schedule_work(&monitor->tnr.work);
++	}
++	if (monitor->restart_module & MONITOR_NR) {
++		val |= NR_SHP_ST;
++		monitor->monitoring_module |= MONITOR_NR;
++		schedule_work(&monitor->nr.work);
++	}
++	if (monitor->restart_module & MONITOR_FEC) {
++		val |= FEC_ST;
++		monitor->monitoring_module |= MONITOR_FEC;
++		schedule_work(&monitor->fec.work);
++	}
++	writel(val, base + RKISPP_CTRL_STRT);
++	monitor->is_restart = false;
++	monitor->restart_module = 0;
++}
++static void restart_monitor(struct work_struct *work)
++{
++	struct module_monitor *m_monitor =
++		container_of(work, struct module_monitor, work);
++	struct rkispp_device *dev = m_monitor->dev;
++	struct rkispp_monitor *monitor = &dev->stream_vdev.monitor;
++	u32 time = (!m_monitor->time ? 300 : m_monitor->time) + 100;
++	unsigned long lock_flags = 0;
++	int ret;
++
++	if (dev->ispp_sdev.state == ISPP_STOP)
++		return;
++	ret = wait_for_completion_timeout(&m_monitor->cmpl,
++					  msecs_to_jiffies(time));
++	spin_lock_irqsave(&monitor->lock, lock_flags);
++	if (m_monitor->is_cancel) {
++		m_monitor->is_cancel = false;
++		spin_unlock_irqrestore(&monitor->lock, lock_flags);
++		return;
++	}
++	monitor->monitoring_module &= ~m_monitor->module;
++	if (!ret) {
++		monitor->restart_module |= m_monitor->module;
++		if (monitor->is_restart)
++			ret = true;
++		else
++			monitor->is_restart = true;
++		if (m_monitor->module == MONITOR_TNR) {
++			rkispp_write(dev, RKISPP_TNR_IIR_Y_BASE,
++				     readl(dev->hw_dev->base_addr + RKISPP_TNR_IIR_Y_BASE_SHD));
++			rkispp_write(dev, RKISPP_TNR_IIR_UV_BASE,
++				     readl(dev->hw_dev->base_addr + RKISPP_TNR_IIR_UV_BASE_SHD));
++		}
++		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
++			 "%s monitoring:0x%x module:0x%x timeout\n", __func__,
++			 monitor->monitoring_module, m_monitor->module);
++	}
++	spin_unlock_irqrestore(&monitor->lock, lock_flags);
++	if (!ret && monitor->is_restart)
++		restart_module(dev);
++	/* waitting for other working module if need restart ispp */
++	if (monitor->is_restart && !monitor->monitoring_module)
++		complete(&monitor->cmpl);
++}
++
++static void monitor_init(struct rkispp_device *dev)
++{
++	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
++	struct rkispp_monitor *monitor = &vdev->monitor;
++
++	monitor->tnr.dev = dev;
++	monitor->nr.dev = dev;
++	monitor->fec.dev = dev;
++	monitor->tnr.module = MONITOR_TNR;
++	monitor->nr.module = MONITOR_NR;
++	monitor->fec.module = MONITOR_FEC;
++	INIT_WORK(&monitor->tnr.work, restart_monitor);
++	INIT_WORK(&monitor->nr.work, restart_monitor);
++	INIT_WORK(&monitor->fec.work, restart_monitor);
++	init_completion(&monitor->tnr.cmpl);
++	init_completion(&monitor->nr.cmpl);
++	init_completion(&monitor->fec.cmpl);
++	init_completion(&monitor->cmpl);
++	spin_lock_init(&monitor->lock);
++	monitor->is_restart = false;
++}
++
+ static void fec_work_event(struct rkispp_device *dev,
+ 			   struct rkispp_dummy_buffer *buf_rd,
+ 			   bool is_isr)
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
++	struct rkispp_monitor *monitor = &vdev->monitor;
+ 	struct list_head *list = &vdev->fec.list_rd;
+ 	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy;
+-	unsigned long lock_flags = 0;
++	unsigned long lock_flags = 0, lock_flags1 = 0;
+ 	bool is_start = false, is_quick = false;
+ 	u32 val;
+ 
+@@ -1967,6 +2082,12 @@ static void fec_work_event(struct rkispp_device *dev,
+ 		vdev->fec.cur_rd = NULL;
+ 	}
+ 
++	spin_lock_irqsave(&monitor->lock, lock_flags1);
++	if (monitor->is_restart && buf_rd) {
++		list_add_tail(&buf_rd->list, list);
++		goto restart_unlock;
++	}
++
+ 	if (buf_rd && vdev->fec.is_end && list_empty(list)) {
+ 		/* fec read buf from nr */
+ 		vdev->fec.cur_rd = buf_rd;
+@@ -2023,10 +2144,20 @@ static void fec_work_event(struct rkispp_device *dev,
+ 
+ 		vdev->fec.dbg.id = seq;
+ 		vdev->fec.dbg.timestamp = ktime_get_ns();
+-
++		if (monitor->is_en) {
++			monitor->fec.is_cancel = false;
++			monitor->fec.time = vdev->fec.dbg.interval / 1000 / 1000;
++			if (monitor->monitoring_module & MONITOR_FEC)
++				monitor->fec.is_cancel = true;
++			else
++				monitor->monitoring_module |= MONITOR_FEC;
++			schedule_work(&monitor->fec.work);
++		}
+ 		writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->fec.is_end = false;
+ 	}
++restart_unlock:
++	spin_unlock_irqrestore(&monitor->lock, lock_flags1);
+ 	spin_unlock_irqrestore(&vdev->fec.buf_lock, lock_flags);
+ }
+ 
+@@ -2037,13 +2168,14 @@ static void nr_work_event(struct rkispp_device *dev,
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
++	struct rkispp_monitor *monitor = &vdev->monitor;
+ 	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *buf_to_fec = NULL;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	struct v4l2_subdev *sd = NULL;
+ 	struct list_head *list;
+ 	struct dma_buf *dbuf;
+-	unsigned long lock_flags = 0;
++	unsigned long lock_flags = 0, lock_flags1 = 0;
+ 	bool is_start = false, is_quick = false;
+ 	bool is_tnr_en = vdev->module_ens & ISPP_MODULE_TNR;
+ 	bool is_fec_en = (vdev->module_ens & ISPP_MODULE_FEC);
+@@ -2089,6 +2221,15 @@ static void nr_work_event(struct rkispp_device *dev,
+ 		goto end;
+ 	}
+ 
++	spin_lock_irqsave(&monitor->lock, lock_flags1);
++	if (monitor->is_restart) {
++		if (buf_rd)
++			list_add_tail(&buf_rd->list, &vdev->nr.list_rd);
++		if (buf_wr)
++			list_add_tail(&buf_wr->list, &vdev->nr.list_wr);
++		goto restart_unlock;
++	}
++
+ 	list = &vdev->nr.list_rd;
+ 	if (buf_rd && vdev->nr.is_end && list_empty(list)) {
+ 		/* nr read buf from isp or tnr */
+@@ -2200,10 +2341,21 @@ static void nr_work_event(struct rkispp_device *dev,
+ 
+ 		vdev->nr.dbg.id = seq;
+ 		vdev->nr.dbg.timestamp = ktime_get_ns();
++		if (monitor->is_en) {
++			monitor->nr.is_cancel = false;
++			monitor->nr.time = vdev->nr.dbg.interval / 1000 / 1000;
++			if (monitor->monitoring_module & MONITOR_NR)
++				monitor->nr.is_cancel = true;
++			else
++				monitor->monitoring_module |= MONITOR_NR;
++			schedule_work(&monitor->nr.work);
++		}
+ 		if (!is_quick)
+ 			writel(NR_SHP_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->nr.is_end = false;
+ 	}
++restart_unlock:
++	spin_unlock_irqrestore(&monitor->lock, lock_flags1);
+ end:
+ 	/* nr_shp->fec->scl
+ 	 * fec start working should after nr
+@@ -2222,12 +2374,13 @@ static void tnr_work_event(struct rkispp_device *dev,
+ {
+ 	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
+ 	struct rkispp_stream *stream = &vdev->stream[STREAM_II];
++	struct rkispp_monitor *monitor = &vdev->monitor;
+ 	void __iomem *base = dev->hw_dev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy;
+ 	struct v4l2_subdev *sd = NULL;
+ 	struct list_head *list;
+ 	struct dma_buf *dbuf;
+-	unsigned long lock_flags = 0;
++	unsigned long lock_flags = 0, lock_flags1 = 0;
+ 	u32 val, size = sizeof(vdev->tnr.buf) / sizeof(*dummy);
+ 	bool is_3to1 = vdev->tnr.is_3to1, is_start = false, is_skip = false;
+ 	bool is_en = rkispp_read(dev, RKISPP_TNR_CORE_CTRL) & SW_TNR_EN;
+@@ -2284,6 +2437,15 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 		goto end;
+ 	}
+ 
++	spin_lock_irqsave(&monitor->lock, lock_flags1);
++	if (monitor->is_restart) {
++		if (buf_rd)
++			list_add_tail(&buf_rd->list, &vdev->tnr.list_rd);
++		if (buf_wr)
++			list_add_tail(&buf_wr->list, &vdev->tnr.list_wr);
++		goto restart_unlock;
++	}
++
+ 	list = &vdev->tnr.list_rd;
+ 	if (buf_rd && vdev->tnr.is_end && list_empty(list)) {
+ 		/* tnr read buf from isp */
+@@ -2403,7 +2565,15 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 
+ 		vdev->tnr.dbg.id = seq;
+ 		vdev->tnr.dbg.timestamp = ktime_get_ns();
+-
++		if (monitor->is_en) {
++			monitor->tnr.is_cancel = false;
++			monitor->tnr.time = vdev->tnr.dbg.interval / 1000 / 1000;
++			if (monitor->monitoring_module & MONITOR_TNR)
++				monitor->tnr.is_cancel = true;
++			else
++				monitor->monitoring_module |= MONITOR_TNR;
++			schedule_work(&monitor->tnr.work);
++		}
+ 		writel(TNR_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->tnr.is_end = false;
+ 	}
+@@ -2415,6 +2585,8 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			vdev->tnr.nxt_rd = NULL;
+ 		vdev->tnr.cur_rd = NULL;
+ 	}
++restart_unlock:
++	spin_unlock_irqrestore(&monitor->lock, lock_flags1);
+ end:
+ 	spin_unlock_irqrestore(&vdev->tnr.buf_lock, lock_flags);
+ }
+@@ -2427,8 +2599,10 @@ void rkispp_module_work_event(struct rkispp_device *dev,
+ 
+ 	if (is_isr && !buf_rd && !buf_wr &&
+ 	    ((is_fec_en && module == ISPP_MODULE_FEC) ||
+-	     (!is_fec_en && module == ISPP_MODULE_NR)))
++	     (!is_fec_en && module == ISPP_MODULE_NR))) {
++		dev->stream_vdev.monitor.retry = 0;
+ 		rkispp_event_handle(dev, CMD_QUEUE_DMABUF, NULL);
++	}
+ 
+ 	if (dev->ispp_sdev.state == ISPP_STOP)
+ 		return;
+@@ -2461,12 +2635,21 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 			 "ispp err:0x%x\n", mis_val);
+ 	}
+ 
+-	if (mis_val & TNR_INT)
++	if (mis_val & TNR_INT) {
++		if (vdev->monitor.is_en)
++			complete(&vdev->monitor.tnr.cmpl);
+ 		vdev->tnr.dbg.interval = ns - vdev->tnr.dbg.timestamp;
+-	if (mis_val & NR_INT)
++	}
++	if (mis_val & NR_INT) {
++		if (vdev->monitor.is_en)
++			complete(&vdev->monitor.nr.cmpl);
+ 		vdev->nr.dbg.interval = ns - vdev->nr.dbg.timestamp;
+-	if (mis_val & FEC_INT)
++	}
++	if (mis_val & FEC_INT) {
++		if (vdev->monitor.is_en)
++			complete(&vdev->monitor.fec.cmpl);
+ 		vdev->fec.dbg.interval = ns - vdev->fec.dbg.timestamp;
++	}
+ 
+ 	if (mis_val & (CMD_TNR_ST_DONE | CMD_NR_SHP_ST_DONE) &&
+ 	    (dev->isp_mode & ISP_ISPP_QUICK || dev->inp == INP_DDR))
+@@ -2568,6 +2751,7 @@ int rkispp_register_stream_vdevs(struct rkispp_device *dev)
+ 		if (ret < 0)
+ 			goto err;
+ 	}
++	monitor_init(dev);
+ 	return 0;
+ err:
+ 	for (j = 0; j < i; j++) {
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index a79c8c38cbc5..21a9018a8ab6 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -171,6 +171,35 @@ struct rkispp_stream {
+ 	bool is_cfg;
+ };
+ 
++enum {
++	MONITOR_OFF = 0,
++	MONITOR_TNR = BIT(0),
++	MONITOR_NR = BIT(1),
++	MONITOR_FEC = BIT(2),
++};
++
++struct module_monitor {
++	struct rkispp_device *dev;
++	struct work_struct work;
++	struct completion cmpl;
++	u16 time;
++	u8 module;
++	bool is_cancel;
++};
++
++struct rkispp_monitor {
++	struct module_monitor tnr;
++	struct module_monitor nr;
++	struct module_monitor fec;
++	struct completion cmpl;
++	spinlock_t lock;
++	u8 monitoring_module;
++	u8 restart_module;
++	u8 retry;
++	bool is_restart;
++	bool is_en;
++};
++
+ /* rkispp stream device */
+ struct rkispp_stream_vdev {
+ 	struct rkispp_stream stream[STREAM_MAX];
+@@ -180,6 +209,7 @@ struct rkispp_stream_vdev {
+ 	struct fec_module fec;
+ 	struct in_fec_buf fec_buf;
+ 	struct frame_debug_info dbg;
++	struct rkispp_monitor monitor;
+ 	atomic_t refcnt;
+ 	u32 module_ens;
+ 	u32 irq_ends;
+-- 
+2.35.3
+

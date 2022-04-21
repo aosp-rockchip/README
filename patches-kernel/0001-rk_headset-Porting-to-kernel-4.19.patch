@@ -1,0 +1,1670 @@
+From 4a4ef4d008e5b2b565f3bbf192f4b9f73dfbc3a0 Mon Sep 17 00:00:00 2001
+From: Shunhua Lan <lsh@rock-chips.com>
+Date: Tue, 22 Oct 2019 20:13:12 +0800
+Subject: [PATCH] rk_headset: Porting to kernel 4.19
+
+use extcon instead of switch
+fix some codes style
+
+Change-Id: I3f1906ddca16b2fedf403c7c88e00ff1dc4edd42
+Signed-off-by: Shunhua Lan <lsh@rock-chips.com>
+---
+ drivers/Kconfig                               |   2 +
+ drivers/Makefile                              |   1 +
+ drivers/headset_observe/rk_headset.c          | 419 +++++++--------
+ drivers/headset_observe/rk_headset.h          |  26 +-
+ .../headset_observe/rk_headset_irq_hook_adc.c | 500 ++++++++----------
+ .../headset_observe/rockchip_headset_core.c   | 146 +++--
+ 6 files changed, 521 insertions(+), 573 deletions(-)
+ mode change 100755 => 100644 drivers/headset_observe/rockchip_headset_core.c
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index ac0cb70196b3..1f79173a3337 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -107,6 +107,8 @@ source "drivers/memstick/Kconfig"
+ 
+ source "drivers/leds/Kconfig"
+ 
++source "drivers/headset_observe/Kconfig"
++
+ source "drivers/accessibility/Kconfig"
+ 
+ source "drivers/infiniband/Kconfig"
+diff --git a/drivers/Makefile b/drivers/Makefile
+index fc714cafc39b..bb146d68ab67 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -189,4 +189,5 @@ obj-$(CONFIG_UNISYS_VISORBUS)	+= visorbus/
+ obj-$(CONFIG_SIOX)		+= siox/
+ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_RK_NAND)		+= rk_nand/
++obj-$(CONFIG_RK_HEADSET)	+= headset_observe/
+ obj-$(CONFIG_RK_FLASH)		+= rkflash/
+diff --git a/drivers/headset_observe/rk_headset.c b/drivers/headset_observe/rk_headset.c
+index 522ba44340ed..63f1fba0e83c 100644
+--- a/drivers/headset_observe/rk_headset.c
++++ b/drivers/headset_observe/rk_headset.c
+@@ -27,10 +27,11 @@
+ #include <linux/errno.h>
+ #include <linux/err.h>
+ #include <linux/hrtimer.h>
+-#include <linux/switch.h>
++#include <linux/extcon-provider.h>
+ #include <linux/debugfs.h>
+ #include <linux/wakelock.h>
+ #include <linux/gpio.h>
++#include <linux/of_gpio.h>
+ #include <asm/atomic.h>
+ #include <linux/pm.h>
+ #include <linux/i2c.h>
+@@ -47,8 +48,8 @@
+ #define DBG(x...) do { } while (0)
+ #endif
+ 
+-#define BIT_HEADSET             (1 << 0)
+-#define BIT_HEADSET_NO_MIC      (1 << 1)
++#define BIT_HEADSET             BIT(0)
++#define BIT_HEADSET_NO_MIC      BIT(1)
+ 
+ #define HEADSET 0
+ #define HOOK 1
+@@ -71,74 +72,80 @@ extern int wm8994_set_status(void);
+ struct headset_priv {
+ 	struct input_dev *input_dev;
+ 	struct rk_headset_pdata *pdata;
+-	unsigned int headset_status:1;
+-	unsigned int hook_status:1;
+-	unsigned int isMic:1;
+-	unsigned int isHook_irq:1;
+-	int cur_headset_status; 
+-	
++	unsigned int headset_status : 1;
++	unsigned int hook_status : 1;
++	unsigned int isMic : 1;
++	unsigned int isHook_irq : 1;
++	int cur_headset_status;
+ 	unsigned int irq[2];
+ 	unsigned int irq_type[2];
+ 	struct delayed_work h_delayed_work[2];
+-	struct switch_dev sdev;
+-	struct mutex mutex_lock[2];	
++	struct extcon_dev *edev;
++	struct mutex mutex_lock[2];
+ 	struct timer_list headset_timer;
+ 	unsigned char *keycodes;
+ };
++
+ static struct headset_priv *headset_info;
+ 
+ #ifdef CONFIG_MODEM_MIC_SWITCH
+ #define HP_MIC 0
+ #define MAIN_MIC 1
++
+ void Modem_Mic_switch(int value)
+ {
+-	if(value == HP_MIC)
+-		gpio_set_value(headset_info->pdata->mic_switch_gpio, headset_info->pdata->hp_mic_io_value);
+-	else if(value == MAIN_MIC)
+-		gpio_set_value(headset_info->pdata->mic_switch_gpio,headset_info->pdata->main_mic_io_value);
++	if (value == HP_MIC)
++		gpio_set_value(headset_info->pdata->mic_switch_gpio,
++			       headset_info->pdata->hp_mic_io_value);
++	else if (value == MAIN_MIC)
++		gpio_set_value(headset_info->pdata->mic_switch_gpio,
++			       headset_info->pdata->main_mic_io_value);
+ }
++
+ void Modem_Mic_release(void)
+ {
+-	if(headset_info->cur_headset_status == 1)
+-		gpio_set_value(headset_info->pdata->mic_switch_gpio, headset_info->pdata->hp_mic_io_value);
++	if (headset_info->cur_headset_status == 1)
++		gpio_set_value(headset_info->pdata->mic_switch_gpio,
++			       headset_info->pdata->hp_mic_io_value);
+ 	else
+-		gpio_set_value(headset_info->pdata->mic_switch_gpio,headset_info->pdata->main_mic_io_value);
++		gpio_set_value(headset_info->pdata->mic_switch_gpio,
++			       headset_info->pdata->main_mic_io_value);
+ }
+ #endif
+ 
+ static int read_gpio(int gpio)
+ {
+-	int i,level;
+-	for(i=0; i<3; i++)
+-	{
++	int i, level;
++
++	for (i = 0; i < 3; i++) {
+ 		level = gpio_get_value(gpio);
+-		if(level < 0)
+-		{
+-			printk("%s:get pin level again,pin=%d,i=%d\n",__FUNCTION__,gpio,i);
++		if (level < 0) {
++			pr_warn("%s:get pin level again,pin=%d,i=%d\n",
++				__func__, gpio, i);
+ 			msleep(1);
+ 			continue;
+-		}
+-		else
+-		break;
++		} else
++			break;
+ 	}
+-	if(level < 0)
+-		printk("%s:get pin level  err!\n",__FUNCTION__);
+-
++	if (level < 0)
++		pr_err("%s:get pin level  err!\n", __func__);
+ 	return level;
+ }
+ 
+ static irqreturn_t headset_interrupt(int irq, void *dev_id)
+ {
+-	DBG("---headset_interrupt---\n");	
+-	schedule_delayed_work(&headset_info->h_delayed_work[HEADSET], msecs_to_jiffies(50));
++	DBG("---headset_interrupt---\n");
++	schedule_delayed_work(&headset_info->h_delayed_work[HEADSET],
++			      msecs_to_jiffies(50));
+ 	return IRQ_HANDLED;
+ }
+ 
+ static irqreturn_t hook_interrupt(int irq, void *dev_id)
+ {
+-	DBG("---Hook_interrupt---\n");	
+-//	disable_irq_nosync(headset_info->irq[HOOK]);
+-	schedule_delayed_work(&headset_info->h_delayed_work[HOOK], msecs_to_jiffies(100));
++	DBG("---Hook_interrupt---\n");
++	/* disable_irq_nosync(headset_info->irq[HOOK]); */
++	schedule_delayed_work(&headset_info->h_delayed_work[HOOK],
++			      msecs_to_jiffies(100));
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -148,79 +155,71 @@ static void headsetobserve_work(struct work_struct *work)
+ 	int level2 = 0;
+ 	struct rk_headset_pdata *pdata = headset_info->pdata;
+ 	static unsigned int old_status = 0;
+-	DBG("---headsetobserve_work---\n");
+-	mutex_lock(&headset_info->mutex_lock[HEADSET]);
+ 
++	printk("---headsetobserve_work---\n");
++	mutex_lock(&headset_info->mutex_lock[HEADSET]);
+ 	level = read_gpio(pdata->headset_gpio);
+-	if(level < 0)
++	if (level < 0)
+ 		goto out;
+-	msleep(100);	
++	msleep(100);
+ 	level2 = read_gpio(pdata->headset_gpio);
+-	if(level2 < 0)
++	if (level2 < 0)
+ 		goto out;
+-	if(level2 != level)
++	if (level2 != level)
+ 		goto out;
+ 	old_status = headset_info->headset_status;
+-	if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-		headset_info->headset_status = level?HEADSET_IN:HEADSET_OUT;
++	if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++		headset_info->headset_status = level ? HEADSET_IN : HEADSET_OUT;
+ 	else
+-		headset_info->headset_status = level?HEADSET_OUT:HEADSET_IN;
++		headset_info->headset_status = level ? HEADSET_OUT : HEADSET_IN;
+ 
+-	if(old_status == headset_info->headset_status)	{
+-		DBG("old_status == headset_info->headset_status\n");
++	if (old_status == headset_info->headset_status) {
++		pr_warn("old_status == headset_info->headset_status\n");
+ 		goto out;
+ 	}
+-	
+ 	DBG("(headset in is %s)headset status is %s\n",
+-		pdata->headset_insert_type?"high level":"low level",
+-		headset_info->headset_status?"in":"out");
+-		
+-	if(headset_info->headset_status == HEADSET_IN)
+-	{
++	    pdata->headset_insert_type ? "high level" : "low level",
++	    headset_info->headset_status ? "in" : "out");
++	if (headset_info->headset_status == HEADSET_IN) {
+ 		headset_info->cur_headset_status = BIT_HEADSET_NO_MIC;
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_FALLING);
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_FALLING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_RISING);
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_RISING);
+ 		if (pdata->hook_gpio) {
+-			del_timer(&headset_info->headset_timer);//Start the timer, wait for switch to the headphone channel
++			/* Start the timer, wait for switch to the headphone channel */
++			del_timer(&headset_info->headset_timer);
+ 			headset_info->headset_timer.expires = jiffies + 100;
+ 			add_timer(&headset_info->headset_timer);
+ 			goto out;
+ 		}
+-	}
+-	else if(headset_info->headset_status == HEADSET_OUT)
+-	{	
++	} else if (headset_info->headset_status == HEADSET_OUT) {
+ 		headset_info->hook_status = HOOK_UP;
+-		if(headset_info->isHook_irq == enable)
+-		{
++		if (headset_info->isHook_irq == enable) {
+ 			DBG("disable headset_hook irq\n");
+ 			headset_info->isHook_irq = disable;
+-			disable_irq(headset_info->irq[HOOK]);		
+-		}	
+-		headset_info->cur_headset_status = 0;//~(BIT_HEADSET|BIT_HEADSET_NO_MIC);
+-		//#if defined(CONFIG_SND_RK_SOC_RK2928) || defined(CONFIG_SOC_RK3028)
+-		//rk2928_codec_set_spk(HEADSET_OUT);
+-		//#endif						
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_RISING);
++			disable_irq(headset_info->irq[HOOK]);
++		}
++		headset_info->cur_headset_status = 0;
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_RISING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_FALLING);
+-	}
+-//	rk28_send_wakeup_key();
+-	switch_set_state(&headset_info->sdev, headset_info->cur_headset_status);	
+-	#if defined(CONFIG_SND_RK_SOC_RK2928) || defined(CONFIG_SND_RK29_SOC_RK610)
+-	if (headset_info->headset_status == HEADSET_OUT)
+-	{
+-		mdelay(200);
+-		rk2928_codec_set_spk(HEADSET_OUT);
+-		gpio_set_value(pdata->Sw_mic_gpio, headset_info->pdata->Main_mic_io_value);
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_FALLING);
+ 	}
+-	#endif
+-	DBG("headset_info->cur_headset_status = %d\n",headset_info->cur_headset_status);
+-
++	if (headset_info->cur_headset_status)
++		extcon_set_state_sync(headset_info->edev, EXTCON_JACK_HEADPHONE,
++				      true);
++	else
++		extcon_set_state_sync(headset_info->edev, EXTCON_JACK_HEADPHONE,
++				      false);
++	DBG("headset_info->cur_headset_status = %d\n",
++	    headset_info->cur_headset_status);
+ out:
+-	mutex_unlock(&headset_info->mutex_lock[HEADSET]);	
++	mutex_unlock(&headset_info->mutex_lock[HEADSET]);
+ }
+ 
+ static void hook_work(struct work_struct *work)
+@@ -230,125 +229,100 @@ static void hook_work(struct work_struct *work)
+ 	static unsigned int old_status = HOOK_UP;
+ 
+ 	mutex_lock(&headset_info->mutex_lock[HOOK]);
+-	
+-	if(headset_info->headset_status == HEADSET_OUT){
++	if (headset_info->headset_status == HEADSET_OUT) {
+ 		DBG("Headset is out\n");
+ 		goto RE_ERROR;
+ 	}
+-	
+-	#ifdef CONFIG_SND_SOC_WM8994
+-	if(wm8994_set_status() != 0)	{
+-		DBG("wm8994 is not set on heatset channel or suspend\n");
+-		goto RE_ERROR;
+-	}
+-	#endif
+-	
+ 	level = read_gpio(pdata->hook_gpio);
+-	if(level < 0)
++	if (level < 0)
+ 		goto RE_ERROR;
+-	
+ 	old_status = headset_info->hook_status;
+-	DBG("Hook_work -- level = %d\n",level);
+-	
+-	if(level == 0)
+-		headset_info->hook_status = pdata->hook_down_type == HOOK_DOWN_HIGH?HOOK_UP:HOOK_DOWN;
+-	else if(level > 0)	
+-		headset_info->hook_status = pdata->hook_down_type == HOOK_DOWN_HIGH?HOOK_DOWN:HOOK_UP;
+-		
+-	if(old_status == headset_info->hook_status)
+-	{
++	DBG("Hook_work -- level = %d\n", level);
++	if (level == 0)
++		headset_info->hook_status =
++			pdata->hook_down_type == HOOK_DOWN_HIGH ? HOOK_UP :
++								  HOOK_DOWN;
++	else if (level > 0)
++		headset_info->hook_status =
++			pdata->hook_down_type == HOOK_DOWN_HIGH ? HOOK_DOWN :
++								  HOOK_UP;
++	if (old_status == headset_info->hook_status) {
+ 		DBG("old_status == headset_info->hook_status\n");
+ 		goto RE_ERROR;
+-	}	
+-	DBG("Hook_work -- level = %d  hook status is %s\n",level,headset_info->hook_status?"key down":"key up");	
+-	if(headset_info->hook_status == HOOK_DOWN)
+-	{
+-		if(pdata->hook_down_type == HOOK_DOWN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_FALLING);
+-		else
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_RISING);		
+ 	}
+-	else
+-	{
+-		if(pdata->hook_down_type == HOOK_DOWN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_RISING);
++	DBG("Hook_work -- level = %d  hook status is %s\n", level,
++	    headset_info->hook_status ? "key down" : "key up");
++	if (headset_info->hook_status == HOOK_DOWN) {
++		if (pdata->hook_down_type == HOOK_DOWN_HIGH)
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_FALLING);
++		else
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_RISING);
++	} else {
++		if (pdata->hook_down_type == HOOK_DOWN_HIGH)
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_RISING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_FALLING);
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_FALLING);
+ 	}
+-	input_report_key(headset_info->input_dev,HOOK_KEY_CODE,headset_info->hook_status);
+-	input_sync(headset_info->input_dev);	
++	input_report_key(headset_info->input_dev, HOOK_KEY_CODE,
++			 headset_info->hook_status);
++	input_sync(headset_info->input_dev);
+ RE_ERROR:
+ 	mutex_unlock(&headset_info->mutex_lock[HOOK]);
+ }
+ 
+-static void headset_timer_callback(unsigned long arg)
++static void headset_timer_callback(struct timer_list *t)
+ {
+-	struct headset_priv *headset = (struct headset_priv *)(arg);
++	struct headset_priv *headset = from_timer(headset, t, headset_timer);
+ 	struct rk_headset_pdata *pdata = headset->pdata;
+ 	int level = 0;
+-	
+-//	printk("headset_timer_callback,headset->headset_status=%d\n",headset->headset_status);	
+ 
+-	if(headset->headset_status == HEADSET_OUT)
+-	{
+-		printk("Headset is out\n");
+-		goto out;
+-	}
+-	#ifdef CONFIG_SND_SOC_WM8994
+-	if(wm8994_set_status() != 0)
+-	{
+-	//	printk("wait wm8994 set the MICB2\n");
+-	//	headset_info->headset_timer.expires = jiffies + 500;
+-		headset_info->headset_timer.expires = jiffies + 10;
+-		add_timer(&headset_info->headset_timer);	
++	pr_info("headset_timer_callback, headset->headset_status %d\n",
++		headset->headset_status);
++	if (headset->headset_status == HEADSET_OUT) {
++		pr_info("Headset is out\n");
+ 		goto out;
+ 	}
+-	#endif
+ 	level = read_gpio(pdata->hook_gpio);
+-	if(level < 0)
++	if (level < 0)
+ 		goto out;
+-	if((level > 0 && pdata->hook_down_type == HOOK_DOWN_LOW)
+-		|| (level == 0 && pdata->hook_down_type == HOOK_DOWN_HIGH))
+-	{
+-		headset->isMic = 1;//have mic
+-		DBG("enable headset_hook irq\n");
++	if ((level > 0 && pdata->hook_down_type == HOOK_DOWN_LOW) ||
++	    (level == 0 && pdata->hook_down_type == HOOK_DOWN_HIGH)) {
++		headset->isMic = 1;
+ 		enable_irq(headset_info->irq[HOOK]);
+ 		headset->isHook_irq = enable;
+ 		headset_info->hook_status = HOOK_UP;
+-		if(pdata->hook_down_type == HOOK_DOWN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_RISING);
++		if (pdata->hook_down_type == HOOK_DOWN_HIGH)
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_RISING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HOOK],IRQF_TRIGGER_FALLING);
+-
+-	}	
+-	else	
+-		headset->isMic= 0;//No microphone
+-		
+-	printk("headset->isMic = %d\n",headset->isMic);	
+-	headset_info->cur_headset_status = headset_info->isMic ? 1:2;//BIT_HEADSET:BIT_HEADSET_NO_MIC;//
+-	#if defined(CONFIG_SND_RK_SOC_RK2928) || defined(CONFIG_SND_RK29_SOC_RK610)
+-	rk2928_codec_set_spk(HEADSET_IN);
+-	if(headset_info->cur_headset_status == 1)
+-		gpio_set_value(pdata->Sw_mic_gpio, pdata->Hp_mic_io_value);
+-	#endif
+-//	rk28_send_wakeup_key();
+-	switch_set_state(&headset_info->sdev, headset_info->cur_headset_status);
+-	
+-	DBG("headset_info->cur_headset_status = %d\n",headset_info->cur_headset_status);	
+-
++			irq_set_irq_type(headset_info->irq[HOOK],
++					 IRQF_TRIGGER_FALLING);
++	} else {
++		headset->isMic = 0;
++	}
++	pr_info("headset->isMic = %d\n", headset->isMic);
++	headset_info->cur_headset_status = headset_info->isMic ? 1 : 2;
++	if (headset->isMic == 1)
++		extcon_set_state_sync(headset_info->edev,
++				      EXTCON_JACK_MICROPHONE, true);
++	else
++		extcon_set_state_sync(headset_info->edev,
++				      EXTCON_JACK_MICROPHONE, false);
++	DBG("headset_info->cur_headset_status = %d\n",
++	    headset_info->cur_headset_status);
+ out:
+ 	return;
+ }
+ 
+-static ssize_t h2w_print_name(struct switch_dev *sdev, char *buf)
+-{
+-	return sprintf(buf, "Headset\n");
+-}
+-
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ static void headset_early_resume(struct early_suspend *h)
+ {
+-	schedule_delayed_work(&headset_info->h_delayed_work[HEADSET], msecs_to_jiffies(10));
++	schedule_delayed_work(&headset_info->h_delayed_work[HEADSET],
++			      msecs_to_jiffies(10));
+ 	//DBG(">>>>>headset_early_resume\n");
+ }
+ 
+@@ -358,72 +332,79 @@ static struct early_suspend hs_early_suspend;
+ static int rk_hskey_open(struct input_dev *dev)
+ {
+ 	//struct rk28_adckey *adckey = input_get_drvdata(dev);
+-//	DBG("===========rk_Hskey_open===========\n");
++	//DBG("===========rk_Hskey_open===========\n");
+ 	return 0;
+ }
+ 
+ static void rk_hskey_close(struct input_dev *dev)
+ {
+-//	DBG("===========rk_Hskey_close===========\n");
+-//	struct rk28_adckey *adckey = input_get_drvdata(dev);
+-
++	//DBG("===========rk_Hskey_close===========\n");
++	//struct rk28_adckey *adckey = input_get_drvdata(dev);
+ }
+ 
+-int rk_headset_probe(struct platform_device *pdev,struct rk_headset_pdata *pdata)
++static const unsigned int headset_cable[] = {
++	EXTCON_JACK_MICROPHONE,
++	EXTCON_JACK_HEADPHONE,
++	EXTCON_NONE,
++};
++
++int rk_headset_probe(struct platform_device *pdev,
++		     struct rk_headset_pdata *pdata)
+ {
+-	int ret;
++	int ret = 0;
+ 	struct headset_priv *headset;
+ 
+-	headset = kzalloc(sizeof(struct headset_priv), GFP_KERNEL);
+-	if (headset == NULL) {
++	headset = devm_kzalloc(&pdev->dev, sizeof(*headset), GFP_KERNEL);
++	if (!headset) {
+ 		dev_err(&pdev->dev, "failed to allocate driver data\n");
+ 		return -ENOMEM;
+ 	}
+-
+ 	headset_info = headset;
+ 	headset->pdata = pdata;
+ 	headset->headset_status = HEADSET_OUT;
+ 	headset->hook_status = HOOK_UP;
+ 	headset->isHook_irq = disable;
+ 	headset->cur_headset_status = 0;
+-	headset->sdev.name = "h2w";
+-	headset->sdev.print_name = h2w_print_name;
+-	ret = switch_dev_register(&headset->sdev);
+-	if (ret < 0)
+-		goto failed_free;
+-	
++	headset->edev = devm_extcon_dev_allocate(&pdev->dev, headset_cable);
++	if (IS_ERR(headset->edev)) {
++		dev_err(&pdev->dev, "failed to allocate extcon device\n");
++		ret = -ENOMEM;
++		goto failed;
++	}
++	ret = devm_extcon_dev_register(&pdev->dev, headset->edev);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "extcon_dev_register() failed: %d\n", ret);
++		goto failed;
++	}
+ 	mutex_init(&headset->mutex_lock[HEADSET]);
+ 	mutex_init(&headset->mutex_lock[HOOK]);
+-	
+-	INIT_DELAYED_WORK(&headset->h_delayed_work[HEADSET], headsetobserve_work);
++	INIT_DELAYED_WORK(&headset->h_delayed_work[HEADSET],
++			  headsetobserve_work);
+ 	INIT_DELAYED_WORK(&headset->h_delayed_work[HOOK], hook_work);
+-
+ 	headset->isMic = 0;
+-	setup_timer(&headset->headset_timer, headset_timer_callback, (unsigned long)headset);
+-//------------------------------------------------------------------	
+-	// Create and register the input driver. 
+-	headset->input_dev = input_allocate_device();
++	timer_setup(&headset->headset_timer, headset_timer_callback, 0);
++	/* Create and register the input driver */
++	headset->input_dev = devm_input_allocate_device(&pdev->dev);
+ 	if (!headset->input_dev) {
+ 		dev_err(&pdev->dev, "failed to allocate input device\n");
+ 		ret = -ENOMEM;
+-		goto failed_free;
+-	}	
++		goto failed;
++	}
+ 	headset->input_dev->name = pdev->name;
+ 	headset->input_dev->open = rk_hskey_open;
+ 	headset->input_dev->close = rk_hskey_close;
+ 	headset->input_dev->dev.parent = &pdev->dev;
+-	//input_dev->phys = KEY_PHYS_NAME;
++	/* input_dev->phys = KEY_PHYS_NAME; */
+ 	headset->input_dev->id.vendor = 0x0001;
+ 	headset->input_dev->id.product = 0x0001;
+ 	headset->input_dev->id.version = 0x0100;
+-	// Register the input device 
++	/* Register the input device */
+ 	ret = input_register_device(headset->input_dev);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to register input device\n");
+-		goto failed_free_dev;
++		goto failed;
+ 	}
+-	input_set_capability(headset->input_dev, EV_KEY,HOOK_KEY_CODE);
+-
++	input_set_capability(headset->input_dev, EV_KEY, HOOK_KEY_CODE);
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ 	hs_early_suspend.suspend = NULL;
+ 	hs_early_suspend.resume = headset_early_resume;
+@@ -432,42 +413,40 @@ int rk_headset_probe(struct platform_device *pdev,struct rk_headset_pdata *pdata
+ #endif
+ 	if (pdata->headset_gpio) {
+ 		headset->irq[HEADSET] = gpio_to_irq(pdata->headset_gpio);
+-
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
+ 			headset->irq_type[HEADSET] = IRQF_TRIGGER_RISING;
+ 		else
+ 			headset->irq_type[HEADSET] = IRQF_TRIGGER_FALLING;
+-		ret = devm_request_irq(&pdev->dev, headset->irq[HEADSET], headset_interrupt, headset->irq_type[HEADSET], "headset_input", NULL);
++		ret = devm_request_irq(&pdev->dev, headset->irq[HEADSET],
++				       headset_interrupt,
++				       headset->irq_type[HEADSET],
++				       "headset_input", NULL);
+ 		if (ret)
+-			goto failed_free_dev;
++			goto failed;
+ 		if (pdata->headset_wakeup)
+ 			enable_irq_wake(headset->irq[HEADSET]);
+ 	} else {
+-		dev_err(&pdev->dev, "failed init headset,please full hook_io_init function in board\n");
+-		goto failed_free_dev;
++		dev_err(&pdev->dev, "failed init headset, please full headset_gpio function in board\n");
++		ret = -EEXIST;
++		goto failed;
+ 	}
+-
+ 	if (pdata->hook_gpio) {
+ 		headset->irq[HOOK] = gpio_to_irq(pdata->hook_gpio);
+-		headset->irq_type[HOOK] = pdata->hook_down_type == HOOK_DOWN_HIGH ? IRQF_TRIGGER_RISING : IRQF_TRIGGER_FALLING;
+-
+-		ret = devm_request_irq(&pdev->dev, headset->irq[HOOK], hook_interrupt, headset->irq_type[HOOK], "headset_hook", NULL);
++		headset->irq_type[HOOK] =
++			pdata->hook_down_type == HOOK_DOWN_HIGH ?
++				IRQF_TRIGGER_RISING :
++				IRQF_TRIGGER_FALLING;
++		ret = devm_request_irq(&pdev->dev, headset->irq[HOOK],
++				       hook_interrupt, headset->irq_type[HOOK],
++				       "headset_hook", NULL);
+ 		if (ret)
+-			goto failed_free_dev;
++			goto failed;
+ 		disable_irq(headset->irq[HOOK]);
+ 	}
+-
+-	schedule_delayed_work(&headset->h_delayed_work[HEADSET], msecs_to_jiffies(500));
++	schedule_delayed_work(&headset->h_delayed_work[HEADSET],
++			      msecs_to_jiffies(500));
+ 	return 0;
+-
+-failed_free_dev:
+-	platform_set_drvdata(pdev, NULL);
+-	input_free_device(headset->input_dev);
+-failed_free:
+-	dev_err(&pdev->dev, "failed to headset probe\n");
+-	kfree(headset);
++failed:
++	dev_err(&pdev->dev, "failed to headset probe ret=%d\n", ret);
+ 	return ret;
+ }
+-
+-
+-
+diff --git a/drivers/headset_observe/rk_headset.h b/drivers/headset_observe/rk_headset.h
+index 28307bd683c5..c10961ce66f8 100644
+--- a/drivers/headset_observe/rk_headset.h
++++ b/drivers/headset_observe/rk_headset.h
+@@ -8,18 +8,20 @@
+ #define HOOK_DOWN_HIGH 0x00000001
+ #define HOOK_DOWN_LOW  0x00000000
+ 
+-struct rk_headset_pdata{
+-//heaset about
++struct rk_headset_pdata {
++	/* heaset about */
+ 	unsigned int headset_gpio;
+-	unsigned int headset_insert_type;//	Headphones into the state level
+-//hook about
++	/* Headphones into the state level */
++	unsigned int headset_insert_type;
++	/* hook about */
+ 	unsigned int hook_gpio;
+-	unsigned int hook_down_type; //Hook key down status  
++	/* Hook key down status */
++	unsigned int hook_down_type;
+ #ifdef CONFIG_MODEM_MIC_SWITCH
+-//mic about	
++	/* mic about */
+ 	unsigned int mic_switch_gpio;
+ 	unsigned int hp_mic_io_value;
+-	unsigned int main_mic_io_value;	
++	unsigned int main_mic_io_value;
+ #endif
+ 	struct iio_channel *chan;
+ 	int headset_wakeup;
+@@ -27,8 +29,10 @@ struct rk_headset_pdata{
+ 
+ #define HOOK_KEY_CODE KEY_MEDIA
+ 
+-extern int rk_headset_probe(struct platform_device *pdev,struct rk_headset_pdata *pdata);
+-extern int rk_headset_adc_probe(struct platform_device *pdev,struct rk_headset_pdata *pdata);
+-extern int rk_headset_adc_suspend(struct platform_device *pdev, pm_message_t state);
+-extern int rk_headset_adc_resume(struct platform_device *pdev);
++int rk_headset_probe(struct platform_device *pdev,
++		     struct rk_headset_pdata *pdata);
++int rk_headset_adc_probe(struct platform_device *pdev,
++			 struct rk_headset_pdata *pdata);
++int rk_headset_adc_suspend(struct platform_device *pdev, pm_message_t state);
++int rk_headset_adc_resume(struct platform_device *pdev);
+ #endif
+diff --git a/drivers/headset_observe/rk_headset_irq_hook_adc.c b/drivers/headset_observe/rk_headset_irq_hook_adc.c
+index 53a0525f7bd0..9b023a2624ca 100644
+--- a/drivers/headset_observe/rk_headset_irq_hook_adc.c
++++ b/drivers/headset_observe/rk_headset_irq_hook_adc.c
+@@ -1,4 +1,4 @@
+-/* 
++/*
+  * Copyright (C) 2009 Rockchip Corporation.
+  *
+  * This software is licensed under the terms of the GNU General Public
+@@ -25,7 +25,7 @@
+ #include <linux/errno.h>
+ #include <linux/err.h>
+ #include <linux/hrtimer.h>
+-#include <linux/switch.h>
++#include <linux/extcon-provider.h>
+ #include <linux/debugfs.h>
+ #include <linux/wakelock.h>
+ #include <linux/pm.h>
+@@ -47,12 +47,13 @@
+ #endif
+ 
+ #define HOOK_ADC_SAMPLE_TIME	100
+-#define HOOK_LEVEL_HIGH  		410		//1V*1024/2.5
+-#define HOOK_LEVEL_LOW  		204		//0.5V*1024/2.5
+-#define HOOK_DEFAULT_VAL  		1024	
+ 
+-#define BIT_HEADSET             (1 << 0)
+-#define BIT_HEADSET_NO_MIC      (1 << 1)
++#define HOOK_LEVEL_HIGH		410	//1V*1024/2.5
++#define HOOK_LEVEL_LOW		204	//0.5V*1024/2.5
++#define HOOK_DEFAULT_VAL	1024
++
++#define BIT_HEADSET             BIT(0)
++#define BIT_HEADSET_NO_MIC      BIT(1)
+ 
+ #define HEADSET 0
+ #define HOOK 1
+@@ -77,12 +78,10 @@ extern int wm8994_headset_mic_detect(bool headset_status);
+ #ifdef CONFIG_SND_SOC_RT5631_PHONE
+ extern int rt5631_headset_mic_detect(bool headset_status);
+ #endif
+-#if defined (CONFIG_SND_SOC_RT3261) || defined (CONFIG_SND_SOC_RT3224)
++#if defined(CONFIG_SND_SOC_RT3261) || defined(CONFIG_SND_SOC_RT3224)
+ extern int rt3261_headset_mic_detect(int jack_insert);
+ #endif
+-#if defined(CONFIG_SND_SOC_ES8316)
+-extern int es8316_headset_detect(int jack_insert);
+-#endif
++
+ #if defined(CONFIG_SND_SOC_CX2072X)
+ extern int cx2072x_jack_report(void);
+ #endif
+@@ -91,160 +90,161 @@ extern int cx2072x_jack_report(void);
+ struct headset_priv {
+ 	struct input_dev *input_dev;
+ 	struct rk_headset_pdata *pdata;
+-	unsigned int headset_status:1;
+-	unsigned int hook_status:1;
++	unsigned int headset_status : 1;
++	unsigned int hook_status : 1;
+ 	int isMic;
+ 	struct iio_channel *chan;
+-	unsigned int heatset_irq_working;// headset interrupt working will not check hook key	
+-	int cur_headset_status; 
+-	
++	/* headset interrupt working will not check hook key  */
++	unsigned int heatset_irq_working;
++	int cur_headset_status;
+ 	unsigned int irq[2];
+-	unsigned int irq_type[2];
+ 	struct delayed_work h_delayed_work[2];
+-	struct switch_dev sdev;
+-	struct mutex mutex_lock[2];	
++	struct extcon_dev *edev;
++	struct mutex mutex_lock[2];
+ 	unsigned char *keycodes;
+ 	struct delayed_work hook_work;
+-	unsigned int hook_time;//ms
++	/* ms */
++	unsigned int hook_time;
+ };
++
+ static struct headset_priv *headset_info;
+ 
+-//1
+ static irqreturn_t headset_interrupt(int irq, void *dev_id)
+ {
+ 	struct rk_headset_pdata *pdata = headset_info->pdata;
+ 	static unsigned int old_status = 0;
+-	int i,level = 0;	
+-	
++	int i, level = 0;
++
+ 	disable_irq_nosync(headset_info->irq[HEADSET]);
+-	if(headset_info->heatset_irq_working == BUSY || headset_info->heatset_irq_working == WAIT)
++	if (headset_info->heatset_irq_working == BUSY ||
++	    headset_info->heatset_irq_working == WAIT)
+ 		return IRQ_HANDLED;
+-
+-	DBG("In the headset_interrupt\n");		
++	DBG("In the headset_interrupt\n");
+ 	headset_info->heatset_irq_working = BUSY;
+ 	msleep(150);
+-	for(i=0; i<3; i++)
+-	{
++	for (i = 0; i < 3; i++) {
+ 		level = gpio_get_value(pdata->headset_gpio);
+-		if(level < 0)
+-		{
+-			printk("%s:get pin level again,pin=%d,i=%d\n",__FUNCTION__,pdata->headset_gpio,i);
++		if (level < 0) {
++			pr_err("%s:get pin level again,pin=%d,i=%d\n",
++			       __func__, pdata->headset_gpio, i);
+ 			msleep(1);
+ 			continue;
+ 		}
+-		else
+ 		break;
+ 	}
+-	if(level < 0)
+-	{
+-		printk("%s:get pin level  err!\n",__FUNCTION__);
++	if (level < 0) {
++		pr_err("%s:get pin level  err!\n", __func__);
+ 		goto out;
++	} else {
++		pr_err("%s:get pin level again, pin=%d,i=%d\n",
++		       __func__, pdata->headset_gpio, i);
+ 	}
+-	else
+-		printk("%s:get pin level again,pin=%d,i=%d\n",__FUNCTION__,pdata->headset_gpio,i);
+ 
+ 	old_status = headset_info->headset_status;
+-	switch(pdata->headset_insert_type)
+-	{
++	switch (pdata->headset_insert_type) {
+ 	case HEADSET_IN_HIGH:
+-		if(level > 0)
++		if (level > 0)
+ 			headset_info->headset_status = HEADSET_IN;
+-		else if(level == 0)
+-			headset_info->headset_status = HEADSET_OUT;	
++		else if (level == 0)
++			headset_info->headset_status = HEADSET_OUT;
+ 		break;
+ 	case HEADSET_IN_LOW:
+-		if(level == 0)
++		if (level == 0)
+ 			headset_info->headset_status = HEADSET_IN;
+-		else if(level > 0)
+-			headset_info->headset_status = HEADSET_OUT;		
+-		break;			
++		else if (level > 0)
++			headset_info->headset_status = HEADSET_OUT;
++		break;
+ 	default:
+ 		DBG("---- ERROR: on headset headset_insert_type error -----\n");
+-		break;			
++		break;
+ 	}
+-	if(old_status == headset_info->headset_status)
+-	{
+-		DBG("Read Headset IO level old status == now status =%d\n",headset_info->headset_status);
++	if (old_status == headset_info->headset_status) {
++		DBG("Read Headset IO level old status == now status =%d\n",
++		    headset_info->headset_status);
+ 		goto out;
+ 	}
+ 
+-	DBG("(headset in is %s)headset status is %s\n",
+-		pdata->headset_insert_type?"high level":"low level",
+-		headset_info->headset_status?"in":"out");
+-
+-	#if defined(CONFIG_SND_SOC_ES8316)
+-	es8316_headset_detect(headset_info->headset_status);
+-	#endif
+-
+-	if(headset_info->headset_status == HEADSET_IN)
+-	{
+-		if(pdata->chan != 0)
+-		{
+-			//detect Hook key
+-			schedule_delayed_work(&headset_info->h_delayed_work[HOOK],msecs_to_jiffies(200));
+-		}
+-		else
+-		{
+-			headset_info->isMic= 0;//No microphone
++	pr_info("(headset in is %s)headset status is %s\n",
++		pdata->headset_insert_type ? "high level" : "low level",
++		headset_info->headset_status ? "in" : "out");
++
++	if (headset_info->headset_status == HEADSET_IN) {
++		if (pdata->chan != 0) {
++			/* detect Hook key */
++			schedule_delayed_work(
++				&headset_info->h_delayed_work[HOOK],
++				msecs_to_jiffies(200));
++		} else {
++			headset_info->isMic = 0;
+ 			headset_info->cur_headset_status = BIT_HEADSET_NO_MIC;
+-
+-			switch_set_state(&headset_info->sdev, headset_info->cur_headset_status);	
+-			DBG("headset notice android headset status = %d\n",headset_info->cur_headset_status);
++			extcon_set_state_sync(headset_info->edev,
++					      EXTCON_JACK_HEADPHONE, true);
++			DBG("headset notice android headset status = %d\n",
++			    headset_info->cur_headset_status);
+ 		}
+-
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_FALLING);
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_FALLING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_RISING);
+-	}
+-	else if(headset_info->headset_status == HEADSET_OUT)
+-	{
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_RISING);
++	} else if (headset_info->headset_status == HEADSET_OUT) {
+ 		headset_info->cur_headset_status = HEADSET_OUT;
+ 		cancel_delayed_work(&headset_info->hook_work);
+-		if(headset_info->isMic)
+-		{
++		if (headset_info->isMic) {
+ 			headset_info->hook_status = HOOK_UP;
+-			#ifdef CONFIG_SND_SOC_WM8994
++#ifdef CONFIG_SND_SOC_WM8994
+ 			//rt5625_headset_mic_detect(false);
+ 			wm8994_headset_mic_detect(false);
+-			#endif
+-			#if defined (CONFIG_SND_SOC_RT3261) || defined (CONFIG_SND_SOC_RT3224)
++#endif
++#if defined(CONFIG_SND_SOC_RT3261) || defined(CONFIG_SND_SOC_RT3224)
+ 			rt3261_headset_mic_detect(false);
+-			#endif
+-			#ifdef CONFIG_SND_SOC_RT5631_PHONE
++#endif
++#ifdef CONFIG_SND_SOC_RT5631_PHONE
+ 			rt5631_headset_mic_detect(false);
+-			#endif
++#endif
+ 			headset_info->isMic = 0;
+-		}	
++		}
+ 
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_RISING);
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_RISING);
+ 		else
+-			irq_set_irq_type(headset_info->irq[HEADSET],IRQF_TRIGGER_FALLING);	
+-
+-		switch_set_state(&headset_info->sdev, headset_info->cur_headset_status);	
+-		DBG("headset notice android headset status = %d\n",headset_info->cur_headset_status);		
+-	}	
+-//	rk_send_wakeup_key();	
++			irq_set_irq_type(headset_info->irq[HEADSET],
++					 IRQF_TRIGGER_FALLING);
++		extcon_set_state_sync(headset_info->edev, EXTCON_JACK_HEADPHONE,
++				      false);
++		extcon_set_state_sync(headset_info->edev,
++				      EXTCON_JACK_MICROPHONE, false);
++		DBG("headset notice android headset status = %d\n",
++		    headset_info->cur_headset_status);
++	}
++	/*rk_send_wakeup_key();  */
+ out:
+ 	headset_info->heatset_irq_working = IDLE;
+ 	enable_irq(headset_info->irq[HEADSET]);
+ 	return IRQ_HANDLED;
+ }
++
+ #if 0
+-static int headset_change_irqtype(int type,unsigned int irq_type)
++static int headset_change_irqtype(int type, unsigned int irq_type)
+ {
+ 	int ret = 0;
+-	free_irq(headset_info->irq[type],NULL);
+ 
+-	DBG("%s: type is %s irqtype is %s\n",__FUNCTION__,	type?"hook":"headset",(irq_type == IRQF_TRIGGER_RISING)?"RISING":"FALLING");
+-//	DBG("%s: type is %s irqtype is %s\n",__FUNCTION__,	type?"hook":"headset",(irq_type == IRQF_TRIGGER_LOW)?"LOW":"HIGH");
+-	switch(type)
+-	{
++	free_irq(headset_info->irq[type], NULL);
++
++	DBG("%s: type is %s irqtype is %s\n", __func__,
++	    type ? "hook" : "headset",
++	    (irq_type == IRQF_TRIGGER_RISING) ? "RISING" : "FALLING");
++//      DBG("%s: type is %s irqtype is %s\n",__func__,      type?"hook":"headset",(irq_type == IRQF_TRIGGER_LOW)?"LOW":"HIGH");
++	switch (type) {
+ 	case HEADSET:
+-		ret = request_threaded_irq(headset_info->irq[type],NULL, headset_interrupt, irq_type, "headset_input", NULL);
+-		if (ret<0) 
+-			DBG("headset_change_irqtype: request irq failed\n");		
++		ret =
++		    request_threaded_irq(headset_info->irq[type], NULL,
++					 headset_interrupt, irq_type,
++					 "headset_input", NULL);
++		if (ret < 0)
++			DBG("headset_change_irqtype: request irq failed\n");
+ 		break;
+ 	default:
+ 		ret = -1;
+@@ -253,162 +253,122 @@ static int headset_change_irqtype(int type,unsigned int irq_type)
+ 	return ret;
+ }
+ #endif
++
+ static void hook_once_work(struct work_struct *work)
+ {
+-	int ret,val;
++	int ret, val;
+ 
+-	#ifdef CONFIG_SND_SOC_WM8994
++#ifdef CONFIG_SND_SOC_WM8994
+ 	wm8994_headset_mic_detect(true);
+-	#endif
++#endif
+ 
+-	#if defined (CONFIG_SND_SOC_RT3261) || defined (CONFIG_SND_SOC_RT3224)
++#if defined(CONFIG_SND_SOC_RT3261) || defined(CONFIG_SND_SOC_RT3224)
+ 	rt3261_headset_mic_detect(true);
+-	#endif
++#endif
+ 
+-	#ifdef CONFIG_SND_SOC_RT5631_PHONE
++#ifdef CONFIG_SND_SOC_RT5631_PHONE
+ 	rt5631_headset_mic_detect(true);
+-	#endif
+-
+-        ret = iio_read_channel_raw(headset_info->chan, &val);
+-        if (ret < 0) {
+-                pr_err("read hook_once_work adc channel() error: %d\n", ret);
+-        }
++#endif
++	ret = iio_read_channel_raw(headset_info->chan, &val);
++	if (ret < 0)
++		pr_err("read hook_once_work adc channel() error: %d\n", ret);
+ 	else
+-		DBG("hook_once_work read adc value: %d\n",val);
++		DBG("hook_once_work read adc value: %d\n", val);
+ 
+-	if(val >= 0 && val < HOOK_LEVEL_LOW)
+-	{
+-		headset_info->isMic= 0;//No microphone
+-		#ifdef CONFIG_SND_SOC_WM8994
++	if (val >= 0 && val < HOOK_LEVEL_LOW) {
++		headset_info->isMic = 0;
++#ifdef CONFIG_SND_SOC_WM8994
+ 		wm8994_headset_mic_detect(false);
+-		#endif
++#endif
+ 
+-		#if defined (CONFIG_SND_SOC_RT3261) || defined (CONFIG_SND_SOC_RT3224)
++#if defined (CONFIG_SND_SOC_RT3261) || defined (CONFIG_SND_SOC_RT3224)
+ 		rt3261_headset_mic_detect(false);
+-		#endif	
++#endif
+ 
+-		#ifdef CONFIG_SND_SOC_RT5631_PHONE
++#ifdef CONFIG_SND_SOC_RT5631_PHONE
+ 		rt5631_headset_mic_detect(false);
+-		#endif					
+-	}	
+-	else if(val >= HOOK_LEVEL_HIGH)
+-	{
+-		headset_info->isMic = 1;//have mic
+-		schedule_delayed_work(&headset_info->hook_work,msecs_to_jiffies(100));
++#endif
++	} else if (val >= HOOK_LEVEL_HIGH) {
++		headset_info->isMic = 1;
++		schedule_delayed_work(&headset_info->hook_work,
++				      msecs_to_jiffies(100));
+ 	}
++	headset_info->cur_headset_status =
++		headset_info->isMic ? BIT_HEADSET : BIT_HEADSET_NO_MIC;
+ 
+-	headset_info->cur_headset_status = headset_info->isMic ? BIT_HEADSET:BIT_HEADSET_NO_MIC;
+-
+-	#if defined(CONFIG_SND_SOC_CX2072X)
++#if defined(CONFIG_SND_SOC_CX2072X)
+ 	if (cx2072x_jack_report() != -1)
+ 		headset_info->cur_headset_status =
+-			(cx2072x_jack_report() == 3) ?
+-			BIT_HEADSET : BIT_HEADSET_NO_MIC;
+-	#endif
+-	
+-	switch_set_state(&headset_info->sdev, headset_info->cur_headset_status);	
+-	DBG("%s notice android headset status = %d\n",__func__,headset_info->cur_headset_status);
+-}
+-
+-//2
+-static void headsetobserve_work(struct work_struct *work)
+-{
+-	struct rk_headset_pdata *pdata = headset_info->pdata;
+-
+-	DBG("In the headsetobserve_work headset_status is %s\n",headset_info->headset_status?"in":"out");
+-
+-	if(headset_info->heatset_irq_working == WAIT && headset_info->headset_status == HEADSET_IN)
+-	{
+-		printk("wait for codec\n");
+-		headset_info->heatset_irq_working = IDLE;
+-		headset_info->headset_status = HEADSET_OUT;	
+-		
+-		free_irq(headset_info->irq[HEADSET],NULL);	
+-		msleep(100);
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			headset_info->irq_type[HEADSET] = IRQF_TRIGGER_LOW|IRQF_ONESHOT;
+-		else
+-			headset_info->irq_type[HEADSET] = IRQF_TRIGGER_HIGH|IRQF_ONESHOT;
+-		if(request_threaded_irq(headset_info->irq[HEADSET], NULL,headset_interrupt, headset_info->irq_type[HEADSET]|IRQF_NO_SUSPEND, "headset_input", NULL) < 0)
+-			printk("headset request_threaded_irq error\n");
+-		return;	
++			(cx2072x_jack_report() == 3) ? BIT_HEADSET :
++						       BIT_HEADSET_NO_MIC;
++#endif
++	if (headset_info->cur_headset_status) {
++		if (headset_info->isMic) {
++			extcon_set_state_sync(headset_info->edev,
++					      EXTCON_JACK_MICROPHONE, true);
++		} else {
++			extcon_set_state_sync(headset_info->edev,
++					      EXTCON_JACK_HEADPHONE, true);
++		}
+ 	}
+-/*	
+-	if(pdata->headset_insert_type == HEADSET_IN_HIGH && headset_info->headset_status == HEADSET_IN)
+-		headset_change_irqtype(HEADSET,IRQF_TRIGGER_FALLING);
+-	else if(pdata->headset_insert_type == HEADSET_IN_LOW && headset_info->headset_status == HEADSET_IN)
+-		headset_change_irqtype(HEADSET,IRQF_TRIGGER_RISING);
+-
+-	if(pdata->headset_insert_type == HEADSET_IN_HIGH && headset_info->headset_status == HEADSET_OUT)
+-		headset_change_irqtype(HEADSET,IRQF_TRIGGER_RISING);
+-	else if(pdata->headset_insert_type == HEADSET_IN_LOW && headset_info->headset_status == HEADSET_OUT)
+-		headset_change_irqtype(HEADSET,IRQF_TRIGGER_FALLING);
+-*/		
++	DBG("%s notice android headset status = %d\n", __func__,
++	    headset_info->cur_headset_status);
+ }
+-//4
++
+ static void hook_work_callback(struct work_struct *work)
+ {
+-	int ret,val;
++	int ret, val;
+ 	struct headset_priv *headset = headset_info;
+ 	struct rk_headset_pdata *pdata = headset->pdata;
+ 	static unsigned int old_status = HOOK_UP;
+ 
+-
+-        ret = iio_read_channel_raw(headset->chan, &val);
+-        if (ret < 0) {
+-                pr_err("read hook adc channel() error: %d\n", ret);
+-		goto out;
+-        }
+-	else
+-		DBG("hook_work_callback read adc value=%d\n",val);
+-
+-	if(headset->headset_status == HEADSET_OUT
+-		|| headset->heatset_irq_working == BUSY
+-		|| headset->heatset_irq_working == WAIT
+-		|| pdata->headset_insert_type?gpio_get_value(pdata->headset_gpio) == 0:gpio_get_value(pdata->headset_gpio) > 0)
+-	{
+-		DBG("Headset is out or waiting for headset is in or out,after same time check HOOK key\n");
++	ret = iio_read_channel_raw(headset->chan, &val);
++	if (ret < 0) {
++		pr_err("read hook adc channel() error: %d\n", ret);
+ 		goto out;
++	} else {
++		DBG("hook_work_callback read adc value=%d\n", val);
+ 	}
+ 
++	if (headset->headset_status == HEADSET_OUT ||
++	    headset->heatset_irq_working == BUSY ||
++	    headset->heatset_irq_working == WAIT ||
++	    (pdata->headset_insert_type ?
++		    gpio_get_value(pdata->headset_gpio) == 0 :
++		    gpio_get_value(pdata->headset_gpio) > 0)) {
++		DBG("Headset is out or waiting for headset is in or out, after same time check HOOK key\n");
++		goto out;
++	}
+ 	old_status = headset->hook_status;
+-	if(val < HOOK_LEVEL_LOW && val >= 0)	
++	if (val < HOOK_LEVEL_LOW && val >= 0)
+ 		headset->hook_status = HOOK_DOWN;
+-	else if(val > HOOK_LEVEL_HIGH && val < HOOK_DEFAULT_VAL)
++	else if (val > HOOK_LEVEL_HIGH && val < HOOK_DEFAULT_VAL)
+ 		headset->hook_status = HOOK_UP;
+-	
+-	DBG("HOOK status is %s , adc value = %d hook_time = %d\n",headset->hook_status?"down":"up",val,headset->hook_time);
+-
+-	if(old_status == headset->hook_status)
+-	{
+-		DBG("Hook adc read old_status == headset->hook_status=%d hook_time = %d\n",headset->hook_status,headset->hook_time);
++	DBG("HOOK status is %s , adc value = %d hook_time = %d\n",
++	    headset->hook_status ? "down" : "up", val, headset->hook_time);
++	if (old_status == headset->hook_status) {
++		DBG("Hook adc read old_status == headset->hook_status=%d hook_time = %d\n",
++		    headset->hook_status, headset->hook_time);
+ 		goto status_error;
+-	}	
+-		
+-	if(headset->headset_status == HEADSET_OUT
+-		|| headset->heatset_irq_working == BUSY
+-		|| headset->heatset_irq_working == WAIT
+-		|| (pdata->headset_insert_type?gpio_get_value(pdata->headset_gpio) == 0:gpio_get_value(pdata->headset_gpio) > 0))
+-	{
+-		printk("headset is out,HOOK status must discard\n");
+-		goto out;
+ 	}
+-	else
+-	{
+-		input_report_key(headset->input_dev,HOOK_KEY_CODE,headset->hook_status);
++	if (headset->headset_status == HEADSET_OUT ||
++	    headset->heatset_irq_working == BUSY ||
++	    headset->heatset_irq_working == WAIT ||
++	    (pdata->headset_insert_type ?
++		     gpio_get_value(pdata->headset_gpio) == 0 :
++		     gpio_get_value(pdata->headset_gpio) > 0)) {
++		printk("headset is out, HOOK status must discard\n");
++		goto out;
++	} else {
++		input_report_key(headset->input_dev,
++				 HOOK_KEY_CODE, headset->hook_status);
+ 		input_sync(headset->input_dev);
+-	}	
++	}
+ status_error:
+-	 schedule_delayed_work(&headset_info->hook_work,msecs_to_jiffies(100));
++	schedule_delayed_work(&headset_info->hook_work, msecs_to_jiffies(100));
+ out:;
+ }
+ 
+-static ssize_t h2w_print_name(struct switch_dev *sdev, char *buf)
+-{
+-	return sprintf(buf, "Headset\n");
+-}
+-
+-
+ static int rk_hskey_open(struct input_dev *dev)
+ {
+ 	return 0;
+@@ -416,18 +376,25 @@ static int rk_hskey_open(struct input_dev *dev)
+ 
+ static void rk_hskey_close(struct input_dev *dev)
+ {
+-
+ }
+ 
+-int rk_headset_adc_probe(struct platform_device *pdev,struct rk_headset_pdata *pdata)
++static const unsigned int headset_cable[] = {
++	EXTCON_JACK_MICROPHONE,
++	EXTCON_JACK_HEADPHONE,
++	EXTCON_NONE,
++};
++
++int rk_headset_adc_probe(struct platform_device *pdev,
++			 struct rk_headset_pdata *pdata)
+ {
+ 	int ret;
+ 	struct headset_priv *headset;
+ 
+-	headset =devm_kzalloc(&pdev->dev,sizeof(struct headset_priv), GFP_KERNEL);
+-	if (headset == NULL) {
++	headset = devm_kzalloc(&pdev->dev, sizeof(*headset), GFP_KERNEL);
++	if (!headset) {
+ 		dev_err(&pdev->dev, "failed to allocate driver data\n");
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto failed;
+ 	}
+ 	headset_info = headset;
+ 	headset->pdata = pdata;
+@@ -436,26 +403,27 @@ int rk_headset_adc_probe(struct platform_device *pdev,struct rk_headset_pdata *p
+ 	headset->hook_status = HOOK_UP;
+ 	headset->hook_time = HOOK_ADC_SAMPLE_TIME;
+ 	headset->cur_headset_status = 0;
+-	headset->sdev.name = "h2w";
+-	headset->sdev.print_name = h2w_print_name;
+-	ret = switch_dev_register(&headset->sdev);
+-	if (ret < 0)
+-		goto failed_free;
+-	
+-//	mutex_init(&headset->mutex_lock[HEADSET]);
+-//	mutex_init(&headset->mutex_lock[HOOK]);
+-	INIT_DELAYED_WORK(&headset->h_delayed_work[HEADSET], headsetobserve_work);
++	headset->edev = devm_extcon_dev_allocate(&pdev->dev, headset_cable);
++	if (IS_ERR(headset->edev)) {
++		dev_err(&pdev->dev, "failed to allocate extcon device\n");
++		ret = -ENOMEM;
++		goto failed;
++	}
++	ret = devm_extcon_dev_register(&pdev->dev, headset->edev);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "extcon_dev_register() failed: %d\n", ret);
++		goto failed;
++	}
+ 	INIT_DELAYED_WORK(&headset->h_delayed_work[HOOK], hook_once_work);
+-
+ 	headset->isMic = 0;
+-//------------------------------------------------------------------		
+-	// Create and register the input driver. 
+-	headset->input_dev = input_allocate_device();
++	//------------------------------------------------------------------
++	// Create and register the input driver
++	headset->input_dev = devm_input_allocate_device(&pdev->dev);
+ 	if (!headset->input_dev) {
+ 		dev_err(&pdev->dev, "failed to allocate input device\n");
+ 		ret = -ENOMEM;
+-		goto failed_free;
+-	}	
++		goto failed;
++	}
+ 	headset->input_dev->name = pdev->name;
+ 	headset->input_dev->open = rk_hskey_open;
+ 	headset->input_dev->close = rk_hskey_close;
+@@ -464,51 +432,49 @@ int rk_headset_adc_probe(struct platform_device *pdev,struct rk_headset_pdata *p
+ 	headset->input_dev->id.vendor = 0x0001;
+ 	headset->input_dev->id.product = 0x0001;
+ 	headset->input_dev->id.version = 0x0100;
+-	// Register the input device 
++	// Register the input device
+ 	ret = input_register_device(headset->input_dev);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to register input device\n");
+-		goto failed_free_dev;
++		goto failed;
+ 	}
+-
+ 	input_set_capability(headset->input_dev, EV_KEY, HOOK_KEY_CODE);
+-
+ 	if (pdata->headset_gpio) {
+-		headset->irq[HEADSET] = gpio_to_irq(pdata->headset_gpio);
++		unsigned long irq_type;
+ 
+-		if(pdata->headset_insert_type == HEADSET_IN_HIGH)
+-			headset->irq_type[HEADSET] = IRQF_TRIGGER_HIGH|IRQF_ONESHOT;
++		headset->irq[HEADSET] = gpio_to_irq(pdata->headset_gpio);
++		if (pdata->headset_insert_type == HEADSET_IN_HIGH)
++			irq_type = IRQF_TRIGGER_HIGH;
+ 		else
+-			headset->irq_type[HEADSET] = IRQF_TRIGGER_LOW|IRQF_ONESHOT;
+-		ret = request_threaded_irq(headset->irq[HEADSET], NULL,headset_interrupt, headset->irq_type[HEADSET]|IRQF_NO_SUSPEND, "headset_input", NULL);
+-		if (ret) 
+-			goto failed_free_dev;
++			irq_type = IRQF_TRIGGER_LOW;
++		irq_type |= IRQF_NO_SUSPEND | IRQF_ONESHOT;
++		ret =
++		    devm_request_threaded_irq(&pdev->dev, headset->irq[HEADSET],
++					      NULL, headset_interrupt,
++					      irq_type, "headset_input",
++					      NULL);
++		if (ret)
++			goto failed;
+ 		if (pdata->headset_wakeup)
+ 			enable_irq_wake(headset->irq[HEADSET]);
+ 	} else {
+ 		dev_err(&pdev->dev, "failed init headset,please full hook_io_init function in board\n");
+-		goto failed_free_dev;
++		ret = -EEXIST;
++		goto failed;
+ 	}
+-
+-	if(pdata->chan != NULL)
+-	{
++	if (pdata->chan) {
+ 		headset->chan = pdata->chan;
+ 		INIT_DELAYED_WORK(&headset->hook_work, hook_work_callback);
+ 	}
+-
+-	return 0;	
+-	
+-failed_free_dev:
+-	platform_set_drvdata(pdev, NULL);
+-	input_free_device(headset->input_dev);
+-failed_free:
+-	dev_err(&pdev->dev, "failed to headset probe\n");
++	return 0;
++failed:
++	dev_err(&pdev->dev, "failed headset adc probe ret=%d\n", ret);
+ 	return ret;
+ }
+ 
+ int rk_headset_adc_suspend(struct platform_device *pdev, pm_message_t state)
+ {
+-	DBG("%s----%d\n",__FUNCTION__,__LINE__);
++	DBG("%s----%d\n", __func__, __LINE__);
+ //	disable_irq(headset_info->irq[HEADSET]);
+ //	del_timer(&headset_info->hook_timer);
+ 	return 0;
+@@ -516,11 +482,9 @@ int rk_headset_adc_suspend(struct platform_device *pdev, pm_message_t state)
+ 
+ int rk_headset_adc_resume(struct platform_device *pdev)
+ {
+-	DBG("%s----%d\n",__FUNCTION__,__LINE__);	
++	DBG("%s----%d\n", __func__, __LINE__);
+ //	enable_irq(headset_info->irq[HEADSET]);
+ //	if(headset_info->isMic)
+-//		mod_timer(&headset_info->hook_timer, jiffies + msecs_to_jiffies(1500));	
++//		mod_timer(&headset_info->hook_timer, jiffies + msecs_to_jiffies(1500));
+ 	return 0;
+ }
+-
+-
+diff --git a/drivers/headset_observe/rockchip_headset_core.c b/drivers/headset_observe/rockchip_headset_core.c
+old mode 100755
+new mode 100644
+index 01b7b4e2f1aa..f28c81add177
+--- a/drivers/headset_observe/rockchip_headset_core.c
++++ b/drivers/headset_observe/rockchip_headset_core.c
+@@ -1,4 +1,4 @@
+-/* 
++/*
+  * Copyright (C) 2014 Rockchip Corporation.
+  *
+  * This software is licensed under the terms of the GNU General Public
+@@ -34,7 +34,7 @@
+ #define DBG(x...) do { } while (0)
+ #endif
+ 
+-struct rk_headset_pdata *pdata_info;
++static struct rk_headset_pdata *pdata_info;
+ 
+ static int rockchip_headset_probe(struct platform_device *pdev)
+ {
+@@ -43,156 +43,154 @@ static int rockchip_headset_probe(struct platform_device *pdev)
+ 	int ret;
+ 	enum of_gpio_flags flags;
+ 
+-	pdata = kzalloc(sizeof(struct rk_headset_pdata), GFP_KERNEL);
+-	if (pdata == NULL) {
+-		printk("%s failed to allocate driver data\n",__FUNCTION__);
++	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata) {
++		printk("%s failed to allocate driver data\n", __func__);
+ 		return -ENOMEM;
+ 	}
+-	memset(pdata,0,sizeof(struct rk_headset_pdata));
+ 	pdata_info = pdata;
+ 
+-	//headset
++	/* headset */
+ 	ret = of_get_named_gpio_flags(node, "headset_gpio", 0, &flags);
+ 	if (ret < 0) {
+-		printk("%s() Can not read property headset_gpio\n", __FUNCTION__);
++		dev_err(&pdev->dev, "Can not read property headset_gpio\n");
+ 		goto err;
+ 	} else {
+ 		pdata->headset_gpio = ret;
+-		ret = devm_gpio_request(&pdev->dev, pdata->headset_gpio, "headset_gpio");
+-		if(ret < 0){
+-			printk("%s() devm_gpio_request headset_gpio request ERROR\n", __FUNCTION__);
++		ret = devm_gpio_request(&pdev->dev, pdata->headset_gpio,
++					"headset_gpio");
++		if (ret < 0) {
++			dev_err(&pdev->dev, "headset_gpio request fail\n");
+ 			goto err;
+ 		}
+-
+-		ret = gpio_direction_input(pdata->headset_gpio); 
+-		if(ret < 0){
+-			printk("%s() gpio_direction_input headset_gpio set ERROR\n", __FUNCTION__);
++		ret = gpio_direction_input(pdata->headset_gpio);
++		if (ret < 0) {
++			dev_err(&pdev->dev,
++				"headset_gpio set direction fail\n");
+ 			goto err;
+ 		}
+-
+-		pdata->headset_insert_type = (flags & OF_GPIO_ACTIVE_LOW) ? HEADSET_IN_LOW : HEADSET_IN_HIGH;
++		pdata->headset_insert_type = (flags & OF_GPIO_ACTIVE_LOW) ?
++						     HEADSET_IN_LOW :
++						     HEADSET_IN_HIGH;
+ 	}
+-
+-	//hook
++	/* hook */
+ 	ret = of_get_named_gpio_flags(node, "hook_gpio", 0, &pdata->hook_gpio);
+ 	if (ret < 0) {
+-		DBG("%s() Can not read property hook_gpio\n", __FUNCTION__);
++		dev_warn(&pdev->dev, "Can not read property hook_gpio\n");
+ 		pdata->hook_gpio = 0;
+-		//adc mode
++		/* adc mode */
+ 		pdata->chan = iio_channel_get(&pdev->dev, NULL);
+-   		if (IS_ERR(pdata->chan))
+- 	       	{
++		if (IS_ERR(pdata->chan)) {
+ 			pdata->chan = NULL;
+-			printk("%s() have not set adc chan\n", __FUNCTION__);
++			dev_warn(&pdev->dev, "have not set adc chan\n");
+ 		}
+ 	} else {
+-		ret = of_property_read_u32(node, "hook_down_type", &pdata->hook_down_type);
++		ret = of_property_read_u32(node, "hook_down_type",
++					   &pdata->hook_down_type);
+ 		if (ret < 0) {
+-			DBG("%s() have not set hook_down_type,set >hook< insert type low level default\n", __FUNCTION__);
++			dev_warn(&pdev->dev,
++				 "have not set hook_down_type,set >hook< insert type low level default\n");
+ 			pdata->hook_down_type = 0;
+ 		}
+-		ret = devm_gpio_request(&pdev->dev, pdata->hook_gpio, "hook_gpio");
+-		if(ret < 0){
+-			printk("%s() devm_gpio_request hook_gpio request ERROR\n", __FUNCTION__);
++		ret = devm_gpio_request(&pdev->dev, pdata->hook_gpio,
++					"hook_gpio");
++		if (ret < 0) {
++			dev_warn(&pdev->dev,
++				 "devm_gpio_request hook_gpio request ERROR\n");
+ 			goto err;
+ 		}
+-		ret = gpio_direction_input(pdata->hook_gpio); 
+-		if(ret < 0){
+-			printk("%s() gpio_direction_input hook_gpio set ERROR\n", __FUNCTION__);
++		ret = gpio_direction_input(pdata->hook_gpio);
++		if (ret < 0) {
++			dev_warn(&pdev->dev,
++				 "gpio_direction_input hook_gpio set ERROR\n");
+ 			goto err;
+ 		}
+ 	}
+ 
+-	#ifdef CONFIG_MODEM_MIC_SWITCH
+-	//mic
++#ifdef CONFIG_MODEM_MIC_SWITCH
++	/* mic */
+ 	ret = of_get_named_gpio_flags(node, "mic_switch_gpio", 0, &flags);
+ 	if (ret < 0) {
+-		DBG("%s() Can not read property mic_switch_gpio\n", __FUNCTION__);
++		DBG("%s() Can not read property mic_switch_gpio\n",
++		    __func__);
+ 	} else {
+ 		pdata->headset_gpio = ret;
+-		ret = of_property_read_u32(node, "hp_mic_io_value", &pdata->hp_mic_io_value);
++		ret = of_property_read_u32(node, "hp_mic_io_value",
++					   &pdata->hp_mic_io_value);
+ 		if (ret < 0) {
+-			DBG("%s() have not set hp_mic_io_value ,so default set pull down low level\n", __FUNCTION__);
++			DBG("%s() have not set hp_mic_io_value ,so default set pull down low level\n",
++			    __func__);
+ 			pdata->hp_mic_io_value = 0;
+ 		}
+-		ret = of_property_read_u32(node, "main_mic_io_value", &pdata->main_mic_io_value);
++		ret = of_property_read_u32(node, "main_mic_io_value",
++					   &pdata->main_mic_io_value);
+ 		if (ret < 0) {
+-			DBG("%s() have not set main_mic_io_value ,so default set pull down low level\n", __FUNCTION__);
++			DBG("%s() have not set main_mic_io_value ,so default set pull down low level\n",
++			    __func__);
+ 			pdata->main_mic_io_value = 1;
+ 		}
+ 	}
+-	#endif
+-
+-	ret = of_property_read_u32(node, "rockchip,headset_wakeup", &pdata->headset_wakeup);
++#endif
++	ret = of_property_read_u32(node, "rockchip,headset_wakeup",
++				   &pdata->headset_wakeup);
+ 	if (ret < 0)
+ 		pdata->headset_wakeup = 1;
+-
+-	if(pdata->chan != NULL)
+-	{//hook adc mode
+-		printk("%s() headset have hook adc mode\n",__FUNCTION__);
+-		ret = rk_headset_adc_probe(pdev,pdata);
+-		if(ret < 0)
+-		{
++	if (pdata->chan) { /* hook adc mode */
++		dev_info(&pdev->dev, "headset have hook adc mode\n");
++		ret = rk_headset_adc_probe(pdev, pdata);
++		if (ret < 0) {
+ 			goto err;
+-		}	
+-
+-	}
+-	else
+-	{//hook interrupt mode and not hook
+-		printk("%s() headset have %s mode\n",__FUNCTION__,pdata->hook_gpio?"interrupt hook":"no hook");
+-		ret = rk_headset_probe(pdev,pdata);
+-		if(ret < 0)
+-		{
++		}
++	} else { /* hook interrupt mode and not hook */
++		dev_info(&pdev->dev, "headset have %s mode\n",
++			 pdata->hook_gpio ? "interrupt hook" : "no hook");
++		ret = rk_headset_probe(pdev, pdata);
++		if (ret < 0) {
+ 			goto err;
+ 		}
+ 	}
+-
+ 	return 0;
+ err:
+-	kfree(pdata);
+ 	return ret;
+ }
+ 
+ static int rockchip_headset_remove(struct platform_device *pdev)
+ {
+-	if(pdata_info)
+-		kfree(pdata_info);
+ 	return 0;
+ }
+ 
+-static int rockchip_headset_suspend(struct platform_device *pdev, pm_message_t state)
++static int rockchip_headset_suspend(struct platform_device *pdev,
++				    pm_message_t state)
+ {
+-	if(pdata_info->chan != 0)
+-	{
+-		return rk_headset_adc_suspend(pdev,state);
++	if (pdata_info->chan != 0) {
++		return rk_headset_adc_suspend(pdev, state);
+ 	}
+ 	return 0;
+ }
+ 
+ static int rockchip_headset_resume(struct platform_device *pdev)
+ {
+-	if(pdata_info->chan != 0)
+-	{
++	if (pdata_info->chan != 0) {
+ 		return rk_headset_adc_resume(pdev);
+-	}	
++	}
+ 	return 0;
+ }
+ 
+ static const struct of_device_id rockchip_headset_of_match[] = {
+-        { .compatible = "rockchip_headset", },
+-        {},
++	{ .compatible = "rockchip_headset", },
++	{},
+ };
+ MODULE_DEVICE_TABLE(of, rockchip_headset_of_match);
+ 
+ static struct platform_driver rockchip_headset_driver = {
+ 	.probe	= rockchip_headset_probe,
+ 	.remove = rockchip_headset_remove,
+-	.resume = 	rockchip_headset_resume,	
+-	.suspend = 	rockchip_headset_suspend,	
++	.resume =	rockchip_headset_resume,
++	.suspend =	rockchip_headset_suspend,
+ 	.driver	= {
+ 		.name	= "rockchip_headset",
+ 		.owner	= THIS_MODULE,
+-		.of_match_table = of_match_ptr(rockchip_headset_of_match),		
++		.of_match_table = of_match_ptr(rockchip_headset_of_match),
+ 	},
+ };
+ 
+-- 
+2.35.3
+

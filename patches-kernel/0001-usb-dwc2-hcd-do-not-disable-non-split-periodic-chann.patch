@@ -1,0 +1,81 @@
+From debf378724206de37e21fdd9a96a33e693ee01c7 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Thu, 6 Jun 2019 10:04:57 +0800
+Subject: [PATCH] usb: dwc2: hcd: do not disable non-split periodic channels
+
+The dwc2 programming guide section 3.5 'Halting a Channel'
+says that the application can disable any channel by
+programming the HCCHARn register with the HCCHARn.ChDis
+and HCCHARn.ChEna bits set to 1'b1. This enables the
+dwc_otg host to flush the posted requests (if any) and
+generates a Channel Halted interrupt.
+
+But it also requires that channel disable must not be
+programmed for non-split periodic channels. At the end
+of the next uframe/frame (in the worst case), the core
+generates a channel halted and disables the channel
+automatically.
+
+If we disable non-spilt periodic channels to halt the
+channels, it will easily to cause data transfer fail.
+A typical case is take photo with usb camera or close
+usb camera, Specifically, the observed order is:
+
+1. uvc driver calls usb_kill_urb
+2. usb_kill_urb calls urb_dequeue to cancel urb
+3. urb_dequeue call dwc_otg_hc_halt to disable
+   non-spilt periodic channels
+4. usb core doesn't halt the non-spilt periodic
+   channels immediately, and the application
+   reallocates the channels for other transactions
+   without waiting for the HCINTn.ChHltd interrupt.
+5. uvc driver calls usb_set_interface to start
+   control transfer, and gets a channel which used
+   for non-spilt periodic transfer before. The core
+   generates a channel halted and disables the channel
+   automatically. This cause control transfer fail.
+
+Change-Id: I95424a99b77b552396a9fb95a5058258270ed4c2
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc2/hcd.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 1aad4765e5a5..29ee451f243d 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -1050,8 +1050,12 @@ void dwc2_hc_halt(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan,
+ 		chan->halt_status = halt_status;
+ 
+ 		hcchar = dwc2_readl(hsotg, HCCHAR(chan->hc_num));
+-		if (!(hcchar & HCCHAR_CHENA)) {
++		if (!(hcchar & HCCHAR_CHENA) ||
++		    (!chan->do_split &&
++		     (chan->ep_type == USB_ENDPOINT_XFER_ISOC ||
++		      chan->ep_type == USB_ENDPOINT_XFER_INT))){
+ 			/*
++			 * HCCHARn.ChEna 0 means that:
+ 			 * The channel is either already halted or it hasn't
+ 			 * started yet. In DMA mode, the transfer may halt if
+ 			 * it finishes normally or a condition occurs that
+@@ -1061,7 +1065,16 @@ void dwc2_hc_halt(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan,
+ 			 * to a channel, but not started yet when an URB is
+ 			 * dequeued. Don't want to halt a channel that hasn't
+ 			 * started yet.
++			 * If channel is used for non-split periodic transfer
++			 * according to DWC Programming Guide:
++			 * '3.5 Halting a Channel': Channel disable must not
++			 * be programmed for non-split periodic channels. At
++			 * the end of the next uframe/frame (in the worst
++			 * case), the core generates a channel halted and
++			 * disables the channel automatically.
+ 			 */
++			dev_info(hsotg->dev, "hcchar 0x%08x, ep_type %d\n",
++				 hcchar, chan->ep_type);
+ 			return;
+ 		}
+ 	}
+-- 
+2.35.3
+

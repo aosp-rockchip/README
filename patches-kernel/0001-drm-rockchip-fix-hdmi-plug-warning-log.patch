@@ -1,0 +1,211 @@
+From ebfdd50335567623560d8b016d9a956c86cf3711 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 4 Dec 2019 17:58:17 +0800
+Subject: [PATCH] drm/rockchip: fix hdmi plug warning log
+
+when hdmi plug out or switch hdmi resolution, vop output timing
+maybe still at 4k resolution, but dclk will be set to 27M immediately,
+this will lead to one frame time change from 16.6ms to
+(594 / 27) * 16.6 = 365ms.
+
+drm will dump the following log, this looks uncomfortable, so we use
+rockchip_drm_atomic_helper_wait_for_vblanks to instead of
+drm_atomic_helper_wait_for_vblanks to cancel the dump log when mode
+update, and retain the debug warning log for every frame commit.
+
+[   31.415329] ------------[ cut here ]------------
+[   31.415383] [CRTC:56:crtc-0] vblank wait timed out:1201:1201
+[   31.415498] WARNING: CPU: 2 PID: 366 at drivers/gpu/drm/drm_atomic_helper.c:1433 drm_atomic_helper_wait_for_vblanks.part.21+0x2c0/0x2d4
+[   31.415529] Modules linked in:
+[   31.415573] CPU: 2 PID: 366 Comm: composer@2.1-se Tainted: G        W         4.19.80 #1337
+[   31.415601] Hardware name: Rockchip RK3328 EVB avb (DT)
+[   31.415633] pstate: 60400005 (nZCv daif +PAN -UAO)
+[   31.415661] pc : drm_atomic_helper_wait_for_vblanks.part.21+0x2c0/0x2d4
+[   31.415696] lr : drm_atomic_helper_wait_for_vblanks.part.21+0x2c0/0x2d4
+....
+
+[   31.423867] Call trace:
+[   31.423904]  drm_atomic_helper_wait_for_vblanks.part.21+0x2c0/0x2d4
+[   31.423939]  drm_atomic_helper_wait_for_vblanks+0x1c/0x20
+[   31.423969]  rockchip_atomic_commit_complete+0xb0/0x130
+[   31.423997]  rockchip_drm_atomic_commit+0x1d4/0x230
+[   31.424032]  drm_atomic_commit+0x50/0x68
+[   31.424067]  drm_mode_atomic_ioctl+0xbe0/0xcb0
+[   31.424100]  drm_ioctl_kernel+0xa0/0xe4
+[   31.424133]  drm_ioctl+0x318/0x4a4
+[   31.424168]  do_vfs_ioctl+0xbc/0xdb4
+[   31.424201]  ksys_ioctl+0x78/0xa8
+[   31.424225]  __arm64_sys_ioctl+0x1c/0x28
+[   31.424262]  el0_svc_common.constprop.1+0xb4/0x168
+[   31.424288]  el0_svc_handler+0x20/0x78
+[   31.424320]  el0_svc+0x8/0x340
+[   31.424349] ---[ end trace af4d2af5b5fb7553 ]---
+
+Change-Id: I5988882380fa91b7527999ac2cd5ae13cfc88a8b
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.c  | 54 ++++++++++++++++++++-
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 16 +++---
+ 3 files changed, 60 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index d90ff5933e4a..8d7d83643435 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -120,6 +120,7 @@ struct rockchip_crtc_state {
+ 	int bcsh_en;
+ 	int color_space;
+ 	int eotf;
++	u8 mode_update;
+ 	struct rockchip_hdr_state hdr;
+ };
+ #define to_rockchip_crtc_state(s) \
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+index 2bea5f1a2d1b..2521c3b54b14 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+@@ -302,6 +302,56 @@ rockchip_drm_psr_inhibit_put_state(struct drm_atomic_state *state)
+ 		rockchip_drm_psr_inhibit_put(encoder);
+ }
+ 
++static void
++rockchip_drm_atomic_helper_wait_for_vblanks(struct drm_device *dev,
++					    struct drm_atomic_state *old_state)
++{
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
++	int i, ret;
++	unsigned int crtc_mask = 0;
++	struct rockchip_crtc_state *s;
++
++	 /*
++	  * Legacy cursor ioctls are completely unsynced, and userspace
++	  * relies on that (by doing tons of cursor updates).
++	  */
++	if (old_state->legacy_cursor_update)
++		return;
++
++	for_each_new_crtc_in_state(old_state, crtc, new_crtc_state, i) {
++		if (!new_crtc_state->active)
++			continue;
++
++		ret = drm_crtc_vblank_get(crtc);
++		if (ret != 0)
++			continue;
++
++		crtc_mask |= drm_crtc_mask(crtc);
++		old_state->crtcs[i].last_vblank_count =
++						drm_crtc_vblank_count(crtc);
++	}
++
++	for_each_old_crtc_in_state(old_state, crtc, old_crtc_state, i) {
++		if (!(crtc_mask & drm_crtc_mask(crtc)))
++			continue;
++
++		ret = wait_event_timeout(dev->vblank[i].queue,
++				old_state->crtcs[i].last_vblank_count !=
++					drm_crtc_vblank_count(crtc),
++				msecs_to_jiffies(50));
++
++		s = to_rockchip_crtc_state(crtc->state);
++
++		if (!s->mode_update)
++			WARN(!ret, "[CRTC:%d:%s] state:%d, vblank wait timed out\n",
++			     crtc->base.id, crtc->name, old_crtc_state->active);
++
++		drm_crtc_vblank_put(crtc);
++		s->mode_update = false;
++	}
++}
++
+ static void
+ rockchip_atomic_helper_commit_tail_rpm(struct drm_atomic_state *old_state)
+ {
+@@ -320,7 +370,7 @@ rockchip_atomic_helper_commit_tail_rpm(struct drm_atomic_state *old_state)
+ 
+ 	drm_atomic_helper_commit_hw_done(old_state);
+ 
+-	drm_atomic_helper_wait_for_vblanks(dev, old_state);
++	rockchip_drm_atomic_helper_wait_for_vblanks(dev, old_state);
+ 
+ 	drm_atomic_helper_cleanup_planes(dev, old_state);
+ }
+@@ -376,7 +426,7 @@ rockchip_atomic_commit_complete(struct rockchip_atomic_commit *commit)
+ 
+ 	drm_atomic_helper_commit_hw_done(state);
+ 
+-	drm_atomic_helper_wait_for_vblanks(dev, state);
++	rockchip_drm_atomic_helper_wait_for_vblanks(dev, state);
+ 
+ 	drm_atomic_helper_cleanup_planes(dev, state);
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 25b41c2ada84..ebd2374d60c6 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -228,7 +228,6 @@ struct vop {
+ 	bool is_iommu_enabled;
+ 	bool is_iommu_needed;
+ 	bool is_enabled;
+-	bool mode_update;
+ 
+ 	u32 version;
+ 
+@@ -2722,8 +2721,8 @@ static void vop_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	vop_initial(crtc);
+ 	vop_disable_allwin(vop);
+ 	VOP_CTRL_SET(vop, standby, 0);
+-	vop->mode_update = vop_crtc_mode_update(crtc);
+-	if (vop->mode_update)
++	s->mode_update = vop_crtc_mode_update(crtc);
++	if (s->mode_update)
+ 		vop_disable_all_planes(vop);
+ 	/*
+ 	 * restore the lut table.
+@@ -3230,7 +3229,7 @@ static void vop_tv_config_update(struct drm_crtc *crtc,
+ 	 */
+ 	if (!memcmp(s->tv_state,
+ 		    &vop->active_tv_state, sizeof(*s->tv_state)) &&
+-	    s->yuv_overlay == old_s->yuv_overlay && vop->mode_update &&
++	    s->yuv_overlay == old_s->yuv_overlay && s->mode_update &&
+ 	    s->bcsh_en == old_s->bcsh_en && s->bus_format == old_s->bus_format)
+ 		return;
+ 
+@@ -3384,13 +3383,13 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		bool need_wait_vblank = 0;
+ 		int ret;
+ 
+-		if (vop->mode_update)
++		if (s->mode_update)
+ 			VOP_CTRL_SET(vop, dma_stop, 1);
+ 
+ 		need_wait_vblank = !vop_is_allwin_disabled(vop);
+-		if (vop->mode_update && need_wait_vblank)
++		if (s->mode_update && need_wait_vblank)
+ 			dev_warn(vop->dev, "mode_update:%d, need wait blk:%d\n",
+-				 vop->mode_update, need_wait_vblank);
++				 s->mode_update, need_wait_vblank);
+ 
+ 		if (need_wait_vblank) {
+ 			bool active;
+@@ -3445,7 +3444,7 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	 */
+ 	if (VOP_MAJOR(vop->version) == 3 &&
+ 	    (VOP_MINOR(vop->version) == 7 || VOP_MINOR(vop->version) == 8)) {
+-		if (!vop->mode_update && VOP_CTRL_GET(vop, reg_done_frm))
++		if (!s->mode_update && VOP_CTRL_GET(vop, reg_done_frm))
+ 			VOP_CTRL_SET(vop, reg_done_frm, 0);
+ 	} else {
+ 		VOP_CTRL_SET(vop, reg_done_frm, 0);
+@@ -3453,7 +3452,6 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	if (vop->mcu_timing.mcu_pix_total)
+ 		VOP_CTRL_SET(vop, mcu_hold_mode, 0);
+ 
+-	vop->mode_update = false;
+ 	spin_unlock_irqrestore(&vop->irq_lock, flags);
+ 
+ 	/*
+-- 
+2.35.3
+

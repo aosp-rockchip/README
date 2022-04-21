@@ -1,0 +1,134 @@
+From 70d2d7f53061588ca4ee001f91c1e3b872eeb5f7 Mon Sep 17 00:00:00 2001
+From: Wu Liang feng <wulf@rock-chips.com>
+Date: Wed, 6 Sep 2017 11:32:24 +0800
+Subject: [PATCH] phy: rockchip-inno-usb2: avoid calling sleeping func from
+ invalid context
+
+Commit 4f519feed0d9 ("phy: rockchip-inno-usb2: delay suspending
+phy if plug out device"), introduced the following issue:
+
+BUG: sleeping function called from invalid context at kernel/workqueue.c:2717
+in_atomic(): 1, irqs_disabled(): 128, pid: 4, name: kworker/0:0
+INFO: lockdep is turned off.
+irq event stamp: 19674
+hardirqs last  enabled at (19673): [<ffffff8008cd8818>] _raw_spin_unlock_irqrestore+0x40/0x70
+hardirqs last disabled at (19674): [<ffffff8008cd8690>] _raw_spin_lock_irq+0x1c/0x60
+softirqs last  enabled at (19664): [<ffffff80088dd1c0>] dw_mci_request+0xe0/0xf0
+softirqs last disabled at (19660): [<ffffff80088dd140>] dw_mci_request+0x60/0xf0
+CPU: 0 PID: 4 Comm: kworker/0:0 Not tainted 4.4.83 #69
+Hardware name: Rockchip RK3399 Evaluation Board v3 (Android) (DT)
+Workqueue: fusb302_wq fusb302_work_func
+Call trace:
+[<ffffff8008089f78>] dump_backtrace+0x0/0x1cc
+[<ffffff800808a158>] show_stack+0x14/0x1c
+[<ffffff80083ca33c>] dump_stack+0xb8/0xf4
+[<ffffff80080cec40>] ___might_sleep+0x1b8/0x1c8
+[<ffffff80080cecc0>] __might_sleep+0x70/0x80
+[<ffffff80080becbc>] flush_work+0x74/0x270
+[<ffffff80080bf09c>] __cancel_work_timer+0x12c/0x1bc
+[<ffffff80080bf154>] cancel_delayed_work_sync+0x10/0x18
+[<ffffff80083f9de8>] rockchip_otg_event+0x18/0x3c
+[<ffffff80080c6380>] notifier_call_chain+0x54/0x88
+[<ffffff80080c63dc>] raw_notifier_call_chain+0x14/0x1c
+[<ffffff80089a5354>] extcon_sync+0x74/0x1c4
+[<ffffff80085ab980>] platform_fusb_notify+0x184/0x204
+[<ffffff80085ac4ac>] set_state_unattached+0x5c/0x90
+[<ffffff80085ac85c>] fusb302_work_func+0x288/0x1904
+[<ffffff80080bdfa4>] process_one_work+0x354/0x6d0
+[<ffffff80080bf4a4>] worker_thread+0x2f8/0x414
+[<ffffff80080c4e58>] kthread+0xf0/0xf8
+[<ffffff80080828d0>] ret_from_fork+0x10/0x40
+
+Actually, we don't need to cancel the otg_sm_work in the
+event EXTCON_USB_HOST notifier_call. So just remove the
+cancel_delayed_work_sync() in the rockchip_otg_event().
+
+With this patch, we may get USB BC1.2 detection error
+if plug in USB peripheral/host cable alternately and
+quickly. So we need to reinit chg_state and chg_type
+if OTG host cable plug in.
+
+Change-Id: I349d59de3188d39707c527acb858a7be20a999ac
+Signed-off-by: Wu Liang feng <wulf@rock-chips.com>
+---
+ drivers/phy/phy-rockchip-inno-usb2.c | 30 +++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/phy/phy-rockchip-inno-usb2.c b/drivers/phy/phy-rockchip-inno-usb2.c
+index 96b638ced223..0d97a901091d 100644
+--- a/drivers/phy/phy-rockchip-inno-usb2.c
++++ b/drivers/phy/phy-rockchip-inno-usb2.c
+@@ -822,6 +822,8 @@ static void rockchip_usb2phy_otg_sm_work(struct work_struct *work)
+ 					    EXTCON_USB_VBUS_EN) > 0) {
+ 			dev_dbg(&rport->phy->dev, "usb otg host connect\n");
+ 			rport->state = OTG_STATE_A_HOST;
++			rphy->chg_state = USB_CHG_STATE_UNDEFINED;
++			rphy->chg_type = POWER_SUPPLY_TYPE_UNKNOWN;
+ 			mutex_unlock(&rport->mutex);
+ 			rockchip_usb2phy_power_on(rport->phy);
+ 			return;
+@@ -892,14 +894,25 @@ static void rockchip_usb2phy_otg_sm_work(struct work_struct *work)
+ 		}
+ 		break;
+ 	case OTG_STATE_B_PERIPHERAL:
+-		if (!rport->vbus_attached) {
++		sch_work = true;
++
++		if (extcon_get_cable_state_(rphy->edev, EXTCON_USB_HOST) > 0 ||
++		    extcon_get_cable_state_(rphy->edev,
++					    EXTCON_USB_VBUS_EN) > 0) {
++			dev_dbg(&rport->phy->dev, "usb otg host connect\n");
++			rport->state = OTG_STATE_A_HOST;
++			rphy->chg_state = USB_CHG_STATE_UNDEFINED;
++			rphy->chg_type = POWER_SUPPLY_TYPE_UNKNOWN;
++			rport->perip_connected = false;
++			sch_work = false;
++			wake_unlock(&rport->wakelock);
++		} else if (!rport->vbus_attached) {
+ 			dev_dbg(&rport->phy->dev, "usb disconnect\n");
+ 			rport->state = OTG_STATE_B_IDLE;
+ 			rport->perip_connected = false;
+ 			delay = OTG_SCHEDULE_DELAY * 2;
+ 			wake_unlock(&rport->wakelock);
+ 		}
+-		sch_work = true;
+ 		break;
+ 	case OTG_STATE_A_HOST:
+ 		if (extcon_get_cable_state_(rphy->edev, EXTCON_USB_HOST) == 0) {
+@@ -909,6 +922,9 @@ static void rockchip_usb2phy_otg_sm_work(struct work_struct *work)
+ 			rockchip_usb2phy_power_off(rport->phy);
+ 			mutex_lock(&rport->mutex);
+ 			sch_work = true;
++		} else {
++			mutex_unlock(&rport->mutex);
++			return;
+ 		}
+ 		break;
+ 	default:
+@@ -919,6 +935,15 @@ static void rockchip_usb2phy_otg_sm_work(struct work_struct *work)
+ 	if (extcon_get_state(rphy->edev, cable) != rport->vbus_attached)
+ 		extcon_set_cable_state_(rphy->edev,
+ 					cable, rport->vbus_attached);
++	else if (rport->state == OTG_STATE_A_HOST &&
++		 extcon_get_state(rphy->edev, cable))
++		/*
++		 * If plug in OTG host cable when the rport state is
++		 * OTG_STATE_B_PERIPHERAL, the vbus voltage will stay
++		 * in high, so the rport->vbus_attached may not be
++		 * changed. We need to set cable state here.
++		 */
++		extcon_set_cable_state_(rphy->edev, cable, false);
+ 
+ 	if (rphy->edev_self &&
+ 	    (extcon_get_state(rphy->edev, EXTCON_USB) !=
+@@ -1332,7 +1357,6 @@ static int rockchip_otg_event(struct notifier_block *nb,
+ 	struct rockchip_usb2phy_port *rport =
+ 		container_of(nb, struct rockchip_usb2phy_port, event_nb);
+ 
+-	cancel_delayed_work_sync(&rport->otg_sm_work);
+ 	schedule_delayed_work(&rport->otg_sm_work, OTG_SCHEDULE_DELAY);
+ 
+ 	return NOTIFY_DONE;
+-- 
+2.35.3
+

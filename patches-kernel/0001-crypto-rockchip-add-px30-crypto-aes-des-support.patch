@@ -1,0 +1,2240 @@
+From c1489ff5ae18088d1d4278b8523393288ac9e8a1 Mon Sep 17 00:00:00 2001
+From: Lin Jinhan <troy.lin@rock-chips.com>
+Date: Fri, 22 Mar 2019 10:50:12 +0800
+Subject: [PATCH] crypto: rockchip - add px30 crypto aes/des support
+
+cipher mode list:
+  aes:      ecb/cbc/xts
+  des/3des: ecb/cbc
+
+Change-Id: I46e8f698a099dd9d4e9a81afb6f3a992dadfd79f
+Signed-off-by: Lin Jinhan <troy.lin@rock-chips.com>
+---
+ drivers/crypto/Kconfig                        |  18 +-
+ drivers/crypto/rockchip/Makefile              |   8 +-
+ .../{rk3288_crypto.c => rk_crypto_core.c}     | 326 +++++---
+ drivers/crypto/rockchip/rk_crypto_core.h      | 119 +++
+ drivers/crypto/rockchip/rk_crypto_v1.h        |  28 +
+ ...ablkcipher.c => rk_crypto_v1_ablkcipher.c} |  74 +-
+ ...88_crypto_ahash.c => rk_crypto_v1_ahash.c} |  77 +-
+ .../{rk3288_crypto.h => rk_crypto_v1_reg.h}   | 110 +--
+ drivers/crypto/rockchip/rk_crypto_v2.h        |  38 +
+ .../crypto/rockchip/rk_crypto_v2_ablkcipher.c | 774 ++++++++++++++++++
+ drivers/crypto/rockchip/rk_crypto_v2_reg.h    | 236 ++++++
+ 11 files changed, 1529 insertions(+), 279 deletions(-)
+ rename drivers/crypto/rockchip/{rk3288_crypto.c => rk_crypto_core.c} (55%)
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_core.h
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v1.h
+ rename drivers/crypto/rockchip/{rk3288_crypto_ablkcipher.c => rk_crypto_v1_ablkcipher.c} (90%)
+ rename drivers/crypto/rockchip/{rk3288_crypto_ahash.c => rk_crypto_v1_ahash.c} (87%)
+ rename drivers/crypto/rockchip/{rk3288_crypto.h => rk_crypto_v1_reg.h} (67%)
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v2.h
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
+ create mode 100644 drivers/crypto/rockchip/rk_crypto_v2_reg.h
+
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index a825b6444459..0efb2c4fce63 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -642,8 +642,7 @@ config CRYPTO_DEV_SUN4I_SS_PRNG
+ 	  the Pseudo-Random Number Generator found in the Security System.
+ 
+ config CRYPTO_DEV_ROCKCHIP
+-	tristate "Rockchip's Cryptographic Engine driver"
+-	depends on OF && ARCH_ROCKCHIP
++	tristate
+ 	select CRYPTO_AES
+ 	select CRYPTO_DES
+ 	select CRYPTO_MD5
+@@ -652,9 +651,24 @@ config CRYPTO_DEV_ROCKCHIP
+ 	select CRYPTO_HASH
+ 	select CRYPTO_BLKCIPHER
+ 
++config CRYPTO_DEV_ROCKCHIP_V1
++	tristate "Rockchip's Cryptographic Engine V1 driver"
++	depends on OF && ARCH_ROCKCHIP
++	select CRYPTO_DEV_ROCKCHIP
++	help
++	  This driver interfaces with the hardware crypto accelerator.
++	  Supporting cbc/ecb chainmode, and aes/des/des3_ede cipher mode.
++	  It currently supports rk3288.
++
++config CRYPTO_DEV_ROCKCHIP_V2
++	tristate "Rockchip's Cryptographic Engine V2 driver"
++	depends on OF && ARCH_ROCKCHIP
++	select CRYPTO_DEV_ROCKCHIP
+ 	help
+ 	  This driver interfaces with the hardware crypto accelerator.
+ 	  Supporting cbc/ecb chainmode, and aes/des/des3_ede cipher mode.
++	  Supporting aes-xts cipher mode.
++	  It currently supports px30.
+ 
+ config CRYPTO_DEV_MEDIATEK
+ 	tristate "MediaTek's EIP97 Cryptographic Engine driver"
+diff --git a/drivers/crypto/rockchip/Makefile b/drivers/crypto/rockchip/Makefile
+index 30f91297b4b6..1589f82d9881 100644
+--- a/drivers/crypto/rockchip/Makefile
++++ b/drivers/crypto/rockchip/Makefile
+@@ -1,4 +1,4 @@
+-obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP) += rk_crypto.o
+-rk_crypto-objs := rk3288_crypto.o \
+-		  rk3288_crypto_ablkcipher.o \
+-		  rk3288_crypto_ahash.o
++obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP) += rk_crypto_core.o
++obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP_V1) += rk_crypto_v1_ahash.o
++obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP_V1) += rk_crypto_v1_ablkcipher.o
++obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP_V2) += rk_crypto_v2_ablkcipher.o
+diff --git a/drivers/crypto/rockchip/rk3288_crypto.c b/drivers/crypto/rockchip/rk_crypto_core.c
+similarity index 55%
+rename from drivers/crypto/rockchip/rk3288_crypto.c
+rename to drivers/crypto/rockchip/rk_crypto_core.c
+index 0ce4a65b95f5..009ccf258f9e 100644
+--- a/drivers/crypto/rockchip/rk3288_crypto.c
++++ b/drivers/crypto/rockchip/rk_crypto_core.c
+@@ -1,70 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+- * Crypto acceleration support for Rockchip RK3288
++ * Crypto acceleration support for Rockchip crypto
+  *
+- * Copyright (c) 2015, Fuzhou Rockchip Electronics Co., Ltd
++ * Copyright (c) 2018, Fuzhou Rockchip Electronics Co., Ltd
+  *
+  * Author: Zain Wang <zain.wang@rock-chips.com>
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
++ * Mender: Lin Jinhan <troy.lin@rock-chips.com>
+  *
+  * Some ideas are from marvell-cesa.c and s5p-sss.c driver.
+  */
+ 
+-#include "rk3288_crypto.h"
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/clk.h>
+ #include <linux/crypto.h>
+ #include <linux/reset.h>
++#include <linux/slab.h>
++#include "rk_crypto_core.h"
++#include "rk_crypto_v1.h"
++#include "rk_crypto_v2.h"
+ 
+ static int rk_crypto_enable_clk(struct rk_crypto_info *dev)
+ {
+-	int err;
++	int ret;
+ 
+-	err = clk_prepare_enable(dev->sclk);
+-	if (err) {
+-		dev_err(dev->dev, "[%s:%d], Couldn't enable clock sclk\n",
+-			__func__, __LINE__);
+-		goto err_return;
+-	}
+-	err = clk_prepare_enable(dev->aclk);
+-	if (err) {
+-		dev_err(dev->dev, "[%s:%d], Couldn't enable clock aclk\n",
+-			__func__, __LINE__);
+-		goto err_aclk;
+-	}
+-	err = clk_prepare_enable(dev->hclk);
+-	if (err) {
+-		dev_err(dev->dev, "[%s:%d], Couldn't enable clock hclk\n",
+-			__func__, __LINE__);
+-		goto err_hclk;
+-	}
+-	err = clk_prepare_enable(dev->dmaclk);
+-	if (err) {
+-		dev_err(dev->dev, "[%s:%d], Couldn't enable clock dmaclk\n",
+-			__func__, __LINE__);
+-		goto err_dmaclk;
++	dev_dbg(dev->dev, "clk_bulk_prepare_enable.\n");
++
++	ret = clk_bulk_prepare_enable(dev->soc_data->clks_num,
++				      &dev->clk_bulks[0]);
++	if (ret < 0) {
++		dev_err(dev->dev, "failed to enable clks %d\n", ret);
++		return ret;
+ 	}
+-	return err;
+-err_dmaclk:
+-	clk_disable_unprepare(dev->hclk);
+-err_hclk:
+-	clk_disable_unprepare(dev->aclk);
+-err_aclk:
+-	clk_disable_unprepare(dev->sclk);
+-err_return:
+-	return err;
++
++	return 0;
+ }
+ 
+ static void rk_crypto_disable_clk(struct rk_crypto_info *dev)
+ {
+-	clk_disable_unprepare(dev->dmaclk);
+-	clk_disable_unprepare(dev->hclk);
+-	clk_disable_unprepare(dev->aclk);
+-	clk_disable_unprepare(dev->sclk);
++	dev_dbg(dev->dev, "clk_bulk_disable_unprepare.\n");
++	clk_bulk_disable_unprepare(dev->soc_data->clks_num, &dev->clk_bulks[0]);
+ }
+ 
+ static int check_alignment(struct scatterlist *sg_src,
+@@ -73,12 +49,12 @@ static int check_alignment(struct scatterlist *sg_src,
+ {
+ 	int in, out, align;
+ 
+-	in = IS_ALIGNED((uint32_t)sg_src->offset, 4) &&
+-	     IS_ALIGNED((uint32_t)sg_src->length, align_mask);
++	in = IS_ALIGNED((u32)sg_src->offset, 4) &&
++	     IS_ALIGNED((u32)sg_src->length, align_mask);
+ 	if (!sg_dst)
+ 		return in;
+-	out = IS_ALIGNED((uint32_t)sg_dst->offset, 4) &&
+-	      IS_ALIGNED((uint32_t)sg_dst->length, align_mask);
++	out = IS_ALIGNED((u32)sg_dst->offset, 4) &&
++	      IS_ALIGNED((u32)sg_dst->length, align_mask);
+ 	align = in && out;
+ 
+ 	return (align && (sg_src->length == sg_dst->length));
+@@ -168,16 +144,12 @@ static void rk_unload_data(struct rk_crypto_info *dev)
+ static irqreturn_t rk_crypto_irq_handle(int irq, void *dev_id)
+ {
+ 	struct rk_crypto_info *dev  = platform_get_drvdata(dev_id);
+-	u32 interrupt_status;
+ 
+ 	spin_lock(&dev->lock);
+-	interrupt_status = CRYPTO_READ(dev, RK_CRYPTO_INTSTS);
+-	CRYPTO_WRITE(dev, RK_CRYPTO_INTSTS, interrupt_status);
+ 
+-	if (interrupt_status & 0x0a) {
+-		dev_warn(dev->dev, "DMA Error\n");
+-		dev->err = -EFAULT;
+-	}
++	if (dev->irq_handle)
++		dev->irq_handle(irq, dev_id);
++
+ 	tasklet_schedule(&dev->done_task);
+ 
+ 	spin_unlock(&dev->lock);
+@@ -247,55 +219,53 @@ static void rk_crypto_done_task_cb(unsigned long data)
+ 		dev->complete(dev->async_req, dev->err);
+ }
+ 
+-static struct rk_crypto_tmp *rk_cipher_algs[] = {
+-	&rk_ecb_aes_alg,
+-	&rk_cbc_aes_alg,
+-	&rk_ecb_des_alg,
+-	&rk_cbc_des_alg,
+-	&rk_ecb_des3_ede_alg,
+-	&rk_cbc_des3_ede_alg,
+-	&rk_ahash_sha1,
+-	&rk_ahash_sha256,
+-	&rk_ahash_md5,
+-};
+-
+ static int rk_crypto_register(struct rk_crypto_info *crypto_info)
+ {
+ 	unsigned int i, k;
++	struct rk_crypto_tmp **algs;
++	struct rk_crypto_tmp *tmp_algs;
+ 	int err = 0;
+ 
+-	for (i = 0; i < ARRAY_SIZE(rk_cipher_algs); i++) {
+-		rk_cipher_algs[i]->dev = crypto_info;
+-		if (rk_cipher_algs[i]->type == ALG_TYPE_CIPHER)
+-			err = crypto_register_alg(
+-					&rk_cipher_algs[i]->alg.crypto);
++	algs = crypto_info->soc_data->cipher_algs;
++
++	for (i = 0; i < crypto_info->soc_data->cipher_num; i++, algs++) {
++		tmp_algs = *algs;
++		tmp_algs->dev = crypto_info;
++		if (tmp_algs->type == ALG_TYPE_CIPHER)
++			err = crypto_register_alg(&tmp_algs->alg.crypto);
+ 		else
+-			err = crypto_register_ahash(
+-					&rk_cipher_algs[i]->alg.hash);
++			err = crypto_register_ahash(&tmp_algs->alg.hash);
+ 		if (err)
+ 			goto err_cipher_algs;
+ 	}
+ 	return 0;
+ 
+ err_cipher_algs:
+-	for (k = 0; k < i; k++) {
+-		if (rk_cipher_algs[i]->type == ALG_TYPE_CIPHER)
+-			crypto_unregister_alg(&rk_cipher_algs[k]->alg.crypto);
++	algs = crypto_info->soc_data->cipher_algs;
++	for (k = 0; k < i; k++, algs++) {
++		tmp_algs = *algs;
++		if (tmp_algs->type == ALG_TYPE_CIPHER)
++			crypto_unregister_alg(&tmp_algs->alg.crypto);
+ 		else
+-			crypto_unregister_ahash(&rk_cipher_algs[i]->alg.hash);
++			crypto_unregister_ahash(&tmp_algs->alg.hash);
+ 	}
+ 	return err;
+ }
+ 
+-static void rk_crypto_unregister(void)
++static void rk_crypto_unregister(struct rk_crypto_info *crypto_info)
+ {
+ 	unsigned int i;
++	struct rk_crypto_tmp **algs;
++	struct rk_crypto_tmp *tmp_algs;
++
++	algs = crypto_info->soc_data->cipher_algs;
+ 
+-	for (i = 0; i < ARRAY_SIZE(rk_cipher_algs); i++) {
+-		if (rk_cipher_algs[i]->type == ALG_TYPE_CIPHER)
+-			crypto_unregister_alg(&rk_cipher_algs[i]->alg.crypto);
++	for (i = 0; i < crypto_info->soc_data->cipher_num; i++, algs++) {
++		tmp_algs = *algs;
++		if (tmp_algs->type == ALG_TYPE_CIPHER)
++			crypto_unregister_alg(&tmp_algs->alg.crypto);
+ 		else
+-			crypto_unregister_ahash(&rk_cipher_algs[i]->alg.hash);
++			crypto_unregister_ahash(&tmp_algs->alg.hash);
+ 	}
+ }
+ 
+@@ -303,21 +273,109 @@ static void rk_crypto_action(void *data)
+ {
+ 	struct rk_crypto_info *crypto_info = data;
+ 
+-	reset_control_assert(crypto_info->rst);
++	if (crypto_info->rst)
++		reset_control_assert(crypto_info->rst);
+ }
+ 
++#ifdef CONFIG_CRYPTO_DEV_ROCKCHIP_V2
++static const char * const px30_crypto_clks[] = {
++	"hclk",
++	"aclk",
++	"sclk",
++	"apb_pclk",
++};
++
++static const char * const px30_crypto_rsts[] = {
++	"crypto-rst",
++};
++
++static struct rk_crypto_tmp *px30_cipher_algs[] = {
++	&rk_v2_ecb_aes_alg,
++	&rk_v2_cbc_aes_alg,
++	&rk_v2_ecb_des_alg,
++	&rk_v2_xts_aes_alg,
++	&rk_v2_cbc_des_alg,
++	&rk_v2_ecb_des3_ede_alg,
++	&rk_v2_cbc_des3_ede_alg,
++};
++
++static const struct rk_crypto_soc_data px30_soc_data = {
++	.cipher_algs = &px30_cipher_algs[0],
++	.cipher_num = ARRAY_SIZE(px30_cipher_algs),
++	.clks = px30_crypto_clks,
++	.clks_num = ARRAY_SIZE(px30_crypto_clks),
++	.rsts = px30_crypto_rsts,
++	.rsts_num = ARRAY_SIZE(px30_crypto_rsts),
++	.hw_init = rk_hw_crypto_v2_init,
++	.hw_deinit = rk_hw_crypto_v2_deinit,
++	.hw_info_size = sizeof(struct rk_hw_crypto_v2_info),
++};
++#endif
++
++#ifdef CONFIG_CRYPTO_DEV_ROCKCHIP_V1
++
++static const char * const rk3288_crypto_clks[] = {
++	"hclk",
++	"aclk",
++	"sclk",
++	"apb_pclk",
++};
++
++static const char * const rk3288_crypto_rsts[] = {
++	"crypto-rst",
++};
++
++static struct rk_crypto_tmp *rk3288_cipher_algs[] = {
++	&rk_v1_ecb_aes_alg,
++	&rk_v1_cbc_aes_alg,
++	&rk_v1_ecb_des_alg,
++	&rk_v1_cbc_des_alg,
++	&rk_v1_ecb_des3_ede_alg,
++	&rk_v1_cbc_des3_ede_alg,
++	&rk_v1_ahash_sha1,
++	&rk_v1_ahash_sha256,
++	&rk_v1_ahash_md5,
++};
++
++static const struct rk_crypto_soc_data rk3288_soc_data = {
++	.cipher_algs = &rk3288_cipher_algs[0],
++	.cipher_num = ARRAY_SIZE(rk3288_cipher_algs),
++	.clks = rk3288_crypto_clks,
++	.clks_num = ARRAY_SIZE(rk3288_crypto_clks),
++	.rsts = rk3288_crypto_rsts,
++	.rsts_num = ARRAY_SIZE(rk3288_crypto_rsts),
++	.hw_init = rk_hw_crypto_v1_init,
++	.hw_deinit = rk_hw_crypto_v1_deinit,
++	.hw_info_size = sizeof(struct rk_hw_crypto_v1_info),
++};
++#endif
++
+ static const struct of_device_id crypto_of_id_table[] = {
+-	{ .compatible = "rockchip,rk3288-crypto" },
+-	{}
++#ifdef CONFIG_CRYPTO_DEV_ROCKCHIP_V2
++	{
++		.compatible = "rockchip,px30-crypto",
++		.data = (void *)&px30_soc_data,
++	},
++#endif
++#ifdef CONFIG_CRYPTO_DEV_ROCKCHIP_V1
++	{
++		.compatible = "rockchip,rk3288-crypto",
++		.data = (void *)&rk3288_soc_data,
++	},
++#endif
++	{ /* sentinel */ }
+ };
++
+ MODULE_DEVICE_TABLE(of, crypto_of_id_table);
+ 
+ static int rk_crypto_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+ 	struct device *dev = &pdev->dev;
++	struct device_node *np = pdev->dev.of_node;
++	const struct of_device_id *match;
+ 	struct rk_crypto_info *crypto_info;
+-	int err = 0;
++	int err = 0, i;
+ 
+ 	crypto_info = devm_kzalloc(&pdev->dev,
+ 				   sizeof(*crypto_info), GFP_KERNEL);
+@@ -326,15 +384,28 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 		goto err_crypto;
+ 	}
+ 
+-	crypto_info->rst = devm_reset_control_get(dev, "crypto-rst");
+-	if (IS_ERR(crypto_info->rst)) {
+-		err = PTR_ERR(crypto_info->rst);
+-		goto err_crypto;
+-	}
++	match = of_match_node(crypto_of_id_table, np);
++	crypto_info->soc_data = (struct rk_crypto_soc_data *)match->data;
++
++	crypto_info->clk_bulks =
++		devm_kzalloc(&pdev->dev, sizeof(*crypto_info->clk_bulks) *
++			     crypto_info->soc_data->clks_num, GFP_KERNEL);
++
++	for (i = 0; i < crypto_info->soc_data->clks_num; i++)
++		crypto_info->clk_bulks[i].id = crypto_info->soc_data->clks[i];
+ 
+-	reset_control_assert(crypto_info->rst);
+-	usleep_range(10, 20);
+-	reset_control_deassert(crypto_info->rst);
++	if (crypto_info->soc_data->rsts[0]) {
++		crypto_info->rst =
++			devm_reset_control_get(dev,
++					       crypto_info->soc_data->rsts[0]);
++		if (IS_ERR(crypto_info->rst)) {
++			err = PTR_ERR(crypto_info->rst);
++			goto err_crypto;
++		}
++		reset_control_assert(crypto_info->rst);
++		usleep_range(10, 20);
++		reset_control_deassert(crypto_info->rst);
++	}
+ 
+ 	err = devm_add_action_or_reset(dev, rk_crypto_action, crypto_info);
+ 	if (err)
+@@ -349,27 +420,10 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 		goto err_crypto;
+ 	}
+ 
+-	crypto_info->aclk = devm_clk_get(&pdev->dev, "aclk");
+-	if (IS_ERR(crypto_info->aclk)) {
+-		err = PTR_ERR(crypto_info->aclk);
+-		goto err_crypto;
+-	}
+-
+-	crypto_info->hclk = devm_clk_get(&pdev->dev, "hclk");
+-	if (IS_ERR(crypto_info->hclk)) {
+-		err = PTR_ERR(crypto_info->hclk);
+-		goto err_crypto;
+-	}
+-
+-	crypto_info->sclk = devm_clk_get(&pdev->dev, "sclk");
+-	if (IS_ERR(crypto_info->sclk)) {
+-		err = PTR_ERR(crypto_info->sclk);
+-		goto err_crypto;
+-	}
+-
+-	crypto_info->dmaclk = devm_clk_get(&pdev->dev, "apb_pclk");
+-	if (IS_ERR(crypto_info->dmaclk)) {
+-		err = PTR_ERR(crypto_info->dmaclk);
++	err = devm_clk_bulk_get(dev, crypto_info->soc_data->clks_num,
++				crypto_info->clk_bulks);
++	if (err) {
++		dev_err(&pdev->dev, "failed to get clks property\n");
+ 		goto err_crypto;
+ 	}
+ 
+@@ -391,6 +445,28 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	crypto_info->dev = &pdev->dev;
++
++	crypto_info->hw_info =
++		devm_kzalloc(&pdev->dev,
++			     crypto_info->soc_data->hw_info_size, GFP_KERNEL);
++	if (!crypto_info->hw_info) {
++		err = -ENOMEM;
++		goto err_crypto;
++	}
++
++	err = crypto_info->soc_data->hw_init(&pdev->dev, crypto_info->hw_info);
++	if (err) {
++		dev_err(crypto_info->dev, "hw_init failed.\n");
++		goto err_crypto;
++	}
++
++	crypto_info->addr_vir = (char *)__get_free_page(GFP_KERNEL);
++	if (!crypto_info->addr_vir) {
++		err = -ENOMEM;
++		dev_err(crypto_info->dev, "__get_free_page failed.\n");
++		goto err_crypto;
++	}
++
+ 	platform_set_drvdata(pdev, crypto_info);
+ 
+ 	tasklet_init(&crypto_info->queue_task,
+@@ -424,11 +500,17 @@ static int rk_crypto_probe(struct platform_device *pdev)
+ 
+ static int rk_crypto_remove(struct platform_device *pdev)
+ {
+-	struct rk_crypto_info *crypto_tmp = platform_get_drvdata(pdev);
++	struct rk_crypto_info *crypto_info = platform_get_drvdata(pdev);
++
++	rk_crypto_unregister(crypto_info);
++	tasklet_kill(&crypto_info->done_task);
++	tasklet_kill(&crypto_info->queue_task);
++
++	if (crypto_info->addr_vir)
++		free_page((unsigned long)crypto_info->addr_vir);
++
++	crypto_info->soc_data->hw_deinit(&pdev->dev, crypto_info->hw_info);
+ 
+-	rk_crypto_unregister();
+-	tasklet_kill(&crypto_tmp->done_task);
+-	tasklet_kill(&crypto_tmp->queue_task);
+ 	return 0;
+ }
+ 
+@@ -436,13 +518,13 @@ static struct platform_driver crypto_driver = {
+ 	.probe		= rk_crypto_probe,
+ 	.remove		= rk_crypto_remove,
+ 	.driver		= {
+-		.name	= "rk3288-crypto",
++		.name	= "rk-crypto",
+ 		.of_match_table	= crypto_of_id_table,
+ 	},
+ };
+ 
+ module_platform_driver(crypto_driver);
+ 
+-MODULE_AUTHOR("Zain Wang <zain.wang@rock-chips.com>");
++MODULE_AUTHOR("Lin Jinhan <troy.lin@rock-chips.com>");
+ MODULE_DESCRIPTION("Support for Rockchip's cryptographic engine");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/crypto/rockchip/rk_crypto_core.h b/drivers/crypto/rockchip/rk_crypto_core.h
+new file mode 100644
+index 000000000000..504499ce8c95
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_core.h
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
++
++#ifndef __RK_CRYPTO_CORE_H__
++#define __RK_CRYPTO_CORE_H__
++
++#include <crypto/aes.h>
++#include <crypto/des.h>
++#include <crypto/algapi.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <crypto/internal/hash.h>
++
++#include <linux/clk.h>
++#include <crypto/md5.h>
++#include <crypto/sha.h>
++
++struct rk_crypto_soc_data {
++	struct rk_crypto_tmp **cipher_algs;
++	int cipher_num;
++	const char * const *clks;
++	const char * const *rsts;
++	int clks_num;
++	int rsts_num;
++	unsigned int hw_info_size;
++	int (*hw_init)(struct device *dev, void *hw_info);
++	void (*hw_deinit)(struct device *dev, void *hw_info);
++};
++
++struct rk_crypto_info {
++	struct device			*dev;
++	struct reset_control		*rst;
++	void __iomem			*reg;
++	int				irq;
++	struct crypto_queue		queue;
++	struct tasklet_struct		queue_task;
++	struct tasklet_struct		done_task;
++	struct crypto_async_request	*async_req;
++	int					err;
++	void				*hw_info;
++	/* device lock */
++	spinlock_t			lock;
++
++	/* the public variable */
++	struct scatterlist		*sg_src;
++	struct scatterlist		*sg_dst;
++	struct scatterlist		sg_tmp;
++	struct scatterlist		*first;
++	struct rk_crypto_soc_data	*soc_data;
++	struct clk_bulk_data	*clk_bulks;
++	unsigned int			left_bytes;
++	void				*addr_vir;
++	int				aligned;
++	int				align_size;
++	size_t				src_nents;
++	size_t				dst_nents;
++	unsigned int			total;
++	unsigned int			count;
++	dma_addr_t			addr_in;
++	dma_addr_t			addr_out;
++	bool				busy;
++	int (*start)(struct rk_crypto_info *dev);
++	int (*update)(struct rk_crypto_info *dev);
++	void (*complete)(struct crypto_async_request *base, int err);
++	int (*enable_clk)(struct rk_crypto_info *dev);
++	void (*disable_clk)(struct rk_crypto_info *dev);
++	int (*irq_handle)(int irq, void *dev_id);
++	int (*load_data)(struct rk_crypto_info *dev,
++			 struct scatterlist *sg_src,
++			 struct scatterlist *sg_dst);
++	void (*unload_data)(struct rk_crypto_info *dev);
++	int (*enqueue)(struct rk_crypto_info *dev,
++		       struct crypto_async_request *async_req);
++};
++
++/* the private variable of hash */
++struct rk_ahash_ctx {
++	struct rk_crypto_info		*dev;
++	/* for fallback */
++	struct crypto_ahash		*fallback_tfm;
++};
++
++/* the privete variable of hash for fallback */
++struct rk_ahash_rctx {
++	struct ahash_request		fallback_req;
++	u32				mode;
++};
++
++/* the private variable of cipher */
++struct rk_cipher_ctx {
++	struct rk_crypto_info		*dev;
++	unsigned char			key[AES_MAX_KEY_SIZE * 2];
++	unsigned int			keylen;
++	u32				mode;
++	u8				iv[AES_BLOCK_SIZE];
++};
++
++enum alg_type {
++	ALG_TYPE_HASH,
++	ALG_TYPE_CIPHER,
++};
++
++struct rk_crypto_tmp {
++	struct rk_crypto_info		*dev;
++	union {
++		struct crypto_alg	crypto;
++		struct ahash_alg	hash;
++	} alg;
++	enum alg_type			type;
++};
++
++#define CRYPTO_READ(dev, offset)		  \
++		readl_relaxed(((dev)->reg + (offset)))
++#define CRYPTO_WRITE(dev, offset, val)	  \
++		writel_relaxed((val), ((dev)->reg + (offset)))
++
++#endif
++
+diff --git a/drivers/crypto/rockchip/rk_crypto_v1.h b/drivers/crypto/rockchip/rk_crypto_v1.h
+new file mode 100644
+index 000000000000..90ad0f9c43d6
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v1.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
++
++#ifndef __RK_CRYPTO_V1_H__
++#define __RK_CRYPTO_V1_H__
++
++#include <linux/platform_device.h>
++
++struct rk_hw_crypto_v1_info {
++	int	clk_enable;
++};
++
++extern struct rk_crypto_tmp rk_v1_ecb_aes_alg;
++extern struct rk_crypto_tmp rk_v1_cbc_aes_alg;
++extern struct rk_crypto_tmp rk_v1_ecb_des_alg;
++extern struct rk_crypto_tmp rk_v1_cbc_des_alg;
++extern struct rk_crypto_tmp rk_v1_ecb_des3_ede_alg;
++extern struct rk_crypto_tmp rk_v1_cbc_des3_ede_alg;
++
++extern struct rk_crypto_tmp rk_v1_ahash_sha1;
++extern struct rk_crypto_tmp rk_v1_ahash_sha256;
++extern struct rk_crypto_tmp rk_v1_ahash_md5;
++
++int rk_hw_crypto_v1_init(struct device *dev, void *hw_info);
++void rk_hw_crypto_v1_deinit(struct device *dev, void *hw_info);
++#endif
++
+diff --git a/drivers/crypto/rockchip/rk3288_crypto_ablkcipher.c b/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
+similarity index 90%
+rename from drivers/crypto/rockchip/rk3288_crypto_ablkcipher.c
+rename to drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
+index 204e4ad62c38..5830fa7d6817 100644
+--- a/drivers/crypto/rockchip/rk3288_crypto_ablkcipher.c
++++ b/drivers/crypto/rockchip/rk_crypto_v1_ablkcipher.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Crypto acceleration support for Rockchip RK3288
+  *
+@@ -5,16 +6,30 @@
+  *
+  * Author: Zain Wang <zain.wang@rock-chips.com>
+  *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+  * Some ideas are from marvell-cesa.c and s5p-sss.c driver.
+  */
+-#include "rk3288_crypto.h"
++#include "rk_crypto_core.h"
++#include "rk_crypto_v1.h"
++#include "rk_crypto_v1_reg.h"
+ 
+ #define RK_CRYPTO_DEC			BIT(0)
+ 
++static int rk_crypto_irq_handle(int irq, void *dev_id)
++{
++	struct rk_crypto_info *dev  = platform_get_drvdata(dev_id);
++	u32 interrupt_status;
++
++	interrupt_status = CRYPTO_READ(dev, RK_CRYPTO_INTSTS);
++	CRYPTO_WRITE(dev, RK_CRYPTO_INTSTS, interrupt_status);
++
++	if (interrupt_status & 0x0a) {
++		dev_warn(dev->dev, "DMA Error\n");
++		dev->err = -EFAULT;
++	}
++
++	return 0;
++}
++
+ static void rk_crypto_complete(struct crypto_async_request *base, int err)
+ {
+ 	if (base->complete)
+@@ -41,8 +56,8 @@ static int rk_aes_setkey(struct crypto_ablkcipher *cipher,
+ 		crypto_ablkcipher_set_flags(cipher, CRYPTO_TFM_RES_BAD_KEY_LEN);
+ 		return -EINVAL;
+ 	}
++	memcpy(ctx->key, key, keylen);
+ 	ctx->keylen = keylen;
+-	memcpy_toio(ctx->dev->reg + RK_CRYPTO_AES_KEY_0, key, keylen);
+ 	return 0;
+ }
+ 
+@@ -66,8 +81,8 @@ static int rk_tdes_setkey(struct crypto_ablkcipher *cipher,
+ 		}
+ 	}
+ 
++	memcpy(ctx->key, key, keylen);
+ 	ctx->keylen = keylen;
+-	memcpy_toio(ctx->dev->reg + RK_CRYPTO_TDES_KEY1_0, key, keylen);
+ 	return 0;
+ }
+ 
+@@ -205,6 +220,8 @@ static void rk_ablk_hw_init(struct rk_crypto_info *dev)
+ 	ivsize = crypto_ablkcipher_ivsize(cipher);
+ 
+ 	if (block == DES_BLOCK_SIZE) {
++		memcpy_toio(ctx->dev->reg + RK_CRYPTO_TDES_KEY1_0,
++			    ctx->key, ctx->keylen);
+ 		ctx->mode |= RK_CRYPTO_TDES_FIFO_MODE |
+ 			     RK_CRYPTO_TDES_BYTESWAP_KEY |
+ 			     RK_CRYPTO_TDES_BYTESWAP_IV;
+@@ -212,6 +229,8 @@ static void rk_ablk_hw_init(struct rk_crypto_info *dev)
+ 		memcpy_toio(dev->reg + RK_CRYPTO_TDES_IV_0, req->info, ivsize);
+ 		conf_reg = RK_CRYPTO_DESSEL;
+ 	} else {
++		memcpy_toio(ctx->dev->reg + RK_CRYPTO_AES_KEY_0,
++			    ctx->key, ctx->keylen);
+ 		ctx->mode |= RK_CRYPTO_AES_FIFO_MODE |
+ 			     RK_CRYPTO_AES_KEY_CHANGE |
+ 			     RK_CRYPTO_AES_BYTESWAP_KEY |
+@@ -378,6 +397,7 @@ static int rk_ablk_cra_init(struct crypto_tfm *tfm)
+ 	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct crypto_alg *alg = tfm->__crt_alg;
+ 	struct rk_crypto_tmp *algt;
++	struct rk_hw_crypto_v1_info *hw_info;
+ 
+ 	algt = container_of(alg, struct rk_crypto_tmp, alg.crypto);
+ 
+@@ -386,20 +406,40 @@ static int rk_ablk_cra_init(struct crypto_tfm *tfm)
+ 	ctx->dev->start = rk_ablk_start;
+ 	ctx->dev->update = rk_ablk_rx;
+ 	ctx->dev->complete = rk_crypto_complete;
+-	ctx->dev->addr_vir = (char *)__get_free_page(GFP_KERNEL);
++	ctx->dev->irq_handle = rk_crypto_irq_handle;
++
++	hw_info = (struct rk_hw_crypto_v1_info *)ctx->dev->hw_info;
++
++	if (hw_info->clk_enable == 0)
++		ctx->dev->enable_clk(ctx->dev);
+ 
+-	return ctx->dev->addr_vir ? ctx->dev->enable_clk(ctx->dev) : -ENOMEM;
++	hw_info->clk_enable++;
++
++	return 0;
+ }
+ 
+ static void rk_ablk_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++	struct rk_hw_crypto_v1_info *hw_info =
++		(struct rk_hw_crypto_v1_info *)ctx->dev->hw_info;
++
++	hw_info->clk_enable--;
++
++	if (hw_info->clk_enable == 0)
++		ctx->dev->disable_clk(ctx->dev);
++}
+ 
+-	free_page((unsigned long)ctx->dev->addr_vir);
+-	ctx->dev->disable_clk(ctx->dev);
++int rk_hw_crypto_v1_init(struct device *dev, void *hw_info)
++{
++	return 0;
++}
++
++void rk_hw_crypto_v1_deinit(struct device *dev, void *hw_info)
++{
+ }
+ 
+-struct rk_crypto_tmp rk_ecb_aes_alg = {
++struct rk_crypto_tmp rk_v1_ecb_aes_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "ecb(aes)",
+@@ -424,7 +464,7 @@ struct rk_crypto_tmp rk_ecb_aes_alg = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_cbc_aes_alg = {
++struct rk_crypto_tmp rk_v1_cbc_aes_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "cbc(aes)",
+@@ -450,7 +490,7 @@ struct rk_crypto_tmp rk_cbc_aes_alg = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_ecb_des_alg = {
++struct rk_crypto_tmp rk_v1_ecb_des_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "ecb(des)",
+@@ -475,7 +515,7 @@ struct rk_crypto_tmp rk_ecb_des_alg = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_cbc_des_alg = {
++struct rk_crypto_tmp rk_v1_cbc_des_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "cbc(des)",
+@@ -501,7 +541,7 @@ struct rk_crypto_tmp rk_cbc_des_alg = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_ecb_des3_ede_alg = {
++struct rk_crypto_tmp rk_v1_ecb_des3_ede_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "ecb(des3_ede)",
+@@ -527,7 +567,7 @@ struct rk_crypto_tmp rk_ecb_des3_ede_alg = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_cbc_des3_ede_alg = {
++struct rk_crypto_tmp rk_v1_cbc_des3_ede_alg = {
+ 	.type = ALG_TYPE_CIPHER,
+ 	.alg.crypto = {
+ 		.cra_name		= "cbc(des3_ede)",
+diff --git a/drivers/crypto/rockchip/rk3288_crypto_ahash.c b/drivers/crypto/rockchip/rk_crypto_v1_ahash.c
+similarity index 87%
+rename from drivers/crypto/rockchip/rk3288_crypto_ahash.c
+rename to drivers/crypto/rockchip/rk_crypto_v1_ahash.c
+index c336ae75e361..e29ce0ff767c 100644
+--- a/drivers/crypto/rockchip/rk3288_crypto_ahash.c
++++ b/drivers/crypto/rockchip/rk_crypto_v1_ahash.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Crypto acceleration support for Rockchip RK3288
+  *
+@@ -5,19 +6,33 @@
+  *
+  * Author: Zain Wang <zain.wang@rock-chips.com>
+  *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+  * Some ideas are from marvell/cesa.c and s5p-sss.c driver.
+  */
+-#include "rk3288_crypto.h"
++#include "rk_crypto_core.h"
++#include "rk_crypto_v1.h"
++#include "rk_crypto_v1_reg.h"
+ 
+ /*
+  * IC can not process zero message hash,
+  * so we put the fixed hash out when met zero message.
+  */
+ 
++static int rk_crypto_irq_handle(int irq, void *dev_id)
++{
++	struct rk_crypto_info *dev  = platform_get_drvdata(dev_id);
++	u32 interrupt_status;
++
++	interrupt_status = CRYPTO_READ(dev, RK_CRYPTO_INTSTS);
++	CRYPTO_WRITE(dev, RK_CRYPTO_INTSTS, interrupt_status);
++
++	if (interrupt_status & 0x0a) {
++		dev_warn(dev->dev, "DMA Error\n");
++		dev->err = -EFAULT;
++	}
++
++	return 0;
++}
++
+ static int zero_message_process(struct ahash_request *req)
+ {
+ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+@@ -274,47 +289,55 @@ static int rk_ahash_crypto_rx(struct rk_crypto_info *dev)
+ 
+ static int rk_cra_hash_init(struct crypto_tfm *tfm)
+ {
+-	struct rk_ahash_ctx *tctx = crypto_tfm_ctx(tfm);
++	struct rk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct rk_crypto_tmp *algt;
+ 	struct ahash_alg *alg = __crypto_ahash_alg(tfm->__crt_alg);
++	struct rk_hw_crypto_v1_info *hw_info;
+ 
+ 	const char *alg_name = crypto_tfm_alg_name(tfm);
+ 
+ 	algt = container_of(alg, struct rk_crypto_tmp, alg.hash);
+ 
+-	tctx->dev = algt->dev;
+-	tctx->dev->addr_vir = (void *)__get_free_page(GFP_KERNEL);
+-	if (!tctx->dev->addr_vir) {
+-		dev_err(tctx->dev->dev, "failed to kmalloc for addr_vir\n");
+-		return -ENOMEM;
+-	}
+-	tctx->dev->start = rk_ahash_start;
+-	tctx->dev->update = rk_ahash_crypto_rx;
+-	tctx->dev->complete = rk_ahash_crypto_complete;
++	ctx->dev = algt->dev;
++	ctx->dev->start = rk_ahash_start;
++	ctx->dev->update = rk_ahash_crypto_rx;
++	ctx->dev->complete = rk_ahash_crypto_complete;
++	ctx->dev->irq_handle = rk_crypto_irq_handle;
+ 
+ 	/* for fallback */
+-	tctx->fallback_tfm = crypto_alloc_ahash(alg_name, 0,
++	ctx->fallback_tfm = crypto_alloc_ahash(alg_name, 0,
+ 					       CRYPTO_ALG_NEED_FALLBACK);
+-	if (IS_ERR(tctx->fallback_tfm)) {
+-		dev_err(tctx->dev->dev, "Could not load fallback driver.\n");
+-		return PTR_ERR(tctx->fallback_tfm);
++	if (IS_ERR(ctx->fallback_tfm)) {
++		dev_err(ctx->dev->dev, "Could not load fallback driver.\n");
++		return PTR_ERR(ctx->fallback_tfm);
+ 	}
+ 	crypto_ahash_set_reqsize(__crypto_ahash_cast(tfm),
+ 				 sizeof(struct rk_ahash_rctx) +
+-				 crypto_ahash_reqsize(tctx->fallback_tfm));
++				 crypto_ahash_reqsize(ctx->fallback_tfm));
++
++	hw_info = (struct rk_hw_crypto_v1_info *)ctx->dev->hw_info;
++
++	if (hw_info->clk_enable == 0)
++		ctx->dev->enable_clk(ctx->dev);
+ 
+-	return tctx->dev->enable_clk(tctx->dev);
++	hw_info->clk_enable++;
++
++	return 0;
+ }
+ 
+ static void rk_cra_hash_exit(struct crypto_tfm *tfm)
+ {
+-	struct rk_ahash_ctx *tctx = crypto_tfm_ctx(tfm);
++	struct rk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
++	struct rk_hw_crypto_v1_info *hw_info =
++		(struct rk_hw_crypto_v1_info *)ctx->dev->hw_info;
++
++	hw_info->clk_enable--;
+ 
+-	free_page((unsigned long)tctx->dev->addr_vir);
+-	return tctx->dev->disable_clk(tctx->dev);
++	if (hw_info->clk_enable == 0)
++		ctx->dev->disable_clk(ctx->dev);
+ }
+ 
+-struct rk_crypto_tmp rk_ahash_sha1 = {
++struct rk_crypto_tmp rk_v1_ahash_sha1 = {
+ 	.type = ALG_TYPE_HASH,
+ 	.alg.hash = {
+ 		.init = rk_ahash_init,
+@@ -344,7 +367,7 @@ struct rk_crypto_tmp rk_ahash_sha1 = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_ahash_sha256 = {
++struct rk_crypto_tmp rk_v1_ahash_sha256 = {
+ 	.type = ALG_TYPE_HASH,
+ 	.alg.hash = {
+ 		.init = rk_ahash_init,
+@@ -374,7 +397,7 @@ struct rk_crypto_tmp rk_ahash_sha256 = {
+ 	}
+ };
+ 
+-struct rk_crypto_tmp rk_ahash_md5 = {
++struct rk_crypto_tmp rk_v1_ahash_md5 = {
+ 	.type = ALG_TYPE_HASH,
+ 	.alg.hash = {
+ 		.init = rk_ahash_init,
+diff --git a/drivers/crypto/rockchip/rk3288_crypto.h b/drivers/crypto/rockchip/rk_crypto_v1_reg.h
+similarity index 67%
+rename from drivers/crypto/rockchip/rk3288_crypto.h
+rename to drivers/crypto/rockchip/rk_crypto_v1_reg.h
+index 54ee5b3ed9db..cf520527a1a8 100644
+--- a/drivers/crypto/rockchip/rk3288_crypto.h
++++ b/drivers/crypto/rockchip/rk_crypto_v1_reg.h
+@@ -1,16 +1,9 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-#ifndef __RK3288_CRYPTO_H__
+-#define __RK3288_CRYPTO_H__
+ 
+-#include <crypto/aes.h>
+-#include <crypto/des.h>
+-#include <crypto/algapi.h>
+-#include <linux/interrupt.h>
+-#include <linux/delay.h>
+-#include <crypto/internal/hash.h>
++/* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
+ 
+-#include <crypto/md5.h>
+-#include <crypto/sha.h>
++#ifndef __RK_CRYPTO_V1_REG_H__
++#define __RK_CRYPTO_V1_REG_H__
+ 
+ #define _SBF(v, f)			((v) << (f))
+ 
+@@ -176,101 +169,4 @@
+ #define RK_CRYPTO_HASH_DOUT_6		0x01a4
+ #define RK_CRYPTO_HASH_DOUT_7		0x01a8
+ 
+-#define CRYPTO_READ(dev, offset)		  \
+-		readl_relaxed(((dev)->reg + (offset)))
+-#define CRYPTO_WRITE(dev, offset, val)	  \
+-		writel_relaxed((val), ((dev)->reg + (offset)))
+-
+-struct rk_crypto_info {
+-	struct device			*dev;
+-	struct clk			*aclk;
+-	struct clk			*hclk;
+-	struct clk			*sclk;
+-	struct clk			*dmaclk;
+-	struct reset_control		*rst;
+-	void __iomem			*reg;
+-	int				irq;
+-	struct crypto_queue		queue;
+-	struct tasklet_struct		queue_task;
+-	struct tasklet_struct		done_task;
+-	struct crypto_async_request	*async_req;
+-	int 				err;
+-	/* device lock */
+-	spinlock_t			lock;
+-
+-	/* the public variable */
+-	struct scatterlist		*sg_src;
+-	struct scatterlist		*sg_dst;
+-	struct scatterlist		sg_tmp;
+-	struct scatterlist		*first;
+-	unsigned int			left_bytes;
+-	void				*addr_vir;
+-	int				aligned;
+-	int				align_size;
+-	size_t				src_nents;
+-	size_t				dst_nents;
+-	unsigned int			total;
+-	unsigned int			count;
+-	dma_addr_t			addr_in;
+-	dma_addr_t			addr_out;
+-	bool				busy;
+-	int (*start)(struct rk_crypto_info *dev);
+-	int (*update)(struct rk_crypto_info *dev);
+-	void (*complete)(struct crypto_async_request *base, int err);
+-	int (*enable_clk)(struct rk_crypto_info *dev);
+-	void (*disable_clk)(struct rk_crypto_info *dev);
+-	int (*load_data)(struct rk_crypto_info *dev,
+-			 struct scatterlist *sg_src,
+-			 struct scatterlist *sg_dst);
+-	void (*unload_data)(struct rk_crypto_info *dev);
+-	int (*enqueue)(struct rk_crypto_info *dev,
+-		       struct crypto_async_request *async_req);
+-};
+-
+-/* the private variable of hash */
+-struct rk_ahash_ctx {
+-	struct rk_crypto_info		*dev;
+-	/* for fallback */
+-	struct crypto_ahash		*fallback_tfm;
+-};
+-
+-/* the privete variable of hash for fallback */
+-struct rk_ahash_rctx {
+-	struct ahash_request		fallback_req;
+-	u32				mode;
+-};
+-
+-/* the private variable of cipher */
+-struct rk_cipher_ctx {
+-	struct rk_crypto_info		*dev;
+-	unsigned int			keylen;
+-	u32				mode;
+-	u8				iv[AES_BLOCK_SIZE];
+-};
+-
+-enum alg_type {
+-	ALG_TYPE_HASH,
+-	ALG_TYPE_CIPHER,
+-};
+-
+-struct rk_crypto_tmp {
+-	struct rk_crypto_info		*dev;
+-	union {
+-		struct crypto_alg	crypto;
+-		struct ahash_alg	hash;
+-	} alg;
+-	enum alg_type			type;
+-};
+-
+-extern struct rk_crypto_tmp rk_ecb_aes_alg;
+-extern struct rk_crypto_tmp rk_cbc_aes_alg;
+-extern struct rk_crypto_tmp rk_ecb_des_alg;
+-extern struct rk_crypto_tmp rk_cbc_des_alg;
+-extern struct rk_crypto_tmp rk_ecb_des3_ede_alg;
+-extern struct rk_crypto_tmp rk_cbc_des3_ede_alg;
+-
+-extern struct rk_crypto_tmp rk_ahash_sha1;
+-extern struct rk_crypto_tmp rk_ahash_sha256;
+-extern struct rk_crypto_tmp rk_ahash_md5;
+-
+ #endif
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2.h b/drivers/crypto/rockchip/rk_crypto_v2.h
+new file mode 100644
+index 000000000000..61e5d21091e1
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v2.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
++
++#ifndef __RK_CRYPTO_V2_H__
++#define __RK_CRYPTO_V2_H__
++
++#include <linux/platform_device.h>
++
++struct crypto_lli_desc {
++	u32 src_addr;
++	u32 src_len;
++	u32 dst_addr;
++	u32 dst_len;
++	u32 user_define;
++	u32 reserve;
++	u32 dma_ctrl;
++	u32 next_addr;
++};
++
++struct rk_hw_crypto_v2_info {
++	struct crypto_lli_desc		*desc;
++	dma_addr_t			desc_dma;
++	int				clk_enable;
++};
++
++extern struct rk_crypto_tmp rk_v2_ecb_aes_alg;
++extern struct rk_crypto_tmp rk_v2_cbc_aes_alg;
++extern struct rk_crypto_tmp rk_v2_ecb_des_alg;
++extern struct rk_crypto_tmp rk_v2_xts_aes_alg;
++extern struct rk_crypto_tmp rk_v2_cbc_des_alg;
++extern struct rk_crypto_tmp rk_v2_ecb_des3_ede_alg;
++extern struct rk_crypto_tmp rk_v2_cbc_des3_ede_alg;
++
++int rk_hw_crypto_v2_init(struct device *dev, void *hw_info);
++void rk_hw_crypto_v2_deinit(struct device *dev, void *hw_info);
++#endif
++
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c b/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
+new file mode 100644
+index 000000000000..1d031bd0218a
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v2_ablkcipher.c
+@@ -0,0 +1,774 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Crypto acceleration support for Rockchip Crypto V2
++ *
++ * Copyright (c) 2018, Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * Author: Lin Jinhan <troy.lin@rock-chips.com>
++ *
++ * Some ideas are from marvell-cesa.c and s5p-sss.c driver.
++ */
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include "rk_crypto_core.h"
++#include "rk_crypto_v2.h"
++#include "rk_crypto_v2_reg.h"
++
++#define RK_CRYPTO_DEC		BIT(0)
++#define IS_AES_XTS(mode)	(((mode) & RK_CRYPTO_AES_XTS_MODE) \
++					== RK_CRYPTO_AES_XTS_MODE)
++
++static int rk_crypto_irq_handle(int irq, void *dev_id)
++{
++	struct rk_crypto_info *dev  = platform_get_drvdata(dev_id);
++	u32 interrupt_status;
++	struct rk_hw_crypto_v2_info *hw_info =
++			(struct rk_hw_crypto_v2_info *)dev->hw_info;
++
++	interrupt_status = CRYPTO_READ(dev, CRYPTO_DMA_INT_ST);
++	CRYPTO_WRITE(dev, CRYPTO_DMA_INT_ST, interrupt_status);
++
++	if (interrupt_status != CRYPTO_DST_ITEM_DONE_INT_ST) {
++		dev_err(dev->dev, "DMA desc = %p\n", hw_info->desc);
++		dev_err(dev->dev, "DMA addr_in = %08x\n",
++			(u32)dev->addr_in);
++		dev_err(dev->dev, "DMA addr_out = %08x\n",
++			(u32)dev->addr_out);
++		dev_err(dev->dev, "DMA count = %08x\n", dev->count);
++		dev_err(dev->dev, "DMA desc_dma = %08x\n",
++			(u32)hw_info->desc_dma);
++		dev_err(dev->dev, "DMA Error status = %08x\n",
++			interrupt_status);
++		dev_err(dev->dev, "DMA CRYPTO_DMA_LLI_ADDR status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_LLI_ADDR));
++		dev_err(dev->dev, "DMA CRYPTO_DMA_ST status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_ST));
++		dev_err(dev->dev, "DMA CRYPTO_DMA_STATE status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_STATE));
++		dev_err(dev->dev, "DMA CRYPTO_DMA_LLI_RADDR status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_LLI_RADDR));
++		dev_err(dev->dev, "DMA CRYPTO_DMA_SRC_RADDR status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_SRC_RADDR));
++		dev_err(dev->dev, "DMA CRYPTO_DMA_DST_RADDR status = %08x\n",
++			CRYPTO_READ(dev, CRYPTO_DMA_DST_RADDR));
++		dev->err = -EFAULT;
++	}
++
++	return 0;
++}
++
++static u32 byte2word(const u8 *ch, u32 endian)
++{
++	u32 w = 0;
++
++	/* 0: Big-Endian 1: Little-Endian */
++	if (endian == BIG_ENDIAN)
++		w = (*ch << 24) + (*(ch + 1) << 16) +
++		    (*(ch + 2) << 8) + *(ch + 3);
++	else if (endian == LITTLE_ENDIAN)
++		w = (*(ch + 3) << 24) + (*(ch + 2) << 16) +
++		    (*(ch + 1) << 8) + *ch;
++
++	return w;
++}
++
++static void word2byte(u32 word, u8 *ch, u32 endian)
++{
++	/* 0: Big-Endian 1: Little-Endian */
++	if (endian == BIG_ENDIAN) {
++		ch[0] = (word >> 24) & 0xff;
++		ch[1] = (word >> 16) & 0xff;
++		ch[2] = (word >> 8) & 0xff;
++		ch[3] = (word >> 0) & 0xff;
++	} else if (endian == LITTLE_ENDIAN) {
++		ch[0] = (word >> 0) & 0xff;
++		ch[1] = (word >> 8) & 0xff;
++		ch[2] = (word >> 16) & 0xff;
++		ch[3] = (word >> 24) & 0xff;
++	} else {
++		ch[0] = 0;
++		ch[1] = 0;
++		ch[2] = 0;
++		ch[3] = 0;
++	}
++}
++
++static void set_iv_reg(struct rk_crypto_info *dev, const u8 *iv, u32 iv_len)
++{
++	u32 i;
++	u8 tmp_buf[4];
++	u32 base_iv;
++
++	base_iv = CRYPTO_CH0_IV_0;
++	/* write iv data to reg */
++	for (i = 0; i < iv_len / 4; i++, base_iv += 4)
++		CRYPTO_WRITE(dev, base_iv, byte2word(iv + i * 4, BIG_ENDIAN));
++
++	if (iv_len % 4) {
++		memset(tmp_buf, 0x00, sizeof(tmp_buf));
++		memcpy((u8 *)tmp_buf, iv + (iv_len / 4) * 4, iv_len % 4);
++		CRYPTO_WRITE(dev, base_iv, byte2word(tmp_buf, BIG_ENDIAN));
++	}
++
++	CRYPTO_WRITE(dev, CRYPTO_CH0_IV_LEN_0, iv_len);
++}
++
++static void read_iv_reg(struct rk_crypto_info *dev, u8 *iv, u32 iv_len)
++{
++	u32 i;
++	u32 base;
++
++	base = CRYPTO_CH0_IV_0;
++	/* read iv data from reg */
++	for (i = 0; i < iv_len / 4; i++, base += 4)
++		word2byte(CRYPTO_READ(dev, base), iv + 4 * i, BIG_ENDIAN);
++}
++
++static void write_key_reg(struct rk_crypto_info *dev, const u8 *key,
++			  u32 key_len)
++{
++	u32 i;
++	u8 tmp_buf[4];
++	u32 chn_base_addr;
++
++	chn_base_addr = CRYPTO_CH0_KEY_0;
++
++	for (i = 0; i < key_len / 4; i++, chn_base_addr += 4)
++		CRYPTO_WRITE(dev, chn_base_addr,
++			     byte2word(key + i * 4, BIG_ENDIAN));
++
++	if (key_len % 4) {
++		memset(tmp_buf, 0x00, sizeof(tmp_buf));
++		memcpy((u8 *)tmp_buf, key + i * 4, key_len % 4);
++		CRYPTO_WRITE(dev, chn_base_addr,
++			     byte2word(tmp_buf, BIG_ENDIAN));
++	}
++}
++
++static void write_tkey_reg(struct rk_crypto_info *dev, const u8 *key,
++			   u32 key_len)
++{
++	u32 i;
++	u8 tmp_buf[4];
++	u32 chn_base_addr;
++
++	chn_base_addr = CRYPTO_CH4_KEY_0;
++
++	for (i = 0; i < key_len / 4; i++, chn_base_addr += 4)
++		CRYPTO_WRITE(dev, chn_base_addr,
++			     byte2word(key + i * 4, BIG_ENDIAN));
++
++	if (key_len % 4) {
++		memset(tmp_buf, 0x00, sizeof(tmp_buf));
++		memcpy((u8 *)tmp_buf, key + i * 4, key_len % 4);
++		CRYPTO_WRITE(dev, chn_base_addr,
++			     byte2word(tmp_buf, BIG_ENDIAN));
++	}
++}
++
++static void rk_crypto_complete(struct crypto_async_request *base, int err)
++{
++	if (base->complete)
++		base->complete(base, err);
++}
++
++static int rk_handle_req(struct rk_crypto_info *dev,
++			 struct ablkcipher_request *req)
++{
++	if (!IS_ALIGNED(req->nbytes, dev->align_size))
++		return -EINVAL;
++	else
++		return dev->enqueue(dev, &req->base);
++}
++
++static int rk_aes_setkey(struct crypto_ablkcipher *cipher,
++			 const u8 *key, unsigned int keylen)
++{
++	struct crypto_tfm *tfm = crypto_ablkcipher_tfm(cipher);
++	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++
++	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
++	    keylen != AES_KEYSIZE_256) {
++		crypto_ablkcipher_set_flags(cipher, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		return -EINVAL;
++	}
++	memcpy(ctx->key, key, keylen);
++	ctx->keylen = keylen;
++	return 0;
++}
++
++static int rk_aes_xts_setkey(struct crypto_ablkcipher *cipher,
++			     const u8 *key, unsigned int keylen)
++{
++	struct crypto_tfm *tfm = crypto_ablkcipher_tfm(cipher);
++	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++
++	if (keylen != AES_KEYSIZE_256 && keylen != (AES_KEYSIZE_256 * 2)) {
++		crypto_ablkcipher_set_flags(cipher, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		return -EINVAL;
++	}
++
++	memcpy(ctx->key, key, keylen);
++	ctx->keylen = keylen / 2;
++
++	return 0;
++}
++
++static int rk_tdes_setkey(struct crypto_ablkcipher *cipher,
++			  const u8 *key, unsigned int keylen)
++{
++	struct crypto_tfm *tfm = crypto_ablkcipher_tfm(cipher);
++	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++	u32 tmp[DES_EXPKEY_WORDS];
++
++	if (keylen != DES_KEY_SIZE && keylen != DES3_EDE_KEY_SIZE) {
++		crypto_ablkcipher_set_flags(cipher, CRYPTO_TFM_RES_BAD_KEY_LEN);
++		return -EINVAL;
++	}
++
++	if (keylen == DES_KEY_SIZE) {
++		if (!des_ekey(tmp, key) &&
++		    (tfm->crt_flags & CRYPTO_TFM_REQ_WEAK_KEY)) {
++			tfm->crt_flags |= CRYPTO_TFM_RES_WEAK_KEY;
++			return -EINVAL;
++		}
++	}
++
++	memcpy(ctx->key, key, keylen);
++	ctx->keylen = keylen;
++	return 0;
++}
++
++static int rk_aes_ecb_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_AES | CRYPTO_BC_ECB;
++
++	return rk_handle_req(dev, req);
++}
++
++static int rk_aes_ecb_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_AES | CRYPTO_BC_ECB | CRYPTO_BC_DECRYPT;
++
++	return rk_handle_req(dev, req);
++}
++
++static int rk_aes_cbc_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_AES | CRYPTO_BC_CBC;
++
++	return rk_handle_req(dev, req);
++}
++
++static int rk_aes_cbc_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_AES | CRYPTO_BC_CBC | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_aes_xts_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_AES | CRYPTO_BC_XTS;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_aes_xts_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode =  CRYPTO_BC_AES | CRYPTO_BC_XTS | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des_ecb_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_DES | CRYPTO_BC_ECB;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des_ecb_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_DES | CRYPTO_BC_ECB | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des_cbc_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_DES | CRYPTO_BC_CBC;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des_cbc_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_DES | CRYPTO_BC_CBC | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des3_ede_ecb_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_TDES | CRYPTO_BC_ECB;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des3_ede_ecb_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_TDES | CRYPTO_BC_ECB | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des3_ede_cbc_encrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_TDES | CRYPTO_BC_CBC;
++	return rk_handle_req(dev, req);
++}
++
++static int rk_des3_ede_cbc_decrypt(struct ablkcipher_request *req)
++{
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(tfm);
++	struct rk_crypto_info *dev = ctx->dev;
++
++	ctx->mode = CRYPTO_BC_TDES | CRYPTO_BC_CBC | CRYPTO_BC_DECRYPT;
++	return rk_handle_req(dev, req);
++}
++
++static void rk_ablk_hw_init(struct rk_crypto_info *dev)
++{
++	struct ablkcipher_request *req =
++		ablkcipher_request_cast(dev->async_req);
++	struct crypto_ablkcipher *cipher = crypto_ablkcipher_reqtfm(req);
++	struct crypto_tfm *tfm = crypto_ablkcipher_tfm(cipher);
++	struct rk_cipher_ctx *ctx = crypto_ablkcipher_ctx(cipher);
++	u32 ivsize, block;
++
++	CRYPTO_WRITE(dev, CRYPTO_BC_CTL, 0x00010000);
++
++	block = crypto_tfm_alg_blocksize(tfm);
++	ivsize = crypto_ablkcipher_ivsize(cipher);
++
++	write_key_reg(ctx->dev, ctx->key, ctx->keylen);
++	if ((ctx->mode & CRYPTO_BC_XTS) == CRYPTO_BC_XTS)
++		write_tkey_reg(ctx->dev, ctx->key + ctx->keylen, ctx->keylen);
++
++	set_iv_reg(dev, req->info, ivsize);
++
++	if (block != DES_BLOCK_SIZE) {
++		if (ctx->keylen == AES_KEYSIZE_128)
++			ctx->mode |= CRYPTO_BC_128_bit_key;
++		else if (ctx->keylen == AES_KEYSIZE_192)
++			ctx->mode |= CRYPTO_BC_192_bit_key;
++		else if (ctx->keylen == AES_KEYSIZE_256)
++			ctx->mode |= CRYPTO_BC_256_bit_key;
++	}
++
++	ctx->mode |= CRYPTO_BC_ENABLE;
++
++	CRYPTO_WRITE(dev, CRYPTO_FIFO_CTL, 0x00030003);
++
++	CRYPTO_WRITE(dev, CRYPTO_DMA_INT_EN, 0x7f);
++
++	CRYPTO_WRITE(dev, CRYPTO_BC_CTL, ctx->mode | CRYPTO_WRITE_MASK_ALL);
++}
++
++static void crypto_dma_start(struct rk_crypto_info *dev)
++{
++	struct rk_hw_crypto_v2_info *hw_info =
++			(struct rk_hw_crypto_v2_info *)dev->hw_info;
++
++	memset(hw_info->desc, 0x00, sizeof(*hw_info->desc));
++
++	hw_info->desc->src_addr = dev->addr_in;
++	hw_info->desc->src_len  = dev->count;
++	hw_info->desc->dst_addr = dev->addr_out;
++	hw_info->desc->dst_len  = dev->count;
++	hw_info->desc->next_addr = 0;
++	hw_info->desc->dma_ctrl = 0x00000201;
++	hw_info->desc->user_define = 0x7;
++
++	dma_sync_single_for_device(dev->dev, hw_info->desc_dma,
++				   sizeof(*hw_info->desc), DMA_TO_DEVICE);
++	CRYPTO_WRITE(dev, CRYPTO_DMA_LLI_ADDR, hw_info->desc_dma);
++	CRYPTO_WRITE(dev, CRYPTO_DMA_CTL, 0x00010001);/* start */
++}
++
++static int rk_set_data_start(struct rk_crypto_info *dev)
++{
++	int err;
++
++	err = dev->load_data(dev, dev->sg_src, dev->sg_dst);
++	if (!err)
++		crypto_dma_start(dev);
++	return err;
++}
++
++static int rk_ablk_start(struct rk_crypto_info *dev)
++{
++	struct ablkcipher_request *req =
++		ablkcipher_request_cast(dev->async_req);
++	unsigned long flags;
++	int err = 0;
++
++	dev->left_bytes = req->nbytes;
++	dev->total = req->nbytes;
++	dev->sg_src = req->src;
++	dev->first = req->src;
++	dev->src_nents = sg_nents(req->src);
++	dev->sg_dst = req->dst;
++	dev->dst_nents = sg_nents(req->dst);
++	dev->aligned = 1;
++
++	spin_lock_irqsave(&dev->lock, flags);
++	rk_ablk_hw_init(dev);
++	err = rk_set_data_start(dev);
++	spin_unlock_irqrestore(&dev->lock, flags);
++	return err;
++}
++
++static void rk_iv_copyback(struct rk_crypto_info *dev)
++{
++	struct ablkcipher_request *req =
++		ablkcipher_request_cast(dev->async_req);
++	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
++
++	u32 ivsize = crypto_ablkcipher_ivsize(tfm);
++
++	read_iv_reg(dev, req->info, ivsize);
++}
++
++/* return:
++ *	true	some err was occurred
++ *	fault	no err, continue
++ */
++static int rk_ablk_rx(struct rk_crypto_info *dev)
++{
++	int err = 0;
++	struct ablkcipher_request *req =
++		ablkcipher_request_cast(dev->async_req);
++
++	dev->unload_data(dev);
++	if (!dev->aligned) {
++		if (!sg_pcopy_from_buffer(req->dst, dev->dst_nents,
++					  dev->addr_vir, dev->count,
++					  dev->total - dev->left_bytes -
++					  dev->count)) {
++			err = -EINVAL;
++			goto out_rx;
++		}
++	}
++	if (dev->left_bytes) {
++		if (dev->aligned) {
++			if (sg_is_last(dev->sg_src)) {
++				dev_err(dev->dev, "[%s:%d] Lack of data\n",
++					__func__, __LINE__);
++				err = -ENOMEM;
++				goto out_rx;
++			}
++			dev->sg_src = sg_next(dev->sg_src);
++			dev->sg_dst = sg_next(dev->sg_dst);
++		}
++		err = rk_set_data_start(dev);
++	} else {
++		rk_iv_copyback(dev);
++		/* here show the calculation is over without any err */
++		dev->complete(dev->async_req, 0);
++		tasklet_schedule(&dev->queue_task);
++	}
++out_rx:
++	return err;
++}
++
++static int rk_ablk_cra_init(struct crypto_tfm *tfm)
++{
++	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++	struct crypto_alg *alg = tfm->__crt_alg;
++	struct rk_crypto_tmp *algt;
++	struct rk_hw_crypto_v2_info *hw_info;
++
++	algt = container_of(alg, struct rk_crypto_tmp, alg.crypto);
++
++	ctx->dev = algt->dev;
++	ctx->dev->align_size = crypto_tfm_alg_alignmask(tfm) + 1;
++	ctx->dev->start = rk_ablk_start;
++	ctx->dev->update = rk_ablk_rx;
++	ctx->dev->complete = rk_crypto_complete;
++	ctx->dev->irq_handle = rk_crypto_irq_handle;
++
++	hw_info = (struct rk_hw_crypto_v2_info *)ctx->dev->hw_info;
++
++	if (hw_info->clk_enable == 0)
++		ctx->dev->enable_clk(ctx->dev);
++
++	hw_info->clk_enable++;
++
++	return 0;
++}
++
++static void rk_ablk_cra_exit(struct crypto_tfm *tfm)
++{
++	struct rk_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
++	struct rk_hw_crypto_v2_info *hw_info =
++			(struct rk_hw_crypto_v2_info *)ctx->dev->hw_info;
++
++	hw_info->clk_enable--;
++
++	if (hw_info->clk_enable == 0)
++		ctx->dev->disable_clk(ctx->dev);
++}
++
++int rk_hw_crypto_v2_init(struct device *dev, void *hw_info)
++{
++	int err = 0;
++	struct rk_hw_crypto_v2_info *info =
++		(struct rk_hw_crypto_v2_info *)hw_info;
++
++	info->desc = dma_alloc_coherent(dev,
++					sizeof(struct crypto_lli_desc),
++					&info->desc_dma,
++					GFP_KERNEL);
++	if (!info->desc) {
++		err = -ENOMEM;
++		goto end;
++	}
++
++end:
++	return err;
++}
++
++void rk_hw_crypto_v2_deinit(struct device *dev, void *hw_info)
++{
++	struct rk_hw_crypto_v2_info *info =
++		(struct rk_hw_crypto_v2_info *)hw_info;
++
++	dma_free_coherent(dev, sizeof(struct crypto_lli_desc),
++			  info->desc, info->desc_dma);
++}
++
++struct rk_crypto_tmp rk_v2_ecb_aes_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "ecb(aes)",
++		.cra_driver_name	= "ecb-aes-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= AES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x0f,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= AES_MIN_KEY_SIZE,
++			.max_keysize	= AES_MAX_KEY_SIZE,
++			.setkey		= rk_aes_setkey,
++			.encrypt	= rk_aes_ecb_encrypt,
++			.decrypt	= rk_aes_ecb_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_cbc_aes_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "cbc(aes)",
++		.cra_driver_name	= "cbc-aes-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= AES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x0f,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= AES_MIN_KEY_SIZE,
++			.max_keysize	= AES_MAX_KEY_SIZE,
++			.ivsize		= AES_BLOCK_SIZE,
++			.setkey		= rk_aes_setkey,
++			.encrypt	= rk_aes_cbc_encrypt,
++			.decrypt	= rk_aes_cbc_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_xts_aes_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "xts(aes)",
++		.cra_driver_name	= "xts-aes-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= AES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x0f,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= AES_MAX_KEY_SIZE,
++			.max_keysize	= AES_MAX_KEY_SIZE * 2,
++			.ivsize		= AES_BLOCK_SIZE,
++			.setkey		= rk_aes_xts_setkey,
++			.encrypt	= rk_aes_xts_encrypt,
++			.decrypt	= rk_aes_xts_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_ecb_des_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "ecb(des)",
++		.cra_driver_name	= "ecb-des-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= DES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x07,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= DES_KEY_SIZE,
++			.max_keysize	= DES_KEY_SIZE,
++			.setkey		= rk_tdes_setkey,
++			.encrypt	= rk_des_ecb_encrypt,
++			.decrypt	= rk_des_ecb_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_cbc_des_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "cbc(des)",
++		.cra_driver_name	= "cbc-des-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= DES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x07,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= DES_KEY_SIZE,
++			.max_keysize	= DES_KEY_SIZE,
++			.ivsize		= DES_BLOCK_SIZE,
++			.setkey		= rk_tdes_setkey,
++			.encrypt	= rk_des_cbc_encrypt,
++			.decrypt	= rk_des_cbc_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_ecb_des3_ede_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "ecb(des3_ede)",
++		.cra_driver_name	= "ecb-des3-ede-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= DES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x07,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= DES3_EDE_KEY_SIZE,
++			.max_keysize	= DES3_EDE_KEY_SIZE,
++			.ivsize		= DES_BLOCK_SIZE,
++			.setkey		= rk_tdes_setkey,
++			.encrypt	= rk_des3_ede_ecb_encrypt,
++			.decrypt	= rk_des3_ede_ecb_decrypt,
++		}
++	}
++};
++
++struct rk_crypto_tmp rk_v2_cbc_des3_ede_alg = {
++	.type = ALG_TYPE_CIPHER,
++	.alg.crypto = {
++		.cra_name		= "cbc(des3_ede)",
++		.cra_driver_name	= "cbc-des3-ede-rk",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER |
++					  CRYPTO_ALG_ASYNC,
++		.cra_blocksize		= DES_BLOCK_SIZE,
++		.cra_ctxsize		= sizeof(struct rk_cipher_ctx),
++		.cra_alignmask		= 0x07,
++		.cra_type		= &crypto_ablkcipher_type,
++		.cra_module		= THIS_MODULE,
++		.cra_init		= rk_ablk_cra_init,
++		.cra_exit		= rk_ablk_cra_exit,
++		.cra_u.ablkcipher	= {
++			.min_keysize	= DES3_EDE_KEY_SIZE,
++			.max_keysize	= DES3_EDE_KEY_SIZE,
++			.ivsize		= DES_BLOCK_SIZE,
++			.setkey		= rk_tdes_setkey,
++			.encrypt	= rk_des3_ede_cbc_encrypt,
++			.decrypt	= rk_des3_ede_cbc_decrypt,
++		}
++	}
++};
+diff --git a/drivers/crypto/rockchip/rk_crypto_v2_reg.h b/drivers/crypto/rockchip/rk_crypto_v2_reg.h
+new file mode 100644
+index 000000000000..bef66457b842
+--- /dev/null
++++ b/drivers/crypto/rockchip/rk_crypto_v2_reg.h
+@@ -0,0 +1,236 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Copyright (c) 2018 Rockchip Electronics Co. Ltd. */
++
++#ifndef __RK_CRYPTO_V2_REG_H__
++#define __RK_CRYPTO_V2_REG_H__
++
++#define _SBF(s, v)			((v) << (s))
++#define _BIT(b)				_SBF(b, 1)
++
++#define CRYPTO_WRITE_MASK_SHIFT		(16)
++#define CRYPTO_WRITE_MASK_ALL		((0xffffu << CRYPTO_WRITE_MASK_SHIFT))
++
++#define WRITE_MASK			(16)
++
++/* Crypto control registers*/
++#define CRYPTO_CLK_CTL			0x0000
++#define CRYPTO_AUTO_CLKGATE_EN		_BIT(0)
++
++#define CRYPTO_RST_CTL			0x0004
++#define CRYPTO_SW_PKA_RESET		_BIT(2)
++#define CRYPTO_SW_RNG_RESET		_BIT(1)
++#define CRYPTO_SW_CC_RESET		_BIT(0)
++
++/* Crypto DMA control registers*/
++#define CRYPTO_DMA_INT_EN		0x0008
++#define CRYPTO_ZERO_ERR_INT_EN		_BIT(6)
++#define CRYPTO_LIST_ERR_INT_EN		_BIT(5)
++#define CRYPTO_SRC_ERR_INT_EN		_BIT(4)
++#define CRYPTO_DST_ERR_INT_EN		_BIT(3)
++#define CRYPTO_SRC_ITEM_INT_EN		_BIT(2)
++#define CRYPTO_DST_ITEM_DONE_INT_EN	_BIT(1)
++#define CRYPTO_LIST_DONE_INT_EN		_BIT(0)
++
++#define CRYPTO_DMA_INT_ST		0x000C
++#define CRYPTO_ZERO_LEN_INT_ST		_BIT(6)
++#define CRYPTO_LIST_ERR_INT_ST		_BIT(5)
++#define CRYPTO_SRC_ERR_INT_ST		_BIT(4)
++#define CRYPTO_DST_ERR_INT_ST		_BIT(3)
++#define CRYPTO_SRC_ITEM_DONE_INT_ST	_BIT(2)
++#define CRYPTO_DST_ITEM_DONE_INT_ST	_BIT(1)
++#define CRYPTO_LIST_DONE_INT_ST		_BIT(0)
++
++#define CRYPTO_DMA_CTL			0x0010
++#define CRYPTO_DMA_RESTART		_BIT(1)
++#define CRYPTO_DMA_START		_BIT(0)
++
++/* DMA LIST Start Address Register */
++#define CRYPTO_DMA_LLI_ADDR		0x0014
++
++#define CRYPTO_DMA_ST			0x0018
++#define CRYPTO_DMA_BUSY			_BIT(0)
++
++#define CRYPTO_DMA_STATE		0x001C
++#define CRYPTO_LLI_IDLE_STATE		_SBF(4, 0x00)
++#define CRYPTO_LLI_FETCH_STATE		_SBF(4, 0x01)
++#define CRYPTO_LLI_WORK_STATE		_SBF(4, 0x02)
++#define CRYPTO_SRC_IDLE_STATE		_SBF(2, 0x00)
++#define CRYPTO_SRC_LOAD_STATE		_SBF(2, 0x01)
++#define CRYPTO_SRC_WORK_STATE		_SBF(2, 0x02)
++#define CRYPTO_DST_IDLE_STATE		_SBF(0, 0x00)
++#define CRYPTO_DST_LOAD_STATE		_SBF(0, 0x01)
++#define CRYPTO_DST_WORK_STATE		_SBF(0, 0x02)
++
++/* DMA LLI Read Address Register */
++#define CRYPTO_DMA_LLI_RADDR		0x0020
++
++/* DMA Source Data Read Address Register */
++#define CRYPTO_DMA_SRC_RADDR		0x0024
++
++/* DMA Destination Data Read Address Register */
++#define CRYPTO_DMA_DST_RADDR		0x0028
++
++#define CRYPTO_DMA_ITEM_ID		0x002C
++
++#define CRYPTO_FIFO_CTL			0x0040
++#define CRYPTO_DOUT_BYTESWAP		_BIT(1)
++#define CRYPTO_DOIN_BYTESWAP		_BIT(0)
++
++/* Block Cipher Control Register */
++#define CRYPTO_BC_CTL			0x0044
++#define CRYPTO_BC_AES			_SBF(8, 0x00)
++#define CRYPTO_BC_DES			_SBF(8, 0x02)
++#define CRYPTO_BC_TDES			_SBF(8, 0x03)
++#define CRYPTO_BC_ECB			_SBF(4, 0x00)
++#define CRYPTO_BC_CBC			_SBF(4, 0x01)
++#define CRYPTO_BC_CTS			_SBF(4, 0x02)
++#define CRYPTO_BC_CTR			_SBF(4, 0x03)
++#define CRYPTO_BC_CFB			_SBF(4, 0x04)
++#define CRYPTO_BC_OFB			_SBF(4, 0x05)
++#define CRYPTO_BC_XTS			_SBF(4, 0x06)
++#define CRYPTO_BC_CCM			_SBF(4, 0x07)
++#define CRYPTO_BC_GCM			_SBF(4, 0x08)
++#define CRYPTO_BC_CMAC			_SBF(4, 0x09)
++#define CRYPTO_BC_CBC_MAC		_SBF(4, 0x0A)
++#define CRYPTO_BC_128_bit_key		_SBF(2, 0x00)
++#define CRYPTO_BC_192_bit_key		_SBF(2, 0x01)
++#define CRYPTO_BC_256_bit_key		_SBF(2, 0x02)
++#define CRYPTO_BC_DECRYPT		_BIT(1)
++#define CRYPTO_BC_ENABLE		_BIT(0)
++
++/* Hash Control Register */
++#define CRYPTO_HASH_CTL			0x0048
++#define CRYPTO_SHA1			_SBF(4, 0x00)
++#define CRYPTO_MD5			_SBF(4, 0x01)
++#define CRYPTO_SHA256			_SBF(4, 0x02)
++#define CRYPTO_SHA224			_SBF(4, 0x03)
++#define CRYPTO_SHA512			_SBF(4, 0x08)
++#define CRYPTO_SHA384			_SBF(4, 0x09)
++#define CRYPTO_SHA512_224		_SBF(4, 0x0A)
++#define CRYPTO_SHA512_256		_SBF(4, 0x0B)
++#define CRYPTO_HMAC_ENABLE		_BIT(3)
++#define CRYPTO_HW_PAD_ENABLE		_BIT(2)
++#define CRYPTO_HASH_SRC_SEL		_BIT(1)
++#define CRYPTO_HASH_ENABLE		_BIT(0)
++
++/* Cipher Status Register */
++#define CRYPTO_CIPHER_ST		0x004C
++#define CRYPTO_OTP_KEY_VALID		_BIT(2)
++#define CRYPTO_HASH_BUSY		_BIT(1)
++#define CRYPTO_BLOCK_CIPHER_BUSY	_BIT(0)
++
++#define CRYPTO_CIPHER_STATE		0x0050
++#define CRYPTO_HASH_IDLE_STATE		_SBF(10, 0x01)
++#define CRYPTO_HASH_IPAD_STATE		_SBF(10, 0x02)
++#define CRYPTO_HASH_TEXT_STATE		_SBF(10, 0x04)
++#define CRYPTO_HASH_OPAD_STATE		_SBF(10, 0x08)
++#define CRYPTO_HASH_OPAD_EXT_STATE	_SBF(10, 0x10)
++#define CRYPTO_GCM_IDLE_STATE		_SBF(8, 0x00)
++#define CRYPTO_GCM_PRE_STATE		_SBF(8, 0x01)
++#define CRYPTO_GCM_NA_STATE		_SBF(8, 0x02)
++#define CRYPTO_GCM_PC_STATE		_SBF(8, 0x03)
++#define CRYPTO_CCM_IDLE_STATE		_SBF(6, 0x00)
++#define CRYPTO_CCM_PRE_STATE		_SBF(6, 0x01)
++#define CRYPTO_CCM_NA_STATE		_SBF(6, 0x02)
++#define CRYPTO_CCM_PC_STATE		_SBF(6, 0x03)
++#define CRYPTO_PARALLEL_IDLE_STATE	_SBF(4, 0x00)
++#define CRYPTO_PARALLEL_PRE_STATE	_SBF(4, 0x01)
++#define CRYPTO_PARALLEL_BULK_STATE	_SBF(4, 0x02)
++#define CRYPTO_MAC_IDLE_STATE		_SBF(2, 0x00)
++#define CRYPTO_MAC_PRE_STATE		_SBF(2, 0x01)
++#define CRYPTO_MAC_BULK_STATE		_SBF(2, 0x02)
++#define CRYPTO_SERIAL_IDLE_STATE	_SBF(0, 0x00)
++#define CRYPTO_SERIAL_PRE_STATE		_SBF(0, 0x01)
++#define CRYPTO_SERIAL_BULK_STATE	_SBF(0, 0x02)
++
++#define CRYPTO_CH0_IV_0         0x0100
++#define CRYPTO_CH0_IV_1         0x0104
++#define CRYPTO_CH0_IV_2         0x0108
++#define CRYPTO_CH0_IV_3         0x010c
++#define CRYPTO_CH1_IV_0         0x0110
++#define CRYPTO_CH1_IV_1         0x0114
++#define CRYPTO_CH1_IV_2         0x0118
++#define CRYPTO_CH1_IV_3         0x011c
++#define CRYPTO_CH2_IV_0         0x0120
++#define CRYPTO_CH2_IV_1         0x0124
++#define CRYPTO_CH2_IV_2         0x0128
++#define CRYPTO_CH2_IV_3         0x012c
++#define CRYPTO_CH3_IV_0         0x0130
++#define CRYPTO_CH3_IV_1         0x0134
++#define CRYPTO_CH3_IV_2         0x0138
++#define CRYPTO_CH3_IV_3         0x013c
++#define CRYPTO_CH4_IV_0         0x0140
++#define CRYPTO_CH4_IV_1         0x0144
++#define CRYPTO_CH4_IV_2         0x0148
++#define CRYPTO_CH4_IV_3         0x014c
++#define CRYPTO_CH5_IV_0         0x0150
++#define CRYPTO_CH5_IV_1         0x0154
++#define CRYPTO_CH5_IV_2         0x0158
++#define CRYPTO_CH5_IV_3         0x015c
++#define CRYPTO_CH6_IV_0         0x0160
++#define CRYPTO_CH6_IV_1         0x0164
++#define CRYPTO_CH6_IV_2         0x0168
++#define CRYPTO_CH6_IV_3         0x016c
++#define CRYPTO_CH7_IV_0         0x0170
++#define CRYPTO_CH7_IV_1         0x0174
++#define CRYPTO_CH7_IV_2         0x0178
++#define CRYPTO_CH7_IV_3         0x017c
++
++#define CRYPTO_CH0_KEY_0        0x0180
++#define CRYPTO_CH0_KEY_1        0x0184
++#define CRYPTO_CH0_KEY_2        0x0188
++#define CRYPTO_CH0_KEY_3        0x018c
++#define CRYPTO_CH1_KEY_0        0x0190
++#define CRYPTO_CH1_KEY_1        0x0194
++#define CRYPTO_CH1_KEY_2        0x0198
++#define CRYPTO_CH1_KEY_3        0x019c
++#define CRYPTO_CH2_KEY_0        0x01a0
++#define CRYPTO_CH2_KEY_1        0x01a4
++#define CRYPTO_CH2_KEY_2        0x01a8
++#define CRYPTO_CH2_KEY_3        0x01ac
++#define CRYPTO_CH3_KEY_0        0x01b0
++#define CRYPTO_CH3_KEY_1        0x01b4
++#define CRYPTO_CH3_KEY_2        0x01b8
++#define CRYPTO_CH3_KEY_3        0x01bc
++#define CRYPTO_CH4_KEY_0        0x01c0
++#define CRYPTO_CH4_KEY_1        0x01c4
++#define CRYPTO_CH4_KEY_2        0x01c8
++#define CRYPTO_CH4_KEY_3        0x01cc
++#define CRYPTO_CH5_KEY_0        0x01d0
++#define CRYPTO_CH5_KEY_1        0x01d4
++#define CRYPTO_CH5_KEY_2        0x01d8
++#define CRYPTO_CH5_KEY_3        0x01dc
++#define CRYPTO_CH6_KEY_0        0x01e0
++#define CRYPTO_CH6_KEY_1        0x01e4
++#define CRYPTO_CH6_KEY_2        0x01e8
++#define CRYPTO_CH6_KEY_3        0x01ec
++#define CRYPTO_CH7_KEY_0        0x01f0
++#define CRYPTO_CH7_KEY_1        0x01f4
++#define CRYPTO_CH7_KEY_2        0x01f8
++#define CRYPTO_CH7_KEY_3        0x01fc
++#define CRYPTO_KEY_CHANNEL_NUM	8
++
++#define CRYPTO_CH0_IV_LEN_0     0x0300
++#define CRYPTO_CH1_IV_LEN_0     0x0304
++#define CRYPTO_CH2_IV_LEN_0     0x0308
++#define CRYPTO_CH3_IV_LEN_0     0x030c
++#define CRYPTO_CH4_IV_LEN_0     0x0310
++#define CRYPTO_CH5_IV_LEN_0     0x0314
++#define CRYPTO_CH6_IV_LEN_0     0x0318
++#define CRYPTO_CH7_IV_LEN_0     0x031c
++
++#define CRYPTO_READ(dev, offset)		  \
++		readl_relaxed(((dev)->reg + (offset)))
++#define CRYPTO_WRITE(dev, offset, val)	  \
++		writel_relaxed((val), ((dev)->reg + (offset)))
++
++#define CRYPTO_CLK_NUM	(4)
++
++enum endian_mode {
++	BIG_ENDIAN = 0,
++	LITTLE_ENDIAN
++};
++
++#endif
++
+-- 
+2.35.3
+

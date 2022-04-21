@@ -1,0 +1,637 @@
+From ba295694228dc604213d9b65da8e4a1fc69a3dd7 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Sun, 1 Apr 2012 19:39:50 +0800
+Subject: [PATCH] rl30 hdmi: support sysfs
+
+---
+ drivers/video/rockchip/hdmi/Kconfig           |   1 +
+ drivers/video/rockchip/hdmi/Makefile          |   2 +-
+ drivers/video/rockchip/hdmi/rk30_hdmi.c       |  51 +++++--
+ drivers/video/rockchip/hdmi/rk30_hdmi.h       |   7 +-
+ drivers/video/rockchip/hdmi/rk30_hdmi_hw.c    | 128 ++++++++++++------
+ drivers/video/rockchip/hdmi/rk30_hdmi_hw.h    |   2 +-
+ drivers/video/rockchip/hdmi/rk30_hdmi_lcdc.c  |   2 +-
+ drivers/video/rockchip/hdmi/rk30_hdmi_sysfs.c | 120 ++++++++++++++++
+ drivers/video/rockchip/hdmi/rk30_hdmi_task.c  |  37 +++++
+ 9 files changed, 290 insertions(+), 60 deletions(-)
+ mode change 100644 => 100755 drivers/video/rockchip/hdmi/Kconfig
+ create mode 100755 drivers/video/rockchip/hdmi/rk30_hdmi_sysfs.c
+
+diff --git a/drivers/video/rockchip/hdmi/Kconfig b/drivers/video/rockchip/hdmi/Kconfig
+old mode 100644
+new mode 100755
+index f92621d0e3ab..6eb659b61e41
+--- a/drivers/video/rockchip/hdmi/Kconfig
++++ b/drivers/video/rockchip/hdmi/Kconfig
+@@ -1,6 +1,7 @@
+ config HDMI_RK30
+         bool "hdmi support"
+         depends on LCDC_RK30
++        select FB_MODE_HELPERS
+ #        default y
+         help
+            Support rk30 hdmi if you say y here
+diff --git a/drivers/video/rockchip/hdmi/Makefile b/drivers/video/rockchip/hdmi/Makefile
+index 470549a7992c..3dd2ee7ea256 100755
+--- a/drivers/video/rockchip/hdmi/Makefile
++++ b/drivers/video/rockchip/hdmi/Makefile
+@@ -1 +1 @@
+-obj-$(CONFIG_HDMI_RK30) += rk30_hdmi_hw.o rk30_hdmi_edid.o rk30_hdmi_lcdc.o rk30_hdmi_task.o rk30_hdmi.o
++obj-$(CONFIG_HDMI_RK30) += rk30_hdmi_hw.o rk30_hdmi_edid.o rk30_hdmi_lcdc.o rk30_hdmi_task.o rk30_hdmi_sysfs.o rk30_hdmi.o
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi.c b/drivers/video/rockchip/hdmi/rk30_hdmi.c
+index cbc08af82b9e..ee7a8740778a 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi.c
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi.c
+@@ -24,20 +24,31 @@ struct hdmi *hdmi = NULL;
+ extern irqreturn_t hdmi_irq(int irq, void *priv);
+ extern void hdmi_work(struct work_struct *work);
+ extern struct rk_lcdc_device_driver * rk_get_lcdc_drv(int  id);
++extern void hdmi_register_display_sysfs(struct hdmi *hdmi, struct device *parent);
+ 
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+ static void hdmi_early_suspend(struct early_suspend *h)
+ {
+ 	hdmi_dbg(hdmi->dev, "hdmi enter early suspend\n");
+ 	disable_irq(hdmi->irq);
+-	if(hdmi->hotplug)
+-		hdmi_sys_remove();
++	hdmi->enable = 0;
++	hdmi->command = HDMI_CONFIG_ENABLE;
++	/* wait for hdmi configuration finish */
++	while(hdmi->wait)
++		msleep(10);
++	init_completion(&hdmi->complete);
++	hdmi->wait = 1;
++	queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, 0);
++	wait_for_completion_interruptible_timeout(&hdmi->complete,
++							msecs_to_jiffies(5000));
++	flush_delayed_work(&hdmi->delay_work);
+ 	return;
+ }
+ 
+ static void hdmi_early_resume(struct early_suspend *h)
+ {
+ 	hdmi_dbg(hdmi->dev, "hdmi exit early resume\n");
++	hdmi->enable = 1;
+ 	enable_irq(hdmi->irq);
+ 	return;
+ }
+@@ -62,8 +73,6 @@ static inline void hdmi_io_remap(void)
+ 	
+ 	// internal hclk = hdmi_hclk/32
+ 	HDMIWrReg(0x800, 19);
+-	
+-	hdmi->lcdc = rk_get_lcdc_drv(HDMI_SOURCE_DEFAULT);
+ }
+ 
+ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+@@ -82,6 +91,14 @@ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+ 	hdmi->dev = &pdev->dev;
+ 	platform_set_drvdata(pdev, hdmi);
+ 
++	hdmi->lcdc = rk_get_lcdc_drv(HDMI_SOURCE_DEFAULT);
++	if(hdmi->lcdc == NULL)
++	{
++		dev_err(hdmi->dev, "can not connect to video source lcdc\n");
++		ret = -ENXIO;
++		goto err0;
++	}
++
+ 	hdmi->hclk = clk_get(NULL,"hclk_hdmi");
+ 	if(IS_ERR(hdmi->hclk))
+ 	{
+@@ -115,7 +132,6 @@ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+ 	}
+ 	
+ 	hdmi_io_remap();
+-	
+ 	hdmi_sys_init();
+ 	
+ 	hdmi->workqueue = create_singlethread_workqueue("hdmi");
+@@ -124,9 +140,14 @@ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+ 	#ifdef CONFIG_HAS_EARLYSUSPEND
+ 	hdmi->early_suspend.suspend = hdmi_early_suspend;
+ 	hdmi->early_suspend.resume = hdmi_early_resume;
+-	hdmi->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN - 1;
++	hdmi->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB - 10;
+ 	register_early_suspend(&hdmi->early_suspend);
+ 	#endif
++	
++	
++	hdmi_register_display_sysfs(hdmi, hdmi->dev);
++	
++	spin_lock_init(&hdmi->irq_lock);
+ 
+ 	/* get the IRQ */
+ 	hdmi->irq = platform_get_irq(pdev, 0);
+@@ -135,7 +156,7 @@ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+ 		ret = -ENXIO;
+ 		goto err2;
+ 	}
+-	hdmi_dbg(hdmi->dev, "[%s] hdmi irq is 0x%x\n", __FUNCTION__, hdmi->irq);
++
+ 	/* request the IRQ */
+ 	ret = request_irq(hdmi->irq, hdmi_irq, 0, dev_name(&pdev->dev), hdmi);
+ 	if (ret)
+@@ -155,13 +176,23 @@ static int __devinit rk30_hdmi_probe (struct platform_device *pdev)
+ 	release_mem_region(res->start,(res->end - res->start) + 1);
+ 	clk_disable(hdmi->hclk);
+ err0:
+-	kfree(hdmi);
+ 	hdmi_dbg(hdmi->dev, "rk30 hdmi probe error.\n");
++	kfree(hdmi);
+ 	return ret;
+ }
+ 
+ static int __devexit rk30_hdmi_remove(struct platform_device *pdev)
+ {
++	flush_scheduled_work();
++	destroy_workqueue(hdmi->workqueue);
++	#ifdef CONFIG_HAS_EARLYSUSPEND
++	unregister_early_suspend(&hdmi->early_suspend);
++	#endif
++	iounmap((void*)hdmi->regbase);
++//	release_mem_region(res->start,(res->end - res->start) + 1);
++	clk_disable(hdmi->hclk);
++	kfree(hdmi);
++	hdmi_dbg(hdmi->dev, "rk30 hdmi unregistered.\n");
+ 	return 0;
+ }
+ 
+@@ -191,6 +222,6 @@ static void __exit rk30_hdmi_exit(void)
+ }
+ 
+ 
+-fs_initcall(rk30_hdmi_init);
+-//module_init(rk30_hdmi_init);
++//fs_initcall(rk30_hdmi_init);
++module_init(rk30_hdmi_init);
+ module_exit(rk30_hdmi_exit);
+\ No newline at end of file
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi.h b/drivers/video/rockchip/hdmi/rk30_hdmi.h
+index 61fa20280b67..7cc680669303 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi.h
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi.h
+@@ -2,6 +2,7 @@
+ #define __RK30_HDMI_H__
+ 
+ #include <linux/fb.h>
++#include <linux/spinlock.h>
+ #include <linux/device.h>
+ #include <linux/workqueue.h>
+ #include <linux/display-sys.h>
+@@ -17,13 +18,13 @@
+ // HDMI video source
+ enum {
+ 	HDMI_SOURCE_LCDC0 = 0,
+-	HDMI_SOURCE_LCDC1
++	HDMI_SOURCE_LCDC1 = 1
+ };
+ 
+ #define HDMI_SOURCE_DEFAULT		HDMI_SOURCE_LCDC1
+ 
+ /* default HDMI output video mode */
+-#define HDMI_VIDEO_DEFAULT_MODE			HDMI_1280x720p_60Hz//HDMI_1920x1080p_60Hz
++#define HDMI_VIDEO_DEFAULT_MODE			HDMI_1920x1080p_60Hz//HDMI_1280x720p_60Hz
+ #define HDMI_AUDIO_DEFAULT_CHANNEL		2
+ #define HDMI_AUDIO_DEFAULT_RATE			HDMI_AUDIO_FS_44100
+ #define HDMI_AUDIO_DEFAULT_WORD_LENGTH	HDMI_AUDIO_WORD_LENGTH_16bit
+@@ -38,6 +39,8 @@ struct hdmi {
+ 	struct workqueue_struct *workqueue;
+ 	struct delayed_work delay_work;
+ 	
++	spinlock_t	irq_lock;
++	
+ 	int wait;
+ 	struct completion	complete;
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi_hw.c b/drivers/video/rockchip/hdmi/rk30_hdmi_hw.c
+index 9686744039b6..e0200dfacc08 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi_hw.c
+@@ -4,7 +4,7 @@
+ #include "rk30_hdmi.h"
+ #include "rk30_hdmi_hw.h"
+ 
+-static char interrupt1 = 0, interrupt2 = 0;
++static char interrupt1 = 0, interrupt2 = 0, interrupt3 = 0, interrupt4 = 0;
+ 
+ static inline void delay100us(void)
+ {
+@@ -40,6 +40,7 @@ static void rk30_hdmi_set_pwr_mode(int mode)
+ 	}
+ 	hdmi->pwr_mode = mode;
+ 	msleep(10);
++	hdmi_dbg(hdmi->dev, "[%s] curmode %02x\n", __FUNCTION__, HDMIRdReg(SYS_CTRL));
+ }
+ 
+ int rk30_hdmi_detect_hotplug(void)
+@@ -56,56 +57,64 @@ int rk30_hdmi_detect_hotplug(void)
+ #define HDMI_EDID_DDC_CLK	100000
+ int rk30_hdmi_read_edid(int block, unsigned char *buff)
+ {
+-	int value, ret = -ENXIO, ddc_bus_freq = 0;
+-	char interrupt = 0;
++	int value, ret = -1, ddc_bus_freq = 0;
++	char interrupt = 0, trytime = 2;
+ 	
+ 	hdmi_dbg(hdmi->dev, "[%s] block %d\n", __FUNCTION__, block);
+-	
++
+ 	//Before Phy parameter was set, DDC_CLK is equal to PLLA freq which is 30MHz.
+ 	//Set DDC I2C CLK which devided from DDC_CLK to 100KHz.
+ 	ddc_bus_freq = (30000000/HDMI_EDID_DDC_CLK)/4;
+ 	HDMIWrReg(DDC_BUS_FREQ_L, ddc_bus_freq & 0xFF);
+ 	HDMIWrReg(DDC_BUS_FREQ_L, (ddc_bus_freq >> 8) & 0xFF);
++	msleep(10);
+ 	
+ 	// Enable edid interrupt
+-//	HDMIMskReg(value, INTR_MASK1, (m_INT_EDID_ERR | m_INT_EDID_READY), (m_INT_EDID_ERR | m_INT_EDID_READY));
+-	HDMIWrReg(INTR_MASK1, m_INT_EDID_ERR | m_INT_EDID_READY | m_INT_HOTPLUG | m_INT_MSENS);
+-	// Config EDID block and segment addr
+-	HDMIWrReg(EDID_WORD_ADDR, (block%2) * 0x80);
+-	HDMIWrReg(EDID_SEGMENT_POINTER, block/2);	
++	HDMIMskReg(value, INTR_MASK1, (m_INT_EDID_ERR | m_INT_EDID_READY), (m_INT_EDID_ERR | m_INT_EDID_READY));
+ 
+-	value = 200;
+-	while(value--)
+-	{
+-		interrupt = interrupt1;
+-//		hdmi_dbg(hdmi->dev, "[%s] interrupt %02x\n", __FUNCTION__, interrupt);
+-		if(interrupt & (m_INT_EDID_ERR | m_INT_EDID_READY))
++	while(trytime--) {
++		// Config EDID block and segment addr
++		HDMIWrReg(EDID_WORD_ADDR, (block%2) * 0x80);
++		HDMIWrReg(EDID_SEGMENT_POINTER, block/2);	
++	
++		value = 100;
++		while(value--)
+ 		{
+-			interrupt1 &= ~(m_INT_EDID_ERR | m_INT_EDID_READY);
+-			break;
++			spin_lock(&hdmi->irq_lock);
++			interrupt = interrupt1;
++			spin_unlock(&hdmi->irq_lock);
++//			hdmi_dbg(hdmi->dev, "[%s] interrupt %02x value %d\n", __FUNCTION__, interrupt, value);
++			if(interrupt & (m_INT_EDID_ERR | m_INT_EDID_READY))
++			{
++				interrupt1 &= ~(m_INT_EDID_ERR | m_INT_EDID_READY);
++				break;
++			}
++			msleep(10);
+ 		}
+-		msleep(10);
++		hdmi_dbg(hdmi->dev, "[%s] edid read value %d\n", __FUNCTION__, value);
++		if(interrupt & m_INT_EDID_READY)
++		{
++			for(value = 0; value < HDMI_EDID_BLOCK_SIZE; value++) 
++				buff[value] = HDMIRdReg(DDC_READ_FIFO_ADDR);
++			ret = 0;
++			
++			hdmi_dbg(hdmi->dev, "[%s] edid read sucess\n", __FUNCTION__);
++#if 0
++			for(value = 0; value < 128; value++) {
++				printk("%02x ,", buff[value]);
++				if( (value + 1) % 8 == 0)
++					printk("\n");
++			}
++#endif
++			break;
++		}		
++		if(interrupt & m_INT_EDID_ERR)
++			hdmi_dbg(hdmi->dev, "[%s] edid read error\n", __FUNCTION__);
++
+ 	}
+-	hdmi_dbg(hdmi->dev, "[%s] edid read value %d\n", __FUNCTION__, value);
+ 	// Disable edid interrupt
+ 	HDMIMskReg(value, INTR_MASK1, (m_INT_EDID_ERR|m_INT_EDID_READY), 0);
+-	if(interrupt & m_INT_EDID_READY)
+-	{
+-		for(value = 0; value < HDMI_EDID_BLOCK_SIZE; value++) 
+-			buff[value] = HDMIRdReg(DDC_READ_FIFO_ADDR);
+-		ret = 0;
+-		hdmi_dbg(hdmi->dev, "[%s] edid read sucess\n", __FUNCTION__);
+-//		for(value = 0; value < 128; value++) {
+-//			printk("%02x ,", buff[value]);
+-//			if( (value + 1) % 8 == 0)
+-//				printk("\n");
+-//		}
+-	}
+-	if(interrupt & m_INT_EDID_ERR)
+-	{
+-		 hdmi_dbg(hdmi->dev, "[%s] edid read error\n", __FUNCTION__);
+-		
+-	}
++
+ 	return ret;
+ }
+ 
+@@ -137,6 +146,9 @@ static void rk30_hdmi_config_phy(unsigned char vic)
+ 			rk30_hdmi_config_phy_reg(0x174, 0x22);
+ 			rk30_hdmi_config_phy_reg(0x178, 0x00);
+ 			break;
++			
++		case HDMI_1920x1080i_60Hz:
++		case HDMI_1920x1080i_50Hz:
+ 		case HDMI_1280x720p_60Hz:
+ 		case HDMI_1280x720p_50Hz:
+ 			rk30_hdmi_config_phy_reg(0x158, 0x06);
+@@ -149,6 +161,9 @@ static void rk30_hdmi_config_phy(unsigned char vic)
+ 			rk30_hdmi_config_phy_reg(0x174, 0x20);
+ 			rk30_hdmi_config_phy_reg(0x178, 0x00);
+ 			break;
++			
++		case HDMI_720x576p_50Hz_4_3:
++		case HDMI_720x576p_50Hz_16_9:
+ 		case HDMI_720x480p_60Hz_4_3:
+ 		case HDMI_720x480p_60Hz_16_9:
+ 			rk30_hdmi_config_phy_reg(0x158, 0x02);
+@@ -400,8 +415,13 @@ int rk30_hdmi_removed(void)
+ 	if(hdmi->pwr_mode == PWR_SAVE_MODE_D)
+ 		rk30_hdmi_set_pwr_mode(PWR_SAVE_MODE_B);
+ 	if(hdmi->pwr_mode == PWR_SAVE_MODE_B)
++	{
++		HDMIWrReg(INTR_MASK1, m_INT_HOTPLUG | m_INT_MSENS);
++		HDMIWrReg(INTR_MASK2, 0);
++		HDMIWrReg(INTR_MASK3, 0);
++		HDMIWrReg(INTR_MASK4, 0);
+ 		rk30_hdmi_set_pwr_mode(PWR_SAVE_MODE_A);
+-		
++	}	
+ 	return HDMI_ERROR_SUCESS;
+ }
+ 
+@@ -410,30 +430,48 @@ int rk30_hdmi_removed(void)
+ 
+ irqreturn_t hdmi_irq(int irq, void *priv)
+ {		
+-	unsigned int count = 0x10000;
+ 	if(hdmi->pwr_mode == PWR_SAVE_MODE_A)
+ 	{
++		hdmi_dbg(hdmi->dev, "hdmi irq wake up\n");
+ 		HDMIWrReg(SYS_CTRL, 0x20);
+ 		hdmi->pwr_mode = PWR_SAVE_MODE_B;
+-		while(count--);
++		
++		// HDMI was inserted when system is sleeping, irq was triggered only once
++		// when wake up. So we need to check hotplug status.
++		if((rk30_hdmi_detect_hotplug() == HDMI_HPD_INSERT)) {
++			if(hdmi->state == HDMI_SLEEP)
++				hdmi->state = WAIT_HOTPLUG;			
++			queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, msecs_to_jiffies(10));
++		}
+ 	}
+ 	else
+ 	{
++		spin_lock(&hdmi->irq_lock);
+ 		interrupt1 = HDMIRdReg(INTR_STATUS1);
+ 		interrupt2 = HDMIRdReg(INTR_STATUS2);
++		interrupt3 = HDMIRdReg(INTR_STATUS3);
++		interrupt4 = HDMIRdReg(INTR_STATUS4);
+ 		HDMIWrReg(INTR_STATUS1, interrupt1);
+ 		HDMIWrReg(INTR_STATUS2, interrupt2);
+-//		hdmi_dbg(hdmi->dev, "[%s] interrupt1 %02x\n", __FUNCTION__, interrupt1);
+-		if( interrupt1 & (m_INT_HOTPLUG | m_INT_MSENS) )
++		HDMIWrReg(INTR_STATUS3, interrupt3);
++		HDMIWrReg(INTR_STATUS4, interrupt4);
++#if 1
++		hdmi_dbg(hdmi->dev, "[%s] interrupt1 %02x interrupt2 %02x interrupt3 %02x interrupt4 %02x\n",\
++			 __FUNCTION__, interrupt1, interrupt2, interrupt3, interrupt4);
++#endif
++		if(interrupt1 & (m_INT_HOTPLUG | m_INT_MSENS))
+ 		{
+ 			if(hdmi->state == HDMI_SLEEP)
+ 				hdmi->state = WAIT_HOTPLUG;
+ 			interrupt1 &= ~(m_INT_HOTPLUG | m_INT_MSENS);
+-			queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, 100);	
++			queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, msecs_to_jiffies(10));	
+ 		}
+-//		else if(hdmi->state == HDMI_SLEEP)
+-//			HDMIWrReg(SYS_CTRL, 0x10);
+-
++		else if(hdmi->state == HDMI_SLEEP) {
++			hdmi_dbg(hdmi->dev, "hdmi return to sleep mode\n");
++			HDMIWrReg(SYS_CTRL, 0x10);
++			hdmi->pwr_mode = PWR_SAVE_MODE_A;
++		}
++		spin_unlock(&hdmi->irq_lock);
+ 	}
+ 	return IRQ_HANDLED;
+ }
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi_hw.h b/drivers/video/rockchip/hdmi/rk30_hdmi_hw.h
+index c326a68cae09..1446baadfa37 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi_hw.h
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi_hw.h
+@@ -248,7 +248,7 @@ enum {
+ 
+ 
+ #define HDMIRdReg(addr)						__raw_readl(hdmi->regbase + addr)
+-#define HDMIWrReg(addr, val)        		__raw_writel(val, hdmi->regbase + addr);
++#define HDMIWrReg(addr, val)        		__raw_writel((val), hdmi->regbase + addr);
+ #define HDMIMskReg(temp, addr, msk, val)	\
+ 	temp = __raw_readl(hdmi->regbase + addr) & (0xFF - (msk)) ; \
+ 	__raw_writel(temp | ( (val) & (msk) ),  hdmi->regbase + addr); 
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi_lcdc.c b/drivers/video/rockchip/hdmi/rk30_hdmi_lcdc.c
+index b5f889989fbe..0c3d6e296e7f 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi_lcdc.c
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi_lcdc.c
+@@ -491,7 +491,7 @@ int hdmi_switch_fb(struct hdmi *hdmi, int vic)
+ //		hdmi->config_set.resolution = HDMI_DEFAULT_RESOLUTION;
+ 		
+ 	if(hdmi->lcdc == NULL || hdmi->lcdc->screen == NULL) {
+-		printk("***************\n");
++		dev_err(hdmi->dev, "lcdc %d not exist\n", HDMI_SOURCE_DEFAULT);
+ 		return -1;
+ 	}
+ 
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi_sysfs.c b/drivers/video/rockchip/hdmi/rk30_hdmi_sysfs.c
+new file mode 100755
+index 000000000000..7c2061bc8bf4
+--- /dev/null
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi_sysfs.c
+@@ -0,0 +1,120 @@
++#include <linux/ctype.h>
++#include <linux/string.h>
++#include <linux/display-sys.h>
++#include "rk30_hdmi.h"
++
++static int hdmi_get_enable(struct rk_display_device *device)
++{
++	struct hdmi *hdmi = device->priv_data;
++
++	return hdmi->enable;
++}
++
++static int hdmi_set_enable(struct rk_display_device *device, int enable)
++{
++	struct hdmi *hdmi = device->priv_data;
++	
++//	if(hdmi->enable == enable)
++//		return 0;
++//	hdmi->enable = enable;
++//	hdmi->command = HDMI_CONFIG_DISPLAY;
++//	queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, 0);
++	return 0;
++}
++
++static int hdmi_get_status(struct rk_display_device *device)
++{
++	struct hdmi *hdmi = device->priv_data;
++	if(hdmi->hotplug > HDMI_HPD_REMOVED)
++		return 1;
++	else
++		return 0;
++}
++
++static int hdmi_get_modelist(struct rk_display_device *device, struct list_head **modelist)
++{
++	struct hdmi *hdmi = device->priv_data;
++	if(!hdmi->hotplug)
++		return -1;
++	*modelist = &hdmi->edid.modelist;
++	return 0;
++}
++
++static int hdmi_set_mode(struct rk_display_device *device, struct fb_videomode *mode)
++{
++	struct hdmi *hdmi = device->priv_data;
++	int vic = hdmi_videomode_to_vic(mode);
++	
++	if(!hdmi->hotplug)
++		return -1;
++	hdmi->autoconfig = HDMI_DISABLE;
++	if(vic && hdmi->vic != vic)
++	{
++		hdmi->vic = vic;
++		hdmi->command = HDMI_CONFIG_VIDEO;
++		init_completion(&hdmi->complete);
++		hdmi->wait = 1;
++		queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, 0);
++		wait_for_completion_interruptible_timeout(&hdmi->complete,
++								msecs_to_jiffies(10000));
++	}
++	return 0;
++}
++
++static int hdmi_get_mode(struct rk_display_device *device, struct fb_videomode *mode)
++{
++	struct hdmi *hdmi = device->priv_data;
++	struct fb_videomode *vmode;
++	
++	if(!hdmi->hotplug)
++		return -1;
++		
++	vmode = (struct fb_videomode*) hdmi_vic_to_videomode(hdmi->vic);
++	if(unlikely(vmode == NULL))
++		return -1;
++	*mode = *vmode;
++	return 0;
++}
++
++struct rk_display_ops hdmi_display_ops = {
++	.setenable = hdmi_set_enable,
++	.getenable = hdmi_get_enable,
++	.getstatus = hdmi_get_status,
++	.getmodelist = hdmi_get_modelist,
++	.setmode = hdmi_set_mode,
++	.getmode = hdmi_get_mode,
++};
++
++#if 1
++static int hdmi_display_probe(struct rk_display_device *device, void *devdata)
++{
++	device->owner = THIS_MODULE;
++	strcpy(device->type, "HDMI");
++	device->priority = DISPLAY_PRIORITY_HDMI;
++//	device->name = kmalloc(strlen(name), GFP_KERNEL);
++//	if(device->name)
++//	{
++//		strcpy(device->name, name);
++//	}
++	device->priv_data = devdata;
++	device->ops = &hdmi_display_ops;
++	return 1;
++}
++
++static struct rk_display_driver display_hdmi = {
++	.probe = hdmi_display_probe,
++};
++
++static struct rk_display_device *display_device_hdmi = NULL;
++
++void hdmi_register_display_sysfs(struct hdmi *hdmi, struct device *parent)
++{
++	display_device_hdmi = rk_display_device_register(&display_hdmi, parent, hdmi);
++}
++
++void hdmi_unregister_display_sysfs(struct hdmi *hdmi)
++{
++	if(display_device_hdmi)
++		rk_display_device_unregister(display_device_hdmi);
++}
++#endif
+\ No newline at end of file
+diff --git a/drivers/video/rockchip/hdmi/rk30_hdmi_task.c b/drivers/video/rockchip/hdmi/rk30_hdmi_task.c
+index 00a59ebe8f0a..27b627081f1e 100755
+--- a/drivers/video/rockchip/hdmi/rk30_hdmi_task.c
++++ b/drivers/video/rockchip/hdmi/rk30_hdmi_task.c
+@@ -8,6 +8,40 @@
+ 
+ static char *envp[] = {"INTERFACE=HDMI", NULL};
+ 
++static void hdmi_sys_show_state(int state)
++{
++	switch(state)
++	{
++		case HDMI_INITIAL:
++			dev_printk(KERN_INFO, hdmi->dev, "HDMI_INITIAL\n");
++			break;
++		case WAIT_HOTPLUG:
++			dev_printk(KERN_INFO, hdmi->dev, "WAIT_HOTPLUG\n");
++			break;
++		case READ_PARSE_EDID:
++			dev_printk(KERN_INFO, hdmi->dev, "READ_PARSE_EDID\n");
++			break;
++		case WAIT_HDMI_ENABLE:
++			dev_printk(KERN_INFO, hdmi->dev, "WAIT_HDMI_ENABLE\n");
++			break;
++		case SYSTEM_CONFIG:
++			dev_printk(KERN_INFO, hdmi->dev, "SYSTEM_CONFIG\n");
++			break;
++		case CONFIG_VIDEO:
++			dev_printk(KERN_INFO, hdmi->dev, "CONFIG_VIDEO\n");
++			break;
++		case CONFIG_AUDIO:
++			dev_printk(KERN_INFO, hdmi->dev, "CONFIG_AUDIO\n");
++			break;
++		case PLAY_BACK:
++			dev_printk(KERN_INFO, hdmi->dev, "PLAY_BACK\n");
++			break;
++		default:
++			dev_printk(KERN_INFO, hdmi->dev, "Unkown State\n");
++			break;
++	}
++}
++
+ int hdmi_sys_init(void)
+ {
+ 	hdmi->pwr_mode			= PWR_SAVE_MODE_A;
+@@ -171,6 +205,8 @@ void hdmi_work(struct work_struct *work)
+ 		}
+ 		if(state != state_last)
+ 			trytimes = 0;
++		
++		hdmi_sys_show_state(state);
+ 	}while((state != state_last || (rc != HDMI_ERROR_SUCESS) ) && trytimes < HDMI_MAX_TRY_TIMES);
+ 	
+ 	if(trytimes == HDMI_MAX_TRY_TIMES)
+@@ -178,4 +214,5 @@ void hdmi_work(struct work_struct *work)
+ 		if(hdmi->hotplug)
+ 			hdmi_sys_remove();
+ 	}
++	hdmi->state = state;
+ }
+\ No newline at end of file
+-- 
+2.35.3
+

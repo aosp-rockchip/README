@@ -1,0 +1,94 @@
+From 6554e715f53aae3f0ef75e2170be9035412b86c5 Mon Sep 17 00:00:00 2001
+From: William wu <wulf@rock-chips.com>
+Date: Tue, 8 Nov 2016 11:31:21 +0800
+Subject: [PATCH] CHROMIUM: usb: dwc3: rockchip: fix NULL pointer dereference
+ when resume
+
+During system PM resume process, if remove XHCI hcd prior to
+XHCI controller PM resume, it will result in a crash with
+the following backtrace.
+
+[   80.730581] Unable to handle kernel NULL pointer dereference at virtual address 00000138
+...
+[   80.731780] Call trace:
+[   80.731784] [<ffffffc0005e43cc>] dev_driver_string+0x18/0x4c
+[   80.731787] [<ffffffc0005e4918>] __dev_printk+0x34/0x88
+[   80.731791] [<ffffffc0005e4da0>] dev_warn+0x7c/0xa0
+[   80.731796] [<ffffffc000651ef8>] usb_root_hub_lost_power+0x28/0x40
+[   80.731801] [<ffffffc0006866e8>] xhci_resume+0x250/0x444
+[   80.731805] [<ffffffc00069612c>] xhci_plat_resume+0x44/0x64
+[   80.731811] [<ffffffc0005ea878>] platform_pm_resume+0x50/0x64
+[   80.731816] [<ffffffc0005f6354>] dpm_run_callback+0xb0/0x198
+[   80.731819] [<ffffffc0005f68f4>] device_resume+0x160/0x19c
+[   80.731822] [<ffffffc0005f6960>] async_resume+0x30/0x60
+[   80.731827] [<ffffffc000242b88>] async_run_entry_fn+0x50/0xfc
+[   80.731832] [<ffffffc000238e38>] process_one_work+0x230/0x3dc
+[   80.731837] [<ffffffc000239db8>] worker_thread+0x248/0x370
+[   80.731840] [<ffffffc00023f23c>] kthread+0x10c/0x114
+[   80.731845] [<ffffffc000203d90>] ret_from_fork+0x10/0x40
+
+It's because that when do PM resume, dwc3_rockchip_resume() will
+be called before XHCI resume, and it will remove XHCI hcd and set
+rhdev->dev to NULL, this cause rhdev->dev NULL pointer dereference
+in XHCI resume.
+
+So we need to check the flag dwc->xhci->dev.power.is_suspended to
+ensure that XHCI has been resumed completely from pm suspended state
+before remove XHCI hcd.
+
+BUG=chrome-os-partner:58705
+TEST=Plug in Type-C USB device, then set system to enter S3.
+After system suspend, plug out the Type-C USB device first,
+and then press keyboard or power key to check if system can
+wakeup successfully.
+
+Change-Id: I90fc48f5d3af8d08a290861ad7fcdaa5e4352320
+Signed-off-by: William wu <wulf@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/408498
+Commit-Ready: Guenter Roeck <groeck@chromium.org>
+Tested-by: Guenter Roeck <groeck@chromium.org>
+Reviewed-by: Guenter Roeck <groeck@chromium.org>
+Reviewed-by: Matthias Kaehlcke <mka@chromium.org>
+Signed-off-by: William Wu <wulf@rock-chips.com>
+---
+ drivers/usb/dwc3/dwc3-rockchip.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-rockchip.c b/drivers/usb/dwc3/dwc3-rockchip.c
+index a0051c1d9b2c..19b53f644be8 100644
+--- a/drivers/usb/dwc3/dwc3-rockchip.c
++++ b/drivers/usb/dwc3/dwc3-rockchip.c
+@@ -86,7 +86,7 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 	struct xhci_hcd		*xhci;
+ 	unsigned long		flags;
+ 	int			ret;
+-	u32			reg;
++	u32			reg, count;
+ 
+ 	mutex_lock(&rockchip->lock);
+ 
+@@ -225,6 +225,21 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 
+ 			if (hcd->state != HC_STATE_HALT) {
+ 				xhci->xhc_state |= XHCI_STATE_REMOVING;
++				count = 0;
++
++				/*
++				 * Wait until XHCI controller resume from
++				 * PM suspend, them we can remove hcd safely.
++				 */
++				while (dwc->xhci->dev.power.is_suspended) {
++					if (++count > 100) {
++						dev_err(rockchip->dev,
++							"wait for XHCI resume 10s timeout!\n");
++						goto out;
++					}
++					msleep(100);
++				}
++
+ 				usb_remove_hcd(hcd->shared_hcd);
+ 				usb_remove_hcd(hcd);
+ 			}
+-- 
+2.35.3
+

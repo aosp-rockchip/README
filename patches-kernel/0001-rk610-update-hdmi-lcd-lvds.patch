@@ -1,0 +1,1167 @@
+From 729262c1c6a025d628bce88f2231b2e10ec9ab37 Mon Sep 17 00:00:00 2001
+From: yzq <yzq@rock-chips.com>
+Date: Wed, 18 Apr 2012 19:00:01 -0700
+Subject: [PATCH] rk610 update hdmi lcd lvds
+
+---
+ drivers/mfd/rk610-core.c                      |  21 +-
+ drivers/video/display/lcd/rk610_lcd.c         | 161 +++++++++--
+ drivers/video/display/lcd/rk610_lcd.h         |  53 ++--
+ .../video/display/screen/lcd_hdmi_1024x768.c  |   9 +-
+ .../video/display/screen/lcd_hdmi_1280x800.c  |  10 +-
+ .../video/display/screen/lcd_hdmi_800x480.c   |   7 +-
+ drivers/video/display/screen/screen.h         |   3 +
+ drivers/video/hdmi/chips/rk610/rk610_hdmi.c   |   5 +-
+ .../video/hdmi/chips/rk610/rk610_hdmi_hw.c    | 270 ++++++++++++++----
+ .../video/hdmi/chips/rk610/rk610_hdmi_hw.h    |  51 +++-
+ drivers/video/hdmi/hdmi-backlight.c           |   6 +
+ drivers/video/rk29_fb.c                       |  35 +--
+ include/linux/mfd/rk610_core.h                |   4 +
+ 13 files changed, 503 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/mfd/rk610-core.c b/drivers/mfd/rk610-core.c
+index 362901b0ce82..d82e62783d30 100755
+--- a/drivers/mfd/rk610-core.c
++++ b/drivers/mfd/rk610-core.c
+@@ -8,6 +8,7 @@
+ #include <linux/clk.h>
+ #include <mach/iomux.h>
+ #include <linux/err.h>
++#include <linux/slab.h>
+ 
+ #ifdef CONFIG_ARCH_RK30
+ #define RK610_RESET_PIN   RK30_PIN0_PC6
+@@ -26,9 +27,9 @@
+ 
+ static struct i2c_client *rk610_control_client = NULL;
+ #ifdef CONFIG_RK610_LCD
+-extern int rk610_lcd_init(struct i2c_client *client);
++extern int rk610_lcd_init(struct rk610_core_info *rk610_core_info);
+ #else
+-int rk610_lcd_init(struct i2c_client *client){}
++int rk610_lcd_init(struct rk610_core_info *rk610_core_info){}
+ #endif
+ int rk610_control_send_byte(const char reg, const char data)
+ {
+@@ -203,14 +204,22 @@ static struct device_attribute rk610_attrs[] = {
+ 	__ATTR(reg_ctl, 0777,rk610_show_reg_attrs,rk610_store_reg_attrs),
+ };
+ #endif
++
+ static int rk610_control_probe(struct i2c_client *client,
+ 			const struct i2c_device_id *id)
+ {
+     int ret;
+     struct clk *iis_clk;
+-	
++	struct rk610_core_info *core_info = NULL; 
+ 	DBG("[%s] start\n", __FUNCTION__);
+-	
++	core_info = kmalloc(sizeof(struct rk610_core_info), GFP_KERNEL);
++    if(!core_info)
++    {
++        dev_err(&client->dev, ">> rk610 core inf kmalloc fail!");
++        return -ENOMEM;
++    }
++    memset(core_info, 0, sizeof(struct rk610_core_info));
++    
+ 		iis_clk = clk_get_sys("rk29_i2s.0", "i2s");
+ 		if (IS_ERR(iis_clk)) {
+ 			printk("failed to get i2s clk\n");
+@@ -237,13 +246,13 @@ static int rk610_control_probe(struct i2c_client *client,
+ 	    else {
+ 	    	DBG("rk610_control_probe request gpio ok\n");
+ 	    	gpio_direction_output(RK610_RESET_PIN, GPIO_HIGH);
+-	    	msleep(100);
+ 		    gpio_direction_output(RK610_RESET_PIN, GPIO_LOW);
+ 			msleep(100);
+ 		    gpio_set_value(RK610_RESET_PIN, GPIO_HIGH);
+ 		}
+ 	}
+-	rk610_lcd_init(client);
++    core_info->client = client;
++	rk610_lcd_init(core_info);
+ 	#ifdef RK610_DEBUG
+ 	device_create_file(&(client->dev), &rk610_attrs[0]);
+     #endif
+diff --git a/drivers/video/display/lcd/rk610_lcd.c b/drivers/video/display/lcd/rk610_lcd.c
+index 1606d6942539..6722527a1206 100644
+--- a/drivers/video/display/lcd/rk610_lcd.c
++++ b/drivers/video/display/lcd/rk610_lcd.c
+@@ -8,7 +8,7 @@
+ #include "rk610_lcd.h"
+ #include <linux/mfd/rk610_core.h>
+ #include "../../rk29_fb.h"
+-static struct i2c_client *rk610_g_lcd_client=NULL;
++static struct rk610_lcd_info *g_lcd_inf = NULL;
+ //static int rk610_scaler_read_p0_reg(struct i2c_client *client, char reg, char *val)
+ //{
+ 	//return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+@@ -22,6 +22,9 @@ static void rk610_scaler_pll_enable(struct i2c_client *client)
+ {
+     char c;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++
++    g_lcd_inf->scl_inf.pll_pwr = ENABLE;
++    
+     c = S_PLL_PWR(0)|S_PLL_RESET(0)|S_PLL_BYPASS(0);
+ 	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+ }
+@@ -29,39 +32,77 @@ static void rk610_scaler_pll_disable(struct i2c_client *client)
+ {
+     char c;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
++
+     c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
+ 	rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
+ }
+ static void rk610_scaler_enable(struct i2c_client *client)
+ {
+     char c;
++    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    
+-    c= SCL_BYPASS(0) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(ENABLE);  
++    g_lcd_inf->scl_inf.scl_pwr = ENABLE;
++    #ifdef CONFIG_HDMI_DUAL_DISP
++    if(g_lcd_inf->screen !=NULL){
++        den_inv = g_lcd_inf->screen->s_den_inv;
++        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
++        clk_inv = g_lcd_inf->screen->s_clk_inv;
++    }
++    #endif
++    c= SCL_BYPASS(0) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(ENABLE);  
+ 	rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+ }
+ static void rk610_scaler_disable(struct i2c_client *client)
+ {
+     char c;
++    bool den_inv = 0,hv_sync_inv = 0,clk_inv = 0;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+     
+-    c= SCL_BYPASS(1) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(DISABLE); 
++    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
++    #ifdef CONFIG_HDMI_DUAL_DISP
++    if(g_lcd_inf->screen !=NULL){
++        den_inv = g_lcd_inf->screen->s_den_inv;
++        hv_sync_inv = g_lcd_inf->screen->s_hv_sync_inv;
++        clk_inv = g_lcd_inf->screen->s_clk_inv;
++    }
++    #endif
++    c= SCL_BYPASS(1) |SCL_DEN_INV(den_inv) |SCL_H_V_SYNC_INV(hv_sync_inv) |SCL_OUT_CLK_INV(clk_inv) |SCL_ENABLE(DISABLE); 
+     rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
+ }
+-static int rk610_output_config(struct i2c_client *client,struct rk29fb_screen *screen,bool enable)
++
++static int rk610_output_config(struct i2c_client *client,struct rk29fb_screen *screen,int mode)
+ {
+     char c=0;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+      if(SCREEN_LVDS == screen->type){
+-        c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(1) |LVDS_PLL_PWR_PIN(0) \
+-            |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
+-            |LVDS_OUTPUT_FORMAT(screen->hw_format) | LVDS_BIASE_PWR(1); 
+-	    rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
+-        c = LVDS_OUT_ENABLE(0x0) |LVDS_TX_PWR_ENABLE(0x0); 
+-	    rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
++        if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
++            c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(1) |LVDS_PLL_PWR_PIN(0) \
++                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
++                |LVDS_OUTPUT_FORMAT(screen->hw_format) | LVDS_BIASE_PWR(1); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
++            c = LVDS_OUT_ENABLE(0x0) |LVDS_TX_PWR_ENABLE(0x0); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
++	    }
++	    else{
++	        c = LVDS_OUT_CLK_PIN(0) |LVDS_OUT_CLK_PWR_PIN(0) |LVDS_PLL_PWR_PIN(1) \
++                |LVDS_LANE_IN_FORMAT(DATA_D0_MSB) |LVDS_INPUT_SOURCE(FROM_LCD0_OR_SCL) \
++                |LVDS_OUTPUT_FORMAT(screen->hw_format) | LVDS_BIASE_PWR(0); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON0, &c);
++            c = LVDS_OUT_ENABLE(0xf) |LVDS_TX_PWR_ENABLE(0xf); 
++	        rk610_scaler_write_p0_reg(client, LVDS_CON1, &c);
++             
++	    }
+ 	}else if(SCREEN_RGB == screen->type){
+-        c = LCD1_OUT_ENABLE(LCD1_AS_OUT) | LCD1_OUT_SRC(enable?LCD1_FROM_SCL : LCD1_FROM_LCD0);
+-	    rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
++	    if(mode == LCD_OUT_SCL || mode == LCD_OUT_BYPASS){
++            c = LCD1_OUT_ENABLE(LCD1_AS_OUT) | LCD1_OUT_SRC((mode == LCD_OUT_SCL)?LCD1_FROM_SCL : LCD1_FROM_LCD0);
++	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
++	    }
++	    else {
++            c = LCD1_OUT_ENABLE(LCD1_AS_IN);
++	        rk610_scaler_write_p0_reg(client, LCD1_CON, &c);
++	    }
+ 	}
+ 	return 0;
+ }
+@@ -265,37 +306,109 @@ static int rk610_lcd_scaler_bypass(struct i2c_client *client,bool enable)//enabl
+ {
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+     
++    rk610_scaler_disable(client);       
+     rk610_scaler_pll_disable(client);
+-    rk610_scaler_disable(client);
+-   
++    
+     return 0;
+ }
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void rk610_lcd_early_suspend(struct early_suspend *h)
++{
++    struct i2c_client *client = g_lcd_inf->client;
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    if(g_lcd_inf->screen != NULL){
++        rk610_output_config(client,g_lcd_inf->screen,LCD_OUT_DISABLE);
++    }
++
++    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
++        c= SCL_BYPASS(1) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(DISABLE); 
++        rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
++        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
++	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++    }
++}
++
++static void rk610_lcd_early_resume(struct early_suspend *h)
++{
++    struct i2c_client *client = g_lcd_inf->client;
++    char c;
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++
++    if(g_lcd_inf->screen != NULL){
++        rk610_output_config(client,g_lcd_inf->screen,g_lcd_inf->disp_mode);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.scl_pwr){
++        c= SCL_BYPASS(0) |SCL_DEN_INV(0) |SCL_H_V_SYNC_INV(0) |SCL_OUT_CLK_INV(0) |SCL_ENABLE(ENABLE);  
++	    rk610_scaler_write_p0_reg(client, SCL_CON0, &c);
++    }
++    if(ENABLE == g_lcd_inf->scl_inf.pll_pwr ){
++        c = S_PLL_PWR(1) |S_PLL_RESET(0) |S_PLL_BYPASS(1);
++	    rk610_scaler_write_p0_reg(client, S_PLL_CON2, &c);
++    }
++}
++#endif
+ int rk610_lcd_scaler_set_param(struct rk29fb_screen *screen,bool enable )//enable:0 bypass 1: scale
+ {
+     int ret=0;
+-    struct i2c_client *client = rk610_g_lcd_client;
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    struct i2c_client *client = g_lcd_inf->client;
+     if(client == NULL){
+-    RK610_ERR(&client->dev,"%s client == NULL FAIL\n",__FUNCTION__);
+-    return -1;
++        printk("%s client == NULL FAIL\n",__FUNCTION__);
++        return -1;
++    }
++    if(screen == NULL){
++        printk("%s screen == NULL FAIL\n",__FUNCTION__);
++        return -1;
+     }
++    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
++    
++    g_lcd_inf->screen = screen;
+     
+ #ifdef CONFIG_HDMI_DUAL_DISP
+     if(enable == 1){
+-        rk610_output_config(client,screen,1);
++        g_lcd_inf->disp_mode = LCD_OUT_SCL;
++        rk610_output_config(client,screen,LCD_OUT_SCL);
+         ret = rk610_scaler_chg(client,screen);
+ 	}
+ 	else 
+ #endif
+ 	{
+-	    rk610_output_config(client,screen,0);
++	    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
++	    rk610_output_config(client,screen,LCD_OUT_BYPASS);
+ 	    ret = rk610_lcd_scaler_bypass(client,enable);
+ 	}
+ 	return ret;
+ }
+-int rk610_lcd_init(struct i2c_client *client)
++int rk610_lcd_init(struct rk610_core_info *rk610_core_info)
+ {
+-    RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-    rk610_g_lcd_client = client;
++    if(rk610_core_info->client == NULL){
++        printk("%s client == NULL FAIL\n",__FUNCTION__);
++        return -1;
++    }
++    RK610_DBG(&rk610_core_info->client->dev,"%s \n",__FUNCTION__);
++
++    g_lcd_inf = kmalloc(sizeof(struct rk610_lcd_info), GFP_KERNEL);
++    if(!g_lcd_inf)
++    {
++        dev_err(&rk610_core_info->client->dev, ">> rk610 inf kmalloc fail!");
++        return -ENOMEM;
++    }
++    memset(g_lcd_inf, 0, sizeof(struct rk610_lcd_info));
++
++    g_lcd_inf->client= rk610_core_info->client;
++    
++    rk610_core_info->lcd_pdata = (void *)g_lcd_inf;
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	g_lcd_inf->early_suspend.suspend = rk610_lcd_early_suspend;
++	g_lcd_inf->early_suspend.resume = rk610_lcd_early_resume;
++	g_lcd_inf->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN - 1;
++	register_early_suspend(&g_lcd_inf->early_suspend);
++#endif
++    g_lcd_inf->scl_inf.pll_pwr = DISABLE;
++    g_lcd_inf->scl_inf.scl_pwr = DISABLE;
++    g_lcd_inf->disp_mode = LCD_OUT_BYPASS;
+     return 0;
+ }
+diff --git a/drivers/video/display/lcd/rk610_lcd.h b/drivers/video/display/lcd/rk610_lcd.h
+index 3307702b9366..8cdeef6e1fa8 100644
+--- a/drivers/video/display/lcd/rk610_lcd.h
++++ b/drivers/video/display/lcd/rk610_lcd.h
+@@ -1,8 +1,11 @@
+ #ifndef _RK610_LCD_H
+ #define _RK610_LCD_H
++#include <linux/mfd/rk610_core.h>
+ #include "../screen/screen.h"
++#include <linux/earlysuspend.h>
+ #define ENABLE      1
+ #define DISABLE     0
++
+ /*      LVDS config         */
+ /*                  LVDS 外部连线接法                       */
+ /*          LVDS_8BIT_1    LVDS_8BIT_2     LVDS_8BIT_3     LVDS_6BIT
+@@ -59,6 +62,14 @@ Y   TX11    G7              G1              GND             GND
+ #define LCD1_FROM_LCD0  0
+ #define LCD1_FROM_SCL   1
+ 
++//SCALER config
++#define NOBYPASS    0
++#define BYPASS      1
++
++//SCALER PLL config
++#define S_PLL_PWR_ON    0
++#define S_PLL_PWR_DOWN  1
++
+ /*      clock config        */
+ #define S_PLL_FROM_DIV      0
+ #define S_PLL_FROM_CLKIN    1
+@@ -151,22 +162,12 @@ Y   TX11    G7              G1              GND             GND
+ #define SCL_V_BORD_END_LSB(x)              ((x)&0xff)      //dsp_vbord_end[7:0]
+ //SCL_CON25
+ #define SCL_V_BORD_END_MSB(x)        (((x)>>8)&0xf)      //dsp_vbord_end[11:8]
+-#if 0
+-/****************LCD STRUCT********/
+-#define PLL_CLKOD(i)	((i) & 0x03)
+-#define PLL_NO_1	PLL_CLKOD(0)
+-#define PLL_NO_2	PLL_CLKOD(1)
+-#define PLL_NO_4	PLL_CLKOD(2)
+-#define PLL_NO_8	PLL_CLKOD(3)
+-#define SCALE_PLL(_parent_rate , _rate, _m, _n, _od) \
+-{ \
+-	.parent_rate	= _parent_rate, \
+-	.rate           = _rate,          \
+-	.m	            = _m,            \
+-	.n	            = _n,            \
+-	.od             = _od,         \
+-}
+-#endif
++
++enum {
++    LCD_OUT_SCL,
++    LCD_OUT_BYPASS,
++    LCD_OUT_DISABLE,
++};
+ struct rk610_pll_info{
+     u32 parent_rate;
+     u32 rate;
+@@ -191,11 +192,23 @@ struct scl_hv_info{
+     int scl_h ;
+     int scl_v;
+     };
++
++struct scl_info{
++    bool pll_pwr;
++    bool scl_pwr;
++    struct scl_hv_info scl_hv;
++};
+ struct rk610_lcd_info{
+-    int enable;
+-    struct scl_hv_info scl;
+-    struct lcd_mode_inf *lcd_mode;
++    int disp_mode;
++    
++    struct rk29fb_screen *screen;
++    struct scl_info scl_inf;
++    struct i2c_client *client;
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	struct early_suspend		early_suspend;
++#endif
+ };
+-extern int rk610_lcd_init(struct i2c_client *client);
++extern int rk610_lcd_init(struct rk610_core_info *rk610_core_info);
+ extern int rk610_lcd_scaler_set_param(struct rk29fb_screen *screen,bool enable );
+ #endif
+diff --git a/drivers/video/display/screen/lcd_hdmi_1024x768.c b/drivers/video/display/screen/lcd_hdmi_1024x768.c
+index 12d1ce1a456a..c4d7ea336dcf 100644
+--- a/drivers/video/display/screen/lcd_hdmi_1024x768.c
++++ b/drivers/video/display/screen/lcd_hdmi_1024x768.c
+@@ -120,12 +120,18 @@
+ 
+ #define S5_H_ST			858
+ #define S5_V_ST			45
++
++#define S_DCLK_POL       0
++
+ /* Other */
+ #define DCLK_POL		0
+ #define SWAP_RB			0 
+ #ifdef  CONFIG_HDMI_DUAL_DISP
+ static int set_scaler_info(struct rk29fb_screen *screen, u8 hdmi_resolution)
+ {
++    screen->s_clk_inv = S_DCLK_POL;
++    screen->s_den_inv = 0;
++    screen->s_hv_sync_inv = 0;
+     switch(hdmi_resolution){
+     case HDMI_1920x1080p_60Hz:
+                 /* Scaler Timing    */
+@@ -230,7 +236,8 @@ void set_lcd_info(struct rk29fb_screen *screen,  struct rk29lcd_info *lcd_info )
+     /* screen type & face */
+     screen->type = OUT_TYPE;
+     screen->face = OUT_FACE;
+-
++    screen->hw_format = OUT_FORMAT;
++    
+     /* Screen size */
+     screen->x_res = H_VD;
+     screen->y_res = V_VD;
+diff --git a/drivers/video/display/screen/lcd_hdmi_1280x800.c b/drivers/video/display/screen/lcd_hdmi_1280x800.c
+index 7154f6a9b12d..43a3348d968e 100644
+--- a/drivers/video/display/screen/lcd_hdmi_1280x800.c
++++ b/drivers/video/display/screen/lcd_hdmi_1280x800.c
+@@ -125,13 +125,18 @@
+ 
+ #define S5_H_ST			476
+ #define S5_V_ST			48
++
++#define S_DCLK_POL       0
++
+ /* Other */
+ #define DCLK_POL		0
+ #define SWAP_RB			0 
+-
+ #ifdef  CONFIG_HDMI_DUAL_DISP
+ static int set_scaler_info(struct rk29fb_screen *screen, u8 hdmi_resolution)
+ {
++    screen->s_clk_inv = S_DCLK_POL;
++    screen->s_den_inv = 0;
++    screen->s_hv_sync_inv = 0;
+     switch(hdmi_resolution){
+     case HDMI_1920x1080p_60Hz:
+                 /* Scaler Timing    */
+@@ -235,7 +240,8 @@ void set_lcd_info(struct rk29fb_screen *screen,  struct rk29lcd_info *lcd_info )
+     /* screen type & face */
+     screen->type = OUT_TYPE;
+     screen->face = OUT_FACE;
+-
++    screen->hw_format = OUT_FORMAT;
++    
+     /* Screen size */
+     screen->x_res = H_VD;
+     screen->y_res = V_VD;
+diff --git a/drivers/video/display/screen/lcd_hdmi_800x480.c b/drivers/video/display/screen/lcd_hdmi_800x480.c
+index 925957702d49..7f71779938cc 100644
+--- a/drivers/video/display/screen/lcd_hdmi_800x480.c
++++ b/drivers/video/display/screen/lcd_hdmi_800x480.c
+@@ -118,13 +118,18 @@
+ 
+ #define S5_H_ST			0
+ #define S5_V_ST			29
++
++#define S_DCLK_POL       0
++
+ /* Other */
+ #define DCLK_POL		0
+ #define SWAP_RB			0 
+-
+ #ifdef  CONFIG_HDMI_DUAL_DISP
+ static int set_scaler_info(struct rk29fb_screen *screen, u8 hdmi_resolution)
+ {
++    screen->s_clk_inv = S_DCLK_POL;
++    screen->s_den_inv = 0;
++    screen->s_hv_sync_inv = 0;
+     switch(hdmi_resolution){
+     case HDMI_1920x1080p_60Hz:
+                 /* Scaler Timing    */
+diff --git a/drivers/video/display/screen/screen.h b/drivers/video/display/screen/screen.h
+index 73bccaf6ca5a..10652aff1cd8 100755
+--- a/drivers/video/display/screen/screen.h
++++ b/drivers/video/display/screen/screen.h
+@@ -117,6 +117,9 @@ typedef struct rk29fb_screen {
+ 	u16 s_vsync_len; 
+ 	u16 s_hsync_st;
+ 	u16 s_vsync_st;
++	bool s_den_inv;
++	bool s_hv_sync_inv;
++	bool s_clk_inv;
+ #endif
+ 	u8 hdmi_resolution;
+     /* mcu need */
+diff --git a/drivers/video/hdmi/chips/rk610/rk610_hdmi.c b/drivers/video/hdmi/chips/rk610/rk610_hdmi.c
+index 0ededa20b08b..72b29189e941 100644
+--- a/drivers/video/hdmi/chips/rk610/rk610_hdmi.c
++++ b/drivers/video/hdmi/chips/rk610/rk610_hdmi.c
+@@ -37,7 +37,10 @@ static int rk610_hdmi_precent(struct hdmi *hdmi)
+ 
+ static int rk610_hdmi_param_chg(struct rk610_hdmi_inf *rk610_hdmi)
+ {
++    int resolution_real;
+     RK610_DBG(&rk610_hdmi->client->dev,"%s \n",__FUNCTION__);
++    resolution_real = Rk610_Get_Optimal_resolution(rk610_hdmi->hdmi->resolution);
++    rk610_hdmi->hdmi->resolution = resolution_real;
+ 	hdmi_switch_fb(rk610_hdmi->hdmi, rk610_hdmi->hdmi->display_on);
+ 	Rk610_hdmi_Set_Video(rk610_hdmi->hdmi->resolution);
+     Rk610_hdmi_Set_Audio(rk610_hdmi->hdmi->audio_fs);
+@@ -294,6 +297,6 @@ static void __exit rk610_hdmi_module_exit(void)
+     i2c_del_driver(&rk610_hdmi_i2c_driver);
+ }
+ 
+-late_initcall(rk610_hdmi_module_init);
++module_init(rk610_hdmi_module_init);
+ //module_init(rk610_hdmi_module_init);
+ module_exit(rk610_hdmi_module_exit);
+diff --git a/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.c b/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.c
+index ba34084b2a83..ac8c3984c47d 100644
+--- a/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.c
++++ b/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.c
+@@ -5,7 +5,13 @@
+ static struct rk610_hdmi_hw_inf g_hw_inf;
+ static EDID_INF g_edid;
+ static byte edid_buf[EDID_BLOCK_SIZE];
++static struct edid_result Rk610_edid_result;
++byte DoEdidRead (struct i2c_client *client);
+ static int RK610_hdmi_soft_reset(struct i2c_client *client);
++static int Rk610_hdmi_Display_switch(struct i2c_client *client);
++static void Rk610_hdmi_plug(struct i2c_client *client);
++static void Rk610_hdmi_unplug(struct i2c_client *client);
++
+ static int Rk610_hdmi_i2c_read_p0_reg(struct i2c_client *client, char reg, char *val)
+ {
+ 	return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
+@@ -20,35 +26,29 @@ static int Rk610_hdmi_pwr_mode(struct i2c_client *client, int mode)
+     char c;
+     int ret=0;
+     switch(mode){
+-    case NORMAL:
+-		c=0x82;
+-	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe3, &c);
+-	    c=0x00;
+-	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe5, &c);
+-        c=0x00;
+-	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe7, &c);
++     case NORMAL:
+         c=0x00;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe4, &c);
++	    c=0x00;
++	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe7, &c);
+         c=0x8e;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe1, &c);
+-	    break;
+-	case LOWER_PWR:
+-        c=0x02;
+-	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe3, &c);
+-	    c=0x1c;
++	    c=0x00;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe5, &c);
++		c=0x82;
++	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe3, &c);   
+ 	    break;
+-	case SHUTDOWN:
++	case LOWER_PWR:
+ 		c=0x02;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe3, &c);
+ 	    c=0x1c;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe5, &c);
++	    c=0x8c;
++	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe1, &c);
+         c=0x04;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe7, &c);
+ 	    c=0x03;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe4, &c);
+-        c=0x8c;
+-	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe1, &c);
+ 	    break;
+ 	default:
+ 	    RK610_ERR(&client->dev,"unkown rk610 hdmi pwr mode %d\n",mode);
+@@ -61,15 +61,26 @@ int Rk610_hdmi_suspend(struct i2c_client *client)
+ {
+     int ret = 0;
+ 	RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+-	ret = Rk610_hdmi_pwr_mode(client,SHUTDOWN);
++	g_hw_inf.suspend_flag = 1;
++	g_hw_inf.hpd = 0;
++	Rk610_hdmi_unplug(client);
+ 	return ret;
+ }
+ int Rk610_hdmi_resume(struct i2c_client *client)
+ {
+ 	int ret = 0;
++	char c = 0;
+ 	RK610_DBG(&client->dev, "%s \n",__FUNCTION__);
+-	ret = Rk610_hdmi_pwr_mode(client,NORMAL);
+-	RK610_hdmi_soft_reset(client);
++	Rk610_hdmi_i2c_read_p0_reg(client, 0xc8, &c);
++	if(c & RK610_HPD_PLUG ){
++        Rk610_hdmi_plug(client);
++		g_hw_inf.hpd=1;
++	}
++	else{
++        Rk610_hdmi_unplug(client);
++		g_hw_inf.hpd=0;
++	}
++	g_hw_inf.suspend_flag = 0;
+ 	return ret;
+ }
+ #endif
+@@ -127,7 +138,7 @@ static int RK610_read_edid_block(struct i2c_client *client,u8 block, u8 * buf)
+ 	c=0xc6;
+ 	ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xc0, &c);
+ 	//wait edid interrupt
+-    msleep(100);
++    msleep(10);
+ 	RK610_DBG(&client->dev,"Interrupt generated\n");
+ 	c=0x00;
+ 	ret =Rk610_hdmi_i2c_read_p0_reg(client, 0xc1, &c);
+@@ -135,7 +146,6 @@ static int RK610_read_edid_block(struct i2c_client *client,u8 block, u8 * buf)
+ 	//clear EDID interrupt reg
+ 	c=0x04;
+ 	ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xc1, &c);
+-	msleep(100);
+ 	for(i=0; i <EDID_BLOCK_SIZE;i++){
+ 	    c = 0;	    
+ 		Rk610_hdmi_i2c_read_p0_reg(client, 0x50, &c);
+@@ -704,6 +714,117 @@ static byte ParseEDID (struct i2c_client *client,byte *pEdid, byte *numExt)
+ 	}
+ 	return EDID_OK;
+ }
++
++int Rk610_Parse_resolution(void)
++{
++    int i,vic;
++    memset(&Rk610_edid_result,0,sizeof(struct edid_result));
++    for(i=0;i < MAX_V_DESCRIPTORS;i++){
++        vic = g_edid.VideoDescriptor[i]&0x7f;
++        if(vic == HDMI_VIC_1080p_50Hz)
++            Rk610_edid_result.supported_1080p_50Hz = 1;
++        else if(vic == HDMI_VIC_1080p_60Hz)
++            Rk610_edid_result.supported_1080p_60Hz = 1; 
++        else if(vic == HDMI_VIC_720p_50Hz)
++            Rk610_edid_result.supported_720p_50Hz = 1; 
++        else if(vic == HDMI_VIC_720p_60Hz)
++            Rk610_edid_result.supported_720p_60Hz = 1; 
++        else if(vic == HDMI_VIC_576p_50Hz)
++            Rk610_edid_result.supported_576p_50Hz = 1; 
++        else if(vic == HDMI_VIC_480p_60Hz)
++            Rk610_edid_result.supported_720x480p_60Hz = 1; 
++    }
++    #ifdef  RK610_DEBUG
++    printk("rk610_hdmi:1080p_50Hz %s\n",Rk610_edid_result.supported_1080p_50Hz?"support":"not support");
++    printk("rk610_hdmi:1080p_60Hz %s\n",Rk610_edid_result.supported_1080p_60Hz?"support":"not support");
++    printk("rk610_hdmi:720p_50Hz %s\n",Rk610_edid_result.supported_720p_50Hz?"support":"not support");
++    printk("rk610_hdmi:720p_60Hz %s\n",Rk610_edid_result.supported_720p_60Hz?"support":"not support");
++    printk("rk610_hdmi:576p_50Hz %s\n",Rk610_edid_result.supported_576p_50Hz?"support":"not support");
++    printk("rk610_hdmi:720x480p_60Hz %s\n",Rk610_edid_result.supported_720x480p_60Hz?"support":"not support");
++    #endif
++    return 0;
++}
++
++int Rk610_Get_Optimal_resolution(int resolution_set)
++{
++	int resolution_real;
++	int find_resolution = 0;
++	
++    Rk610_Parse_resolution();
++	switch(resolution_set){
++	case HDMI_1280x720p_50Hz:
++		if(Rk610_edid_result.supported_720p_50Hz){
++			resolution_real = HDMI_1280x720p_50Hz;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_1280x720p_60Hz:
++		if(Rk610_edid_result.supported_720p_60Hz){
++			resolution_real = HDMI_1280x720p_60Hz;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_720x576p_50Hz_4x3:
++		if(Rk610_edid_result.supported_576p_50Hz){
++			resolution_real = HDMI_720x576p_50Hz_4x3;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_720x576p_50Hz_16x9:
++		if(Rk610_edid_result.supported_576p_50Hz){
++			resolution_real = HDMI_720x576p_50Hz_16x9;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_720x480p_60Hz_4x3:
++		if(Rk610_edid_result.supported_720x480p_60Hz){
++			resolution_real = HDMI_720x480p_60Hz_4x3;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_720x480p_60Hz_16x9:
++		if(Rk610_edid_result.supported_720x480p_60Hz){
++			resolution_real = HDMI_720x480p_60Hz_16x9;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_1920x1080p_50Hz:
++		if(Rk610_edid_result.supported_1080p_50Hz){
++			resolution_real = HDMI_1920x1080p_50Hz;
++			find_resolution = 1;
++		}
++		break;
++	case HDMI_1920x1080p_60Hz:
++		if(Rk610_edid_result.supported_1080p_60Hz){
++			resolution_real = HDMI_1920x1080p_60Hz;
++			find_resolution = 1;
++		}
++		break;
++	default:
++		break;
++	}
++
++	if(find_resolution == 0){
++
++		if(Rk610_edid_result.supported_720p_50Hz)
++			resolution_real = HDMI_1280x720p_50Hz;
++		else if(Rk610_edid_result.supported_720p_60Hz)
++			resolution_real = HDMI_1280x720p_60Hz;
++		else if(Rk610_edid_result.supported_1080p_50Hz)
++			resolution_real = HDMI_1920x1080p_50Hz;
++		else if(Rk610_edid_result.supported_1080p_60Hz)
++			resolution_real = HDMI_1920x1080p_60Hz;
++		else if(Rk610_edid_result.supported_576p_50Hz)
++			resolution_real = HDMI_720x576p_50Hz_4x3;
++		else if(Rk610_edid_result.supported_720x480p_60Hz)
++			resolution_real = HDMI_720x480p_60Hz_4x3;
++		else
++			resolution_real = HDMI_1280x720p_60Hz;
++	}
++
++	return resolution_real;
++}
++
+ byte DoEdidRead (struct i2c_client *client)
+ {
+     u8 NumOfExtensions=0;
+@@ -718,37 +839,43 @@ byte DoEdidRead (struct i2c_client *client)
+         memset(edid_buf,0,EDID_BLOCK_SIZE);
+ 		RK610_read_edid_block(client,EDID_BLOCK0, edid_buf);		// read first 128 bytes of EDID ROM
+         RK610_DBG(&client->dev,"/************first block*******/\n");
++        #ifdef  RK610_DEBUG
+ 	    for (j=0; j<EDID_BLOCK_SIZE; j++)
+ 	        {
+-	        if(j%16==0)
+-	        printk("\n%x :",j);
+-	        printk("%2.2x ", edid_buf[j]);
++	            if(j%16==0)
++	                printk("\n%x :",j);
++	                printk("%2.2x ", edid_buf[j]);
+ 	        }
++	    #endif
+         Result = ParseEDID(client,edid_buf, &NumOfExtensions);
+         if(Result!=EDID_OK){
+             if(Result==EDID_NO_861_EXTENSIONS){
+                 g_edid.HDMI_Sink = FALSE;
+             }
+-            else{
+-                g_edid.HDMI_Sink = TRUE;
++            else {
++                g_edid.HDMI_Sink = FALSE;
++                return FALSE;
+             }
+         }
+ 	    else{
+-            g_edid.HDMI_Sink = TRUE;
+-	    }
+-	    NumOfExtensions = edid_buf[NUM_OF_EXTEN_ADDR];
+-	    for(i=1;i<=NumOfExtensions;i++){
+-	    RK610_DBG(&client->dev,"\n/************block %d*******/\n",i);
+-	    memset(edid_buf,0,EDID_BLOCK_SIZE);
+-           RK610_read_edid_block(client,i, edid_buf); 
+-           Parse861ShortDescriptors(client,edid_buf);
+-           for (j=0; j<EDID_BLOCK_SIZE; j++)
+-	        {
+-	        if(j%16==0)
+-	        printk("\n%x :",j);
+-	        printk("%2.2X ", edid_buf[j]);
++	    	NumOfExtensions = edid_buf[NUM_OF_EXTEN_ADDR];
++	        for(i=1;i<=NumOfExtensions;i++){
++	        RK610_DBG(&client->dev,"\n/************block %d*******/\n",i);
++	        memset(edid_buf,0,EDID_BLOCK_SIZE);
++            RK610_read_edid_block(client,i, edid_buf); 
++            Parse861ShortDescriptors(client,edid_buf);
++        #ifdef  RK610_DEBUG
++            for (j=0; j<EDID_BLOCK_SIZE; j++){
++	            if(j%16==0)
++	            printk("\n%x :",j);
++	            printk("%2.2X ", edid_buf[j]);
++	            }
++	    #endif
+ 	        }
++
++            g_edid.HDMI_Sink = TRUE;
+ 	    }
++
+ #if 0
+ 		Result = ParseEDID(edid_buf, &NumOfExtensions);
+ 			if (Result != EDID_OK)
+@@ -803,6 +930,7 @@ byte DoEdidRead (struct i2c_client *client)
+ 	}
+ 	return TRUE;
+ }
++
+ static int Rk610_hdmi_Display_switch(struct i2c_client *client)
+ {
+     char c;
+@@ -884,23 +1012,23 @@ static int Rk610_hdmi_Config_Video(struct i2c_client *client, u8 video_format)
+     switch(video_format){
+ 		case HDMI_720x480p_60Hz_4x3:
+ 		case HDMI_720x480p_60Hz_16x9:
+-			vic = 0x02;
++			vic = HDMI_VIC_480p_60Hz;
+ 			break;
+         case HDMI_720x576p_50Hz_4x3:
+         case HDMI_720x576p_50Hz_16x9:
+-            vic = 0x11;
++            vic = HDMI_VIC_576p_50Hz;
+             break;
+ 		case HDMI_1280x720p_50Hz:
+-		    vic = 0x13;
++		    vic = HDMI_VIC_720p_50Hz;
+ 			break;
+ 		case HDMI_1280x720p_60Hz:
+-			vic = 0x04;
++			vic = HDMI_VIC_720p_60Hz;
+ 			break;
+ 		case HDMI_1920x1080p_50Hz:
+-		    vic = 0x1f;
++		    vic = HDMI_VIC_1080p_50Hz;
+ 			break;
+ 		case HDMI_1920x1080p_60Hz:
+-			vic = 0x10;
++			vic = HDMI_VIC_1080p_60Hz;
+ 			break;
+ 		default:
+ 			vic = 0x04;
+@@ -971,49 +1099,62 @@ static int RK610_hdmi_PLL_mode(struct i2c_client *client)
+     char c;
+     int ret=0;
+     c=0x10;
+-	ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe8, &c);
++	ret = Rk610_hdmi_i2c_write_p0_reg(client, 0xe8, &c);
+ 	c=0x2c;
+-	ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe6, &c);
++	ret = Rk610_hdmi_i2c_write_p0_reg(client, 0xe6, &c);
+ 	c=0x00;
+-	ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xe5, &c);
++	ret = Rk610_hdmi_i2c_write_p0_reg(client, 0xe5, &c);
+ 	return 0;
+ }
++static void Rk610_hdmi_plug(struct i2c_client *client)
++{
++    RK610_DBG(&client->dev,">>> hdmi plug \n");
++	DoEdidRead(client);
++	Rk610_hdmi_Display_switch(client);
++	Rk610_hdmi_pwr_mode(client,LOWER_PWR);
++	Rk610_hdmi_pwr_mode(client,NORMAL);
++}
++static void Rk610_hdmi_unplug(struct i2c_client *client)
++{
++    RK610_DBG(&client->dev,">>> hdmi unplug \n");
++	g_edid.edidDataValid = FALSE;
++	Rk610_hdmi_pwr_mode(client,LOWER_PWR); 
++}
+ void Rk610_hdmi_event_work(struct i2c_client *client, bool *hpd)
+ {
+ 	char c=0;
+ 	int ret=0;
++    if(g_hw_inf.suspend_flag == 1){
++        *hpd = 0;
++        return ;
++    }
+ 
+ 	c=0x00;
+ 	ret =Rk610_hdmi_i2c_read_p0_reg(client, 0xc1, &c);
+ 	if(c & RK610_HPD_EVENT){
+ 		RK610_DBG(&client->dev,">>>HPD EVENT\n");
+ 		/**********clear hpd event******/
+-		c=RK610_HPD_EVENT;
++		c = RK610_HPD_EVENT;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xc1, &c);
+-		c=0x00;
+ 	    ret =Rk610_hdmi_i2c_read_p0_reg(client, 0xc8, &c);
+ 		if(c & RK610_HPD_PLUG ){
+-			RK610_DBG(&client->dev,">>> hdmi plug \n");
+-			DoEdidRead(client);
+-			Rk610_hdmi_Display_switch(client);
+-			Rk610_hdmi_pwr_mode(client,NORMAL);
+-			*hpd=1;
++            Rk610_hdmi_plug(client);
++			g_hw_inf.hpd=1;
+ 		}
+ 		else{
+-			RK610_DBG(&client->dev,">>> hdmi unplug \n");
+-			g_edid.edidDataValid = FALSE;
+-			Rk610_hdmi_pwr_mode(client,LOWER_PWR);
+-			*hpd=0;
++            Rk610_hdmi_unplug(client);
++			g_hw_inf.hpd=0;
+ 		}
+ 
+ 	}
+ 	if(c & RK610_EDID_EVENT){
+ 			/**********clear hpd event******/
+-		c=RK610_EDID_EVENT;
++		c = RK610_EDID_EVENT;
+ 	    ret =Rk610_hdmi_i2c_write_p0_reg(client, 0xc1, &c);
+ 		RK610_DBG(&client->dev,">>>EDID EVENT\n");
+ 		/*************clear edid event*********/
+ 	}
++	*hpd = g_hw_inf.hpd;
+ }
+ int Rk610_hdmi_Config_Done(struct i2c_client *client)
+ {
+@@ -1077,10 +1218,13 @@ static void Rk610_hdmi_Variable_Initial(void)
+     g_hw_inf.audio_fs = HDMI_I2S_DEFAULT_Fs;
+     g_hw_inf.video_format = HDMI_DEFAULT_RESOLUTION;
+     g_hw_inf.config_param = AUDIO_CHANGE | VIDEO_CHANGE;
++    g_hw_inf.hpd = 0;
++    g_hw_inf.suspend_flag = 0;
+ 
+ }
+ int Rk610_hdmi_init(struct i2c_client *client)
+ {
++    char c;
+     RK610_DBG(&client->dev,"%s \n",__FUNCTION__);
+     Rk610_hdmi_Variable_Initial();
+     RK610_hdmi_soft_reset(client);
+@@ -1090,5 +1234,13 @@ int Rk610_hdmi_init(struct i2c_client *client)
+ 	Rk610_hdmi_Set_Audio(g_hw_inf.audio_fs);
+     Rk610_hdmi_Config_Done(client);
+     
++    Rk610_hdmi_i2c_read_p0_reg(client, 0xc8, &c);
++    if(c & RK610_HPD_PLUG ){
++        Rk610_hdmi_plug(client);
++	    g_hw_inf.hpd=1;
++	}else{
++        Rk610_hdmi_unplug(client);
++	    g_hw_inf.hpd=0;
++	}
+ 	return 0;
+ }
+diff --git a/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.h b/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.h
+index 59c296578f05..e14e19ada6a6 100644
+--- a/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.h
++++ b/drivers/video/hdmi/chips/rk610/rk610_hdmi_hw.h
+@@ -143,12 +143,57 @@ enum{
+ #define INTER_PROGRESSIVE(x)    (x)<<1  //0: progressive 1:interlace
+ #define VIDEO_SET_ENABLE(x)     (x)<<0  //0:disable 1: enable
+ 
++/*          0xe1        */  
++//Main-driver strength :0000~1111: the strength from low to high
++#define M_DRIVER_STR(x)         (((x)&0xf)<<4)
++//Pre-driver strength  :00~11: the strength from low to high
++#define P_DRIVER_STR(x)         (((x)&3)<<2)
++//TX driver enable  1: enable   0: disable
++#define TX_DRIVER_EN(x)         (((x)&1)<<1)
++/*          0xe2        */ 
++//Pre-emphasis strength 00~11: the strength from 0 to high
++#define P_EMPHASIS_STR(x)       (((x)&3)<<4)
++//Power down TMDS driver      1: power down. 0: not
++#define PWR_DOWN_TMDS(x)        (((x)&1)<<0)
++/*          0xe3        */ 
++//PLL out enable.   Just for test. need set to 1’b0
++#define PLL_OUT_EN(x)           (((x)&1)<<7)
++/*          0xe4        */
++// Band-Gap power down  11: power down  00: not
++#define BAND_PWR(x)             (((x)&3)<<0)
++/*          0xe5        */ 
++//PLL disable   1: disable  0: enable
++#define PLL_PWR(x)              (((x)&1)<<4)
++//  PLL reset   1: reset    0: not
++#define PLL_RST(x)              (((x)&1)<<3)
++//PHY TMDS channels reset   1: reset    0: not
++#define TMDS_RST(x)             (((x)&1)<<2)
++/*          0xe7        */ 
++// PLL LDO power down   1: power down   0: not
++#define PLL_LDO_PWR(x)      (((x)&1)<<2) 
++
++
+ /**********CONFIG CHANGE ************/
+ #define VIDEO_CHANGE            1<<0
+ #define AUDIO_CHANGE            1<<1
+ 
+ #define byte    u8
+ 
++#define HDMI_VIC_1080p_50Hz	    0x1f
++#define HDMI_VIC_1080p_60Hz 	0x10
++#define HDMI_VIC_720p_50Hz 	    0x13
++#define HDMI_VIC_720p_60Hz		0x04
++#define HDMI_VIC_576p_50Hz	    0x11
++#define HDMI_VIC_480p_60Hz  	0x02
++
++struct edid_result{
++    bool supported_720p_50Hz;
++	bool supported_720p_60Hz;
++	bool supported_576p_50Hz;
++	bool supported_720x480p_60Hz;
++	bool supported_1080p_50Hz;
++	bool supported_1080p_60Hz;
++};
+ typedef struct edid_info
+ {												// for storing EDID parsed data
+ 	byte edidDataValid;
+@@ -186,7 +231,6 @@ enum EDID_ErrorCodes
+ enum PWR_MODE{
+     NORMAL,
+     LOWER_PWR,
+-    SHUTDOWN,
+ };
+ struct rk610_hdmi_hw_inf{
+     struct i2c_client *client;
+@@ -194,6 +238,8 @@ struct rk610_hdmi_hw_inf{
+     u8 video_format;
+     u8 audio_fs;
+     u8 config_param;
++    bool suspend_flag;
++    bool hpd;
+ };
+ 
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+@@ -203,6 +249,7 @@ extern int Rk610_hdmi_resume(struct i2c_client *client);
+ extern int Rk610_hdmi_Set_Video(u8 video_format);
+ extern int Rk610_hdmi_Set_Audio(u8 audio_fs);
+ extern int Rk610_hdmi_Config_Done(struct i2c_client *client);
++extern int Rk610_Get_Optimal_resolution(int resolution_set);
+ extern void Rk610_hdmi_event_work(struct i2c_client *client, bool *hpd);
+ extern int Rk610_hdmi_init(struct i2c_client *client);
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/drivers/video/hdmi/hdmi-backlight.c b/drivers/video/hdmi/hdmi-backlight.c
+index 707942ac1beb..1bb739a7a199 100755
+--- a/drivers/video/hdmi/hdmi-backlight.c
++++ b/drivers/video/hdmi/hdmi-backlight.c
+@@ -11,7 +11,13 @@ void rk29_backlight_set(bool on)
+ 	*/
+ }
+ #endif
++#ifdef CONFIG_FB_RK29 && CONFIG_HDMI_DUAL_DISP
++extern void rk29_lcd_set(bool on);
++#else
++void rk29_lcd_set(bool on){}
++#endif
+ void hdmi_set_backlight(int on)
+ {
+ 	rk29_backlight_set(on);
++	rk29_lcd_set(on);
+ }
+diff --git a/drivers/video/rk29_fb.c b/drivers/video/rk29_fb.c
+index 9db07658bcd2..1d39f93a7bb7 100644
+--- a/drivers/video/rk29_fb.c
++++ b/drivers/video/rk29_fb.c
+@@ -236,18 +236,7 @@ struct rk29fb_inf {
+ #endif
+ 
+ };
+-#ifdef CONFIG_BACKLIGHT_RK29_BL
+-/* drivers/video/backlight/rk29_backlight.c */
+-extern void rk29_backlight_set(bool on);
+-#else
+-void rk29_backlight_set(bool on)
+-{
+-	/* please add backlight switching-related code here or on your backlight driver
+-	   parameter: on=1 ==> open spk 
+-	   			  on=0 ==> close spk
+-	*/
+-}
+-#endif
++
+ typedef enum _TRSP_MODE
+ {
+     TRSP_CLOSE = 0,
+@@ -345,7 +334,15 @@ static int rk29fb_notify(struct rk29fb_inf *inf, unsigned long event)
+ {
+ 	return blocking_notifier_call_chain(&rk29fb_notifier_list, event, inf->cur_screen);
+ }
++void rk29_lcd_set(bool on)
++{
++    struct rk29fb_info *mach_info = g_pdev->dev.platform_data;
++    if(on == 1 &&mach_info->io_enable)
++        mach_info->io_enable();       //open lcd out
++    else if(mach_info->io_disable)
++        mach_info->io_disable();  //close lcd out
+ 
++}
+ int mcu_do_refresh(struct rk29fb_inf *inf)
+ {
+     if(inf->mcu_stopflush)  return 0;
+@@ -3089,10 +3086,13 @@ static void rk29fb_early_suspend(struct early_suspend *h)
+ #ifdef CONFIG_CLOSE_WIN1_DYNAMIC   
+      cancel_delayed_work_sync(&rk29_win1_check_work);
+ #endif  
+-
++#ifdef CONFIG_HDMI_DUAL_DISP
++    if(mach_info->io_disable)  // close lcd pwr when output screen is lcd
++       mach_info->io_disable();  //close lcd out 
++#else
+     if((inf->cur_screen != &inf->panel2_info) && mach_info->io_disable)  // close lcd pwr when output screen is lcd
+        mach_info->io_disable();  //close lcd out 
+-
++#endif
+ 	if(inf->cur_screen->standby)
+ 	{
+ 		fbprintk(">>>>>> power down the screen! \n");
+@@ -3177,10 +3177,13 @@ static void rk29fb_early_resume(struct early_suspend *h)
+     usleep_range(10*1000, 10*1000);
+     memcpy((u8*)inf->preg, (u8*)&inf->regbak, 0xa4);  //resume reg
+     usleep_range(40*1000, 40*1000);
+-    
++    #ifdef CONFIG_HDMI_DUAL_DISP
++    if(mach_info->io_enable)  // open lcd pwr when output screen is lcd
++       mach_info->io_enable();  //close lcd out 
++    #else
+     if((inf->cur_screen != &inf->panel2_info) && mach_info->io_enable)  // open lcd pwr when output screen is lcd
+        mach_info->io_enable();  //close lcd out 
+-       	
++    #endif
+ }
+ 
+ static struct suspend_info suspend_info = {
+diff --git a/include/linux/mfd/rk610_core.h b/include/linux/mfd/rk610_core.h
+index 22c0674893a6..e67b146224bf 100644
+--- a/include/linux/mfd/rk610_core.h
++++ b/include/linux/mfd/rk610_core.h
+@@ -136,6 +136,10 @@ enum {
+ #define CODEC_CON       0x2e
+ #define I2C_CON         0x2f
+ 
++struct rk610_core_info{
++    struct i2c_client *client;
++    void *lcd_pdata;
++};
+ 
+ extern int rk610_control_send_byte(const char reg, const char data);
+ 
+-- 
+2.35.3
+

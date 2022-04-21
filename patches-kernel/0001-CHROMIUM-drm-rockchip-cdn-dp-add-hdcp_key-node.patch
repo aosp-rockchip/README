@@ -1,0 +1,184 @@
+From 6b1bb8ae1e94c1161f88a9a00e30b1fab903e4ee Mon Sep 17 00:00:00 2001
+From: Ziyuan Xu <xzy.xu@rock-chips.com>
+Date: Wed, 26 Oct 2016 16:10:56 +0800
+Subject: [PATCH] CHROMIUM: drm/rockchip: cdn-dp: add hdcp_key node
+
+Provide the "hdcp_key" debug node in sysfs, so that userspace can pass
+the legitimate HDCP key to driver.
+
+For ATF security, we should transmit HDCP key data via smc argument one
+by one.
+
+Moreover, driver request one page SRAM space as share memory for HDCP
+key transmission.
+
+BUG=chrome-os-partner:56883
+TEST=WITH HDCP KEY SITUATION:
+	1.flash encrypt key to vpd area, and reboot chromebook.
+	$ vpd -O; vpd -s hdcp_key_v1_4=something...; dump_vpd_log
+	--force
+	2.write key to DP driver.
+	$ grep hdcp_key /var/cache/vpd/full-v2.txt | cut -s -d \" -f 4 |
+	tr -d "\n" > /sys/devices/platform/fec00000.dp/hdcp_key
+
+Signed-off-by: Ziyuan Xu <xzy.xu@rock-chips.com>
+Reviewed-on: https://chromium-review.googlesource.com/403972
+Reviewed-by: Julius Werner <jwerner@chromium.org>
+Reviewed-by: Sean Paul <seanpaul@google.com>
+
+Change-Id: I0b97dcf938623685b6938d8a40285fac3b1d5045
+Signed-off-by: Wyon Bi <bivvy.bi@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/cdn-dp-core.c | 71 ++++++++++++++++++++++++++
+ drivers/gpu/drm/rockchip/cdn-dp-core.h | 18 +++++++
+ 2 files changed, 89 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.c b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+index 5eb7a23d547f..8295722fc1e3 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.c
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.c
+@@ -19,14 +19,17 @@
+ #include <drm/drm_edid.h>
+ #include <drm/drm_of.h>
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
++#include <linux/crc16.h>
+ #include <linux/extcon.h>
+ #include <linux/firmware.h>
+ #include <linux/hdmi-notifier.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/nvmem-consumer.h>
+ #include <linux/phy/phy.h>
+ #include <uapi/linux/videodev2.h>
+ 
+@@ -36,6 +39,11 @@
+ #include "cdn-dp-reg.h"
+ #include "rockchip_drm_vop.h"
+ 
++#define HDCP_KEY_DATA_START_TRANSFER	0
++#define HDCP_KEY_DATA_START_DECRYPT	1
++
++#define RK_SIP_HDCP_CONTROL		0x82000009
++
+ #define connector_to_dp(c) \
+ 		container_of(c, struct cdn_dp_device, connector)
+ 
+@@ -1199,6 +1207,67 @@ static const struct component_ops cdn_dp_component_ops = {
+ 	.unbind = cdn_dp_unbind,
+ };
+ 
++static ssize_t hdcp_key_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct nvmem_cell *cell;
++	struct cdn_dp_device *dp = dev_get_drvdata(dev);
++	u8 *cpu_id;
++	int ret;
++	size_t len;
++
++	/*
++	 * The HDCP Key format should look like this: "12345678...",
++	 * every two characters stand for a byte, so the total key size
++	 * would be (308 * 2) byte.
++	 */
++	if (count != (CDN_DP_HDCP_KEY_LEN * 2)) {
++		dev_err(dev, "mis-match hdcp cipher length\n");
++		return -EINVAL;
++	}
++
++	cell = nvmem_cell_get(dev, "cpu-id");
++	if (IS_ERR(cell)) {
++		dev_err(dev, "missing cpu-id nvmen cell property\n");
++		return -ENODEV;
++	}
++
++	cpu_id = (u8 *)nvmem_cell_read(cell, &len);
++	nvmem_cell_put(cell);
++
++	if (IS_ERR(cpu_id))
++		return PTR_ERR(cpu_id);
++
++	if (len != CDN_DP_HDCP_UID_LEN) {
++		dev_err(dev, "mismatch cpu-id size\n");
++		ret = -EINVAL;
++		goto err;
++	}
++
++	/*
++	 * The format of input HDCP Key should be "12345678...".
++	 * there is no standard format for HDCP keys, so it is
++	 * just made up for this driver.
++	 *
++	 * The "ksv & device_key & sha" should parsed from input data
++	 * buffer, and the "seed" would take the crc16 of cpu uid.
++	 */
++	ret = hex2bin((u8 *)&dp->key, buf, CDN_DP_HDCP_KEY_LEN);
++	if (ret) {
++		dev_err(dev, "failed to decode the input HDCP key format\n");
++		goto err;
++	}
++
++	memcpy(dp->key.uid, cpu_id, CDN_DP_HDCP_UID_LEN);
++	dp->key.seed = crc16(0xffff, cpu_id, 16);
++	ret = count;
++err:
++	kfree(cpu_id);
++	return ret;
++}
++static DEVICE_ATTR(hdcp_key, S_IWUSR, NULL, hdcp_key_store);
++
+ static int cdn_dp_suspend(struct device *dev)
+ {
+ 	struct cdn_dp_device *dp = dev_get_drvdata(dev);
+@@ -1275,6 +1344,8 @@ static int cdn_dp_probe(struct platform_device *pdev)
+ 	mutex_init(&dp->lock);
+ 	dev_set_drvdata(dev, dp);
+ 
++	device_create_file(dev, &dev_attr_hdcp_key);
++
+ 	return component_add(dev, &cdn_dp_component_ops);
+ }
+ 
+diff --git a/drivers/gpu/drm/rockchip/cdn-dp-core.h b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+index 5c4f3c93d7eb..c5efdea174df 100644
+--- a/drivers/gpu/drm/rockchip/cdn-dp-core.h
++++ b/drivers/gpu/drm/rockchip/cdn-dp-core.h
+@@ -72,6 +72,23 @@ struct cdn_dp_port {
+ 	u8 id;
+ };
+ 
++enum {
++	CDN_DP_HDCP_KSV_LEN = 8,
++	CDN_DP_HDCP_UID_LEN = 16,
++	CDN_DP_HDCP_SHA_LEN = 20,
++	CDN_DP_HDCP_DPK_LEN = 280,
++	CDN_DP_HDCP_KEY_LEN = 308,
++};
++
++struct cdn_dp_hdcp_key_1x {
++	u8 ksv[CDN_DP_HDCP_KSV_LEN];
++	u8 device_key[CDN_DP_HDCP_DPK_LEN];
++	u8 sha1[CDN_DP_HDCP_SHA_LEN];
++	u8 uid[CDN_DP_HDCP_UID_LEN];
++	u16 seed;
++	u8 reserved[10];
++};
++
+ struct cdn_dp_device {
+ 	struct device *dev;
+ 	struct drm_device *drm_dev;
+@@ -114,5 +131,6 @@ struct cdn_dp_device {
+ #ifdef CONFIG_SWITCH
+ 	struct switch_dev switchdev;
+ #endif
++	struct cdn_dp_hdcp_key_1x key;
+ };
+ #endif  /* _CDN_DP_CORE_H */
+-- 
+2.35.3
+

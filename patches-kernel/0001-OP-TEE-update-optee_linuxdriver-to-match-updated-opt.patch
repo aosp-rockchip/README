@@ -1,0 +1,831 @@
+From f7b87e8de9b4a6de71781d20ac7beb6f37d99e75 Mon Sep 17 00:00:00 2001
+From: "sean.huang" <sean.huang@rock-chips.com>
+Date: Tue, 10 Jan 2017 12:48:20 +0800
+Subject: [PATCH] OP-TEE: update optee_linuxdriver to match updated optee_os &
+ optee_client
+
+Match the optee_os version 1.5 or later.
+
+Main update features:
+1.Support 32-bit client working with 64-bit linux kernel.
+2.Fix Shared Memory protection.
+3.Add mutex to serialize tee-supplicant request.
+4.Revert "rename tee-supplicant to tee_supplicant".
+
+cherry-pick from 3.10
+commit id:5f6467dc09e8c00f7fa6a621b3aad7046ae84d48
+
+Change-Id: I5c77ed85aa56e36d346be7c4462c5a15120df439
+Signed-off-by: sean.huang <sean.huang@rock-chips.com>
+---
+ security/Kconfig                              |  2 +
+ security/Makefile                             |  1 +
+ security/optee_linuxdriver/Kconfig            |  2 +-
+ security/optee_linuxdriver/armtz/tee_tz_drv.c | 16 ++++--
+ security/optee_linuxdriver/core/tee_context.c |  6 +--
+ security/optee_linuxdriver/core/tee_core.c    | 29 ++++++----
+ .../optee_linuxdriver/core/tee_kernel_api.c   |  3 +-
+ security/optee_linuxdriver/core/tee_session.c | 18 ++++---
+ security/optee_linuxdriver/core/tee_shm.c     | 39 ++++++++------
+ .../optee_linuxdriver/core/tee_supp_com.c     | 13 +++--
+ .../optee_linuxdriver/core/tee_supp_com.h     |  8 ++-
+ .../fdts/fvp-foundation-gicv2-psci.dts        | 11 +++-
+ .../include/arm_common/teesmc.h               | 10 ++--
+ .../include/linux/tee_client_api.h            | 54 +++++++++++++++----
+ .../optee_linuxdriver/include/linux/tee_ioc.h | 40 ++++++++++----
+ 15 files changed, 178 insertions(+), 74 deletions(-)
+
+diff --git a/security/Kconfig b/security/Kconfig
+index 3aa60791f84d..d9c9b1f76059 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -173,6 +173,8 @@ source security/tomoyo/Kconfig
+ source security/apparmor/Kconfig
+ source security/yama/Kconfig
+ 
++source security/optee_linuxdriver/Kconfig
++
+ source security/integrity/Kconfig
+ 
+ choice
+diff --git a/security/Makefile b/security/Makefile
+index c9bfbc84ff50..db9ed0a664a7 100644
+--- a/security/Makefile
++++ b/security/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_SECURITY_TOMOYO)		+= tomoyo/
+ obj-$(CONFIG_SECURITY_APPARMOR)		+= apparmor/
+ obj-$(CONFIG_SECURITY_YAMA)		+= yama/
+ obj-$(CONFIG_CGROUP_DEVICE)		+= device_cgroup.o
++obj-$(CONFIG_TEE_SUPPORT)		+= optee_linuxdriver/
+ 
+ # Object integrity file lists
+ subdir-$(CONFIG_INTEGRITY)		+= integrity
+diff --git a/security/optee_linuxdriver/Kconfig b/security/optee_linuxdriver/Kconfig
+index a3f0714e4675..3e16d831648c 100644
+--- a/security/optee_linuxdriver/Kconfig
++++ b/security/optee_linuxdriver/Kconfig
+@@ -14,7 +14,7 @@
+ # Trursted Execution Environment Configuration
+ config TEE_SUPPORT
+ 	bool "Trusted Execution Environment Support"
+-	default y
++	default n
+ 	---help---
+ 	  This implements the Trusted Execution Environment (TEE) Client
+ 	  API Specification from GlobalPlatform Device Technology.
+diff --git a/security/optee_linuxdriver/armtz/tee_tz_drv.c b/security/optee_linuxdriver/armtz/tee_tz_drv.c
+index 70e7c5bb1198..65145297d162 100644
+--- a/security/optee_linuxdriver/armtz/tee_tz_drv.c
++++ b/security/optee_linuxdriver/armtz/tee_tz_drv.c
+@@ -32,11 +32,17 @@
+ #include <arm_common/teesmc.h>
+ #include <arm_common/teesmc_st.h>
+ 
++#include <linux/cpumask.h>
++
+ #include "tee_mem.h"
+ #include "tee_tz_op.h"
+ #include "tee_tz_priv.h"
+ #include "handle.h"
+ 
++#ifdef CONFIG_OUTER_CACHE
++#undef CONFIG_OUTER_CACHE
++#endif
++
+ #define SWITCH_CPU0_DEBUG
+ 
+ #define _TEE_TZ_NAME "armtz"
+@@ -71,9 +77,9 @@ static struct handle_db shm_handle_db = HANDLE_DB_INITIALIZER;
+ static void switch_cpumask_to_cpu0(cpumask_t *saved_cpu_mask)
+ {
+ 	long ret;
++
+ 	cpumask_t local_cpu_mask = CPU_MASK_NONE;
+-	pr_info("switch_cpumask_to_cpu cpu0\n");
+-	cpu_set(0, local_cpu_mask);
++	cpumask_set_cpu(0, &local_cpu_mask);
+ 	cpumask_copy(saved_cpu_mask, tsk_cpus_allowed(current));
+ 	ret = sched_setaffinity(0, &local_cpu_mask);
+ 	if (ret)
+@@ -83,7 +89,7 @@ static void switch_cpumask_to_cpu0(cpumask_t *saved_cpu_mask)
+ static void restore_cpumask(cpumask_t *saved_cpu_mask)
+ {
+ 	long ret;
+-	pr_info("restore_cpumask cpu0\n");
++
+ 	ret = sched_setaffinity(0, saved_cpu_mask);
+ 	if (ret)
+ 		pr_err("sched_setaffinity #2 -> 0x%lX", ret);
+@@ -451,9 +457,9 @@ static void call_tee(struct tee_tz *ptee,
+ #endif
+ 		ret = param.a0;
+ 
+-		if (ret == TEESMC_RETURN_EBUSY) {
++		if (ret == TEESMC_RETURN_ETHREAD_LIMIT) {
+ 			/*
+-			 * Since secure world returned busy, release the
++			 * Since secure world is out of threads, release the
+ 			 * lock we had when entering this function and wait
+ 			 * for "something to happen" (something else to
+ 			 * exit from secure world and needed resources may
+diff --git a/security/optee_linuxdriver/core/tee_context.c b/security/optee_linuxdriver/core/tee_context.c
+index b86c61ac4789..9c3bce65e470 100644
+--- a/security/optee_linuxdriver/core/tee_context.c
++++ b/security/optee_linuxdriver/core/tee_context.c
+@@ -173,10 +173,8 @@ static void _tee_context_do_release(struct kref *kref)
+ 
+ 	dev_dbg(_DEV(tee), "%s: > ctx=%p\n", __func__, ctx);
+ 
+-	mutex_lock(&tee->lock);
+ 	tee_dec_stats(&tee->stats[TEE_STATS_CONTEXT_IDX]);
+ 	list_del(&ctx->entry);
+-	mutex_unlock(&tee->lock);
+ 
+ 	devm_kfree(_DEV(tee), ctx);
+ 	tee_put(tee);
+@@ -202,10 +200,8 @@ static int is_in_list(struct tee *tee, struct list_head *entry)
+ {
+ 	int present = 1;
+ 
+-	mutex_lock(&tee->lock);
+ 	if ((entry->next == LIST_POISON1) && (entry->prev == LIST_POISON2))
+ 		present = 0;
+-	mutex_unlock(&tee->lock);
+ 	return present;
+ }
+ 
+@@ -245,7 +241,9 @@ void tee_context_destroy(struct tee_context *ctx)
+ 
+ 	dev_dbg(_DEV(tee), "%s: ctx=%p\n", __func__, ctx);
+ 
++	mutex_lock(&tee->lock);
+ 	tee_context_put(ctx);
++	mutex_unlock(&tee->lock);
+ }
+ 
+ int tee_context_copy_from_client(const struct tee_context *ctx,
+diff --git a/security/optee_linuxdriver/core/tee_core.c b/security/optee_linuxdriver/core/tee_core.c
+index 8ef8ade7a3b5..c718481982fb 100644
+--- a/security/optee_linuxdriver/core/tee_core.c
++++ b/security/optee_linuxdriver/core/tee_core.c
+@@ -39,7 +39,7 @@
+ 
+ #define _TEE_CORE_FW_VER "1:0.1"
+ 
+-static char *_tee_supp_app_name = "tee_supplicant";
++static char *_tee_supp_app_name = "tee-supplicant";
+ 
+ /* Store the class misc reference */
+ static struct class *misc_class;
+@@ -368,24 +368,33 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+ 	int ret = -EINVAL;
+ 	struct tee_context *ctx = filp->private_data;
++	void __user *u_arg;
+ 
+ 	BUG_ON(!ctx);
+ 	BUG_ON(!ctx->tee);
+ 
+ 	dev_dbg(_DEV(ctx->tee), "%s: > cmd nr=%d\n", __func__, _IOC_NR(cmd));
+ 
++#ifdef CONFIG_COMPAT
++	if (is_compat_task())
++		u_arg = compat_ptr(arg);
++	else
++		u_arg = (void __user *)arg;
++#else
++	u_arg = (void __user *)arg;
++#endif
++
+ 	switch (cmd) {
+ 	case TEE_OPEN_SESSION_IOC:
+-		ret =
+-		    tee_do_create_session(ctx, (struct tee_cmd_io __user *)arg);
++		ret = tee_do_create_session(ctx,
++				(struct tee_cmd_io __user *)u_arg);
+ 		break;
+ 	case TEE_ALLOC_SHM_IOC:
+-		ret = tee_do_shm_alloc(ctx, (struct tee_shm_io __user *)arg);
++		ret = tee_do_shm_alloc(ctx, (struct tee_shm_io __user *)u_arg);
+ 		break;
+ 	case TEE_GET_FD_FOR_RPC_SHM_IOC:
+-		ret =
+-		    tee_do_get_fd_for_rpc_shm(ctx,
+-					      (struct tee_shm_io __user *)arg);
++		ret = tee_do_get_fd_for_rpc_shm(ctx,
++				 (struct tee_shm_io __user *)u_arg);
+ 		break;
+ 	default:
+ 		ret = -ENOSYS;
+@@ -403,8 +412,10 @@ static const struct file_operations tee_file_fops = {
+ 	.write = tee_supp_write,
+ 	.open = tee_ctx_open,
+ 	.release = tee_ctx_release,
+-	.unlocked_ioctl = tee_ioctl,
+-	.compat_ioctl = tee_ioctl
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = tee_ioctl,
++#endif
++	.unlocked_ioctl = tee_ioctl
+ };
+ 
+ static void tee_plt_device_release(struct device *dev)
+diff --git a/security/optee_linuxdriver/core/tee_kernel_api.c b/security/optee_linuxdriver/core/tee_kernel_api.c
+index 9da7bc80ad67..3b4380faf3b1 100644
+--- a/security/optee_linuxdriver/core/tee_kernel_api.c
++++ b/security/optee_linuxdriver/core/tee_kernel_api.c
+@@ -28,6 +28,7 @@
+ 
+ static void reset_tee_cmd(struct tee_cmd_io *cmd)
+ {
++	memset(cmd, 0, sizeof(struct tee_cmd_io));
+ 	cmd->fd_sess = -1;
+ 	cmd->cmd = 0;
+ 	cmd->uuid = NULL;
+@@ -230,7 +231,7 @@ TEEC_Result TEEC_AllocateSharedMemory(TEEC_Context *context,
+ 	shm = (struct tee_shm *)(long)shm_io.fd_shm;
+ 	shared_memory->buffer = shm->kaddr;
+ 
+-	pr_debug("%s(%zd) => fd=%d, kaddr=%p\n", __func__,
++	pr_debug("%s(%d) => fd=%d, kaddr=%p\n", __func__,
+ 		 shm_io.size, shm_io.fd_shm, (void *)shared_memory->buffer);
+ 
+ 	return TEEC_SUCCESS;
+diff --git a/security/optee_linuxdriver/core/tee_session.c b/security/optee_linuxdriver/core/tee_session.c
+index e90725582cfc..987e7c954c84 100644
+--- a/security/optee_linuxdriver/core/tee_session.c
++++ b/security/optee_linuxdriver/core/tee_session.c
+@@ -359,6 +359,9 @@ static int tee_session_release(struct inode *inode, struct file *filp)
+ 
+ const struct file_operations tee_session_fops = {
+ 	.owner = THIS_MODULE,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = tee_session_ioctl,
++#endif
+ 	.unlocked_ioctl = tee_session_ioctl,
+ 	.compat_ioctl = tee_session_ioctl,
+ 	.release = tee_session_release,
+@@ -383,14 +386,14 @@ int tee_session_close_and_destroy(struct tee_session *sess)
+ 
+ 	ret = tee_session_close_be(sess);
+ 
+-	mutex_lock(&sess->ctx->tee->lock);
++	mutex_lock(&tee->lock);
+ 	tee_dec_stats(&tee->stats[TEE_STATS_SESSION_IDX]);
+ 	list_del(&sess->entry);
+-	mutex_unlock(&sess->ctx->tee->lock);
+ 
+ 	devm_kfree(_DEV(tee), sess);
+ 	tee_context_put(ctx);
+ 	tee_put(tee);
++	mutex_unlock(&tee->lock);
+ 
+ 	dev_dbg(_DEV(tee), "%s: <\n", __func__);
+ 	return ret;
+@@ -424,6 +427,7 @@ struct tee_session *tee_session_create_and_open(struct tee_context *ctx,
+ 	sess->ctx = ctx;
+ 
+ 	ret = tee_session_open_be(sess, cmd_io);
++	mutex_lock(&tee->lock);
+ 	if (ret || !sess->sessid || cmd_io->err) {
+ 		dev_err(_DEV(tee), "%s: ERROR ret=%d (err=0x%08x, org=%d,  sessid=0x%08x)\n",
+ 				__func__, ret, cmd_io->err,
+@@ -431,13 +435,13 @@ struct tee_session *tee_session_create_and_open(struct tee_context *ctx,
+ 		tee_put(tee);
+ 		tee_context_put(ctx);
+ 		devm_kfree(_DEV(tee), sess);
++		mutex_unlock(&tee->lock);
+ 		if (ret)
+ 			return ERR_PTR(ret);
+ 		else
+ 			return NULL;
+ 	}
+ 
+-	mutex_lock(&tee->lock);
+ 	tee_inc_stats(&tee->stats[TEE_STATS_SESSION_IDX]);
+ 	list_add_tail(&sess->entry, &ctx->list_sess);
+ 	mutex_unlock(&tee->lock);
+@@ -728,8 +732,7 @@ static void _update_client_tee_cmd(struct tee_session *sess,
+ 				dev_dbg(_DEV_TEE,
+ 					"Size has been updated by the TA %zd != %zd\n",
+ 					size_new,
+-					cmd_io->op->params[idx].tmpref.
+-					size);
++					cmd_io->op->params[idx].tmpref.size);
+ 				tee_put_user(ctx, size_new,
+ 				     &cmd_io->op->params[idx].tmpref.size);
+ 			}
+@@ -742,8 +745,7 @@ static void _update_client_tee_cmd(struct tee_session *sess,
+ 				dev_err(_DEV_TEE,
+ 					"  *** Wrong returned size from %d:%zd > %zd\n",
+ 					idx, size_new,
+-					cmd_io->op->params[idx].tmpref.
+-					size);
++					cmd_io->op->params[idx].tmpref.size);
+ 
+ 			else if (tee_copy_to_user
+ 				 (ctx,
+@@ -758,6 +760,7 @@ static void _update_client_tee_cmd(struct tee_session *sess,
+ 		case TEEC_MEMREF_PARTIAL_OUTPUT:
+ 		case TEEC_MEMREF_PARTIAL_INOUT:
+ 		case TEEC_MEMREF_WHOLE:
++			parent = &cmd->param.c_shm[idx];
+ 			if (type == TEEC_MEMREF_WHOLE) {
+ 				offset = 0;
+ 				size = parent->size;
+@@ -765,7 +768,6 @@ static void _update_client_tee_cmd(struct tee_session *sess,
+ 				offset = cmd_io->op->params[idx].memref.offset;
+ 				size = cmd_io->op->params[idx].memref.size;
+ 			}
+-			parent = &cmd->param.c_shm[idx];
+ 
+ 			/* Returned updated size */
+ 			size_new = cmd->param.params[idx].shm->size_req;
+diff --git a/security/optee_linuxdriver/core/tee_shm.c b/security/optee_linuxdriver/core/tee_shm.c
+index ccc560c2594f..5e310344e95b 100644
+--- a/security/optee_linuxdriver/core/tee_shm.c
++++ b/security/optee_linuxdriver/core/tee_shm.c
+@@ -43,6 +43,7 @@ struct tee_shm *tee_shm_alloc_from_rpc(struct tee *tee, size_t size)
+ 
+ 	INMSG();
+ 
++	mutex_lock(&tee->lock);
+ 	shm = tee_shm_alloc(tee, size, TEE_SHM_TEMP | TEE_SHM_FROM_RPC);
+ 	if (IS_ERR_OR_NULL(shm)) {
+ 		dev_err(_DEV(tee), "%s: buffer allocation failed (%ld)\n",
+@@ -50,30 +51,32 @@ struct tee_shm *tee_shm_alloc_from_rpc(struct tee *tee, size_t size)
+ 		goto out;
+ 	}
+ 
+-	mutex_lock(&tee->lock);
+ 	tee_inc_stats(&tee->stats[TEE_STATS_SHM_IDX]);
+ 	list_add_tail(&shm->entry, &tee->list_rpc_shm);
+-	mutex_unlock(&tee->lock);
++
+ 	shm->ctx = NULL;
+ 
+ out:
++	mutex_unlock(&tee->lock);
+ 	OUTMSGX(shm);
+ 	return shm;
+ }
+ 
+ void tee_shm_free_from_rpc(struct tee_shm *shm)
+ {
++	struct tee *tee;
++
+ 	if (shm == NULL)
+ 		return;
+-
++	tee = shm->tee;
++	mutex_lock(&tee->lock);
+ 	if (shm->ctx == NULL) {
+-		mutex_lock(&shm->tee->lock);
+ 		tee_dec_stats(&shm->tee->stats[TEE_STATS_SHM_IDX]);
+ 		list_del(&shm->entry);
+-		mutex_unlock(&shm->tee->lock);
+ 	}
+ 
+ 	tee_shm_free(shm);
++	mutex_unlock(&tee->lock);
+ }
+ 
+ struct tee_shm *tee_shm_alloc(struct tee *tee, size_t size, uint32_t flags)
+@@ -397,14 +400,14 @@ int tee_shm_alloc_io(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 
+ 	if (ctx->usr_client)
+ 		shm_io->fd_shm = 0;
+-	else
+-		shm_io->ptr = NULL;
+ 
++	mutex_lock(&tee->lock);
+ 	shm = tee_shm_alloc(tee, shm_io->size, shm_io->flags);
+ 	if (IS_ERR_OR_NULL(shm)) {
+ 		dev_err(_DEV(tee), "%s: buffer allocation failed (%ld)\n",
+ 			__func__, PTR_ERR(shm));
+-		return PTR_ERR(shm);
++		ret = PTR_ERR(shm);
++		goto out;
+ 	}
+ 
+ 	if (ctx->usr_client) {
+@@ -416,8 +419,7 @@ int tee_shm_alloc_io(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 		}
+ 
+ 		shm->flags |= TEEC_MEM_DMABUF;
+-	} else
+-		shm_io->ptr = shm;
++	}
+ 
+ 	shm->ctx = ctx;
+ 	shm->dev = get_device(_DEV(tee));
+@@ -425,11 +427,10 @@ int tee_shm_alloc_io(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 	BUG_ON(ret);		/* tee_core_get must not issue */
+ 	tee_context_get(ctx);
+ 
+-	mutex_lock(&tee->lock);
+ 	tee_inc_stats(&tee->stats[TEE_STATS_SHM_IDX]);
+ 	list_add_tail(&shm->entry, &ctx->list_shm);
+-	mutex_unlock(&tee->lock);
+ out:
++	mutex_unlock(&tee->lock);
+ 	OUTMSG(ret);
+ 	return ret;
+ }
+@@ -443,13 +444,13 @@ void tee_shm_free_io(struct tee_shm *shm)
+ 	mutex_lock(&ctx->tee->lock);
+ 	tee_dec_stats(&tee->stats[TEE_STATS_SHM_IDX]);
+ 	list_del(&shm->entry);
+-	mutex_unlock(&ctx->tee->lock);
+ 
+ 	tee_shm_free(shm);
+ 	tee_put(ctx->tee);
+ 	tee_context_put(ctx);
+ 	if (dev)
+ 		put_device(dev);
++	mutex_unlock(&ctx->tee->lock);
+ }
+ 
+ /* Buffer allocated by rpc from fw and to be accessed by the user
+@@ -465,6 +466,7 @@ int tee_shm_fd_for_rpc(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 
+ 	shm_io->fd_shm = 0;
+ 
++	mutex_lock(&tee->lock);
+ 	if (!list_empty(&tee->list_rpc_shm)) {
+ 		list_for_each(pshm, &tee->list_rpc_shm) {
+ 			shm = list_entry(pshm, struct tee_shm, entry);
+@@ -485,9 +487,7 @@ int tee_shm_fd_for_rpc(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 	}
+ 
+ 	shm->ctx = ctx;
+-	mutex_lock(&tee->lock);
+ 	list_move(&shm->entry, &ctx->list_shm);
+-	mutex_unlock(&tee->lock);
+ 
+ 	shm->dev = get_device(_DEV(tee));
+ 	ret = tee_get(tee);
+@@ -496,6 +496,7 @@ int tee_shm_fd_for_rpc(struct tee_context *ctx, struct tee_shm_io *shm_io)
+ 
+ 	BUG_ON(!tee->ops->shm_inc_ref(shm));
+ out:
++	mutex_unlock(&tee->lock);
+ 	OUTMSG(ret);
+ 	return ret;
+ }
+@@ -722,10 +723,12 @@ struct tee_shm *tee_shm_get(struct tee_context *ctx, TEEC_SharedMemory *c_shm,
+ 	dev_dbg(_DEV(tee), "%s: > fd=%d flags=%08x\n",
+ 			__func__, c_shm->d.fd, c_shm->flags);
+ 
++	mutex_lock(&tee->lock);
+ 	shm = kzalloc(sizeof(*shm), GFP_KERNEL);
+ 	if (IS_ERR_OR_NULL(shm)) {
+ 		dev_err(_DEV(tee), "can't alloc tee_shm\n");
+-		return ERR_PTR(-ENOMEM);
++		ret = -ENOMEM;
++		goto err;
+ 	}
+ 
+ 	shm->ctx = ctx;
+@@ -773,11 +776,13 @@ struct tee_shm *tee_shm_get(struct tee_context *ctx, TEEC_SharedMemory *c_shm,
+ #endif
+ 	}
+ 
++	mutex_unlock(&tee->lock);
+ 	OUTMSGX(shm);
+ 	return shm;
+ 
+ err:
+ 	kfree(shm);
++	mutex_unlock(&tee->lock);
+ 	OUTMSGX(ERR_PTR(ret));
+ 	return ERR_PTR(ret);
+ }
+@@ -792,6 +797,7 @@ void tee_shm_put(struct tee_context *ctx, struct tee_shm *shm)
+ 	BUG_ON(!shm);
+ 	BUG_ON(!(shm->flags & TEE_SHM_MEMREF));
+ 
++	mutex_lock(&tee->lock);
+ 	if (shm->flags & TEEC_MEM_DMABUF) {
+ 		struct tee_shm_dma_buf *sdb;
+ 		struct dma_buf *dma_buf;
+@@ -810,6 +816,7 @@ void tee_shm_put(struct tee_context *ctx, struct tee_shm *shm)
+ 	}
+ 
+ 	kfree(shm);
++	mutex_unlock(&tee->lock);
+ 	OUTMSG(0);
+ }
+ 
+diff --git a/security/optee_linuxdriver/core/tee_supp_com.c b/security/optee_linuxdriver/core/tee_supp_com.c
+index 3e60e9155c26..dbb5f19270d3 100644
+--- a/security/optee_linuxdriver/core/tee_supp_com.c
++++ b/security/optee_linuxdriver/core/tee_supp_com.c
+@@ -78,10 +78,14 @@ enum teec_rpc_result tee_supp_cmd(struct tee *tee,
+ 			if (sizeof(rpc->commToUser) < datalen)
+ 				break;
+ 
+-			mutex_lock(&rpc->outsync);
++			/*
++			 * Other threads blocks here until we've copied our
++			 * answer from the supplicant
++			 */
++			mutex_lock(&rpc->thrd_mutex);
+ 
++			mutex_lock(&rpc->outsync);
+ 			memcpy(&rpc->commToUser, data, datalen);
+-
+ 			mutex_unlock(&rpc->outsync);
+ 
+ 			dev_dbg(tee->dev,
+@@ -97,11 +101,11 @@ enum teec_rpc_result tee_supp_cmd(struct tee *tee,
+ 				rpc->commToUser.cmd);
+ 
+ 			mutex_lock(&rpc->insync);
+-
+ 			memcpy(data, &rpc->commFromUser, datalen);
+-
+ 			mutex_unlock(&rpc->insync);
+ 
++			mutex_unlock(&rpc->thrd_mutex);
++
+ 			res = TEEC_RPC_OK;
+ 
+ 			break;
+@@ -258,6 +262,7 @@ int tee_supp_init(struct tee *tee)
+ 	    __SEMAPHORE_INITIALIZER(rpc->datafromuser, 0);
+ 	rpc->datatouser = (struct semaphore)
+ 	    __SEMAPHORE_INITIALIZER(rpc->datatouser, 0);
++	mutex_init(&rpc->thrd_mutex);
+ 	mutex_init(&rpc->outsync);
+ 	mutex_init(&rpc->insync);
+ 	atomic_set(&rpc->used, 0);
+diff --git a/security/optee_linuxdriver/core/tee_supp_com.h b/security/optee_linuxdriver/core/tee_supp_com.h
+index 841fe9f1fbd3..e5117e8357cc 100644
+--- a/security/optee_linuxdriver/core/tee_supp_com.h
++++ b/security/optee_linuxdriver/core/tee_supp_com.h
+@@ -65,16 +65,21 @@ struct tee_rpc_free {
+ };
+ 
+ struct tee_rpc_cmd {
+-	void *buffer;
++	union {
++		void    *buffer;
++		uint64_t padding_buf;
++	};
+ 	uint32_t size;
+ 	uint32_t type;
+ 	int fd;
++	int reserved;
+ };
+ 
+ struct tee_rpc_invoke {
+ 	uint32_t cmd;
+ 	uint32_t res;
+ 	uint32_t nbr_bf;
++	uint32_t reserved;
+ 	struct tee_rpc_cmd cmds[TEE_RPC_BUFFER_NUMBER];
+ };
+ 
+@@ -83,6 +88,7 @@ struct tee_rpc {
+ 	struct tee_rpc_invoke commFromUser;
+ 	struct semaphore datatouser;
+ 	struct semaphore datafromuser;
++	struct mutex thrd_mutex; /* Block the thread to wait for supp answer */
+ 	struct mutex outsync; /* Out sync mutex */
+ 	struct mutex insync; /* In sync mutex */
+ 	struct mutex reqsync; /* Request sync mutex */
+diff --git a/security/optee_linuxdriver/fdts/fvp-foundation-gicv2-psci.dts b/security/optee_linuxdriver/fdts/fvp-foundation-gicv2-psci.dts
+index 2237fbec0d2b..c2de12ba9a63 100644
+--- a/security/optee_linuxdriver/fdts/fvp-foundation-gicv2-psci.dts
++++ b/security/optee_linuxdriver/fdts/fvp-foundation-gicv2-psci.dts
+@@ -30,7 +30,6 @@
+ 
+ /dts-v1/;
+ 
+-/memreserve/ 0x81000000 0x00100000;
+ /memreserve/ 0x80000000 0x00010000;
+ 
+ / {
+@@ -96,6 +95,16 @@
+ 		      <0x00000008 0x80000000 0 0x80000000>;
+ 	};
+ 
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		optee@0x83000000 {
++			reg = <0x00000000 0x83000000 0 0x01000000>;
++		};
++	};
++
+ 	gic: interrupt-controller@2f000000 {
+ 		compatible = "arm,cortex-a15-gic", "arm,cortex-a9-gic";
+ 		#interrupt-cells = <3>;
+diff --git a/security/optee_linuxdriver/include/arm_common/teesmc.h b/security/optee_linuxdriver/include/arm_common/teesmc.h
+index 6727db4713d2..cbc12c02b370 100644
+--- a/security/optee_linuxdriver/include/arm_common/teesmc.h
++++ b/security/optee_linuxdriver/include/arm_common/teesmc.h
+@@ -435,7 +435,7 @@ struct teesmc_meta_open_session {
+  * r4-7/x4-7	Preserved
+  *
+  * Ebusy return register usage:
+- * r0/x0	Return value, TEESMC_RETURN_EBUSY
++ * r0/x0	Return value, TEESMC_RETURN_ETHREAD_LIMIT
+  * r1-3/x1-3	Preserved
+  * r4-7/x4-7	Preserved
+  *
+@@ -450,7 +450,8 @@ struct teesmc_meta_open_session {
+  * TEESMC_RETURN_OK			Call completed, result updated in
+  *					the previously supplied struct
+  *					teesmc32_arg.
+- * TEESMC_RETURN_EBUSY			Trusted OS busy, try again later.
++ * TEESMC_RETURN_ETHREAD_LIMIT		Trusted OS out of threads,
++ *					try again later.
+  * TEESMC_RETURN_EBADADDR		Bad physcial pointer to struct
+  *					teesmc32_arg.
+  * TEESMC_RETURN_EBADCMD		Bad/unknown cmd in struct teesmc32_arg
+@@ -500,7 +501,8 @@ struct teesmc_meta_open_session {
+  *					struct teesmc32_arg
+  * TEESMC_RETURN_RPC			Call suspended by RPC call to normal
+  *					world.
+- * TEESMC_RETURN_EBUSY			Trusted OS busy, try again later.
++ * TEESMC_RETURN_ETHREAD_LIMIT		Trusted OS out of threads,
++ *					try again later.
+  * TEESMC_RETURN_ERESUME		Resume failed, the opaque resume
+  *					information was corrupt.
+  */
+@@ -685,7 +687,7 @@ struct teesmc_meta_open_session {
+ 
+ /* Returned in r0 only from Trusted OS functions */
+ #define TEESMC_RETURN_OK		0x0
+-#define TEESMC_RETURN_EBUSY		0x1
++#define TEESMC_RETURN_ETHREAD_LIMIT	0x1
+ #define TEESMC_RETURN_ERESUME		0x2
+ #define TEESMC_RETURN_EBADADDR		0x3
+ #define TEESMC_RETURN_EBADCMD		0x4
+diff --git a/security/optee_linuxdriver/include/linux/tee_client_api.h b/security/optee_linuxdriver/include/linux/tee_client_api.h
+index 729a408ac209..89d137b24096 100644
+--- a/security/optee_linuxdriver/include/linux/tee_client_api.h
++++ b/security/optee_linuxdriver/include/linux/tee_client_api.h
+@@ -269,6 +269,14 @@ typedef struct {
+ 	uint8_t clockSeqAndNode[8];
+ } TEEC_UUID;
+ 
++/**
++ * In terms of compatible kernel, the data struct shared by client application
++ * and TEE driver should be restructrued in "compatible" rules. To keep GP's
++ * standard in compatibility mode, the anonymous padding members are filled
++ * in the struct definition below.
++ */
++
++
+ /**
+  * struct TEEC_SharedMemory - Memory to transfer data between a client
+  * application and trusted code.
+@@ -286,18 +294,26 @@ typedef struct {
+  * is responsible to populate the buffer pointer.
+  */
+ typedef struct {
+-	void *buffer;
+-	size_t size;
++	union {
++		void *buffer;
++		uint64_t padding_ptr;
++	};
++	union {
++		size_t size;
++		uint64_t padding_sz;
++	};
+ 	uint32_t flags;
+ 	/*
+ 	 * identifier can store a handle (int) or a structure pointer (void *).
+ 	 * define this union to match case where sizeof(int)!=sizeof(void *).
+ 	 */
++	uint32_t reserved;
+ 	union {
+ 		int fd;
+ 		void *ptr;
++		uint64_t padding_d;
+ 	} d;
+-	uint8_t registered;
++	uint64_t registered;
+ } TEEC_SharedMemory;
+ 
+ /**
+@@ -313,8 +329,14 @@ typedef struct {
+  * operation to be called.
+  */
+ typedef struct {
+-	void *buffer;
+-	size_t size;
++	union {
++		void *buffer;
++		uint64_t padding_ptr;
++	};
++	union {
++		size_t size;
++		uint64_t padding_sz;
++	};
+ } TEEC_TempMemoryReference;
+ 
+ /**
+@@ -333,9 +355,18 @@ typedef struct {
+  *
+  */
+ typedef struct {
+-	TEEC_SharedMemory *parent;
+-	size_t size;
+-	size_t offset;
++	union {
++		TEEC_SharedMemory *parent;
++		uint64_t padding_ptr;
++	};
++	union {
++		size_t size;
++		uint64_t padding_sz;
++	};
++	union {
++		size_t offset;
++		uint64_t padding_off;
++	};
+ } TEEC_RegisteredMemoryReference;
+ 
+ /**
+@@ -400,9 +431,12 @@ typedef struct {
+ 	uint32_t paramTypes;
+ 	TEEC_Parameter params[TEEC_CONFIG_PAYLOAD_REF_COUNT];
+ 	/* Implementation-Defined */
+-	TEEC_Session *session;
++	union {
++		TEEC_Session *session;
++		uint64_t padding_ptr;
++	};
+ 	TEEC_SharedMemory memRefs[TEEC_CONFIG_PAYLOAD_REF_COUNT];
+-	uint32_t flags;
++	uint64_t flags;
+ } TEEC_Operation;
+ 
+ /**
+diff --git a/security/optee_linuxdriver/include/linux/tee_ioc.h b/security/optee_linuxdriver/include/linux/tee_ioc.h
+index fb6ed964396a..69df95439827 100644
+--- a/security/optee_linuxdriver/include/linux/tee_ioc.h
++++ b/security/optee_linuxdriver/include/linux/tee_ioc.h
+@@ -36,22 +36,42 @@ struct tee_cmd_io {
+ 	TEEC_Result err;
+ 	uint32_t origin;
+ 	uint32_t cmd;
+-	TEEC_UUID __user *uuid;
+-	void __user *data;
+-	uint32_t data_size;
+-	TEEC_Operation __user *op;
+ 	int fd_sess;
++	/*
++	 * Here fd_sess is 32-bit variable. Since TEEC_Result also is defined as
++	 * "uint32_t", this structure is aligned.
++	 */
++	union {
++		TEEC_UUID __user *uuid;
++		uint64_t padding_uuid;
++	};
++	union {
++		void __user *data;
++		uint64_t padding_data;
++	};
++	union {
++		TEEC_Operation __user *op;
++		uint64_t padding_op;
++	};
++	uint32_t data_size;
++	int32_t reserved;
+ };
+ 
+ struct tee_shm_io {
+-	void __user *buffer;
+-	size_t size;
+-	uint32_t flags;
+ 	union {
+-		int fd_shm;
+-		void *ptr;
++		void __user *buffer;
++		uint64_t padding_buf;
+ 	};
+-	uint8_t registered;
++	uint32_t size;
++	uint32_t flags;
++	/*
++	 * Here fd_shm is 32-bit. To be compliant with the convention of file
++	 * descriptor definition, fd_shm is defined as "int" type other
++	 * than "int32_t". Even though using "int32_t" is more obvious to
++	 * indicate that we intend to keep this structure aligned.
++	 */
++	int fd_shm;
++	uint32_t registered;
+ };
+ 
+ #define TEE_OPEN_SESSION_IOC		_IOWR('t', 161, struct tee_cmd_io)
+-- 
+2.35.3
+

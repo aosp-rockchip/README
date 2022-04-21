@@ -1,0 +1,158 @@
+From c336f64cf9a9c1bbeb0027f26c94ecfb29367ee1 Mon Sep 17 00:00:00 2001
+From: "Huang, Tao" <huangtao@rock-chips.com>
+Date: Thu, 6 Apr 2017 20:27:14 +0800
+Subject: [PATCH] soc: rockchip: add cpuinfo support
+
+Set system_serial_low/high from eFuse ID.
+Serial can read from /proc/cpuinfo.
+
+Change-Id: If412fc5a89a5e5092b510452fc5a126fdd374ac2
+Signed-off-by: Huang, Tao <huangtao@rock-chips.com>
+---
+ .../soc/rockchip/rockchip-cpuinfo.txt         | 16 ++++
+ drivers/soc/rockchip/Kconfig                  | 10 +++
+ drivers/soc/rockchip/Makefile                 |  1 +
+ drivers/soc/rockchip/rockchip-cpuinfo.c       | 75 +++++++++++++++++++
+ 4 files changed, 102 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/soc/rockchip/rockchip-cpuinfo.txt
+ create mode 100644 drivers/soc/rockchip/rockchip-cpuinfo.c
+
+diff --git a/Documentation/devicetree/bindings/soc/rockchip/rockchip-cpuinfo.txt b/Documentation/devicetree/bindings/soc/rockchip/rockchip-cpuinfo.txt
+new file mode 100644
+index 000000000000..2e80be34fba4
+--- /dev/null
++++ b/Documentation/devicetree/bindings/soc/rockchip/rockchip-cpuinfo.txt
+@@ -0,0 +1,16 @@
++Rockchip cpuinfo device tree bindings
++----------------------------------
++
++Required properties:
++- compatible: Should be one of the following.
++ - "rockchip,cpuinfo"
++- nvmem-cells: A phandle to the ID data provided by a nvmem device.
++- nvmem-cell-names: Should be "id"
++
++Example:
++
++cpuinfo {
++	compatible = "rockchip,cpuinfo";
++	nvmem-cells = <&efuse_id>;
++	nvmem-cell-names = "id";
++};
+diff --git a/drivers/soc/rockchip/Kconfig b/drivers/soc/rockchip/Kconfig
+index 4a34aab187c4..ae4cf24a8f70 100644
+--- a/drivers/soc/rockchip/Kconfig
++++ b/drivers/soc/rockchip/Kconfig
+@@ -3,6 +3,16 @@ if ARCH_ROCKCHIP || COMPILE_TEST
+ #
+ # Rockchip Soc drivers
+ #
++config ROCKCHIP_CPUINFO
++	tristate "Rockchip cpuinfo support"
++	depends on ROCKCHIP_EFUSE && (ARM64 || ARM)
++	help
++	  Say y here to enable Rockchip cpuinfo support.
++	  Set system_serial_low/high from eFuse ID.
++	  Serial can read from /proc/cpuinfo.
++
++	  If unsure, say N.
++
+ config ROCKCHIP_PM_TEST
+ 	bool "Rockchip pm_test support"
+ 	default n
+diff --git a/drivers/soc/rockchip/Makefile b/drivers/soc/rockchip/Makefile
+index 8c322d2ae911..4c2ee0cf5881 100644
+--- a/drivers/soc/rockchip/Makefile
++++ b/drivers/soc/rockchip/Makefile
+@@ -1,6 +1,7 @@
+ #
+ # Rockchip Soc drivers
+ #
++obj-$(CONFIG_ROCKCHIP_CPUINFO)	+= rockchip-cpuinfo.o
+ obj-$(CONFIG_ROCKCHIP_PM_TEST)	+= pm_test.o
+ obj-$(CONFIG_ROCKCHIP_PM_DOMAINS) += pm_domains.o
+ obj-$(CONFIG_FIQ_DEBUGGER) += rk_fiq_debugger.o
+diff --git a/drivers/soc/rockchip/rockchip-cpuinfo.c b/drivers/soc/rockchip/rockchip-cpuinfo.c
+new file mode 100644
+index 000000000000..5c8e9f2022be
+--- /dev/null
++++ b/drivers/soc/rockchip/rockchip-cpuinfo.c
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (C) 2017 Rockchip Electronics Co. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/crc32.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <asm/system_info.h>
++
++static int rockchip_cpuinfo_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct nvmem_cell *cell;
++	unsigned char *efuse_buf, buf[16];
++	size_t len;
++	int i;
++
++	cell = nvmem_cell_get(dev, "id");
++	if (IS_ERR(cell)) {
++		dev_err(dev, "failed to get id cell: %ld\n", PTR_ERR(cell));
++		if (PTR_ERR(cell) == -EPROBE_DEFER)
++			return PTR_ERR(cell);
++		return PTR_ERR(cell);
++	}
++	efuse_buf = nvmem_cell_read(cell, &len);
++	nvmem_cell_put(cell);
++
++	if (len != 16) {
++		kfree(efuse_buf);
++		dev_err(dev, "invalid id len: %zu\n", len);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < 8; i++) {
++		buf[i] = efuse_buf[1 + (i << 1)];
++		buf[i + 8] = efuse_buf[i << 1];
++	}
++
++	kfree(efuse_buf);
++
++	system_serial_low = crc32(0, buf, 8);
++	system_serial_high = crc32(system_serial_low, buf + 8, 8);
++
++	dev_info(dev, "Serial\t\t: %08x%08x\n",
++		 system_serial_high, system_serial_low);
++
++	return 0;
++}
++
++static const struct of_device_id rockchip_cpuinfo_of_match[] = {
++	{ .compatible = "rockchip,cpuinfo", },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, rockchip_cpuinfo_of_match);
++
++static struct platform_driver rockchip_cpuinfo_driver = {
++	.probe = rockchip_cpuinfo_probe,
++	.driver = {
++		.name = "rockchip-cpuinfo",
++		.of_match_table = rockchip_cpuinfo_of_match,
++	},
++};
++module_platform_driver(rockchip_cpuinfo_driver);
+-- 
+2.35.3
+

@@ -1,0 +1,603 @@
+From fed63ea3657d8bf9fca579a5a27769e096e282bf Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Sun, 5 Dec 2010 15:24:04 +0800
+Subject: [PATCH] add i2c-dev interface support
+
+---
+ drivers/i2c/busses/Kconfig        |   7 +-
+ drivers/i2c/busses/Makefile       |   2 +
+ drivers/i2c/busses/i2c-dev-rk29.c | 395 ++++++++++++++++++++++++++++++
+ drivers/i2c/busses/i2c-dev-rk29.h |  62 +++++
+ drivers/i2c/busses/i2c-rk29.c     |   2 +-
+ drivers/i2c/i2c-boardinfo.c       |   3 +-
+ drivers/i2c/i2c-core.c            |  16 +-
+ 7 files changed, 483 insertions(+), 4 deletions(-)
+ create mode 100755 drivers/i2c/busses/i2c-dev-rk29.c
+ create mode 100755 drivers/i2c/busses/i2c-dev-rk29.h
+ mode change 100644 => 100755 drivers/i2c/i2c-boardinfo.c
+
+diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+index 241ec4b3ed6f..51c404943ac8 100644
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -65,5 +65,10 @@ if I2C_RK29
+ 		help
+ 			This supports the use of the I2C3 interface on rk29 processors.
+ endif
+-
++config I2C_DEV_RK29
++	tristate "RK29 I2C device interface support"
++		default n
++		depends on I2C_RK29
++		help
++			Nothing
+ endmenu
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index 98e13476d3b6..231d1aadacb7 100644
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -3,6 +3,8 @@
+ #
+ obj-$(CONFIG_I2C_RK2818)	+= i2c-rk2818.o
+ obj-$(CONFIG_I2C_RK29)		+= i2c-rk29.o
++obj-$(CONFIG_I2C_DEV_RK29)		+= i2c-dev-rk29.o
++
+ 
+ ifeq ($(CONFIG_I2C_DEBUG_BUS),y)
+ EXTRA_CFLAGS += -DDEBUG
+diff --git a/drivers/i2c/busses/i2c-dev-rk29.c b/drivers/i2c/busses/i2c-dev-rk29.c
+new file mode 100755
+index 000000000000..135ca3495e1f
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-dev-rk29.c
+@@ -0,0 +1,395 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/i2c.h>
++#include <linux/jiffies.h>
++#include <linux/miscdevice.h>
++#include <linux/delay.h>
++#include <linux/rwsem.h>
++
++
++#include <asm/uaccess.h>
++
++#include "i2c-dev-rk29.h"
++#include "../i2c-core.h"
++
++
++#define I2C_DEV_SCL_RATE	100 * 1000
++
++struct completion		i2c_dev_complete;
++struct i2c_dump_info	g_dump;
++
++static void i2c_dev_get_list(struct i2c_list_info *list)
++{
++	struct i2c_devinfo	*devinfo;
++	struct i2c_adapter *adap = NULL;
++	int index;
++
++	memset(list, 0, sizeof(struct i2c_list_info));
++	
++	down_read(&__i2c_board_lock);
++	list_for_each_entry(devinfo, &__i2c_board_list, list) {
++		if(devinfo->busnum >= MAX_I2C_BUS) {
++			list->adap_nr = -1;
++			up_read(&__i2c_board_lock);
++			return;
++		}
++		adap = i2c_get_adapter(devinfo->busnum);
++		if(adap != NULL) {
++			list->adap[devinfo->busnum].id = adap->nr;
++			strcpy(list->adap[devinfo->busnum].name, adap->name);
++
++			index = list->adap[devinfo->busnum].client_nr++;
++			if(index >= MAX_CLIENT_NUM || index == -1)
++				list->adap[devinfo->busnum].client_nr = -1;
++			else {
++				list->adap[devinfo->busnum].client[index].addr = devinfo->board_info.addr;
++				strcpy(list->adap[devinfo->busnum].client[index].name,
++						devinfo->board_info.type);
++			}
++		}
++	}
++	list->adap_nr = MAX_I2C_BUS;
++	up_read(&__i2c_board_lock);
++	return;
++}
++void i2c_dev_dump_start(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
++{
++	int i, j;
++	
++	memset(&g_dump, 0, sizeof(struct i2c_dump_info));
++	g_dump.id = adap->nr;
++	g_dump.addr = msgs[0].addr;
++	
++	for(i = 0; i < num; i++) {
++		if(msgs[i].flags & I2C_M_RD) {
++			if(msgs[i].len >= MAX_VALUE_NUM)
++				g_dump.get_num = -1;
++			else
++				g_dump.get_num = msgs[i].len;
++		}
++		else {
++			if(msgs[i].len >= MAX_VALUE_NUM)
++				g_dump.set_num = -1;
++			else {
++				g_dump.set_num = msgs[i].len;
++				for(j = 0; j < msgs[i].len; j++)
++					g_dump.set_value[j] = msgs[i].buf[j];
++			}
++		}
++	}
++	return;
++}
++EXPORT_SYMBOL(i2c_dev_dump_start);
++
++void i2c_dev_dump_stop(struct i2c_adapter *adap, struct i2c_msg *msgs, int num, int ret)
++{
++	int i, j;
++	
++	if(ret < 0) {
++		g_dump.get_num = 0;
++		g_dump.set_num = 0;
++	}
++	for(i = 0; i < num; i++) {
++		if((msgs[i].flags & I2C_M_RD) && (g_dump.get_num > 0)) {
++			for(j = 0; j < msgs[i].len; j++)
++				g_dump.get_value[j] = msgs[i].buf[j];
++		}
++	}
++	complete(&i2c_dev_complete);
++	return;
++}
++EXPORT_SYMBOL(i2c_dev_dump_stop);
++
++static void i2c_dev_get_dump(struct i2c_dump_info *dump)
++{
++	init_completion(&i2c_dev_complete);
++	wait_for_completion_killable(&i2c_dev_complete);
++	*dump = g_dump;
++	return;
++}
++static int i2c_dev_get_normal(struct i2c_adapter *adap, struct i2c_get_info *get)
++{
++	struct i2c_msg msg;
++	char buf[MAX_VALUE_NUM];
++	int ret, i;
++
++	msg.addr = (__u16)get->addr;
++	msg.flags = I2C_M_RD;
++	msg.len = get->num;
++	msg.buf = buf;
++	msg.scl_rate = I2C_DEV_SCL_RATE;
++
++	ret = i2c_transfer(adap, &msg, 1);
++	if(ret == 1) {
++		for(i = 0; i < get->num; i++)
++			get->value[i] = buf[i];
++		return 0;
++	}
++	else
++		return -1;
++}
++static int i2c_dev_set_normal(struct i2c_adapter *adap, struct i2c_set_info *set)
++{
++	struct i2c_msg msg;
++	char buf[MAX_VALUE_NUM];
++	int ret;
++
++	msg.addr = (__u16)set->addr;
++	msg.flags = 0;
++	msg.len = set->num;
++	msg.buf = buf;
++	msg.scl_rate = I2C_DEV_SCL_RATE;
++
++	ret = i2c_transfer(adap, &msg, 1);
++	return(ret == 1)? 0: -1;
++}
++static int i2c_dev_get_reg8(struct i2c_adapter *adap, struct i2c_get_info *get)
++{
++	int ret, i;
++	struct i2c_msg msgs[2];
++	char reg = get->reg;
++	char buf[MAX_VALUE_NUM];
++	
++	msgs[0].addr = (__u16)get->addr;
++	msgs[0].flags = 0;
++	msgs[0].len = 1;
++	msgs[0].buf = &reg;
++	msgs[0].scl_rate = I2C_DEV_SCL_RATE;
++
++	msgs[1].addr = get->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len = get->num;
++	msgs[1].buf = buf;
++	msgs[1].scl_rate = I2C_DEV_SCL_RATE;
++
++	ret = i2c_transfer(adap, msgs, 2);
++	if(ret == 2) {
++		for(i = 0; i < get->num; i++)
++			get->value[i] = buf[i];
++		return 0;
++	}
++	else
++		return -1;
++
++}
++
++static int i2c_dev_set_reg8(struct i2c_adapter *adap, struct i2c_set_info *set)
++{
++	int ret, i;
++	struct i2c_msg msg;
++	char buf[MAX_VALUE_NUM + 1];
++
++	buf[0] = (char)set->reg;
++	for(i = 0; i < set->num; i++) 
++		buf[i+1] = (char)set->value[i];
++	
++	msg.addr = (__u16)set->addr;
++	msg.flags = 0;
++	msg.len = set->num + 1;
++	msg.buf = buf;
++	msg.scl_rate = I2C_DEV_SCL_RATE;
++
++
++	ret = i2c_transfer(adap, &msg, 1);
++	return (ret == 1)? 0: -1;
++}
++
++static int i2c_dev_get_reg16(struct i2c_adapter *adap, struct i2c_get_info *get)
++{
++	int ret, i;
++	struct i2c_msg msgs[2];
++	char reg[2];
++	char buf[MAX_VALUE_NUM * 2];
++
++	reg[0] = (char)(get->reg & 0xff);
++	reg[1] = (char)((get->reg >>8) & 0xff);
++	
++	msgs[0].addr = (__u16)get->addr;
++	msgs[0].flags = 0;
++	msgs[0].len = 2;
++	msgs[0].buf = reg;
++	msgs[0].scl_rate = I2C_DEV_SCL_RATE;
++
++	msgs[1].addr = get->addr;
++	msgs[1].flags = I2C_M_RD;
++	msgs[1].len = get->num * 2;
++	msgs[1].buf = buf;
++	msgs[1].scl_rate = I2C_DEV_SCL_RATE;
++
++	ret = i2c_transfer(adap, msgs, 2);
++	if(ret == 2) {
++		for(i = 0; i < get->num; i++)
++			get->value[i] = buf[2*i] & (buf[2*i+1]<<8);
++		return 0;
++	}
++	else
++		return -1;
++
++}
++static int i2c_dev_set_reg16(struct i2c_adapter *adap, struct i2c_set_info *set)
++{
++	struct i2c_msg msg;
++	int ret, i;
++	char buf[2 * (MAX_VALUE_NUM + 1)];
++
++	buf[0] = (char)(set->reg & 0xff);
++	buf[1] = (char)((set->reg >>8) & 0xff);
++	
++	for(i = 0; i < set->num; i++) {
++		buf[2 * (i + 1)] = (char)(set->value[i] & 0xff);
++		buf[2 * (i + 1) + 1] = (char)((set->value[i]>>8) & 0xff);
++	}
++
++	msg.addr = set->addr;
++	msg.flags = 0;
++	msg.len = 2 * (set->num + 1);
++	msg.buf = buf;
++	msg.scl_rate = I2C_DEV_SCL_RATE;
++
++	ret = i2c_transfer(adap, &msg, 1);
++	return (ret == 1)? 0: -1;
++}
++
++static int i2c_dev_get_value(struct i2c_get_info *get)
++{
++	int ret = 0;
++	struct i2c_adapter *adap = NULL;
++	
++	if(get->num >= MAX_VALUE_NUM)
++		return -1;
++	adap = i2c_get_adapter(get->id);
++	if(adap == NULL)
++		return -1;
++	switch(get->mode) {
++		case 'b': 
++			ret = i2c_dev_get_reg8(adap, get);
++			break;
++		case 's':
++			ret = i2c_dev_get_reg16(adap, get);
++			break;
++		case 'o':
++			ret = -1;
++			break;
++		default:
++			ret = i2c_dev_get_normal(adap, get);
++			break;
++	}
++	return ret;
++}
++
++static int i2c_dev_set_value(struct i2c_set_info *set)
++{
++	int ret = 0;
++	struct i2c_adapter *adap = NULL;
++
++	printk("id=%d, addr=0x%x, mode = %c, num = %d, reg = 0x%x, value[0] = %d,",set->id, set->addr, set->mode, set->num, set->reg, set->value[0]);
++	if(set->num >= MAX_VALUE_NUM)
++		return -1;
++	adap = i2c_get_adapter(set->id);
++	if(adap == NULL)
++		return -1;
++	switch(set->mode) {
++		case 'b': 
++			ret = i2c_dev_set_reg8(adap, set);
++			break;
++		case 's':
++			ret = i2c_dev_set_reg16(adap, set);
++			break;
++		case 'o':
++			ret = -1;
++			break;
++		default:
++			ret = i2c_dev_set_normal(adap, set);
++			break;
++	}
++	return ret;	
++}
++
++static int i2c_dev_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++static long i2c_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	int ret = 0;
++	struct i2c_list_info *list = NULL;
++	struct i2c_dump_info dump;
++	struct i2c_get_info get;
++	struct i2c_set_info set;
++
++	switch(cmd) {
++		case I2C_LIST:
++			list = kzalloc(sizeof(struct i2c_list_info), GFP_KERNEL);
++			if(list == NULL) {
++				ret = -ENOMEM;
++				break;
++			}
++			i2c_dev_get_list(list);
++			if(copy_to_user((void __user *)arg, (void *)list, sizeof(struct i2c_list_info)))  
++				ret = -EFAULT;
++			kfree(list);
++			break;
++		case I2C_DUMP:
++			i2c_dev_get_dump(&dump);
++			if(copy_to_user((void __user *)arg, (void *)&dump, sizeof(struct i2c_dump_info)))  
++				ret = -EFAULT;
++			break;
++		case I2C_GET:
++			if(copy_from_user((void *)&get, (void __user *)arg, sizeof(struct i2c_get_info))) { 
++				ret = -EFAULT;
++				break;
++			}
++			if(i2c_dev_get_value(&get) < 0) {
++				ret = -EFAULT;
++				break;
++			}
++			if(copy_to_user((void __user *)arg, (void *)&get, sizeof(struct i2c_get_info)))  
++				ret = -EFAULT;
++			break;
++		case I2C_SET:
++			if(copy_from_user((void *)&set, (void __user *)arg, sizeof(struct i2c_set_info))) { 
++				ret = -EFAULT;
++				break;
++			}
++			ret = i2c_dev_set_value(&set);
++			break;
++		default:
++			break;
++	}
++	return ret;
++}
++static int i2c_dev_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static struct file_operations i2c_dev_fops = {
++	.owner	 		 = THIS_MODULE,
++	.open			 = i2c_dev_open,
++	.unlocked_ioctl	 = i2c_dev_ioctl,
++	.release 		 = i2c_dev_release,
++};
++static struct miscdevice i2c_misc_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = I2C_DEV_NAME,
++	.fops = &i2c_dev_fops,
++};
++static int __init i2c_dev_init(void)
++{
++	return misc_register(&i2c_misc_dev);
++}
++static void __exit i2c_dev_exit(void)
++{
++	misc_deregister(&i2c_misc_dev);
++}
++module_init(i2c_dev_init);
++module_exit(i2c_dev_exit);
++
++MODULE_DESCRIPTION("Driver for RK29 I2C Device");
++MODULE_AUTHOR("kfx, kfx@rock-chips.com");
++MODULE_LICENSE("GPL");
++
+diff --git a/drivers/i2c/busses/i2c-dev-rk29.h b/drivers/i2c/busses/i2c-dev-rk29.h
+new file mode 100755
+index 000000000000..086c937ffc4a
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-dev-rk29.h
+@@ -0,0 +1,62 @@
++#ifndef _I2C_DEV_H
++#define _I2C_DEV_H
++
++#define I2C_DEV_NAME		"i2c-dev"
++#define I2C_DEV_PATH        "/dev/"I2C_DEV_NAME
++
++#define MAX_ADAP_LENG		48
++#define MAX_CLIENT_LENG		20
++#define MAX_VALUE_NUM     	16
++#define MAX_I2C_BUS			4
++#define MAX_CLIENT_NUM		32
++
++
++
++#define I2C_LIST			0X7000
++#define I2C_DUMP			0x7010
++#define I2C_GET				0x7020
++#define I2C_SET				0x7030
++
++
++struct i2c_client_info {
++	int addr;
++	char name[MAX_CLIENT_LENG];
++};
++struct i2c_adap_info {
++	int id;
++	char name[MAX_ADAP_LENG];
++	int client_nr;
++	struct i2c_client_info client[MAX_CLIENT_NUM];
++};
++struct i2c_list_info {
++	int adap_nr;
++	struct i2c_adap_info adap[MAX_I2C_BUS];
++};
++
++struct i2c_dump_info {
++	int id;
++	int addr;
++	int get_num;
++	int get_value[MAX_VALUE_NUM];
++	int set_num;
++	int set_value[MAX_VALUE_NUM];
++};
++
++struct i2c_get_info {
++	char mode;
++	int id;
++	int addr;
++	int reg;
++	int num;
++	int value[MAX_VALUE_NUM];
++};
++struct i2c_set_info {
++	char mode;
++	int id;
++	int addr;
++	int reg;
++	int num;
++	int value[MAX_VALUE_NUM];
++};
++
++#endif /* _I2CDEV_H */
+diff --git a/drivers/i2c/busses/i2c-rk29.c b/drivers/i2c/busses/i2c-rk29.c
+index 45f4afb0e1fe..b1916ec06c91 100755
+--- a/drivers/i2c/busses/i2c-rk29.c
++++ b/drivers/i2c/busses/i2c-rk29.c
+@@ -35,7 +35,7 @@
+ #define RK2818_I2C_TIMEOUT		(msecs_to_jiffies(500))
+ #define RK2818_DELAY_TIME		2
+ 
+-#if 0
++#if 1
+ #define i2c_dbg(dev, format, arg...)		\
+ 	dev_printk(KERN_INFO , dev , format , ## arg)
+ #else
+diff --git a/drivers/i2c/i2c-boardinfo.c b/drivers/i2c/i2c-boardinfo.c
+old mode 100644
+new mode 100755
+index a26a34a06641..837f97d88d9d
+--- a/drivers/i2c/i2c-boardinfo.c
++++ b/drivers/i2c/i2c-boardinfo.c
+@@ -65,7 +65,7 @@ i2c_register_board_info(int busnum,
+ 	int status;
+ 
+ 	down_write(&__i2c_board_lock);
+-
++	printk("busnum = %d, len = %d>>>>>>>>>>>>>>>>>>\n", busnum, len);
+ 	/* dynamic bus numbers will be assigned after the last static one */
+ 	if (busnum >= __i2c_first_dynamic_bus_num)
+ 		__i2c_first_dynamic_bus_num = busnum + 1;
+@@ -82,6 +82,7 @@ i2c_register_board_info(int busnum,
+ 
+ 		devinfo->busnum = busnum;
+ 		devinfo->board_info = *info;
++		printk("busnum = %d>>>>>>>>>>>>>>>>>>\n", busnum);
+ 		list_add_tail(&devinfo->list, &__i2c_board_list);
+ 	}
+ 
+diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
+index fac7cedadc73..a59cba96f494 100755
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -51,7 +51,11 @@ static int i2c_check_addr(struct i2c_adapter *adapter, int addr);
+ static int i2c_detect(struct i2c_adapter *adapter, struct i2c_driver *driver);
+ 
+ /* ------------------------------------------------------------------------- */
+-
++#ifdef CONFIG_I2C_DEV_RK29
++extern struct completion		i2c_dev_complete;
++extern void i2c_dev_dump_start(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
++extern void i2c_dev_dump_stop(struct i2c_adapter *adap, struct i2c_msg *msgs, int num, int ret);
++#endif
+ static const struct i2c_device_id *i2c_match_id(const struct i2c_device_id *id,
+ 						const struct i2c_client *client)
+ {
+@@ -1017,6 +1021,10 @@ static int __init i2c_init(void)
+ 	retval = i2c_add_driver(&dummy_driver);
+ 	if (retval)
+ 		goto class_err;
++#ifdef CONFIG_I2C_DEV_RK29
++		init_completion(&i2c_dev_complete);
++#endif
++
+ 	return 0;
+ 
+ class_err:
+@@ -1107,6 +1115,9 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+ 
+ 		/* Retry automatically on arbitration loss */
+ 		orig_jiffies = jiffies;
++#ifdef CONFIG_I2C_DEV_RK29
++	i2c_dev_dump_start(adap, msgs, num);
++#endif
+ 		for (ret = 0, try = 0; try <= adap->retries; try++) {
+ 			ret = adap->algo->master_xfer(adap, msgs, num);
+ 			if (ret != -EAGAIN)
+@@ -1114,6 +1125,9 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+ 			if (time_after(jiffies, orig_jiffies + adap->timeout))
+ 				break;
+ 		}
++#ifdef CONFIG_I2C_DEV_RK29
++	i2c_dev_dump_stop(adap, msgs, num ,ret);
++#endif
+ 		mutex_unlock(&adap->bus_lock);
+ 
+ 		return ret;
+-- 
+2.35.3
+

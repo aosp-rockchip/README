@@ -1,0 +1,187 @@
+From 9e443f2f34523d16fc1fd915259ae3db0513f15c Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Mon, 17 Nov 2014 14:30:09 +0800
+Subject: [PATCH] rk3036/3128 hdmi: 	Take following sequence to avoid
+ picture flash when swiching resolution: 	1. Send AV_MUTE GCP packet. 
+ 2. Power off hdmi phy. 	3. Sleep 2 second to wait TV process no TMDS
+ signal. 	4. Configure video and audio registers. 	5. Power on
+ HDMI phy. 	6. Send CLEAR_MUTE GCP packet.
+
+---
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdmi.c  |  2 +
+ .../hdmi/chips/rk3036/rk3036_hdmi_hw.c        | 46 ++++++++++++-------
+ .../hdmi/chips/rk3036/rk3036_hdmi_hw.h        |  6 +++
+ drivers/video/rockchip/hdmi/rk_hdmi_task.c    |  5 +-
+ 4 files changed, 42 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+index f6d1888637e3..8c48563e0dae 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+@@ -513,6 +513,8 @@ static void rk3036_hdmi_shutdown(struct platform_device *pdev)
+ 		if (hdmi_drv->irq)
+ 			disable_irq(hdmi_drv->irq);
+ 		mutex_unlock(&hdmi_drv->enable_mutex);
++		if (hdmi_drv->hotplug == HDMI_HPD_ACTIVED)
++			rk3036_hdmi_control_output(hdmi_drv, 0);
+ 	}
+ 	hdmi_dbg(hdmi_drv->dev, "rk3036 hdmi shut down.\n");
+ }
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
+index b3419b930148..7c7b2770468b 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
+@@ -51,9 +51,16 @@ static void rk3036_hdmi_av_mute(struct hdmi *hdmi_drv, bool enable)
+ 	struct rk_hdmi_device *hdmi_dev = container_of(hdmi_drv,
+ 						       struct rk_hdmi_device,
+ 						       driver);
+-
+-	hdmi_writel(hdmi_dev, AV_MUTE,
+-		    v_AUDIO_MUTE(enable) | v_VIDEO_MUTE(enable));
++	if (enable) {
++		hdmi_msk_reg(hdmi_dev, AV_MUTE,
++			     m_AVMUTE_CLEAR | m_AVMUTE_ENABLE,
++			     v_AVMUTE_CLEAR(0) | v_AVMUTE_ENABLE(1));
++	} else {
++		hdmi_msk_reg(hdmi_dev, AV_MUTE,
++			     m_AVMUTE_CLEAR | m_AVMUTE_ENABLE,
++			     v_AVMUTE_CLEAR(1) | v_AVMUTE_ENABLE(0));
++	}
++	hdmi_writel(hdmi_dev, PACKET_SEND_AUTO, m_PACKET_GCP_EN);
+ }
+ 
+ static void rk3036_hdmi_sys_power(struct hdmi *hdmi_drv, bool enable)
+@@ -100,14 +107,12 @@ static void rk3036_hdmi_set_pwr_mode(struct hdmi *hdmi_drv, int mode)
+ 		hdmi_writel(hdmi_dev, PHY_CHG_PWR, 0x0f);
+ 		hdmi_writel(hdmi_dev, 0xce, 0x00);
+ 		hdmi_writel(hdmi_dev, 0xce, 0x01);
+-		rk3036_hdmi_av_mute(hdmi_drv, 1);
+ 		rk3036_hdmi_sys_power(hdmi_drv, true);
+ 		break;
+ 	case LOWER_PWR:
+ 		hdmi_dbg(hdmi_drv->dev,
+ 			 "%s change pwr_mode LOWER_PWR pwr_mode = %d, mode = %d\n",
+ 			 __func__, hdmi_drv->pwr_mode, mode);
+-		rk3036_hdmi_av_mute(hdmi_drv, 0);
+ 		rk3036_hdmi_sys_power(hdmi_drv, false);
+ 		hdmi_writel(hdmi_dev, PHY_DRIVER, 0x00);
+ 		hdmi_writel(hdmi_dev, PHY_PRE_EMPHASIS, 0x00);
+@@ -526,11 +531,13 @@ static int rk3036_hdmi_config_video(struct hdmi *hdmi_drv,
+ 			vpara->output_color = VIDEO_OUTPUT_RGB444;*/
+ 	}
+ 
+-	if (hdmi_drv->pwr_mode == LOWER_PWR)
++/*	if (hdmi_drv->pwr_mode == LOWER_PWR)
+ 		rk3036_hdmi_set_pwr_mode(hdmi_drv, NORMAL);
+-
++*/
+ 	/* Disable video and audio output */
+-	hdmi_writel(hdmi_dev, AV_MUTE, v_AUDIO_MUTE(1) | v_VIDEO_MUTE(1));
++	hdmi_msk_reg(hdmi_dev, AV_MUTE,
++		     m_AUDIO_MUTE | m_VIDEO_BLACK,
++		     v_AUDIO_MUTE(1) | v_VIDEO_MUTE(1));
+ 
+ 	/* Input video mode is SDR RGB24bit, Data enable signal from external */
+ 	hdmi_writel(hdmi_dev, VIDEO_CONTRL1,
+@@ -601,7 +608,6 @@ static int rk3036_hdmi_config_video(struct hdmi *hdmi_drv,
+ 	value = mode->vsync_len;
+ 	hdmi_writel(hdmi_dev, VIDEO_EXT_VDURATION, value & 0xFF);
+ #endif
+-
+ 	if (vpara->output_mode == OUTPUT_HDMI) {
+ 		rk3036_hdmi_config_avi(hdmi_drv, vpara->vic,
+ 				      	vpara->output_color);
+@@ -740,11 +746,7 @@ void rk3036_hdmi_control_output(struct hdmi *hdmi_drv, int enable)
+ 	if (enable) {
+ 		if (hdmi_drv->pwr_mode == LOWER_PWR)
+ 			rk3036_hdmi_set_pwr_mode(hdmi_drv, NORMAL);
+-		hdmi_readl(hdmi_dev, AV_MUTE, &mutestatus);
+-		if (mutestatus && (m_AUDIO_MUTE | m_VIDEO_BLACK)) {
+-			hdmi_writel(hdmi_dev, AV_MUTE,
+-				    v_AUDIO_MUTE(0) | v_VIDEO_MUTE(0));
+-		}
++
+ 		rk3036_hdmi_sys_power(hdmi_drv, true);
+ 		rk3036_hdmi_sys_power(hdmi_drv, false);
+ 		delay100us();
+@@ -752,9 +754,21 @@ void rk3036_hdmi_control_output(struct hdmi *hdmi_drv, int enable)
+ 		hdmi_writel(hdmi_dev, 0xce, 0x00);
+ 		delay100us();
+ 		hdmi_writel(hdmi_dev, 0xce, 0x01);
++
++		hdmi_readl(hdmi_dev, AV_MUTE, &mutestatus);
++		if (mutestatus && (m_AUDIO_MUTE | m_VIDEO_BLACK)) {
++			hdmi_msk_reg(hdmi_dev, AV_MUTE,
++				     m_AUDIO_MUTE | m_VIDEO_BLACK,
++				     v_AUDIO_MUTE(0) | v_VIDEO_MUTE(0));
++		}
++		rk3036_hdmi_av_mute(hdmi_drv, 0);
+ 	} else {
+-		hdmi_writel(hdmi_dev, AV_MUTE,
+-			    v_AUDIO_MUTE(1) | v_VIDEO_MUTE(1));
++		hdmi_msk_reg(hdmi_dev, AV_MUTE,
++			     m_AUDIO_MUTE | m_VIDEO_BLACK,
++			     v_AUDIO_MUTE(1) | v_VIDEO_MUTE(1));
++		rk3036_hdmi_av_mute(hdmi_drv, 1);
++		msleep(100);
++		rk3036_hdmi_set_pwr_mode(hdmi_drv, LOWER_PWR);
+ 	}
+ }
+ 
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
+index 7f70adbb1104..20b326653e6c 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
+@@ -124,6 +124,8 @@ enum {
+ #define m_AVMUTE_ENABLE		(1 << 6)
+ #define m_AUDIO_MUTE		(1 << 1)
+ #define m_VIDEO_BLACK		(1 << 0)
++#define v_AVMUTE_CLEAR(n)	(n << 7)
++#define v_AVMUTE_ENABLE(n)	(n << 6)
+ #define v_AUDIO_MUTE(n)		(n << 1)
+ #define v_VIDEO_MUTE(n)		(n << 0)
+ 
+@@ -230,6 +232,10 @@ enum {
+ #define EDID_FIFO_OFFSET		0x4f
+ #define EDID_FIFO_ADDR			0x50
+ 
++
++#define PACKET_SEND_MANUAL		0x9c
++#define PACKET_SEND_AUTO		0x9d
++	#define m_PACKET_GCP_EN		(1 << 7)
+ /* CONTROL_PACKET_BUF_INDEX */
+ #define CONTROL_PACKET_BUF_INDEX	0x9f
+ enum {
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_task.c b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+index eb3c7db97adf..1f68cc909bb8 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_task.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+@@ -130,6 +130,7 @@ static int hdmi_process_command(struct hdmi *hdmi)
+ 			if (!hdmi->enable || hdmi->suspend) {
+ 				if (hdmi->hotplug != HDMI_HPD_REMOVED) {
+ 					hdmi->hotplug = HDMI_HPD_REMOVED;
++					hdmi->control_output(hdmi, HDMI_DISABLE);
+ 					hdmi_sys_remove(hdmi);
+ 				}
+ 				hdmi->state = HDMI_SLEEP;
+@@ -158,6 +159,8 @@ static int hdmi_process_command(struct hdmi *hdmi)
+ 		default:
+ 			if (state > SYSTEM_CONFIG) {
+ 				state = SYSTEM_CONFIG;
++				hdmi->control_output(hdmi, HDMI_DISABLE);
++				msleep(2000);
+ 			} else {
+ 				if (hdmi->wait == 1) {
+ 					complete(&hdmi->complete);
+@@ -222,7 +225,7 @@ void hdmi_work(struct work_struct *work)
+ 		hdmi->hotplug = hotplug;
+ 	} else if (hotplug == HDMI_HPD_REMOVED) {
+ 		hdmi_sys_sleep(hdmi);
+-	}else if (hotplug == HDMI_HPD_ACTIVED) {
++	} else if (hotplug == HDMI_HPD_ACTIVED) {
+ 		if (hdmi->uboot_logo) {
+ 			if (hdmi->insert)
+ 				hdmi->insert(hdmi);
+-- 
+2.35.3
+

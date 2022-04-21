@@ -1,0 +1,542 @@
+From 08e812ab4ecf95bc0df868be01f35e8bf4a23ea4 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Sat, 28 Mar 2020 11:55:00 +0800
+Subject: [PATCH] media: rockchip: using dma buf to transfer data between isp
+ and ispp
+
+Image from isp to ispp need share memory, using dma buf to do this.
+
+Change-Id: I4acdbc1bd1c600d46230c8cecce6ea3d5d2bce3e
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/dev.c     |  27 ----
+ drivers/media/platform/rockchip/isp/mpfbc.c   |  97 ++++++++++----
+ drivers/media/platform/rockchip/isp/mpfbc.h   |  13 +-
+ drivers/media/platform/rockchip/ispp/common.c |  39 ++++--
+ drivers/media/platform/rockchip/ispp/common.h |   1 +
+ drivers/media/platform/rockchip/ispp/ispp.c   | 118 +++++++++++++-----
+ drivers/media/platform/rockchip/ispp/stream.c |  11 +-
+ 7 files changed, 205 insertions(+), 101 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index 27253a83b25f..470e0c2c00be 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -41,11 +41,9 @@
+ #include <linux/of_gpio.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_platform.h>
+-#include <linux/of_reserved_mem.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/regmap.h>
+-#include <media/videobuf2-dma-contig.h>
+ #include <dt-bindings/soc/rockchip-system-status.h>
+ #include <soc/rockchip/rockchip-system-status.h>
+ #include "regs.h"
+@@ -896,24 +894,6 @@ static int rkisp_enable_sys_clk(struct rkisp_device *rkisp_dev)
+ 	return ret;
+ }
+ 
+-static inline bool is_iommu_enable(struct device *dev)
+-{
+-	struct device_node *iommu;
+-
+-	iommu = of_parse_phandle(dev->of_node, "iommus", 0);
+-	if (!iommu) {
+-		dev_info(dev, "no iommu attached, using non-iommu buffers\n");
+-		return false;
+-	} else if (!of_device_is_available(iommu)) {
+-		dev_info(dev, "iommu is disabled, using non-iommu buffers\n");
+-		of_node_put(iommu);
+-		return false;
+-	}
+-	of_node_put(iommu);
+-
+-	return true;
+-}
+-
+ static int rkisp_vs_irq_parse(struct platform_device *pdev)
+ {
+ 	int ret;
+@@ -1122,13 +1102,6 @@ static int rkisp_plat_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_unreg_media_dev;
+ 
+-	if (!is_iommu_enable(dev)) {
+-		ret = of_reserved_mem_device_init(dev);
+-		if (ret)
+-			v4l2_warn(v4l2_dev,
+-				  "No reserved memory region assign to isp\n");
+-	}
+-
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	ret = rkisp_vs_irq_parse(pdev);
+diff --git a/drivers/media/platform/rockchip/isp/mpfbc.c b/drivers/media/platform/rockchip/isp/mpfbc.c
+index d8ee3096908e..86b78857b55b 100644
+--- a/drivers/media/platform/rockchip/isp/mpfbc.c
++++ b/drivers/media/platform/rockchip/isp/mpfbc.c
+@@ -29,47 +29,97 @@ static int mpfbc_get_set_fmt(struct v4l2_subdev *sd,
+ 	return ret;
+ }
+ 
++static void free_dma_buf(struct rkisp_dma_buf *buf)
++{
++	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
++
++	if (!buf)
++		return;
++
++	ops->unmap_dmabuf(buf->mem_priv);
++	ops->detach_dmabuf(buf->mem_priv);
++	dma_buf_put(buf->dbuf);
++	kfree(buf);
++}
++
++static void mpfbc_free_dma_buf(struct rkisp_mpfbc_device *dev)
++{
++	free_dma_buf(dev->pic_cur);
++	dev->pic_cur = NULL;
++	free_dma_buf(dev->pic_nxt);
++	dev->pic_nxt = NULL;
++	free_dma_buf(dev->gain_cur);
++	dev->gain_cur = NULL;
++	free_dma_buf(dev->gain_nxt);
++	dev->gain_nxt = NULL;
++}
++
+ static int mpfbc_s_rx_buffer(struct v4l2_subdev *sd,
+-			     void *buf, unsigned int *size)
++			     void *dbuf, unsigned int *size)
+ {
+ 	struct rkisp_mpfbc_device *mpfbc_dev = v4l2_get_subdevdata(sd);
+ 	struct rkisp_device *dev = mpfbc_dev->ispdev;
+ 	void __iomem *base = dev->base_addr;
++	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
++	struct rkisp_dma_buf *buf;
++	dma_addr_t dma_addr;
+ 	u32 w = ALIGN(mpfbc_dev->fmt.format.width, 16);
+ 	u32 h = ALIGN(mpfbc_dev->fmt.format.height, 16);
+ 	u32 sizes = (w * h >> 4) + w * h * 2;
++	int ret = 0;
++
++	if (!dbuf || !size)
++		return -EINVAL;
++
++	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	buf->dbuf = dbuf;
++	buf->mem_priv = ops->attach_dmabuf(dev->dev, dbuf,
++				*size, DMA_FROM_DEVICE);
++	if (IS_ERR(buf->mem_priv)) {
++		ret = PTR_ERR(buf->mem_priv);
++		goto err;
++	}
++
++	ret = ops->map_dmabuf(buf->mem_priv);
++	if (ret) {
++		ops->detach_dmabuf(buf->mem_priv);
++		goto err;
++	}
++
++	dma_addr = *((dma_addr_t *)ops->cookie(buf->mem_priv));
+ 
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+ 		 "%s buf:0x%x size:%d\n",
+-		 __func__, *(u32 *)buf, *size);
++		 __func__, (u32)dma_addr, *size);
+ 
+ 	/* picture or gain buffer */
+ 	if (*size == sizes) {
+ 		if (mpfbc_dev->pic_cur) {
+-			mpfbc_dev->pic_nxt = (u32 *)buf;
+-			writel(*mpfbc_dev->pic_nxt,
+-				base + ISP_MPFBC_HEAD_PTR2);
+-			writel(*mpfbc_dev->pic_nxt + (w * h >> 4),
+-				base + ISP_MPFBC_PAYL_PTR2);
++			mpfbc_dev->pic_nxt = buf;
++			writel(dma_addr, base + ISP_MPFBC_HEAD_PTR2);
++			writel(dma_addr + (w * h >> 4),
++			       base + ISP_MPFBC_PAYL_PTR2);
+ 			mpfbc_dev->pingpong = true;
+ 		} else {
+-			mpfbc_dev->pic_cur = (u32 *)buf;
+-			writel(*mpfbc_dev->pic_cur,
+-				base + ISP_MPFBC_HEAD_PTR);
+-			writel(*mpfbc_dev->pic_cur + (w * h >> 4),
+-				base + ISP_MPFBC_PAYL_PTR);
++			mpfbc_dev->pic_cur = buf;
++			writel(dma_addr, base + ISP_MPFBC_HEAD_PTR);
++			writel(dma_addr + (w * h >> 4),
++			       base + ISP_MPFBC_PAYL_PTR);
+ 			mpfbc_dev->pingpong = false;
+ 		}
+ 	} else {
+ 		if (mpfbc_dev->gain_cur) {
+-			mpfbc_dev->gain_nxt = (u32 *)buf;
+-			writel(*mpfbc_dev->gain_nxt,
+-				base + MI_GAIN_WR_BASE2);
++			mpfbc_dev->gain_nxt = buf;
++			writel(dma_addr, base + MI_GAIN_WR_BASE2);
+ 			mi_wr_ctrl2(base, SW_GAIN_WR_PINGPONG);
+ 		} else {
+-			mpfbc_dev->gain_cur = (u32 *)buf;
+-			writel(*mpfbc_dev->gain_cur,
+-				base + MI_GAIN_WR_BASE);
++			mpfbc_dev->gain_cur = buf;
++			writel(dma_addr, base + MI_GAIN_WR_BASE);
+ 			isp_clear_bits(base + MI_WR_CTRL2,
+ 					SW_GAIN_WR_PINGPONG);
+ 		}
+@@ -77,7 +127,13 @@ static int mpfbc_s_rx_buffer(struct v4l2_subdev *sd,
+ 		writel(w >> 4, base + MI_GAIN_WR_LENGTH);
+ 		mi_wr_ctrl2(base, SW_GAIN_WR_AUTOUPD);
+ 	}
++
+ 	return 0;
++err:
++	kfree(buf);
++	dma_buf_put(dbuf);
++	mpfbc_free_dma_buf(mpfbc_dev);
++	return ret;
+ }
+ 
+ static int mpfbc_start(struct rkisp_mpfbc_device *mpfbc_dev)
+@@ -121,10 +177,7 @@ static int mpfbc_stop(struct rkisp_mpfbc_device *mpfbc_dev)
+ 	mpfbc_dev->stopping = false;
+ 	isp_clear_bits(base + MI_IMSC, MI_MPFBC_FRAME);
+ 	mpfbc_dev->en = false;
+-	mpfbc_dev->pic_cur = NULL;
+-	mpfbc_dev->pic_nxt = NULL;
+-	mpfbc_dev->gain_cur = NULL;
+-	mpfbc_dev->gain_nxt = NULL;
++	mpfbc_free_dma_buf(mpfbc_dev);
+ 	hdr_destroy_buf(dev);
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/rockchip/isp/mpfbc.h b/drivers/media/platform/rockchip/isp/mpfbc.h
+index 823bc5fd0e63..3f6729d6b65d 100644
+--- a/drivers/media/platform/rockchip/isp/mpfbc.h
++++ b/drivers/media/platform/rockchip/isp/mpfbc.h
+@@ -10,16 +10,21 @@
+ 
+ struct rkisp_mpfbc_device;
+ 
++struct rkisp_dma_buf {
++	struct dma_buf *dbuf;
++	void *mem_priv;
++};
++
+ struct rkisp_mpfbc_device {
+ 	struct rkisp_device *ispdev;
+ 	struct v4l2_subdev sd;
+ 	struct v4l2_subdev_format fmt;
+ 	struct media_pad pad;
+ 	wait_queue_head_t done;
+-	u32 *pic_cur;
+-	u32 *pic_nxt;
+-	u32 *gain_cur;
+-	u32 *gain_nxt;
++	struct rkisp_dma_buf *pic_cur;
++	struct rkisp_dma_buf *pic_nxt;
++	struct rkisp_dma_buf *gain_cur;
++	struct rkisp_dma_buf *gain_nxt;
+ 	u8 pingpong;
+ 	u8 stopping;
+ 	u8 en;
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index 4e6cd13e830d..2d79343e6c64 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /* Copyright (C) 2019 Rockchip Electronics Co., Ltd */
+ 
+-#include <linux/dma-mapping.h>
++#include <media/videobuf2-dma-contig.h>
+ #include <media/v4l2-mc.h>
+ #include "dev.h"
+ #include "regs.h"
+@@ -43,23 +43,40 @@ int rkispp_fh_release(struct file *filp)
+ int rkispp_allow_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
+-	if (!buf->size)
+-		return -EINVAL;
++	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
++	void *mem_priv;
++	int ret = 0;
+ 
+-	buf->vaddr = dma_alloc_coherent(dev->dev, buf->size,
+-					&buf->dma_addr, GFP_KERNEL);
+-	if (!buf->vaddr)
+-		return -ENOMEM;
+-	return 0;
++	if (!buf->size) {
++		ret = -EINVAL;
++		goto err;
++	}
++
++	mem_priv = ops->alloc(dev->dev, 0, buf->size,
++			DMA_BIDIRECTIONAL, GFP_KERNEL);
++	if (IS_ERR_OR_NULL(mem_priv)) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	buf->mem_priv = mem_priv;
++	buf->dma_addr = *((dma_addr_t *)ops->cookie(mem_priv));
++	buf->vaddr = ops->vaddr(mem_priv);
++	return ret;
++err:
++	dev_err(dev->dev, "%s failed ret:%d\n", __func__, ret);
++	return ret;
+ }
+ 
+ void rkispp_free_buffer(struct rkispp_device *dev,
+ 			struct rkispp_dummy_buffer *buf)
+ {
+-	if (buf && buf->vaddr && buf->size) {
+-		dma_free_coherent(dev->dev, buf->size,
+-				  buf->vaddr, buf->dma_addr);
++	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
++
++	if (buf && buf->mem_priv) {
++		ops->put(buf->mem_priv);
+ 		buf->size = 0;
+ 		buf->vaddr = NULL;
++		buf->mem_priv = NULL;
+ 	}
+ }
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index e78101fc1d5c..4f965b359b8b 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -42,6 +42,7 @@ struct rkispp_dummy_buffer {
+ 	dma_addr_t dma_addr;
+ 	void *vaddr;
+ 	u32 size;
++	void *mem_priv;
+ };
+ 
+ extern int rkispp_debug;
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index 9adfc4735e8f..cc54fe08b169 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -2,9 +2,11 @@
+ /* Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd. */
+ 
+ #include <linux/interrupt.h>
++#include <linux/iommu.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/videodev2.h>
+ #include <media/media-entity.h>
++#include <media/videobuf2-dma-contig.h>
+ 
+ #include "dev.h"
+ #include "regs.h"
+@@ -144,47 +146,89 @@ static int rkispp_sd_set_fmt(struct v4l2_subdev *sd,
+ 				set_fmt, NULL, fmt);
+ }
+ 
++static int rkispp_s_rx_buffer(struct rkispp_subdev *ispp_sdev)
++{
++	const struct vb2_mem_ops *ops = &vb2_dma_contig_memops;
++	struct rkispp_device *dev = ispp_sdev->dev;
++	struct rkispp_stream_vdev *vdev = &dev->stream_vdev;
++	struct rkispp_dummy_buffer *buf;
++	struct dma_buf *dbuf;
++	void *size;
++	int ret;
++
++	if (vdev->module_ens & ISPP_MODULE_TNR) {
++		buf = &vdev->tnr_buf.pic_cur;
++		size = &buf->size;
++		dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++		ret = v4l2_subdev_call(ispp_sdev->remote_sd,
++			video, s_rx_buffer, dbuf, size);
++		if (ret)
++			return ret;
++
++		buf = &vdev->tnr_buf.gain_cur;
++		size = &buf->size;
++		dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++		if (vdev->tnr_mode) {
++			ret = v4l2_subdev_call(ispp_sdev->remote_sd,
++				video, s_rx_buffer, dbuf, size);
++			if (ret)
++				return ret;
++			buf = &vdev->tnr_buf.pic_next;
++			size = &buf->size;
++			dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++			ret = v4l2_subdev_call(ispp_sdev->remote_sd,
++				video, s_rx_buffer, dbuf, size);
++			if (ret)
++				return ret;
++			buf = &vdev->tnr_buf.gain_next;
++			size = &buf->size;
++			dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++		}
++	} else {
++		buf = &vdev->nr_buf.pic_cur;
++		size = &buf->size;
++		dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++		ret = v4l2_subdev_call(ispp_sdev->remote_sd,
++			video, s_rx_buffer, dbuf, size);
++		if (ret)
++			return ret;
++		buf = &vdev->nr_buf.gain_cur;
++		size = &buf->size;
++		dbuf = ops->get_dmabuf(buf->mem_priv, O_RDWR);
++	}
++
++	return v4l2_subdev_call(ispp_sdev->remote_sd,
++		video, s_rx_buffer, dbuf, size);
++}
++
+ static int rkispp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ {
+ 	struct rkispp_subdev *ispp_sdev = v4l2_get_subdevdata(sd);
+ 	struct rkispp_device *dev = ispp_sdev->dev;
+-	struct rkispp_stream_vdev *vdev;
++	struct rkispp_stream *stream;
++	int ret, i;
+ 
+-	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
++	for (i = 0; i < STREAM_MAX; i++) {
++		stream = &dev->stream_vdev.stream[i];
++		if (stream->streaming)
++			break;
++	}
++
++	if (i == STREAM_MAX) {
++		v4l2_err(&dev->v4l2_dev,
++			 "no video start before subdev stream on\n");
++		return -EINVAL;
++	}
++
++	v4l2_dbg(1, rkispp_debug, &ispp_sdev->dev->v4l2_dev,
+ 		 "s_stream on:%d\n", on);
+ 
+-	vdev = &dev->stream_vdev;
+ 	if (on) {
+-		void *buf, *size;
+-
+-		if (vdev->module_ens & ISPP_MODULE_TNR) {
+-			buf = &vdev->tnr_buf.pic_cur.dma_addr;
+-			size = &vdev->tnr_buf.pic_cur.size;
+-			v4l2_subdev_call(ispp_sdev->remote_sd,
+-				video, s_rx_buffer, buf, size);
+-			buf = &vdev->tnr_buf.gain_cur.dma_addr;
+-			size = &vdev->tnr_buf.gain_cur.size;
+-			if (vdev->tnr_mode) {
+-				v4l2_subdev_call(ispp_sdev->remote_sd,
+-					video, s_rx_buffer, buf, size);
+-				buf = &vdev->tnr_buf.pic_next.dma_addr;
+-				size = &vdev->tnr_buf.pic_next.size;
+-				v4l2_subdev_call(ispp_sdev->remote_sd,
+-					video, s_rx_buffer, buf, size);
+-				buf = &vdev->tnr_buf.gain_next.dma_addr;
+-				size = &vdev->tnr_buf.gain_next.size;
+-			}
+-		} else {
+-			buf = &vdev->nr_buf.pic_cur.dma_addr;
+-			size = &vdev->nr_buf.pic_cur.size;
+-			v4l2_subdev_call(ispp_sdev->remote_sd,
+-				video, s_rx_buffer, buf, size);
+-			buf = &vdev->nr_buf.gain_cur.dma_addr;
+-			size = &vdev->nr_buf.gain_cur.size;
+-		}
+-		v4l2_subdev_call(ispp_sdev->remote_sd,
+-			video, s_rx_buffer, buf, size);
++		ret = rkispp_s_rx_buffer(ispp_sdev);
++		if (ret)
++			return ret;
+ 	}
++
+ 	return  v4l2_subdev_call(ispp_sdev->remote_sd,
+ 				video, s_stream, on);
+ }
+@@ -193,6 +237,7 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ {
+ 	struct rkispp_subdev *ispp_sdev = v4l2_get_subdevdata(sd);
+ 	struct rkispp_device *ispp_dev = ispp_sdev->dev;
++	struct iommu_domain *domain;
+ 	int ret;
+ 
+ 	v4l2_dbg(1, rkispp_debug, &ispp_dev->v4l2_dev,
+@@ -207,7 +252,6 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 			return ret;
+ 		}
+ 		atomic_set(&ispp_sdev->frm_sync_seq, 0);
+-		rkispp_soft_reset(ispp_dev->base_addr);
+ 		writel(0xfffffff, ispp_dev->base_addr + RKISPP_CTRL_INT_MSK);
+ 		if (ispp_dev->inp == INP_ISP) {
+ 			struct v4l2_subdev_format *fmt = &ispp_sdev->in_fmt;
+@@ -231,6 +275,14 @@ static int rkispp_sd_s_power(struct v4l2_subdev *sd, int on)
+ 		}
+ 	} else {
+ 		writel(0, ispp_dev->base_addr + RKISPP_CTRL_INT_MSK);
++		rkispp_soft_reset(ispp_dev->base_addr);
++		domain = iommu_get_domain_for_dev(ispp_dev->dev);
++		if (domain) {
++#ifdef CONFIG_IOMMU_API
++			domain->ops->detach_dev(domain, ispp_dev->dev);
++			domain->ops->attach_dev(domain, ispp_dev->dev);
++#endif
++		}
+ 		if (ispp_dev->inp == INP_ISP)
+ 			v4l2_subdev_call(ispp_sdev->remote_sd, core, s_power, 0);
+ 		ret = pm_runtime_put(ispp_dev->dev);
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index efeedf68804f..6bf9f4d88fc1 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -755,9 +755,6 @@ static int config_modules(struct rkispp_device *dev)
+ {
+ 	int ret;
+ 
+-	if (dev->inp == INP_ISP)
+-		dev->stream_vdev.module_ens |= ISPP_MODULE_NR;
+-
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "stream module ens:0x%x\n", dev->stream_vdev.module_ens);
+ 
+@@ -817,7 +814,7 @@ static int config_mb(struct rkispp_stream *stream)
+ 	u32 i, limit_range, mult = 1;
+ 
+ 	for (i = ISPP_MODULE_FEC; i > 0; i = i >> 1) {
+-		if (dev->stream_vdev.module_ens >> i)
++		if (dev->stream_vdev.module_ens & i)
+ 			break;
+ 	}
+ 	if (!i)
+@@ -1288,6 +1285,9 @@ static int rkispp_start_streaming(struct vb2_queue *queue,
+ 	if (ret < 0)
+ 		goto free_buf_queue;
+ 
++	if (dev->inp == INP_ISP)
++		dev->stream_vdev.module_ens |= ISPP_MODULE_NR;
++
+ 	if (stream->ops->config) {
+ 		ret = stream->ops->config(stream);
+ 		if (ret < 0)
+@@ -1313,6 +1313,9 @@ static int rkispp_start_streaming(struct vb2_queue *queue,
+ free_buf_queue:
+ 	destroy_buf_queue(stream, VB2_BUF_STATE_QUEUED);
+ 	atomic_dec(&dev->stream_vdev.refcnt);
++	v4l2_err(&dev->v4l2_dev,
++		 "ispp stream:%d on failed ret:%d\n",
++		 stream->id, ret);
+ 	return ret;
+ }
+ 
+-- 
+2.35.3
+

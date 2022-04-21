@@ -1,0 +1,134 @@
+From 1a88c4e7a5c9a6a55711ab1ac50059d493ae33b3 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Sat, 14 Jul 2012 17:14:33 +0800
+Subject: [PATCH] rkfb:add ioctl to get buffers number
+
+---
+ arch/arm/mach-rk30/board-rk30-sdk.c      |  2 +-
+ drivers/video/rockchip/chips/rk30_lcdc.c | 29 ++++++++++++++----------
+ drivers/video/rockchip/rk_fb.c           |  8 +++++++
+ include/linux/fb.h                       |  2 ++
+ include/linux/rk_fb.h                    |  1 +
+ 5 files changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm/mach-rk30/board-rk30-sdk.c b/arch/arm/mach-rk30/board-rk30-sdk.c
+index b3db166033fe..31911f44708a 100755
+--- a/arch/arm/mach-rk30/board-rk30-sdk.c
++++ b/arch/arm/mach-rk30/board-rk30-sdk.c
+@@ -64,7 +64,7 @@
+ #include "../../../drivers/staging/android/timed_gpio.h"
+ #endif
+ 
+-#define RK30_FB0_MEM_SIZE 8*SZ_1M
++#define RK30_FB0_MEM_SIZE 12*SZ_1M
+ 
+ #ifdef CONFIG_VIDEO_RK29
+ /*---------------- Camera Sensor Macro Define Begin  ------------------------*/
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index 87d2ab494b61..21a1c4e5c0bf 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -610,17 +610,19 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		 
+ 	}
+ 
+-	spin_lock_irqsave(&dev_drv->cpl_lock,flags);
+-	init_completion(&dev_drv->frame_done);
+-	spin_unlock_irqrestore(&dev_drv->cpl_lock,flags);
+-	timeout = wait_for_completion_timeout(&dev_drv->frame_done,msecs_to_jiffies(dev_drv->screen->ft+5));
+-	if(!timeout&&(!dev_drv->frame_done.done))
++	if(dev_drv->num_buf < 3) //3buffer ,no need to  wait for sysn
+ 	{
+-		printk(KERN_ERR "wait for new frame start time out!\n");
+-		return -ETIMEDOUT;
++		spin_lock_irqsave(&dev_drv->cpl_lock,flags);
++		init_completion(&dev_drv->frame_done);
++		spin_unlock_irqrestore(&dev_drv->cpl_lock,flags);
++		timeout = wait_for_completion_timeout(&dev_drv->frame_done,msecs_to_jiffies(dev_drv->screen->ft+5));
++		if(!timeout&&(!dev_drv->frame_done.done))
++		{
++			printk(KERN_ERR "wait for new frame start time out!\n");
++			return -ETIMEDOUT;
++		}
+ 	}
+ 	
+-	
+ 	return 0;
+ }
+ 
+@@ -804,10 +806,13 @@ static irqreturn_t rk30_lcdc_isr(int irq, void *dev_id)
+ 	LcdMskReg(lcdc_dev, INT_STATUS, m_FRM_START_INT_CLEAR, v_FRM_START_INT_CLEAR(1));
+ 	LCDC_REG_CFG_DONE();
+ 	//LcdMskReg(lcdc_dev, INT_STATUS, m_LINE_FLAG_INT_CLEAR, v_LINE_FLAG_INT_CLEAR(1));
+-	
+-	spin_lock(&(lcdc_dev->driver.cpl_lock));
+-	complete(&(lcdc_dev->driver.frame_done));
+-	spin_unlock(&(lcdc_dev->driver.cpl_lock));
++ 
++	if(lcdc_dev->driver.num_buf < 3)  //three buffer ,no need to wait for sync
++	{
++		spin_lock(&(lcdc_dev->driver.cpl_lock));
++		complete(&(lcdc_dev->driver.frame_done));
++		spin_unlock(&(lcdc_dev->driver.cpl_lock));
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 9ec9cd885821..a07940b493a2 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -249,6 +249,7 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ 	int layer_id = get_fb_layer_id(&info->fix);
+ 	int enable; // enable fb:1 enable;0 disable 
+ 	int ovl;	//overlay:0 win1 on the top of win0;1,win0 on the top of win1
++	int num_buf; //buffer_number
+ 	void __user *argp = (void __user *)arg;
+ 	
+ 	switch(cmd)
+@@ -278,10 +279,17 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ 			if (copy_from_user(&ovl, argp, sizeof(ovl)))
+ 				return -EFAULT;
+ 			dev_drv->ovl_mgr(dev_drv,ovl,1);
++			break;
+ 		case FBIOGET_OVERLAY_STATE:
+ 			ovl = dev_drv->ovl_mgr(dev_drv,0,0);
+ 			if (copy_to_user(argp, &ovl, sizeof(ovl)))
+ 				return -EFAULT;
++			break;
++		case FBIOPUT_NUM_BUFFERS:
++			if (copy_from_user(&num_buf, argp, sizeof(num_buf)))
++				return -EFAULT;
++			dev_drv->num_buf = num_buf;
++			break;
+ 		case FBIOGET_SCREEN_STATE:
+ 		case FBIOPUT_SET_CURSOR_EN:
+ 		case FBIOPUT_SET_CURSOR_POS:
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+index 0dcb6b4dc8d6..97e479bdc8c5 100755
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -27,6 +27,8 @@
+ #define FBIOPUT_SET_CURSOR_CMAP    0x460c
+ #define FBIOPUT_GET_CURSOR_RESOLUTION    0x460d
+ #define FBIOPUT_GET_CURSOR_EN    0x460e
++#define FBIOPUT_NUM_BUFFERS 	0x460f
++
+ #ifdef __KERNEL__
+ #define FBIO_CURSOR            _IOWR('F', 0x08, struct fb_cursor_user)
+ #else
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 70ae80ee99d0..1b8663626f45 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -191,6 +191,7 @@ struct rk_lcdc_device_driver{
+ 	struct layer_par *layer_par[RK_MAX_FB_SUPPORT];
+ 	struct layer_par *def_layer_par;
+ 	int num_layer;
++	int num_buf;				//the num_of buffer
+ 	int fb_index_base;                     //the first fb index of the lcdc device
+ 	rk_screen *screen;
+ 	u32 pixclock;
+-- 
+2.35.3
+

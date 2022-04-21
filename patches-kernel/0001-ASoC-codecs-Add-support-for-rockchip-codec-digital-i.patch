@@ -1,0 +1,1119 @@
+From 5d33c809c30b5d9a93c2c5853ccd5e2b46af044b Mon Sep 17 00:00:00 2001
+From: Sugar Zhang <sugar.zhang@rock-chips.com>
+Date: Thu, 5 Mar 2020 09:31:02 +0800
+Subject: [PATCH] ASoC: codecs: Add support for rockchip codec digital
+ interface
+
+This patch adds support for rockchip codec digital interface,
+which is used to communicate with external codec analog part
+with pdm link.
+
+Change-Id: I9ea7020d904b63f7a34696b0f538accd8c700076
+Signed-off-by: Sugar Zhang <sugar.zhang@rock-chips.com>
+---
+ sound/soc/codecs/Kconfig            |   3 +
+ sound/soc/codecs/Makefile           |   2 +
+ sound/soc/codecs/rk_codec_digital.c | 730 ++++++++++++++++++++++++++++
+ sound/soc/codecs/rk_codec_digital.h | 319 ++++++++++++
+ 4 files changed, 1054 insertions(+)
+ create mode 100644 sound/soc/codecs/rk_codec_digital.c
+ create mode 100644 sound/soc/codecs/rk_codec_digital.h
+
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index d086df12dee4..b4a74cae796d 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -818,6 +818,9 @@ config SND_SOC_RK817
+ 	depends on MFD_RK808
+ 	select REGMAP_I2C
+ 
++config SND_SOC_RK_CODEC_DIGITAL
++	tristate "Rockchip Codec Digital Interface"
++
+ config SND_SOC_RL6231
+ 	tristate
+ 	default y if SND_SOC_RT5514=y
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index ef6a3d9d1d18..843dc2bae27f 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -137,6 +137,7 @@ snd-soc-rk3228-objs := rk3228_codec.o
+ snd-soc-rk3308-objs := rk3308_codec.o
+ snd-soc-rk3328-objs := rk3328_codec.o
+ snd-soc-rk817-objs := rk817_codec.o
++snd-soc-rk-codec-digital-objs := rk_codec_digital.o
+ snd-soc-rl6231-objs := rl6231.o
+ snd-soc-rl6347a-objs := rl6347a.o
+ snd-soc-rt1305-objs := rt1305.o
+@@ -408,6 +409,7 @@ obj-$(CONFIG_SND_SOC_RK3228)	+= snd-soc-rk3228.o
+ obj-$(CONFIG_SND_SOC_RK3308)	+= snd-soc-rk3308.o
+ obj-$(CONFIG_SND_SOC_RK3328)	+= snd-soc-rk3328.o
+ obj-$(CONFIG_SND_SOC_RK817)	+= snd-soc-rk817.o
++obj-$(CONFIG_SND_SOC_RK_CODEC_DIGITAL)	+= snd-soc-rk-codec-digital.o
+ obj-$(CONFIG_SND_SOC_RL6231)	+= snd-soc-rl6231.o
+ obj-$(CONFIG_SND_SOC_RL6347A)	+= snd-soc-rl6347a.o
+ obj-$(CONFIG_SND_SOC_RT1305)	+= snd-soc-rt1305.o
+diff --git a/sound/soc/codecs/rk_codec_digital.c b/sound/soc/codecs/rk_codec_digital.c
+new file mode 100644
+index 000000000000..bfe1c49b8cfd
+--- /dev/null
++++ b/sound/soc/codecs/rk_codec_digital.c
+@@ -0,0 +1,730 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Rockchip Audio Codec Digital Interface
++ *
++ * Copyright (C) 2020 Rockchip Electronics Co.,Ltd
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/clk.h>
++#include <linux/mfd/syscon.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <sound/pcm_params.h>
++#include <sound/dmaengine_pcm.h>
++#include <sound/tlv.h>
++#include "rk_codec_digital.h"
++
++#define RV1126_GRF_SOC_CON2 (0x0008)
++
++struct rk_codec_digital_soc_data {
++	int (*init)(struct device *dev);
++	void (*deinit)(struct device *dev);
++};
++
++struct rk_codec_digital_priv {
++	struct regmap *grf;
++	struct regmap *regmap;
++	struct clk *clk_adc;
++	struct clk *clk_dac;
++	struct clk *pclk;
++	atomic_t enable;
++
++	struct reset_control *rc;
++	const struct rk_codec_digital_soc_data *data;
++};
++
++/* ADC digital gain */
++static const DECLARE_TLV_DB_SCALE(adc_tlv, -95625, 375, 0);
++/* PGA gain */
++static const DECLARE_TLV_DB_SCALE(pga_tlv, -18, 3, 0);
++/* DAC digital gain */
++static const DECLARE_TLV_DB_SCALE(dac_tlv, -95625, 375, 0);
++
++/* ADC Cutoff Freq for High Pass Filter */
++static const char * const adc_hpf_cutoff_text[] = {
++	"3.79Hz", "60Hz", "243Hz", "493Hz",
++};
++
++static SOC_ENUM_SINGLE_DECL(adc_hpf_cutoff_enum, ADCHPFCF, 0,
++			    adc_hpf_cutoff_text);
++
++/* DAC Cutoff for High Pass Filter */
++static const char * const dac_hpf_cutoff_text[] = {
++	"80Hz", "100Hz", "120Hz", "140Hz",
++};
++
++static SOC_ENUM_SINGLE_DECL(dac_hpf_cutoff_enum, DACHPF, 4,
++			    dac_hpf_cutoff_text);
++
++static const struct snd_kcontrol_new rk_codec_digital_snd_controls[] = {
++	SOC_SINGLE_TLV("ADCL0 Digital Volume",
++		       ADCVOLL0, 0, 0Xff, 1, adc_tlv),
++	SOC_SINGLE_TLV("ADCL1 Digital Volume",
++		       ADCVOLL1, 0, 0xff, 1, adc_tlv),
++	SOC_SINGLE_TLV("ADCR0 Digital Volume",
++		       ADCVOLR0, 0, 0xff, 1, adc_tlv),
++
++	SOC_SINGLE_TLV("ADCL0 PGA Gain",
++		       ADCPGL0, 0, 0Xf, 0, pga_tlv),
++	SOC_SINGLE_TLV("ADCL1 PGA Gain",
++		       ADCPGL1, 0, 0xf, 0, pga_tlv),
++	SOC_SINGLE_TLV("ADCR0 PGA Gain",
++		       ADCPGR0, 0, 0xf, 0, pga_tlv),
++
++	SOC_SINGLE_TLV("DACL Digital Volume",
++		       DACVOLL0, 0, 0xff, 1, dac_tlv),
++	SOC_SINGLE_TLV("DACR Digital Volume",
++		       DACVOLR0, 0, 0xff, 1, dac_tlv),
++
++	SOC_ENUM("ADC HPF Cutoff", adc_hpf_cutoff_enum),
++	SOC_SINGLE("ADC L0 HPF Switch", ADCHPFEN, 0, 1, 0),
++	SOC_SINGLE("ADC R0 HPF Switch", ADCHPFEN, 1, 1, 0),
++	SOC_SINGLE("ADC L1 HPF Switch", ADCHPFEN, 2, 1, 0),
++
++	SOC_ENUM("DAC HPF Cutoff", dac_hpf_cutoff_enum),
++	SOC_SINGLE("DAC HPF Switch", DACHPF, 0, 1, 0),
++};
++
++static void rk_codec_digital_reset(struct rk_codec_digital_priv *rcd)
++{
++	if (IS_ERR(rcd->rc))
++		return;
++
++	reset_control_assert(rcd->rc);
++	udelay(1);
++	reset_control_deassert(rcd->rc);
++}
++
++/*
++ * ACDC_CLK  D2A_CLK   D2A_SYNC Sample rates supported
++ * 49.152MHz 49.152MHz 6.144MHz 12/24/48/96/192kHz
++ * 45.154MHz 45.154MHz 5.644MHz 11.025/22.05/44.1/88.2/176.4kHz
++ * 32.768MHz 32.768MHz 4.096MHz 8/16/32/64/128kHz
++ *
++ */
++static void rk_codec_digital_get_sync_clk(unsigned int samplerate,
++					  unsigned int *mclk,
++					  unsigned int *sclk)
++{
++	switch (samplerate) {
++	case 12000:
++	case 24000:
++	case 48000:
++	case 96000:
++	case 192000:
++		*mclk = 49152000;
++		*sclk = 6144000;
++		break;
++	case 11025:
++	case 22050:
++	case 44100:
++	case 88200:
++	case 176400:
++		*mclk = 45158400;
++		*sclk = 5644800;
++		break;
++	case 8000:
++	case 16000:
++	case 32000:
++	case 64000:
++	case 128000:
++		*mclk = 32768000;
++		*sclk = 4096000;
++		break;
++	default:
++		*mclk = 0;
++		*sclk = 0;
++		break;
++	}
++}
++
++static void rk_codec_digital_enable_clk_adc(struct rk_codec_digital_priv *rcd)
++{
++	regmap_update_bits(rcd->regmap, ADCCLKCTRL,
++			   ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_MASK |
++			   ACDCDIG_ADCCLKCTRL_ADC_CKE_MASK |
++			   ACDCDIG_ADCCLKCTRL_I2STX_CKE_MASK |
++			   ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_MASK |
++			   ACDCDIG_ADCCLKCTRL_FILTER_GATE_EN_MASK |
++			   ACDCDIG_ADCCLKCTRL_ADC_SYNC_ENA_MASK,
++			   ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_16 |
++			   ACDCDIG_ADCCLKCTRL_ADC_CKE_EN |
++			   ACDCDIG_ADCCLKCTRL_I2STX_CKE_EN |
++			   ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_EN |
++			   ACDCDIG_ADCCLKCTRL_FILTER_GATE_EN |
++			   ACDCDIG_ADCCLKCTRL_ADC_SYNC_ENA_EN);
++}
++
++static void rk_codec_digital_disable_clk_adc(struct rk_codec_digital_priv *rcd)
++{
++	regmap_update_bits(rcd->regmap, ADCCLKCTRL,
++			   ACDCDIG_ADCCLKCTRL_ADC_CKE_MASK |
++			   ACDCDIG_ADCCLKCTRL_I2STX_CKE_MASK |
++			   ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_MASK,
++			   ACDCDIG_ADCCLKCTRL_ADC_CKE_DIS |
++			   ACDCDIG_ADCCLKCTRL_I2STX_CKE_DIS |
++			   ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_DIS);
++}
++
++static void rk_codec_digital_enable_clk_dac(struct rk_codec_digital_priv *rcd)
++{
++	regmap_update_bits(rcd->regmap, DACCLKCTRL,
++			   ACDCDIG_DACCLKCTRL_DAC_CKE_MASK |
++			   ACDCDIG_DACCLKCTRL_I2SRX_CKE_MASK |
++			   ACDCDIG_DACCLKCTRL_CKE_BCLKRX_MASK |
++			   ACDCDIG_DACCLKCTRL_DAC_SYNC_ENA_MASK |
++			   ACDCDIG_DACCLKCTRL_DAC_MODE_ATTENU_MASK,
++			   ACDCDIG_DACCLKCTRL_DAC_CKE_EN |
++			   ACDCDIG_DACCLKCTRL_I2SRX_CKE_EN |
++			   ACDCDIG_DACCLKCTRL_CKE_BCLKRX_EN |
++			   ACDCDIG_DACCLKCTRL_DAC_SYNC_ENA_EN |
++			   ACDCDIG_DACCLKCTRL_DAC_MODE_ATTENU_EN);
++}
++
++static void rk_codec_digital_disable_clk_dac(struct rk_codec_digital_priv *rcd)
++{
++	regmap_update_bits(rcd->regmap, DACCLKCTRL,
++			   ACDCDIG_DACCLKCTRL_DAC_CKE_MASK |
++			   ACDCDIG_DACCLKCTRL_I2SRX_CKE_MASK |
++			   ACDCDIG_DACCLKCTRL_CKE_BCLKRX_MASK,
++			   ACDCDIG_DACCLKCTRL_DAC_CKE_DIS |
++			   ACDCDIG_DACCLKCTRL_I2SRX_CKE_DIS |
++			   ACDCDIG_DACCLKCTRL_CKE_BCLKRX_DIS);
++}
++
++static int rk_codec_digital_set_clk(struct rk_codec_digital_priv *rcd,
++				    int stream, unsigned int samplerate)
++{
++	unsigned int mclk, sclk, div_sync;
++	unsigned int bclk, div_bclk;
++
++	rk_codec_digital_get_sync_clk(samplerate, &mclk, &sclk);
++	if (!mclk || !sclk)
++		return -EINVAL;
++
++	clk_set_rate(rcd->clk_adc, mclk);
++	clk_set_rate(rcd->clk_dac, mclk);
++
++	/* select clock sync is from ADC. */
++	regmap_update_bits(rcd->regmap, SYSCTRL0,
++			   ACDCDIG_SYSCTRL0_SYNC_MODE_MASK |
++			   ACDCDIG_SYSCTRL0_CLK_COM_SEL_MASK,
++			   ACDCDIG_SYSCTRL0_SYNC_MODE_SYNC |
++			   ACDCDIG_SYSCTRL0_CLK_COM_SEL_ADC);
++
++	div_sync = DIV_ROUND_CLOSEST(mclk, sclk);
++
++	regmap_update_bits(rcd->regmap, ADCINT_DIV,
++			   ACDCDIG_ADCINT_DIV_INT_DIV_CON_MASK,
++			   ACDCDIG_ADCINT_DIV_INT_DIV_CON(div_sync));
++	regmap_update_bits(rcd->regmap, DACINT_DIV,
++			   ACDCDIG_DACINT_DIV_INT_DIV_CON_MASK,
++			   ACDCDIG_DACINT_DIV_INT_DIV_CON(div_sync));
++
++	rk_codec_digital_enable_clk_adc(rcd);
++	rk_codec_digital_enable_clk_dac(rcd);
++
++	bclk = 64 * samplerate;
++	div_bclk = DIV_ROUND_CLOSEST(mclk, bclk);
++
++	regmap_update_bits(rcd->regmap, DACSCLKRXINT_DIV,
++			   ACDCDIG_DACSCLKRXINT_DIV_SCKRXDIV_MASK,
++			   ACDCDIG_DACSCLKRXINT_DIV_SCKRXDIV(div_bclk));
++	regmap_update_bits(rcd->regmap, I2S_CKR0,
++			   ACDCDIG_I2S_CKR0_RSD_MASK,
++			   ACDCDIG_I2S_CKR0_RSD(64));
++	regmap_update_bits(rcd->regmap, ADCSCLKTXINT_DIV,
++			   ACDCDIG_ADCSCLKTXINT_DIV_SCKTXDIV_MASK,
++			   ACDCDIG_ADCSCLKTXINT_DIV_SCKTXDIV(div_bclk));
++	regmap_update_bits(rcd->regmap, I2S_CKR0,
++			   ACDCDIG_I2S_CKR0_TSD_MASK,
++			   ACDCDIG_I2S_CKR0_TSD(64));
++
++	return 0;
++}
++
++static int rk_codec_digital_set_dai_fmt(struct snd_soc_dai *dai,
++					unsigned int fmt)
++{
++	struct rk_codec_digital_priv *rcd =
++		snd_soc_component_get_drvdata(dai->component);
++	unsigned int mask = 0, val = 0;
++
++	/* master mode only */
++	regmap_update_bits(rcd->regmap, I2S_CKR1,
++			   ACDCDIG_I2S_CKR1_MSS_MASK,
++			   ACDCDIG_I2S_CKR1_MSS_MASTER);
++
++	mask = ACDCDIG_I2S_CKR1_CKP_MASK |
++	       ACDCDIG_I2S_CKR1_RLP_MASK |
++	       ACDCDIG_I2S_CKR1_TLP_MASK;
++
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_NB_NF:
++		val = ACDCDIG_I2S_CKR1_CKP_NORMAL |
++		      ACDCDIG_I2S_CKR1_RLP_NORMAL |
++		      ACDCDIG_I2S_CKR1_TLP_NORMAL;
++		break;
++	case SND_SOC_DAIFMT_IB_IF:
++		val = ACDCDIG_I2S_CKR1_CKP_INVERTED |
++		      ACDCDIG_I2S_CKR1_RLP_INVERTED |
++		      ACDCDIG_I2S_CKR1_TLP_INVERTED;
++		break;
++	case SND_SOC_DAIFMT_IB_NF:
++		val = ACDCDIG_I2S_CKR1_CKP_INVERTED |
++		      ACDCDIG_I2S_CKR1_RLP_NORMAL |
++		      ACDCDIG_I2S_CKR1_TLP_NORMAL;
++		break;
++	case SND_SOC_DAIFMT_NB_IF:
++		val = ACDCDIG_I2S_CKR1_CKP_NORMAL |
++		      ACDCDIG_I2S_CKR1_RLP_INVERTED |
++		      ACDCDIG_I2S_CKR1_TLP_INVERTED;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	regmap_update_bits(rcd->regmap, I2S_CKR1, mask, val);
++
++	return 0;
++}
++
++static int rk_codec_digital_hw_params(struct snd_pcm_substream *substream,
++				      struct snd_pcm_hw_params *params,
++				      struct snd_soc_dai *dai)
++{
++	struct rk_codec_digital_priv *rcd =
++		snd_soc_component_get_drvdata(dai->component);
++	unsigned int srt = 0, val = 0;
++
++	if (atomic_inc_return(&rcd->enable) == 1) {
++		rk_codec_digital_set_clk(rcd, substream->stream, params_rate(params));
++		rk_codec_digital_reset(rcd);
++	}
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		switch (params_rate(params)) {
++		case 8000:
++		case 11025:
++		case 12000:
++			srt = 0;
++			break;
++		case 16000:
++		case 22050:
++		case 24000:
++			srt = 1;
++			break;
++		case 32000:
++		case 44100:
++		case 48000:
++			srt = 2;
++			break;
++		case 64000:
++		case 88200:
++		case 96000:
++			srt = 3;
++			break;
++		case 128000:
++		case 176400:
++		case 192000:
++			srt = 4;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		regmap_update_bits(rcd->regmap, DACCFG1,
++				   ACDCDIG_DACCFG1_DACSRT_MASK,
++				   ACDCDIG_DACCFG1_DACSRT(srt));
++
++		switch (params_format(params)) {
++		case SNDRV_PCM_FORMAT_S16_LE:
++			val = 16;
++			break;
++		case SNDRV_PCM_FORMAT_S24_LE:
++		case SNDRV_PCM_FORMAT_S32_LE:
++			val = 24;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		regmap_update_bits(rcd->regmap, I2S_RXCR0,
++				   ACDCDIG_I2S_RXCR0_VDW_MASK,
++				   ACDCDIG_I2S_RXCR0_VDW(val));
++	} else {
++		switch (params_rate(params)) {
++		case 8000:
++		case 11025:
++		case 12000:
++			srt = 0;
++			break;
++		case 16000:
++		case 22050:
++		case 24000:
++			srt = 1;
++			break;
++		case 32000:
++			srt = 2;
++			break;
++		case 44100:
++		case 48000:
++			srt = 3;
++			break;
++		case 64000:
++		case 88200:
++		case 96000:
++			srt = 4;
++			break;
++		case 128000:
++		case 176400:
++		case 192000:
++			srt = 5;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		regmap_update_bits(rcd->regmap, ADCCFG1,
++				   ACDCDIG_ADCCFG1_ADCSRT_MASK,
++				   ACDCDIG_ADCCFG1_ADCSRT(srt));
++
++		switch (params_format(params)) {
++		case SNDRV_PCM_FORMAT_S16_LE:
++			val = 16;
++			break;
++		case SNDRV_PCM_FORMAT_S24_LE:
++		case SNDRV_PCM_FORMAT_S32_LE:
++			val = 24;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		regmap_update_bits(rcd->regmap, I2S_TXCR0,
++				   ACDCDIG_I2S_TXCR0_VDW_MASK,
++				   ACDCDIG_I2S_TXCR0_VDW(val));
++
++		switch (params_channels(params)) {
++		case 4:
++			val = ACDCDIG_I2S_TXCR1_TCSR_4CH;
++			break;
++		case 2:
++			val = ACDCDIG_I2S_TXCR1_TCSR_2CH;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		regmap_update_bits(rcd->regmap, I2S_TXCR1,
++				   ACDCDIG_I2S_TXCR1_TCSR_MASK, val);
++	}
++
++	regmap_write(rcd->regmap, I2S_CLR,
++		     ACDCDIG_I2S_CLR_RXC_CLR | ACDCDIG_I2S_CLR_TXC_CLR);
++
++	regmap_update_bits(rcd->regmap, I2S_XFER,
++			   ACDCDIG_I2S_XFER_RXS_MASK |
++			   ACDCDIG_I2S_XFER_TXS_MASK,
++			   ACDCDIG_I2S_XFER_RXS_START |
++			   ACDCDIG_I2S_XFER_TXS_START);
++
++	regmap_update_bits(rcd->regmap, SYSCTRL0,
++			   ACDCDIG_SYSCTRL0_GLB_CKE_MASK,
++			   ACDCDIG_SYSCTRL0_GLB_CKE_EN);
++
++	regmap_update_bits(rcd->regmap, ADCDIGEN,
++			   ACDCDIG_ADCDIGEN_ADC_GLBEN_MASK |
++			   ACDCDIG_ADCDIGEN_ADCEN_L2_MASK |
++			   ACDCDIG_ADCDIGEN_ADCEN_L0R1_MASK,
++			   ACDCDIG_ADCDIGEN_ADC_GLBEN_EN |
++			   ACDCDIG_ADCDIGEN_ADCEN_L2_EN |
++			   ACDCDIG_ADCDIGEN_ADCEN_L0R1_EN);
++
++	regmap_update_bits(rcd->regmap, DACDIGEN,
++			   ACDCDIG_DACDIGEN_DAC_GLBEN_MASK |
++			   ACDCDIG_DACDIGEN_DACEN_L0R1_MASK,
++			   ACDCDIG_DACDIGEN_DAC_GLBEN_EN |
++			   ACDCDIG_DACDIGEN_DACEN_L0R1_EN);
++
++	return 0;
++}
++
++static void rk_codec_digital_pcm_shutdown(struct snd_pcm_substream *substream,
++					  struct snd_soc_dai *dai)
++{
++	struct rk_codec_digital_priv *rcd =
++		snd_soc_component_get_drvdata(dai->component);
++
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
++		regmap_update_bits(rcd->regmap, I2S_XFER,
++				   ACDCDIG_I2S_XFER_RXS_MASK,
++				   ACDCDIG_I2S_XFER_RXS_STOP);
++		regmap_update_bits(rcd->regmap, I2S_CLR,
++				   ACDCDIG_I2S_CLR_RXC_MASK,
++				   ACDCDIG_I2S_CLR_RXC_CLR);
++		regmap_update_bits(rcd->regmap, DACDIGEN,
++				   ACDCDIG_DACDIGEN_DAC_GLBEN_MASK |
++				   ACDCDIG_DACDIGEN_DACEN_L0R1_MASK,
++				   ACDCDIG_DACDIGEN_DAC_GLBEN_DIS |
++				   ACDCDIG_DACDIGEN_DACEN_L0R1_DIS);
++	} else {
++		regmap_update_bits(rcd->regmap, I2S_XFER,
++				   ACDCDIG_I2S_XFER_TXS_MASK,
++				   ACDCDIG_I2S_XFER_TXS_STOP);
++		regmap_update_bits(rcd->regmap, I2S_CLR,
++				   ACDCDIG_I2S_CLR_TXC_MASK,
++				   ACDCDIG_I2S_CLR_TXC_CLR);
++
++		regmap_update_bits(rcd->regmap, ADCDIGEN,
++				   ACDCDIG_ADCDIGEN_ADC_GLBEN_MASK |
++				   ACDCDIG_ADCDIGEN_ADCEN_L2_MASK |
++				   ACDCDIG_ADCDIGEN_ADCEN_L0R1_MASK,
++				   ACDCDIG_ADCDIGEN_ADC_GLBEN_DIS |
++				   ACDCDIG_ADCDIGEN_ADCEN_L2_DIS |
++				   ACDCDIG_ADCDIGEN_ADCEN_L0R1_DIS);
++	}
++
++	if (atomic_dec_and_test(&rcd->enable)) {
++		rk_codec_digital_disable_clk_adc(rcd);
++		rk_codec_digital_disable_clk_dac(rcd);
++	}
++}
++
++static const struct snd_soc_dai_ops rcd_dai_ops = {
++	.hw_params = rk_codec_digital_hw_params,
++	.set_fmt = rk_codec_digital_set_dai_fmt,
++	.shutdown = rk_codec_digital_pcm_shutdown,
++};
++
++static struct snd_soc_dai_driver rcd_dai[] = {
++	{
++		.name = "rk_codec_digital",
++		.id = 0,
++		.playback = {
++			.stream_name = "Playback",
++			.channels_min = 2,
++			.channels_max = 2,
++			.rates = SNDRV_PCM_RATE_8000_192000,
++			.formats = (SNDRV_PCM_FMTBIT_S16_LE |
++				    SNDRV_PCM_FMTBIT_S24_LE |
++				    SNDRV_PCM_FMTBIT_S32_LE),
++		},
++		.capture = {
++			.stream_name = "Capture",
++			.channels_min = 2,
++			.channels_max = 4,
++			.rates = SNDRV_PCM_RATE_8000_192000,
++			.formats = (SNDRV_PCM_FMTBIT_S16_LE |
++				    SNDRV_PCM_FMTBIT_S24_LE |
++				    SNDRV_PCM_FMTBIT_S32_LE),
++		},
++		.ops = &rcd_dai_ops,
++	},
++};
++
++static const struct snd_soc_component_driver soc_codec_dev_rcd = {
++	.controls = rk_codec_digital_snd_controls,
++	.num_controls = ARRAY_SIZE(rk_codec_digital_snd_controls),
++};
++
++static const struct regmap_config rcd_regmap_config = {
++	.reg_bits = 32,
++	.reg_stride = 4,
++	.val_bits = 32,
++	.max_register = VERSION,
++	.cache_type = REGCACHE_FLAT,
++};
++
++static int rv1126_soc_init(struct device *dev)
++{
++	struct rk_codec_digital_priv *rcd = dev_get_drvdata(dev);
++
++	if (IS_ERR(rcd->grf))
++		return PTR_ERR(rcd->grf);
++
++	/* enable internal codec to i2s0 */
++	return regmap_write(rcd->grf, RV1126_GRF_SOC_CON2,
++			    (BIT(13) << 16 | BIT(13)));
++}
++
++static void rv1126_soc_deinit(struct device *dev)
++{
++	struct rk_codec_digital_priv *rcd = dev_get_drvdata(dev);
++
++	if (IS_ERR(rcd->grf))
++		return;
++
++	regmap_write(rcd->grf, RV1126_GRF_SOC_CON2, (BIT(13) << 16));
++}
++
++static const struct rk_codec_digital_soc_data rv1126_data = {
++	.init = rv1126_soc_init,
++	.deinit = rv1126_soc_deinit,
++};
++
++#ifdef CONFIG_OF
++static const struct of_device_id rcd_of_match[] = {
++	{ .compatible = "rockchip,codec-digital-v1", },
++	{ .compatible = "rockchip,rv1126-codec-digital", .data = &rv1126_data },
++	{},
++};
++MODULE_DEVICE_TABLE(of, rcd_of_match);
++#endif
++
++#ifdef CONFIG_PM
++static int rk_codec_digital_runtime_resume(struct device *dev)
++{
++	struct rk_codec_digital_priv *rcd = dev_get_drvdata(dev);
++	int ret = 0;
++
++	ret = clk_prepare_enable(rcd->pclk);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(rcd->clk_adc);
++	if (ret)
++		goto err;
++
++	ret = clk_prepare_enable(rcd->clk_dac);
++	if (ret)
++		goto err_clk;
++
++	return 0;
++
++err_clk:
++	clk_disable_unprepare(rcd->clk_adc);
++err:
++	clk_disable_unprepare(rcd->pclk);
++
++	return ret;
++}
++
++static int rk_codec_digital_runtime_suspend(struct device *dev)
++{
++	struct rk_codec_digital_priv *rcd = dev_get_drvdata(dev);
++
++	clk_disable_unprepare(rcd->clk_adc);
++	clk_disable_unprepare(rcd->clk_dac);
++	clk_disable_unprepare(rcd->pclk);
++
++	return 0;
++}
++#endif
++
++static int rk_codec_digital_platform_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct rk_codec_digital_priv *rcd;
++	struct resource *res;
++	void __iomem *base;
++	int ret = 0;
++
++	rcd = devm_kzalloc(&pdev->dev, sizeof(*rcd), GFP_KERNEL);
++	if (!rcd)
++		return -ENOMEM;
++
++	rcd->grf = syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
++
++	rcd->rc = devm_reset_control_get(&pdev->dev, "reset");
++
++	rcd->clk_adc = devm_clk_get(&pdev->dev, "adc");
++	if (IS_ERR(rcd->clk_adc))
++		return PTR_ERR(rcd->clk_adc);
++
++	rcd->clk_dac = devm_clk_get(&pdev->dev, "dac");
++	if (IS_ERR(rcd->clk_dac))
++		return PTR_ERR(rcd->clk_dac);
++
++	rcd->pclk = devm_clk_get(&pdev->dev, "pclk");
++	if (IS_ERR(rcd->pclk))
++		return PTR_ERR(rcd->pclk);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	rcd->regmap =
++		devm_regmap_init_mmio(&pdev->dev, base, &rcd_regmap_config);
++	if (IS_ERR(rcd->regmap))
++		return PTR_ERR(rcd->regmap);
++
++	atomic_set(&rcd->enable, 0);
++	platform_set_drvdata(pdev, rcd);
++
++	rcd->data = of_device_get_match_data(&pdev->dev);
++	if (rcd->data && rcd->data->init) {
++		ret = rcd->data->init(&pdev->dev);
++		if (ret)
++			return ret;
++	}
++
++	pm_runtime_enable(&pdev->dev);
++	if (!pm_runtime_enabled(&pdev->dev)) {
++		ret = rk_codec_digital_runtime_resume(&pdev->dev);
++		if (ret)
++			goto err_pm_disable;
++	}
++
++	ret = devm_snd_soc_register_component(&pdev->dev, &soc_codec_dev_rcd,
++					      rcd_dai, ARRAY_SIZE(rcd_dai));
++
++	if (ret)
++		goto err_suspend;
++
++	return 0;
++
++err_suspend:
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		rk_codec_digital_runtime_suspend(&pdev->dev);
++err_pm_disable:
++	pm_runtime_disable(&pdev->dev);
++
++	if (rcd->data && rcd->data->deinit)
++		rcd->data->deinit(&pdev->dev);
++
++	return ret;
++}
++
++static int rk_codec_digital_platform_remove(struct platform_device *pdev)
++{
++	struct rk_codec_digital_priv *rcd = dev_get_drvdata(&pdev->dev);
++
++	pm_runtime_disable(&pdev->dev);
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		rk_codec_digital_runtime_suspend(&pdev->dev);
++
++	if (rcd->data && rcd->data->deinit)
++		rcd->data->deinit(&pdev->dev);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rcd_pm = {
++	SET_RUNTIME_PM_OPS(rk_codec_digital_runtime_suspend,
++		rk_codec_digital_runtime_resume, NULL)
++};
++
++static struct platform_driver rk_codec_digital_driver = {
++	.driver = {
++		.name = "rk_codec_digital",
++		.of_match_table = of_match_ptr(rcd_of_match),
++		.pm = &rcd_pm,
++	},
++	.probe = rk_codec_digital_platform_probe,
++	.remove = rk_codec_digital_platform_remove,
++};
++module_platform_driver(rk_codec_digital_driver);
++
++MODULE_AUTHOR("Sugar Zhang <sugar.zhang@rock-chips.com>");
++MODULE_DESCRIPTION("ASoC Rockchip codec digital driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/sound/soc/codecs/rk_codec_digital.h b/sound/soc/codecs/rk_codec_digital.h
+new file mode 100644
+index 000000000000..e22fef05882d
+--- /dev/null
++++ b/sound/soc/codecs/rk_codec_digital.h
+@@ -0,0 +1,319 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Rockchip Audio Codec Digital driver
++ *
++ * Copyright (C) 2020 Rockchip Electronics Co., Ltd
++ *
++ */
++
++#ifndef _RK_CODEC_DIGITAL_H
++#define _RK_CODEC_DIGITAL_H
++
++#define SYSCTRL0		0x0000
++#define ADCVUCTL		0x0040
++#define ADCVUCTIME		0x0044
++#define ADCDIGEN		0x0048
++#define ADCCLKCTRL		0x004C
++#define ADCINT_DIV		0x0054
++#define ADCSCLKTXINT_DIV	0x006C
++#define ADCCFG1			0x0084
++#define ADCVOLL0		0x0088
++#define ADCVOLL1		0x008C
++#define ADCVOLR0		0x0098
++#define ADCVOGP			0x00A8
++#define ADCRVOLL0		0x00AC
++#define ADCRVOLL1		0x00B0
++#define ADCRVOLR0		0x00BC
++#define ADCALC0			0x00CC
++#define ADCALC1			0x00D0
++#define ADCALC2			0x00D4
++#define ADCNG			0x00D8
++#define ADCNGST			0x00DC
++#define ADCHPFEN		0x00E0
++#define ADCHPFCF		0x00E4
++#define ADCPGL0			0x00EC
++#define ADCPGL1			0x00F0
++#define ADCPGR0			0x00FC
++#define ADCLILMT0		0x010C
++#define ADCLILMT1		0x0110
++#define ADCDMICNG0		0x0114
++#define ADCDMICNG1		0x0118
++#define DACVUCTL		0x0140
++#define DACVUCTIME		0x0144
++#define DACDIGEN		0x0148
++#define DACCLKCTRL		0x014C
++#define DACINT_DIV		0x0154
++#define DACSCLKRXINT_DIV	0x0160
++#define DACPWM_DIV		0x0164
++#define DACPWM_CTRL		0x0168
++#define DACCFG1			0x0184
++#define DACMUTE			0x0188
++#define DACMUTEST		0x018C
++#define DACVOLL0		0x0190
++#define DACVOLR0		0x01A0
++#define DACVOGP			0x01B0
++#define DACRVOLL0		0x01B4
++#define DACRVOLR0		0x01C4
++#define DACLMT0			0x01D4
++#define DACLMT1			0x01D8
++#define DACLMT2			0x01DC
++#define DACMIXCTRLL		0x01E0
++#define DACMIXCTRLR		0x01E4
++#define DACHPF			0x01E8
++#define I2S_TXCR0		0x0300
++#define I2S_TXCR1		0x0304
++#define I2S_TXCR2		0x0308
++#define I2S_RXCR0		0x030C
++#define I2S_RXCR1		0x0310
++#define I2S_CKR0		0x0314
++#define I2S_CKR1		0x0318
++#define I2S_XFER		0x031C
++#define I2S_CLR			0x0320
++#define VERSION			0x0380
++
++/* SYSCTRL0 */
++#define ACDCDIG_SYSCTRL0_SYNC_SEL_MASK		BIT(1)
++#define ACDCDIG_SYSCTRL0_SYNC_SEL_DAC		BIT(1)
++#define ACDCDIG_SYSCTRL0_SYNC_SEL_ADC		0
++#define ACDCDIG_SYSCTRL0_GLB_CKE_MASK		BIT(3)
++#define ACDCDIG_SYSCTRL0_GLB_CKE_EN		BIT(3)
++#define ACDCDIG_SYSCTRL0_GLB_CKE_DIS		0
++#define ACDCDIG_SYSCTRL0_CLK_COM_SEL_MASK	BIT(4)
++#define ACDCDIG_SYSCTRL0_CLK_COM_SEL_DAC	BIT(4)
++#define ACDCDIG_SYSCTRL0_CLK_COM_SEL_ADC	0
++#define ACDCDIG_SYSCTRL0_SYNC_MODE_MASK		BIT(5)
++#define ACDCDIG_SYSCTRL0_SYNC_MODE_SYNC		BIT(5)
++#define ACDCDIG_SYSCTRL0_SYNC_MODE_ASYNC	0
++/* ADCVUCTL */
++#define ACDCDIG_ADCVUCTL_ADC_BYPS_MASK		BIT(2)
++#define ACDCDIG_ADCVUCTL_ADC_BYPS		BIT(2)
++/* ADCDIGEN */
++#define ACDCDIG_ADCDIGEN_ADCEN_L0R1_MASK	BIT(0)
++#define ACDCDIG_ADCDIGEN_ADCEN_L0R1_EN		BIT(0)
++#define ACDCDIG_ADCDIGEN_ADCEN_L0R1_DIS		0
++#define ACDCDIG_ADCDIGEN_ADCEN_L2_MASK		BIT(1)
++#define ACDCDIG_ADCDIGEN_ADCEN_L2_EN		BIT(1)
++#define ACDCDIG_ADCDIGEN_ADCEN_L2_DIS		0
++#define ACDCDIG_ADCDIGEN_ADC_GLBEN_MASK		BIT(4)
++#define ACDCDIG_ADCDIGEN_ADC_GLBEN_EN		BIT(4)
++#define ACDCDIG_ADCDIGEN_ADC_GLBEN_DIS		0
++/* ADCCLKCTRL */
++#define ACDCDIG_ADCCLKCTRL_ADC_SYNC_STATUS_MASK	BIT(0)
++#define ACDCDIG_ADCCLKCTRL_ADC_SYNC_ENA_MASK	BIT(1)
++#define ACDCDIG_ADCCLKCTRL_ADC_SYNC_ENA_EN	BIT(1)
++#define ACDCDIG_ADCCLKCTRL_ADC_SYNC_ENA_DIS	0
++#define ACDCDIG_ADCCLKCTRL_FILTER_GATE_EN_MASK	BIT(2)
++#define ACDCDIG_ADCCLKCTRL_FILTER_GATE_EN	BIT(2)
++#define ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_MASK	BIT(3)
++#define ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_EN	BIT(3)
++#define ACDCDIG_ADCCLKCTRL_CKE_BCLKTX_DIS	0
++#define ACDCDIG_ADCCLKCTRL_I2STX_CKE_MASK	BIT(4)
++#define ACDCDIG_ADCCLKCTRL_I2STX_CKE_EN		BIT(4)
++#define ACDCDIG_ADCCLKCTRL_I2STX_CKE_DIS	0
++#define ACDCDIG_ADCCLKCTRL_ADC_CKE_MASK		BIT(5)
++#define ACDCDIG_ADCCLKCTRL_ADC_CKE_EN		BIT(5)
++#define ACDCDIG_ADCCLKCTRL_ADC_CKE_DIS		0
++#define ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_MASK	GENMASK(7, 6)
++#define ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_16	(0x0 << 6)
++#define ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_8	(0x1 << 6)
++#define ACDCDIG_ADCCLKCTRL_CIC_DS_RATIO_4	(0x2 << 6)
++/* ADCINT_DIV */
++#define ACDCDIG_ADCINT_DIV_INT_DIV_CON_MASK	GENMASK(7, 0)
++#define ACDCDIG_ADCINT_DIV_INT_DIV_CON(x)	((x) - 1)
++/* ADCSCLKTXINT_DIV */
++#define ACDCDIG_ADCSCLKTXINT_DIV_SCKTXDIV_MASK	GENMASK(7, 0)
++#define ACDCDIG_ADCSCLKTXINT_DIV_SCKTXDIV(x)	((x) - 1)
++/* ADCCFG1 */
++#define ACDCDIG_ADCCFG1_FIR_COM_BPS_MASK	BIT(0)
++#define ACDCDIG_ADCCFG1_FIR_COM_BPS_EN		BIT(0)
++#define ACDCDIG_ADCCFG1_SIG_SCALE_MODE_MASK	BIT(1)
++#define ACDCDIG_ADCCFG1_SIG_SCALE_MODE_HALF	BIT(1)
++#define ACDCDIG_ADCCFG1_ADCSRT_MASK		GENMASK(4, 2)
++#define ACDCDIG_ADCCFG1_ADCSRT(x)		(((x) & 0x7) << 2)
++/* ADCVOLL0 */
++#define ACDCDIG_ADCVOLL0_ADCLV0_MASK		GENMASK(7, 0)
++#define ACDCDIG_ADCVOLL0_ADCLV0(x)		(x)
++/* ADCVOLL1 */
++#define ACDCDIG_ADCVOLL1_ADCLV1_MASK		GENMASK(7, 0)
++#define ACDCDIG_ADCVOLL1_ADCLV1(x)		(x)
++/* ADCVOLR0 */
++#define ACDCDIG_ADCVOLR0_ADCRV0_MASK		GENMASK(7, 0)
++#define ACDCDIG_ADCVOLR0_ADCRV0(x)		(x)
++/* ADCVOGP */
++#define ACDCDIG_ADCVOGP_VOLGPL0_MASK		BIT(0)
++#define ACDCDIG_ADCVOGP_VOLGPL0_POS		BIT(0)
++#define ACDCDIG_ADCVOGP_VOLGPL0_NEG		0
++#define ACDCDIG_ADCVOGP_VOLGPR1_MASK		BIT(1)
++#define ACDCDIG_ADCVOGP_VOLGPR1_POS		BIT(1)
++#define ACDCDIG_ADCVOGP_VOLGPR1_NEG		0
++#define ACDCDIG_ADCVOGP_VOLGPL2_MASK		BIT(2)
++#define ACDCDIG_ADCVOGP_VOLGPL2_POS		BIT(2)
++#define ACDCDIG_ADCVOGP_VOLGPL2_NEG		0
++/* ADCALC0 */
++#define ACDCDIG_ADCALC0_ALCL0_MASK		BIT(0)
++#define ACDCDIG_ADCALC0_ALCL0_EN		BIT(0)
++#define ACDCDIG_ADCALC0_ALCR1_MASK		BIT(1)
++#define ACDCDIG_ADCALC0_ALCR1_EN		BIT(1)
++#define ACDCDIG_ADCALC0_ALCL2_MASK		BIT(2)
++#define ACDCDIG_ADCALC0_ALCL2_EN		BIT(2)
++/* ADCALC1 */
++#define ACDCDIG_ADCALC1_ALCRRATE_MASK		GENMASK(3, 0)
++#define ACDCDIG_ADCALC1_ALCRRATE(x)		((x) & 0xf)
++#define ACDCDIG_ADCALC1_ALCARATE_MASK		GENMASK(7, 4)
++#define ACDCDIG_ADCALC1_ALCARATE(x)		(((x) & 0xf) << 4)
++/* ADCALC2 */
++#define ACDCDIG_ADCALC2_ALCMIN_MASK		GENMASK(2, 0)
++#define ACDCDIG_ADCALC2_ALCMIN(x)		((x) & 0x7)
++#define ACDCDIG_ADCALC2_ALCMAX_MASK		GENMASK(6, 4)
++#define ACDCDIG_ADCALC2_ALCMAX(x)		(((x) & 0x7) << 4)
++/* ADCHPFEN */
++#define ACDCDIG_ADCHPFEN_HPFEN_L0_MASK		BIT(0)
++#define ACDCDIG_ADCHPFEN_HPFEN_L0_EN		BIT(0)
++#define ACDCDIG_ADCHPFEN_HPFEN_R1_MASK		BIT(1)
++#define ACDCDIG_ADCHPFEN_HPFEN_R1_EN		BIT(1)
++#define ACDCDIG_ADCHPFEN_HPFEN_L2_MASK		BIT(2)
++#define ACDCDIG_ADCHPFEN_HPFEN_L2_EN		BIT(2)
++/* ADCHPFCF */
++#define ACDCDIG_ADCHPFCF_HPFCF_MASK		GENMASK(1, 0)
++#define ACDCDIG_ADCHPFCF_HPFCF_493HZ		3
++#define ACDCDIG_ADCHPFCF_HPFCF_243HZ		2
++#define ACDCDIG_ADCHPFCF_HPFCF_60HZ		1
++#define ACDCDIG_ADCHPFCF_HPFCF_3P79HZ		0
++/* ADCPGL0 */
++#define ACDCDIG_ADCPGL0_PGA_L0_MASK		GENMASK(3, 0)
++/* ADCPGL1 */
++#define ACDCDIG_ADCPGL1_PGA_L1_MASK		GENMASK(3, 0)
++/* ADCPGR0 */
++#define ACDCDIG_ADCPGR0_PGA_R0_MASK		GENMASK(3, 0)
++/* DACDIGEN */
++#define ACDCDIG_DACDIGEN_DACEN_L0R1_MASK	BIT(0)
++#define ACDCDIG_DACDIGEN_DACEN_L0R1_EN		BIT(0)
++#define ACDCDIG_DACDIGEN_DACEN_L0R1_DIS		0
++#define ACDCDIG_DACDIGEN_DAC_GLBEN_MASK		BIT(4)
++#define ACDCDIG_DACDIGEN_DAC_GLBEN_EN		BIT(4)
++#define ACDCDIG_DACDIGEN_DAC_GLBEN_DIS		0
++/* DACCLKCTRL */
++#define ACDCDIG_DACCLKCTRL_DAC_MODE_ATTENU_MASK	BIT(0)
++#define ACDCDIG_DACCLKCTRL_DAC_MODE_ATTENU_EN	BIT(0)
++#define ACDCDIG_DACCLKCTRL_DAC_MODE_ATTENU_DIS	0
++#define ACDCDIG_DACCLKCTRL_DAC_SYNC_STATUS_MASK	BIT(1)
++#define ACDCDIG_DACCLKCTRL_DAC_SYNC_STATUS_DONE	0
++#define ACDCDIG_DACCLKCTRL_DAC_SYNC_ENA_MASK	BIT(2)
++#define ACDCDIG_DACCLKCTRL_DAC_SYNC_ENA_EN	BIT(2)
++#define ACDCDIG_DACCLKCTRL_DAC_SYNC_ENA_DIS	0
++#define ACDCDIG_DACCLKCTRL_CKE_BCLKRX_MASK	BIT(3)
++#define ACDCDIG_DACCLKCTRL_CKE_BCLKRX_EN	BIT(3)
++#define ACDCDIG_DACCLKCTRL_CKE_BCLKRX_DIS	0
++#define ACDCDIG_DACCLKCTRL_I2SRX_CKE_MASK	BIT(4)
++#define ACDCDIG_DACCLKCTRL_I2SRX_CKE_EN		BIT(4)
++#define ACDCDIG_DACCLKCTRL_I2SRX_CKE_DIS	0
++#define ACDCDIG_DACCLKCTRL_DAC_CKE_MASK		BIT(5)
++#define ACDCDIG_DACCLKCTRL_DAC_CKE_EN		BIT(5)
++#define ACDCDIG_DACCLKCTRL_DAC_CKE_DIS		0
++/* DACINT_DIV */
++#define ACDCDIG_DACINT_DIV_INT_DIV_CON_MASK	GENMASK(7, 0)
++#define ACDCDIG_DACINT_DIV_INT_DIV_CON(x)	((x) - 1)
++/* DACSCLKRXINT_DIV */
++#define ACDCDIG_DACSCLKRXINT_DIV_SCKRXDIV_MASK	GENMASK(7, 0)
++#define ACDCDIG_DACSCLKRXINT_DIV_SCKRXDIV(x)	((x) - 1)
++/* DACPWM_DIV */
++#define ACDCDIG_DACPWM_DIV_AUDIO_PWM_DIV_MASK	GENMASK(7, 0)
++#define ACDCDIG_DACPWM_DIV_AUDIO_PWM_DIV(x)	((x) - 1)
++/* DACPWM_CTRL */
++#define ACDCDIG_DACPWM_CTRL_DITH_SEL_MASK	GENMASK(2, 0)
++#define ACDCDIG_DACPWM_CTRL_DITH_SEL(x)		(x)
++#define ACDCDIG_DACPWM_CTRL_PWM_EN_MASK		BIT(3)
++#define ACDCDIG_DACPWM_CTRL_PWM_EN		BIT(3)
++#define ACDCDIG_DACPWM_CTRL_PWM_DIS		0
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_MASK	GENMASK(5, 4)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_1		(0x2 << 4)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_0		(0x1 << 4)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_DAC	(0x0 << 4)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_CKE_MASK	BIT(6)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_CKE_EN	BIT(6)
++#define ACDCDIG_DACPWM_CTRL_PWM_MODE_CKE_DIS	0
++/* DACCFG1 */
++#define ACDCDIG_DACCFG1_DACSRT_MASK		GENMASK(4, 2)
++#define ACDCDIG_DACCFG1_DACSRT(x)		((x) << 2)
++/* DACMUTE */
++#define ACDCDIG_DACMUTE_DACMT_MASK		BIT(0)
++#define ACDCDIG_DACMUTE_DACUNMT_MASK		BIT(1)
++/* DACVOLL0 */
++#define ACDCDIG_DACVOLL0_DACLV0_MASK		GENMASK(7, 0)
++#define ACDCDIG_DACVOLL0_DACLV0(x)		(x)
++/* DACVOLR0 */
++#define ACDCDIG_DACVOLR0_DACRV0_MASK		GENMASK(7, 0)
++#define ACDCDIG_DACVOLR0_DACRV0(x)		(x)
++/* DACVOGP */
++#define ACDCDIG_DACVOGP_VOLGPL0_MASK		BIT(0)
++#define ACDCDIG_DACVOGP_VOLGPL0_POS		BIT(0)
++#define ACDCDIG_DACVOGP_VOLGPL0_NEG		0
++#define ACDCDIG_DACVOGP_VOLGPR0_MASK		BIT(1)
++#define ACDCDIG_DACVOGP_VOLGPR0_POS		BIT(1)
++#define ACDCDIG_DACVOGP_VOLGPR0_NEG		0
++/* DACMIXCTRLL */
++#define ACDCDIG_DACMIXCTRLL_MIXMODE_L0_MASK	GENMASK(1, 0)
++#define ACDCDIG_DACMIXCTRLL_MIXMODE_L0_LR	2
++#define ACDCDIG_DACMIXCTRLL_MIXMODE_L0_R	1
++#define ACDCDIG_DACMIXCTRLL_MIXMODE_L0_L	0
++/* DACMIXCTRLR */
++#define ACDCDIG_DACMIXCTRLR_MIXMODE_R0_MASK	GENMASK(1, 0)
++#define ACDCDIG_DACMIXCTRLR_MIXMODE_R0_LR	2
++#define ACDCDIG_DACMIXCTRLR_MIXMODE_R0_L	1
++#define ACDCDIG_DACMIXCTRLR_MIXMODE_R0_R	0
++/* DACHPF */
++#define ACDCDIG_DACHPF_HPFEN_L0R0_MASK		BIT(0)
++#define ACDCDIG_DACHPF_HPFEN_L0R0_EN		BIT(0)
++#define ACDCDIG_DACHPF_HPFCF_MASK		GENMASK(5, 4)
++#define ACDCDIG_DACHPF_HPFCF_140HZ		(0x3 << 4)
++#define ACDCDIG_DACHPF_HPFCF_120HZ		(0x2 << 4)
++#define ACDCDIG_DACHPF_HPFCF_100HZ		(0x1 << 4)
++#define ACDCDIG_DACHPF_HPFCF_80HZ		(0x0 << 4)
++/* I2S_TXCR0 */
++#define ACDCDIG_I2S_TXCR0_VDW_MASK		GENMASK(4, 0)
++#define ACDCDIG_I2S_TXCR0_VDW(x)		((x) - 1)
++/* I2S_TXCR1 */
++#define ACDCDIG_I2S_TXCR1_CEX_MASK		BIT(4)
++#define ACDCDIG_I2S_TXCR1_CEX_EXCHANGE		BIT(4)
++#define ACDCDIG_I2S_TXCR1_TCSR_MASK		GENMASK(7, 6)
++#define ACDCDIG_I2S_TXCR1_TCSR_4CH		(0x1 << 6)
++#define ACDCDIG_I2S_TXCR1_TCSR_2CH		(0x0 << 6)
++/* I2S_RXCR0 */
++#define ACDCDIG_I2S_RXCR0_VDW_MASK		GENMASK(4, 0)
++#define ACDCDIG_I2S_RXCR0_VDW(x)		((x) - 1)
++/* I2S_RXCR1 */
++#define ACDCDIG_I2S_RXCR1_CEX_MASK		BIT(4)
++#define ACDCDIG_I2S_RXCR1_CEX_EXCHANGE		BIT(4)
++#define ACDCDIG_I2S_RXCR1_RCSR_MASK		GENMASK(7, 6)
++#define ACDCDIG_I2S_RXCR1_RCSR_2CH		(0x0 << 6)
++/* I2S_CKR0 */
++#define ACDCDIG_I2S_CKR0_TSD_MASK		GENMASK(1, 0)
++#define ACDCDIG_I2S_CKR0_TSD(x)			((x) << 0)
++#define ACDCDIG_I2S_CKR0_RSD_MASK		GENMASK(3, 2)
++#define ACDCDIG_I2S_CKR0_RSD(x)			((x) << 2)
++/* I2S_CKR1 */
++#define ACDCDIG_I2S_CKR1_TLP_MASK		BIT(0)
++#define ACDCDIG_I2S_CKR1_TLP_INVERTED		BIT(0)
++#define ACDCDIG_I2S_CKR1_TLP_NORMAL		0
++#define ACDCDIG_I2S_CKR1_RLP_MASK		BIT(1)
++#define ACDCDIG_I2S_CKR1_RLP_INVERTED		BIT(1)
++#define ACDCDIG_I2S_CKR1_RLP_NORMAL		0
++#define ACDCDIG_I2S_CKR1_CKP_MASK		BIT(2)
++#define ACDCDIG_I2S_CKR1_CKP_INVERTED		BIT(2)
++#define ACDCDIG_I2S_CKR1_CKP_NORMAL		0
++#define ACDCDIG_I2S_CKR1_MSS_MASK		BIT(3)
++#define ACDCDIG_I2S_CKR1_MSS_MASTER		0
++/* I2S_XFER */
++#define ACDCDIG_I2S_XFER_TXS_MASK		BIT(0)
++#define ACDCDIG_I2S_XFER_TXS_START		BIT(0)
++#define ACDCDIG_I2S_XFER_TXS_STOP		0
++#define ACDCDIG_I2S_XFER_RXS_MASK		BIT(1)
++#define ACDCDIG_I2S_XFER_RXS_START		BIT(1)
++#define ACDCDIG_I2S_XFER_RXS_STOP		0
++/* I2S_CLR */
++#define ACDCDIG_I2S_CLR_TXC_MASK		BIT(0)
++#define ACDCDIG_I2S_CLR_TXC_CLR			BIT(0)
++#define ACDCDIG_I2S_CLR_RXC_MASK		BIT(1)
++#define ACDCDIG_I2S_CLR_RXC_CLR			BIT(1)
++
++#endif
+-- 
+2.35.3
+

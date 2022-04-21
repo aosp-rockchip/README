@@ -1,0 +1,298 @@
+From 8e77c532507113dcc9a8e9ca7d8177ec7854bfe3 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Thu, 13 Mar 2014 11:21:13 +0800
+Subject: [PATCH] =?UTF-8?q?rk=20transmitter:=20dp=20anx6345=E3=80=81dp=20r?=
+ =?UTF-8?q?k32=E3=80=81lvds=20rk32=20implement=20rk=5Ffb=5Ftrsm=5Fops=20in?=
+ =?UTF-8?q?terface?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ drivers/video/rockchip/transmitter/anx6345.h  |  1 +
+ .../video/rockchip/transmitter/dp_anx6345.c   | 66 ++++++++++++++-----
+ drivers/video/rockchip/transmitter/rk32_dp.c  | 28 ++++----
+ .../video/rockchip/transmitter/rk32_lvds.c    | 24 +++----
+ 4 files changed, 78 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/video/rockchip/transmitter/anx6345.h b/drivers/video/rockchip/transmitter/anx6345.h
+index 11f3599ce36d..dbf6c5d55901 100644
+--- a/drivers/video/rockchip/transmitter/anx6345.h
++++ b/drivers/video/rockchip/transmitter/anx6345.h
+@@ -670,6 +670,7 @@ struct  anx6345_platform_data {
+ 	int 	     dvdd18_en_val;
+ 	unsigned int edp_rst_pin;
+ 	int (*power_ctl)(struct anx6345_platform_data *pdata);
++	bool pwron;
+ };
+ 
+ struct edp_anx6345 {
+diff --git a/drivers/video/rockchip/transmitter/dp_anx6345.c b/drivers/video/rockchip/transmitter/dp_anx6345.c
+index ea148e288a38..1dbd77f84935 100644
+--- a/drivers/video/rockchip/transmitter/dp_anx6345.c
++++ b/drivers/video/rockchip/transmitter/dp_anx6345.c
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ 
++static struct edp_anx6345 *edp;
+ //#define BIST_MODE 0
+ static int i2c_master_reg8_send(const struct i2c_client *client,
+ 		const char reg, const char *buf, int count, int scl_rate)
+@@ -1201,24 +1202,46 @@ static int anx6345_init(struct i2c_client *client)
+ }
+ 
+ 
+-#ifdef CONFIG_HAS_EARLYSUSPEND
+-static void anx6345_early_suspend(struct early_suspend *h)
++static int  anx6345_disable(void)
+ {
+-	struct edp_anx6345 *anx6345 = container_of(h, struct edp_anx6345, early_suspend);
++	struct edp_anx6345 *anx6345 = edp;
++
++	if (!anx6345->pdata->pwron)
++		return 0;
+ 	gpio_set_value(anx6345->pdata->dvdd33_en_pin,!anx6345->pdata->dvdd33_en_val);
+ 	gpio_set_value(anx6345->pdata->dvdd18_en_pin,!anx6345->pdata->dvdd18_en_val);
++	anx6345->pdata->pwron = false;
++
++	return 0;
++	
+ }
++	
+ 
+-static void anx6345_late_resume(struct early_suspend *h)
++static int anx6345_enable(void)
+ {
+-	struct edp_anx6345 *anx6345 = container_of(h, struct edp_anx6345, early_suspend);
+-	gpio_set_value(anx6345->pdata->dvdd33_en_pin,anx6345->pdata->dvdd33_en_val);
+-	msleep(5);
+-	gpio_set_value(anx6345->pdata->dvdd18_en_pin,anx6345->pdata->dvdd18_en_val);
+-	gpio_set_value(anx6345->pdata->edp_rst_pin,0);
+-	msleep(50);
+-	gpio_set_value(anx6345->pdata->edp_rst_pin,1);
++	struct edp_anx6345 *anx6345 = edp;
++
++	if (!anx6345->pdata->pwron) {
++		gpio_set_value(anx6345->pdata->dvdd33_en_pin,anx6345->pdata->dvdd33_en_val);
++		msleep(5);
++		gpio_set_value(anx6345->pdata->dvdd18_en_pin,anx6345->pdata->dvdd18_en_val);
++		gpio_set_value(anx6345->pdata->edp_rst_pin,0);
++		msleep(50);
++		gpio_set_value(anx6345->pdata->edp_rst_pin,1);
++		anx6345->pdata->pwron = true;
++	}
+ 	anx6345->edp_anx_init(anx6345->client);
++	return 0;
++}
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void anx6345_early_suspend(struct early_suspend *h)
++{
++	anx6345_disable();
++}
++
++static void anx6345_late_resume(struct early_suspend *h)
++{
++	anx6345_enable();
+ }
+ #endif				
+ 
+@@ -1256,10 +1279,17 @@ static int anx6345_power_ctl(struct anx6345_platform_data  *pdata)
+ 	       msleep(50);
+ 	       gpio_direction_output(pdata->edp_rst_pin, 1);
+        }
++       pdata->pwron = true;
+        return 0;
+ 
+ }
+ 
++
++struct rk_fb_trsm_ops  trsm_edp_ops = {
++	.enable = anx6345_enable,
++	.disable = anx6345_disable,
++	
++};
+ static void anx6345_parse_dt(struct edp_anx6345 *anx6345)
+ {
+ 	struct device_node *np = anx6345->client->dev.of_node;
+@@ -1312,14 +1342,17 @@ static int anx6345_i2c_probe(struct i2c_client *client,const struct i2c_device_i
+ 	}
+ 	i2c_set_clientdata(client,anx6345);
+ 	rk_fb_get_prmry_screen(&anx6345->screen);
++	if (anx6345->screen.type != SCREEN_EDP){
++		dev_err(&client->dev, "screen is not edp!\n");
++		return -EINVAL;
++	}
+ 	if(anx6345->pdata->power_ctl)
+ 		anx6345->pdata->power_ctl(anx6345->pdata);
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ 	anx6345->debugfs_dir = debugfs_create_dir("edp", NULL);
+-	if (IS_ERR(anx6345->debugfs_dir))
+-	{
+-		printk(KERN_ERR "failed to create debugfs dir for edp!\n");
++	if (IS_ERR(anx6345->debugfs_dir)) {
++		dev_err(&client->dev, "failed to create debugfs dir for edp!\n");
+ 	}
+ 	else
+ 		debugfs_create_file("edp-reg", S_IRUSR,anx6345->debugfs_dir,anx6345,&edp_reg_fops);
+@@ -1336,8 +1369,9 @@ static int anx6345_i2c_probe(struct i2c_client *client,const struct i2c_device_i
+ 		anx6345->edp_anx_init = anx980x_init;
+ 	else
+ 		anx6345->edp_anx_init = anx6345_init;
++	edp = anx6345;
+ 
+-	anx6345->edp_anx_init(client);
++	rk_fb_trsm_ops_register(&trsm_edp_ops, SCREEN_EDP);
+ 
+ 	dev_info(&client->dev, "edp anx%x probe ok \n", get_dp_chip_id(client));
+ 	
+@@ -1385,6 +1419,6 @@ static void __exit anx6345_module_exit(void)
+ 	i2c_del_driver(&anx6345_i2c_driver);
+ }
+ 
+-fs_initcall_sync(anx6345_module_init);
++subsys_initcall_sync(anx6345_module_init);
+ module_exit(anx6345_module_exit);
+ 
+diff --git a/drivers/video/rockchip/transmitter/rk32_dp.c b/drivers/video/rockchip/transmitter/rk32_dp.c
+index c6c08ed9e275..5ea21b658f8b 100644
+--- a/drivers/video/rockchip/transmitter/rk32_dp.c
++++ b/drivers/video/rockchip/transmitter/rk32_dp.c
+@@ -33,6 +33,7 @@
+ 
+ /*#define EDP_BIST_MODE*/
+ 
++static struct rk32_edp *rk32_edp;
+ static int rk32_edp_init_edp(struct rk32_edp *edp)
+ {
+ 	struct rk_screen *screen = &edp->screen;
+@@ -1061,11 +1062,11 @@ static irqreturn_t rk32_edp_isr(int irq, void *arg)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static int rk32_edp_enable(struct rk32_edp *edp)
++static int rk32_edp_enable(void)
+ {
+ 	int ret = 0;
+ 	int retry = 0;
+-
++	struct rk32_edp *edp = rk32_edp;
+ 	if (edp->enabled)
+ 		goto out;
+ 
+@@ -1133,10 +1134,12 @@ static int rk32_edp_enable(struct rk32_edp *edp)
+ 	return ret;
+ }
+ 	
+-static void rk32_edp_disable(struct rk32_edp *edp)
++static int  rk32_edp_disable(void )
+ {
++	struct rk32_edp *edp = rk32_edp;
++
+ 	if (!edp->enabled)
+-		return ;
++		return 0;
+ 
+ 	edp->enabled = 0;
+ 
+@@ -1145,15 +1148,14 @@ static void rk32_edp_disable(struct rk32_edp *edp)
+ 
+ 	clk_disable(edp->clk_24m);
+ 	clk_disable(edp->clk_edp);
++	return 0;
+ }
+ 
+ 
+-
+-static void rk32_edp_init(struct rk32_edp *edp)
+-{
+-
+-	rk32_edp_enable(edp);
+-}
++static struct rk_fb_trsm_ops trsm_edp_ops = {
++	.enable = rk32_edp_enable,
++	.disable = rk32_edp_disable,
++};
+ static int rk32_edp_probe(struct platform_device *pdev)
+ {
+ 	struct rk32_edp *edp;
+@@ -1209,8 +1211,8 @@ static int rk32_edp_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "cannot claim IRQ %d\n", edp->irq);
+ 		return ret;
+ 	}
+-	
+-	rk32_edp_init(edp);
++	rk32_edp = edp;
++	rk_fb_trsm_ops_register(&trsm_edp_ops, SCREEN_EDP);
+ 	dev_info(&pdev->dev, "rk32 edp driver probe success\n");
+ 
+ 	return 0;
+@@ -1252,5 +1254,5 @@ static void __exit rk32_edp_module_exit(void)
+ 
+ }
+ 
+-fs_initcall(rk32_edp_module_init);
++subsys_initcall_sync(rk32_edp_module_init);
+ module_exit(rk32_edp_module_exit);
+diff --git a/drivers/video/rockchip/transmitter/rk32_lvds.c b/drivers/video/rockchip/transmitter/rk32_lvds.c
+index c77e22402d9a..285bf6c46980 100644
+--- a/drivers/video/rockchip/transmitter/rk32_lvds.c
++++ b/drivers/video/rockchip/transmitter/rk32_lvds.c
+@@ -15,16 +15,19 @@
+ #include "rk32_lvds.h"
+ 
+ 
+-static int rk32_lvds_disable(struct rk32_lvds *lvds)
++static struct rk32_lvds *rk32_lvds;
++static int rk32_lvds_disable(void)
+ {
++	struct rk32_lvds *lvds = rk32_lvds;
+ 	writel_relaxed(0x80008000, RK_GRF_VIRT + RK3288_GRF_SOC_CON7);
+ 	writel_relaxed(0x00, lvds->regs + LVDS_CFG_REG_21); /*disable tx*/
+ 	writel_relaxed(0xff, lvds->regs + LVDS_CFG_REG_c); /*disable pll*/
+ 	return 0;
+ }
+ 
+-static int rk32_lvds_en(struct rk32_lvds *lvds)
++static int rk32_lvds_en(void)
+ {
++	struct rk32_lvds *lvds = rk32_lvds;
+ 	struct rk_screen *screen = &lvds->screen;
+ 	u32 h_bp = screen->mode.hsync_len + screen->mode.left_margin;
+ 	u32 val ;
+@@ -77,16 +80,11 @@ static int rk32_lvds_en(struct rk32_lvds *lvds)
+ }
+ 
+ 
+-static int rk32_lvds_init(struct rk32_lvds *lvds, bool enable)
+-{
+-	
+-	if (enable) 
+-		rk32_lvds_en(lvds);
+-	else
+-		rk32_lvds_disable(lvds);
+ 
+-	return 0;
+-}
++static struct rk_fb_trsm_ops trsm_lvds_ops = {
++	.enable = rk32_lvds_en,
++	.disable = rk32_lvds_disable,
++};
+ 
+ static int rk32_lvds_probe(struct platform_device *pdev)
+ {
+@@ -120,7 +118,9 @@ static int rk32_lvds_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "ioremap reg failed\n");
+ 		return PTR_ERR(lvds->regs);
+ 	}
+-	rk32_lvds_init(lvds, true);
++
++	rk32_lvds = lvds;
++	rk_fb_trsm_ops_register(&trsm_lvds_ops,SCREEN_LVDS);
+ 	dev_info(&pdev->dev, "rk32 lvds driver probe success\n");
+ 
+ 	return 0;
+-- 
+2.35.3
+

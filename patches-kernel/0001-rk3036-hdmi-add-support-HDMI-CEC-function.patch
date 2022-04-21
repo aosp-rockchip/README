@@ -1,0 +1,850 @@
+From 266161a208eb4282b67a6bb77f9f1b4dc3ef24c7 Mon Sep 17 00:00:00 2001
+From: hjc <hjc@rock-chips.com>
+Date: Fri, 1 Aug 2014 17:04:55 +0800
+Subject: [PATCH] rk3036 hdmi: add support HDMI CEC function
+
+---
+ .../video/rockchip/hdmi/chips/rk3036/Kconfig  |   6 +
+ .../video/rockchip/hdmi/chips/rk3036/Makefile |   1 +
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdmi.c  |  16 +
+ .../rockchip/hdmi/chips/rk3036/rk3036_hdmi.h  |   5 +
+ .../hdmi/chips/rk3036/rk3036_hdmi_cec.c       | 459 ++++++++++++++++++
+ .../hdmi/chips/rk3036/rk3036_hdmi_cec.h       | 161 ++++++
+ .../hdmi/chips/rk3036/rk3036_hdmi_hw.c        |   2 +
+ .../hdmi/chips/rk3036/rk3036_hdmi_hw.h        |  37 ++
+ drivers/video/rockchip/hdmi/rk_hdmi.h         |   8 +-
+ drivers/video/rockchip/hdmi/rk_hdmi_edid.c    |   4 +
+ drivers/video/rockchip/hdmi/rk_hdmi_task.c    |   4 +
+ 11 files changed, 702 insertions(+), 1 deletion(-)
+ create mode 100755 drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.c
+ create mode 100755 drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.h
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/Kconfig b/drivers/video/rockchip/hdmi/chips/rk3036/Kconfig
+index c60c1ffc8971..7c210a7a61e9 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/Kconfig
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/Kconfig
+@@ -11,3 +11,9 @@ config HDCP_RK3036_DEBUG
+         default n
+ 	help
+ 	  Enableds verbose debugging the the HDCP drivers
++
++config CEC_RK3036
++	bool "RK3036 CEC support"
++        default n
++	help
++	  CEC Interface. This adds the HDMI CEC Interface.
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/Makefile b/drivers/video/rockchip/hdmi/chips/rk3036/Makefile
+index f6f27f932d72..0766e060d776 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/Makefile
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/Makefile
+@@ -7,3 +7,4 @@ ccflags-$(CONFIG_HDCP_RK616_DEBUG) = -DHDCP_DEBUG
+ 
+ obj-$(CONFIG_HDMI_RK3036) += rk3036_hdmi_hw.o rk3036_hdmi.o
+ obj-$(CONFIG_HDCP_RK3036) += rk3036_hdmi_hdcp.o rk3036_hdcp.o
++obj-$(CONFIG_CEC_RK3036) += rk3036_hdmi_cec.o
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+index df8333b5ba8f..6067eec725a3 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.c
+@@ -132,6 +132,22 @@ int rk3036_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
+ 	return HDMI_ERROR_SUCESS;
+ }
+ 
++int rk3036_hdmi_register_cec_callbacks(void (*cec_irq)(void),
++					       void (*cec_set_device_pa)(int addr),
++					       int (*cec_enumerate)(void))
++{
++	struct hdmi *hdmi_drv = &hdmi_dev->driver;
++
++	if (hdmi_drv == NULL)
++		return HDMI_ERROR_FALSE;
++
++	hdmi_drv->cec_irq = cec_irq;
++	hdmi_drv->cec_set_device_pa = cec_set_device_pa;
++	hdmi_drv->cec_enumerate = cec_enumerate;
++
++	return HDMI_ERROR_SUCESS;
++}
++
+ static void rk3036_hdmi_early_suspend(void)
+ {
+ 	struct hdmi *hdmi_drv = &hdmi_dev->driver;
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
+index b54b1495aacd..9c1d67311b5b 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi.h
+@@ -19,6 +19,11 @@ extern int rk3036_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
+ 					      void (*hdcp_irq_cb)(int status),
+ 					      int (*hdcp_power_on_cb)(void),
+ 					      void (*hdcp_power_off_cb)(void));
++extern int rk3036_hdmi_register_cec_callbacks(void (*cec_irq)(void),
++						      void (*cec_set_device_pa)(int addr),
++						      int (*cec_enumerate)(void));
++
++
+ extern struct rk_hdmi_device *hdmi_dev;
+ 
+ struct rk_hdmi_device {
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.c
+new file mode 100755
+index 000000000000..89337e6483db
+--- /dev/null
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.c
+@@ -0,0 +1,459 @@
++#include "rk3036_hdmi.h"
++#include "rk3036_hdmi_hw.h"
++#include "rk3036_hdmi_cec.h"
++
++static cec_t cec;
++static char la_player[3] = {CEC_LOGADDR_PLAYBACK1,
++			    CEC_LOGADDR_PLAYBACK2,
++			    CEC_LOGADDR_PLAYBACK3};
++
++static int cec_read_frame(cec_framedata_t *frame)
++{
++	int i, length,val;
++	char *data = (char *)frame;//modify by hjc
++	if(frame == NULL)
++		return -1;
++	
++	hdmi_readl(hdmi_dev, CEC_RX_LENGTH, &length);
++	hdmi_writel(hdmi_dev, CEC_RX_OFFSET, 0);
++	
++	printk("CEC: %s length is %d\n", __FUNCTION__, length);
++	for(i = 0; i < length; i++) {
++		hdmi_readl(hdmi_dev, CEC_DATA, &val);
++		data[i] = val;
++		printk("%02x\n", data[i]);
++	}
++	return 0;
++}
++
++static int cec_send_frame(cec_framedata_t *frame)
++{
++	int i;
++	
++	CECDBG("CEC: TX srcdestaddr %02x opcode %02x ",
++		 frame->srcdestaddr, frame->opcode);
++	if(frame->argcount) {
++		CECDBG("args:");
++		for(i = 0; i < frame->argcount; i++) {
++			CECDBG("%02x ", frame->args[i]);
++		}
++	}
++	CECDBG("\n");
++
++	hdmi_writel(hdmi_dev, CEC_TX_OFFSET, 0);
++	hdmi_writel(hdmi_dev, CEC_DATA, frame->srcdestaddr);
++	hdmi_writel(hdmi_dev, CEC_DATA, frame->opcode);
++
++	for(i = 0; i < frame->argcount; i++)
++		hdmi_writel(hdmi_dev, CEC_DATA, frame->args[i]);
++
++	hdmi_writel(hdmi_dev, CEC_TX_LENGTH, frame->argcount + 2);
++	
++	/*Wait for bus free*/
++	cec.busfree = 1;
++	hdmi_writel(hdmi_dev, CEC_CTRL, m_BUSFREETIME_ENABLE);
++	CECDBG("start wait bus free\n");
++	if(wait_event_interruptible_timeout(cec.wait, cec.busfree == 0, msecs_to_jiffies(17))) {
++		return -1;
++	}
++	CECDBG("end wait bus free,start tx,busfree=%d\n",cec.busfree);
++	/*Start TX*/
++	cec.tx_done = 0;
++	hdmi_writel(hdmi_dev, CEC_CTRL, m_BUSFREETIME_ENABLE|m_START_TX);
++	if(wait_event_interruptible_timeout(cec.wait, cec.tx_done != 0, msecs_to_jiffies(100)))
++		hdmi_writel(hdmi_dev, CEC_CTRL, 0);
++	CECDBG("end tx,tx_done=%d\n",cec.tx_done);
++	if (cec.tx_done == 1) {
++		cec.tx_done = 0;//hjc add ,need?
++		return 0;
++	} else
++		return -1;
++}
++
++static int cec_send_message(char opcode, char dest)
++{
++	cec_framedata_t cecframe;
++	CECDBG("CEC: cec_send_message\n");
++
++	cecframe.opcode = opcode;
++	cecframe.srcdestaddr = MAKE_SRCDEST(cec.address_logic, dest);
++	cecframe.argcount = 0;
++	return cec_send_frame(&cecframe);
++}
++
++static void cec_send_feature_abort ( cec_framedata_t *pcpi, char reason )
++{
++    cec_framedata_t cecFrame;
++    CECDBG("CEC: cec_send_feature_abort\n");
++
++    if (( pcpi->srcdestaddr & 0x0F) != CEC_LOGADDR_UNREGORBC )
++    {
++        cecFrame.opcode        = CECOP_FEATURE_ABORT;
++        cecFrame.srcdestaddr   = MAKE_SRCDEST( cec.address_logic, (pcpi->srcdestaddr & 0xF0) >> 4 );
++        cecFrame.args[0]       = pcpi->opcode;
++        cecFrame.args[1]       = reason;
++        cecFrame.argcount      = 2;
++        cec_send_frame( &cecFrame );
++    }
++}
++
++static void cec_send_active_source(void)
++{
++	cec_framedata_t    cecframe;
++	
++	CECDBG("CEC: start_active_source\n");
++	cecframe.opcode        = CECOP_ACTIVE_SOURCE;
++	cecframe.srcdestaddr   = MAKE_SRCDEST( cec.address_logic, CEC_LOGADDR_UNREGORBC);
++	cecframe.args[0]       = (cec.address_phy & 0xFF00) >> 8;        /* [Physical Address]*/
++	cecframe.args[1]       = (cec.address_phy & 0x00FF);             /* [Physical Address]*/
++	cecframe.argcount      = 2;
++	cec_send_frame( &cecframe );
++}
++
++static void start_active_source(void)
++{
++	int i;
++	CECDBG("CEC: start_active_source\n");
++	/* GPIO simulate CEC timing may be not correct, so we try more times.*/
++	/*send image view on first*/
++	for(i = 0; i < 1; i++) {
++		if(cec_send_message(CECOP_IMAGE_VIEW_ON,CEC_LOGADDR_TV) == 0) {
++			cec_send_active_source();
++		}
++	}
++}
++
++static void cec_handle_inactive_source ( cec_framedata_t *pcpi )
++{
++	
++}
++
++static void cec_handle_feature_abort( cec_framedata_t *pcpi )
++{
++   
++}
++
++static bool validate_cec_message(cec_framedata_t *pcpi)
++{
++	char parametercount = 0;
++	bool countok = true;
++	CECDBG("CEC: validate_cec_message,opcode=%d\n",pcpi->opcode);
++
++	/* Determine required parameter count   */
++	switch (pcpi->opcode)
++	{
++	case CECOP_IMAGE_VIEW_ON:
++	case CECOP_TEXT_VIEW_ON:
++	case CECOP_STANDBY:
++	case CECOP_GIVE_PHYSICAL_ADDRESS:
++	case CECOP_GIVE_DEVICE_POWER_STATUS:
++	case CECOP_GET_MENU_LANGUAGE:
++	case CECOP_GET_CEC_VERSION:
++		parametercount = 0;
++		break;
++	case CECOP_REPORT_POWER_STATUS:         // power status*/
++	case CECOP_CEC_VERSION:                 // cec version*/
++		parametercount = 1;
++		break;
++	case CECOP_INACTIVE_SOURCE:             // physical address*/
++	case CECOP_FEATURE_ABORT:               // feature opcode / abort reason*/
++	case CECOP_ACTIVE_SOURCE:               // physical address*/
++		parametercount = 2;
++		break;
++	case CECOP_REPORT_PHYSICAL_ADDRESS:     // physical address / device type*/
++	case CECOP_DEVICE_VENDOR_ID:            // vendor id*/
++		parametercount = 3;
++		break;
++	case CECOP_SET_OSD_NAME:                // osd name (1-14 bytes)*/
++	case CECOP_SET_OSD_STRING:              // 1 + x   display control / osd string (1-13 bytes)*/
++		parametercount = 1;                 // must have a minimum of 1 operands*/
++		break;
++	case CECOP_ABORT:
++		break;
++	case CECOP_ARC_INITIATE:
++		break;
++	case CECOP_ARC_REPORT_INITIATED:
++		break;
++	case CECOP_ARC_REPORT_TERMINATED:
++		break;
++
++	case CECOP_ARC_REQUEST_INITIATION:
++		break;
++	case CECOP_ARC_REQUEST_TERMINATION:
++		break;
++	case CECOP_ARC_TERMINATE:
++		break;
++	default:
++		break;
++	}
++
++    	/* Test for correct parameter count.    */
++
++    	if (pcpi->argcount < parametercount) {
++		CECDBG("CEC: pcpi->argcount[%d] < parametercount[%d]\n",
++			pcpi->argcount,parametercount);
++        	countok = false;
++    	}
++    	return(countok );
++}
++
++static bool cec_rx_msg_handler_last(cec_framedata_t *pcpi)
++{
++	bool isdirectaddressed;
++	cec_framedata_t cecFrame;
++	
++	CECDBG("CEC: cec_rx_msg_handler_last,opcode=%d\n",pcpi->opcode);
++	isdirectaddressed = !((pcpi->srcdestaddr & 0x0F) == CEC_LOGADDR_UNREGORBC);
++
++	if (validate_cec_message(pcpi)) {/* If invalid message, ignore it, but treat it as handled*/
++	        if (isdirectaddressed) {
++			switch (pcpi->opcode) {
++			case CECOP_FEATURE_ABORT:
++				cec_handle_feature_abort(pcpi);
++				break;
++			case CECOP_IMAGE_VIEW_ON:       /*In our case, respond the same to both these messages*/
++			case CECOP_TEXT_VIEW_ON:
++				break;
++			case CECOP_STANDBY:             /* Direct and Broadcast*/
++	                        /* Setting this here will let the main task know    */
++	                        /* (via SI_CecGetPowerState) and at the same time   */
++	                        /* prevent us from broadcasting a STANDBY message   */
++	                        /* of our own when the main task responds by        */
++	                        /* calling SI_CecSetPowerState( STANDBY );          */
++				cec.powerstatus = CEC_POWERSTATUS_STANDBY;
++				break;
++			case CECOP_INACTIVE_SOURCE:
++				cec_handle_inactive_source(pcpi);
++				break;
++			case CECOP_GIVE_PHYSICAL_ADDRESS:
++				/* TV responds by broadcasting its Physical Address: 0.0.0.0   */
++				cecFrame.opcode        = CECOP_REPORT_PHYSICAL_ADDRESS;
++				cecFrame.srcdestaddr   = MAKE_SRCDEST(cec.address_logic,
++								      CEC_LOGADDR_UNREGORBC);
++				cecFrame.args[0]       = (cec.address_phy&0xFF00)>>8;             /* [Physical Address]*/
++				cecFrame.args[1]       = (cec.address_phy&0x00FF);             /*[Physical Address]*/
++				cecFrame.args[2]       = cec.address_logic;/*CEC_LOGADDR_PLAYBACK1;//2011.08.03 CEC_LOGADDR_TV;   // [Device Type] = 0 = TV*/
++				cecFrame.argcount      = 3;
++				cec_send_frame(&cecFrame);
++				break;
++			case CECOP_GIVE_DEVICE_POWER_STATUS:
++				/* TV responds with power status.   */
++				cecFrame.opcode        = CECOP_REPORT_POWER_STATUS;
++				cecFrame.srcdestaddr   = MAKE_SRCDEST(cec.address_logic, (pcpi->srcdestaddr & 0xF0) >> 4);
++				cecFrame.args[0]       = cec.powerstatus;
++				cecFrame.argcount      = 1;
++				cec_send_frame(&cecFrame);
++				break;
++			case CECOP_GET_MENU_LANGUAGE:
++				/* TV Responds with a Set Menu language command.    */
++				cecFrame.opcode         = CECOP_SET_MENU_LANGUAGE;
++				cecFrame.srcdestaddr    = CEC_LOGADDR_UNREGORBC;
++				cecFrame.args[0]        = 'e';     /* [language code see iso/fdis 639-2]*/
++				cecFrame.args[1]        = 'n';     /* [language code see iso/fdis 639-2]*/
++				cecFrame.args[2]        = 'g';     /* [language code see iso/fdis 639-2]*/
++				cecFrame.argcount       = 3;
++				cec_send_frame(&cecFrame);
++				break;
++			case CECOP_GET_CEC_VERSION:
++	                    /* TV responds to this request with it's CEC version support.   */
++				cecFrame.srcdestaddr   = MAKE_SRCDEST(cec.address_logic, (pcpi->srcdestaddr & 0xF0) >> 4);
++				cecFrame.opcode        = CECOP_CEC_VERSION;
++				cecFrame.args[0]       = 0x04;       /* Report CEC1.3a*/
++				cecFrame.argcount      = 1;
++				cec_send_frame(&cecFrame);
++				break;
++			case CECOP_REPORT_POWER_STATUS:         /* Someone sent us their power state.*/
++				/*l_sourcePowerStatus = pcpi->args[0];
++				Let NEW SOURCE task know about it.   
++				if  (l_cecTaskState.task == SI_CECTASK_NEWSOURCE)  {
++				l_cecTaskState.cpiState = CPI_RESPONSE;
++				}*/
++				break;
++	                /* Do not reply to directly addressed 'Broadcast' msgs.  */
++			case CECOP_ACTIVE_SOURCE:
++			case CECOP_REPORT_PHYSICAL_ADDRESS:     /*A physical address was broadcast -- ignore it.*/
++			case CECOP_REQUEST_ACTIVE_SOURCE:       /*We are not a source, so ignore this one.*/
++			case CECOP_ROUTING_CHANGE:              /*We are not a downstream switch, so ignore this one.*/
++			case CECOP_ROUTING_INFORMATION:         /*We are not a downstream switch, so ignore this one.*/
++			case CECOP_SET_STREAM_PATH:             /*We are not a source, so ignore this one.*/
++			case CECOP_SET_MENU_LANGUAGE:           /*As a TV, we can ignore this message*/
++			case CECOP_DEVICE_VENDOR_ID:
++				break;
++			case CECOP_ABORT:       /*Send Feature Abort for all unsupported features.*/
++			default:
++				cec_send_feature_abort(pcpi, CECAR_UNRECOG_OPCODE);
++				break;
++			}
++		} else {
++	        /* Respond to broadcast messages. */
++			switch (pcpi->opcode) {
++			case CECOP_STANDBY:
++
++	                        /* Setting this here will let the main task know    */
++	                        /* (via SI_CecGetPowerState) and at the same time   */
++	                        /* prevent us from broadcasting a STANDBY message   */
++	                        /* of our own when the main task responds by        */
++	                        /* calling SI_CecSetPowerState( STANDBY );          */
++
++	                    cec.powerstatus = CEC_POWERSTATUS_STANDBY;
++	                    break;
++
++			case CECOP_ACTIVE_SOURCE:
++			/*CecHandleActiveSource( pcpi );*/
++				break;
++			case CECOP_REPORT_PHYSICAL_ADDRESS:
++			/*CecHandleReportPhysicalAddress( pcpi );*/
++				break;
++			/* Do not reply to 'Broadcast' msgs that we don't need.  */
++			case CECOP_REQUEST_ACTIVE_SOURCE:       /*We are not a source, so ignore this one.*/
++			/*SI_StartActiveSource(0,0);//2011.08.03*/
++				break;
++			case CECOP_ROUTING_CHANGE:              /*We are not a downstream switch, so ignore this one.*/
++			case CECOP_ROUTING_INFORMATION:         /*We are not a downstream switch, so ignore this one.*/
++			case CECOP_SET_STREAM_PATH:             /*We are not a source, so ignore this one.*/
++			case CECOP_SET_MENU_LANGUAGE:           /*As a TV, we can ignore this message*/
++				break;
++			}
++		}
++	}
++	return 0;
++}
++
++static void cec_work_func(struct work_struct *work)
++{
++	struct cec_delayed_work *cec_w =
++		container_of(work, struct cec_delayed_work, work.work);
++	cec_framedata_t cecFrame;
++	CECDBG(KERN_WARNING "CEC: cec_work_func,event=%d\n",cec_w->event);
++	switch(cec_w->event)
++	{
++		case EVENT_ENUMERATE:
++			break;
++		case EVENT_RX_FRAME:
++			memset(&cecFrame, 0, sizeof(cec_framedata_t));
++			cec_read_frame(&cecFrame);
++			cec_rx_msg_handler_last(&cecFrame);
++			break;
++		default:
++			break;
++	}
++
++	if(cec_w->data)
++		kfree(cec_w->data);
++	kfree(cec_w);
++}
++
++static void cec_submit_work(int event, int delay, void *data)
++{
++	struct cec_delayed_work *work;
++
++	CECDBG("%s event %04x delay %d", __func__, event, delay);
++	work = kmalloc(sizeof(struct cec_delayed_work), GFP_ATOMIC);
++
++	if (work) {
++		INIT_DELAYED_WORK(&work->work, cec_work_func);
++		work->event = event;
++		work->data = data;
++		queue_delayed_work(cec.workqueue,
++				   &work->work,
++				   msecs_to_jiffies(delay));
++	} else {
++		CECDBG(KERN_WARNING "CEC: GPIO CEC: Cannot allocate memory to "
++				    "create work\n");;
++	}
++}
++
++int cec_enumerate(void)
++{
++	/*for(i = 0; i < 3; i++) {
++		if(Cec_Ping(la_player[i]) == 1) {
++			cec.address_logic = la_player[i];
++			break;
++		}
++	}
++	if(i == 3)
++		return -1;
++	//Broadcast our physical address.
++	GPIO_CecSendMessage(CECOP_GET_MENU_LANGUAGE,CEC_LOGADDR_TV);
++	msleep(100);*/
++	CECDBG("CEC: %s\n", __func__);	
++	cec.address_logic = la_player[0];
++	hdmi_writel(hdmi_dev, CEC_LOGICADDR, cec.address_logic);
++	start_active_source();
++	return 0;
++}
++
++void cec_set_device_pa(int addr)
++{
++	CECDBG("CEC: Physical Address is %02x", addr);
++	cec.address_phy = addr;
++}
++
++void rk3036_cec_isr(void)
++{
++	int tx_isr = 0, rx_isr = 0;
++	hdmi_readl(hdmi_dev, CEC_TX_INT, &tx_isr);
++	hdmi_readl(hdmi_dev, CEC_RX_INT, &rx_isr);
++
++	CECDBG("CEC: rk3036_cec_isr:tx_isr %02x  rx_isr %02x\n\n", tx_isr, rx_isr);
++	
++	hdmi_writel(hdmi_dev, CEC_TX_INT, tx_isr);
++	hdmi_writel(hdmi_dev, CEC_RX_INT, rx_isr);
++	
++	if (tx_isr & m_TX_BUSNOTFREE) {
++		cec.busfree = 0;
++		CECDBG("CEC: m_TX_BUSNOTFREE,busfree=%d\n",cec.busfree);		
++	} else if (tx_isr & m_TX_DONE) {
++		cec.tx_done = 1;
++		CECDBG("CEC: m_TX_DONE,busfree=%d\n",cec.tx_done);
++	} else {
++		cec.tx_done = -1;
++		CECDBG("CEC: else:busfree=%d\n",cec.tx_done);
++	}	
++	
++	wake_up_interruptible_all(&cec.wait);
++	if(rx_isr & m_RX_DONE)
++		cec_submit_work(EVENT_RX_FRAME, 0, NULL);
++}
++
++
++static int __init rk3036_cec_init(void)
++{
++	CECDBG(KERN_ERR "CEC: rk3036_cec_init start.\n");
++	memset(&cec, 0, sizeof(cec_t));
++	cec.workqueue = create_singlethread_workqueue("cec");
++	if (cec.workqueue == NULL) {
++		CECDBG(KERN_ERR "CEC: GPIO CEC: create workqueue failed.\n");
++		return -1;
++	}
++	init_waitqueue_head(&cec.wait);
++	
++	/*Fref = Fsys / ((register 0xd4 + 1)*(register 0xd5 + 1))*/
++	/*Fref = 0.5M, Fsys = 74.25M*/
++	hdmi_writel(hdmi_dev, CEC_CLK_H, 11);
++	hdmi_writel(hdmi_dev, CEC_CLK_L, 11);
++
++	/*Set bus free time to 16.8ms*/
++	hdmi_writel(hdmi_dev, CEC_BUSFREETIME_L, 0xd0);
++	hdmi_writel(hdmi_dev, CEC_BUSFREETIME_H, 0x20);	
++	
++	/*Enable TX/RX INT*/
++	hdmi_writel(hdmi_dev, CEC_TX_INT, 0xFF);
++	hdmi_writel(hdmi_dev, CEC_RX_INT, 0xFF);
++
++	rk3036_hdmi_register_cec_callbacks(rk3036_cec_isr,
++					   cec_set_device_pa,
++					   cec_enumerate);
++	
++	CECDBG(KERN_ERR "CEC: rk3036_cec_init sucess\n");
++
++	return 0;
++}
++
++static void __exit rk3036_cec_exit(void)
++{
++	kfree(&cec);
++}
++
++late_initcall_sync(rk3036_cec_init);
++module_exit(rk3036_cec_exit);
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.h
+new file mode 100755
+index 000000000000..e9f6cf2a4d72
+--- /dev/null
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_cec.h
+@@ -0,0 +1,161 @@
++#ifndef __RK3036_CEC_H__
++#define __RK3036_CEC_H__
++
++typedef enum
++{
++	CEC_LOGADDR_TV          = 0x00,
++	CEC_LOGADDR_RECDEV1     = 0x01,
++	CEC_LOGADDR_RECDEV2     = 0x02,
++	CEC_LOGADDR_TUNER1      = 0x03,     /* STB1 in Spev v1.3*/
++	CEC_LOGADDR_PLAYBACK1   = 0x04,     /* DVD1 in Spev v1.3*/
++	CEC_LOGADDR_AUDSYS      = 0x05,
++	CEC_LOGADDR_TUNER2      = 0x06,     /* STB2 in Spec v1.3*/
++	CEC_LOGADDR_TUNER3      = 0x07,     /* STB3 in Spec v1.3*/
++	CEC_LOGADDR_PLAYBACK2   = 0x08,     /* DVD2 in Spec v1.3*/
++	CEC_LOGADDR_RECDEV3     = 0x09,
++	CEC_LOGADDR_TUNER4      = 0x0A,     /* RES1 in Spec v1.3*/
++	CEC_LOGADDR_PLAYBACK3   = 0x0B,     /* RES2 in Spec v1.3*/
++	CEC_LOGADDR_RES3        = 0x0C,
++	CEC_LOGADDR_RES4        = 0x0D,
++	CEC_LOGADDR_FREEUSE     = 0x0E,
++	CEC_LOGADDR_UNREGORBC   = 0x0F
++} cec_log_addr_t;
++
++typedef enum                    /* CEC Messages*/
++{
++	CECOP_FEATURE_ABORT             = 0x00,
++	CECOP_IMAGE_VIEW_ON             = 0x04,
++	CECOP_TUNER_STEP_INCREMENT      = 0x05,     /* N/A*/
++	CECOP_TUNER_STEP_DECREMENT      = 0x06,     /* N/A*/
++	CECOP_TUNER_DEVICE_STATUS       = 0x07,     /* N/A*/
++	CECOP_GIVE_TUNER_DEVICE_STATUS  = 0x08,     /* N/A*/
++	CECOP_RECORD_ON                 = 0x09,     /* N/A*/
++	CECOP_RECORD_STATUS             = 0x0A,     /* N/A*/
++	CECOP_RECORD_OFF                = 0x0B,     /* N/A*/
++	CECOP_TEXT_VIEW_ON              = 0x0D,
++	CECOP_RECORD_TV_SCREEN          = 0x0F,     /* N/A*/
++	CECOP_GIVE_DECK_STATUS          = 0x1A,
++	CECOP_DECK_STATUS               = 0x1B,
++	CECOP_SET_MENU_LANGUAGE         = 0x32,
++	CECOP_CLEAR_ANALOGUE_TIMER      = 0x33,     /* Spec 1.3A*/
++	CECOP_SET_ANALOGUE_TIMER        = 0x34,     /* Spec 1.3A*/
++	CECOP_TIMER_STATUS              = 0x35,     /* Spec 1.3A*/
++	CECOP_STANDBY                   = 0x36,
++	CECOP_PLAY                      = 0x41,
++	CECOP_DECK_CONTROL              = 0x42,
++	CECOP_TIMER_CLEARED_STATUS      = 0x43,     /* Spec 1.3A*/
++	CECOP_USER_CONTROL_PRESSED      = 0x44,
++	CECOP_USER_CONTROL_RELEASED     = 0x45,
++	CECOP_GIVE_OSD_NAME             = 0x46,
++	CECOP_SET_OSD_NAME              = 0x47,
++	CECOP_SET_OSD_STRING            = 0x64,
++	CECOP_SET_TIMER_PROGRAM_TITLE   = 0x67,     /* Spec 1.3A*/
++	CECOP_SYSTEM_AUDIO_MODE_REQUEST = 0x70,     /* Spec 1.3A*/
++	CECOP_GIVE_AUDIO_STATUS         = 0x71,     /* Spec 1.3A*/
++	CECOP_SET_SYSTEM_AUDIO_MODE     = 0x72,     /* Spec 1.3A*/
++	CECOP_REPORT_AUDIO_STATUS       = 0x7A,     /* Spec 1.3A*/
++	CECOP_GIVE_SYSTEM_AUDIO_MODE_STATUS = 0x7D, /* Spec 1.3A*/
++	CECOP_SYSTEM_AUDIO_MODE_STATUS  = 0x7E,     /* Spec 1.3A*/
++	CECOP_ROUTING_CHANGE            = 0x80,
++	CECOP_ROUTING_INFORMATION       = 0x81,
++	CECOP_ACTIVE_SOURCE             = 0x82,
++	CECOP_GIVE_PHYSICAL_ADDRESS     = 0x83,
++	CECOP_REPORT_PHYSICAL_ADDRESS   = 0x84,
++	CECOP_REQUEST_ACTIVE_SOURCE     = 0x85,
++	CECOP_SET_STREAM_PATH           = 0x86,
++	CECOP_DEVICE_VENDOR_ID          = 0x87,
++	CECOP_VENDOR_COMMAND            = 0x89,
++	CECOP_VENDOR_REMOTE_BUTTON_DOWN = 0x8A,
++	CECOP_VENDOR_REMOTE_BUTTON_UP   = 0x8B,
++	CECOP_GIVE_DEVICE_VENDOR_ID     = 0x8C,
++	CECOP_MENU_REQUEST              = 0x8D,
++	CECOP_MENU_STATUS               = 0x8E,
++	CECOP_GIVE_DEVICE_POWER_STATUS  = 0x8F,
++	CECOP_REPORT_POWER_STATUS       = 0x90,
++	CECOP_GET_MENU_LANGUAGE         = 0x91,
++	CECOP_SELECT_ANALOGUE_SERVICE   = 0x92,     /* Spec 1.3A    N/A*/
++	CECOP_SELECT_DIGITAL_SERVICE    = 0x93,     /*              N/A*/
++	CECOP_SET_DIGITAL_TIMER         = 0x97,     /* Spec 1.3A*/
++	CECOP_CLEAR_DIGITAL_TIMER       = 0x99,     /* Spec 1.3A*/
++	CECOP_SET_AUDIO_RATE            = 0x9A,     /* Spec 1.3A*/
++	CECOP_INACTIVE_SOURCE           = 0x9D,     /* Spec 1.3A*/
++	CECOP_CEC_VERSION               = 0x9E,     /* Spec 1.3A*/
++	CECOP_GET_CEC_VERSION           = 0x9F,     /* Spec 1.3A*/
++	CECOP_VENDOR_COMMAND_WITH_ID    = 0xA0,     /* Spec 1.3A*/
++	CECOP_CLEAR_EXTERNAL_TIMER      = 0xA1,     /* Spec 1.3A*/
++	CECOP_SET_EXTERNAL_TIMER        = 0xA2,     /* Spec 1.3A*/
++	CDCOP_HEADER                    = 0xF8,
++	CECOP_ABORT                     = 0xFF,
++
++	CECOP_REPORT_SHORT_AUDIO    	= 0xA3,     /* Spec 1.4*/
++	CECOP_REQUEST_SHORT_AUDIO    	= 0xA4,     /* Spec 1.4*/
++
++	CECOP_ARC_INITIATE              = 0xC0,
++	CECOP_ARC_REPORT_INITIATED      = 0xC1,
++	CECOP_ARC_REPORT_TERMINATED     = 0xC2,
++
++	CECOP_ARC_REQUEST_INITIATION    = 0xC3,
++	CECOP_ARC_REQUEST_TERMINATION   = 0xC4,
++	CECOP_ARC_TERMINATE             = 0xC5,   
++} cec_opcode_t;
++
++typedef enum                        /* Operands for <Feature Abort> Opcode*/
++{
++	CECAR_UNRECOG_OPCODE            = 0x00,
++	CECAR_NOT_CORRECT_MODE,
++	CECAR_CANT_PROVIDE_SOURCE,
++	CECAR_INVALID_OPERAND,
++	CECAR_REFUSED
++} cec_abor_reason_t;
++    
++enum                        /* Operands for <Power Status> Opcode*/
++{
++	CEC_POWERSTATUS_ON              = 0x00,
++	CEC_POWERSTATUS_STANDBY         = 0x01,
++	CEC_POWERSTATUS_STANDBY_TO_ON   = 0x02,
++	CEC_POWERSTATUS_ON_TO_STANDBY   = 0x03,
++};
++
++enum {
++	EVENT_RX_FRAME,
++	EVENT_ENUMERATE,
++};
++
++#define MAKE_SRCDEST( src, dest)    (( src << 4) | dest )
++
++#define MAX_CMD_SIZE 16
++
++typedef struct
++{
++	char srcdestaddr;            /*Source in upper nybble, dest in lower nybble*/
++	char opcode;
++	char args[ MAX_CMD_SIZE ];
++	char argcount;
++	char nextframeargcount;
++} cec_framedata_t;
++
++struct cec_delayed_work {
++	struct delayed_work work;
++	int event;
++	void *data;
++};
++
++typedef struct
++{
++	struct workqueue_struct *workqueue;	
++	wait_queue_head_t wait;
++	int busfree;
++	int tx_done;
++	int address_phy;
++	int address_logic;
++	int powerstatus;
++} cec_t;
++
++//#define DEBUG
++#ifdef DEBUG
++#define CECDBG(format, ...) \
++		printk(KERN_INFO format, ## __VA_ARGS__)
++#else
++#define CECDBG(format, ...)
++#endif
++#endif
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
+index a8cdceebd9bb..28040182de93 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.c
+@@ -532,6 +532,8 @@ void rk3036_hdmi_irq(struct hdmi *hdmi_drv)
+ 
+ 	if (hdmi_drv->hdcp_irq_cb)
+ 		hdmi_drv->hdcp_irq_cb(0);
++	if (hdmi_drv->cec_irq)
++		hdmi_drv->cec_irq();
+ }
+ 
+ static void rk3036_hdmi_reset(struct hdmi *hdmi_drv)
+diff --git a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
+index 70f384118f41..d19c1805689c 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
++++ b/drivers/video/rockchip/hdmi/chips/rk3036/rk3036_hdmi_hw.h
+@@ -2,6 +2,8 @@
+ #define _RK3036_HDMI_HW_H
+ 
+ #include <linux/rockchip/iomap.h>
++#include <linux/delay.h>
++
+ enum PWR_MODE {
+ 	NORMAL,
+ 	LOWER_PWR,
+@@ -282,6 +284,41 @@ enum {
+ #define PHY_PRE_DIV_RATIO		0xed
+ #define v_PRE_DIV_RATIO(n)	(n & 0x1f)
+ 
++
++/*-----START----- HDMI CEC CTRL------START------*/
++#define CEC_CTRL		0xd0
++	#define m_ADJUST_FOR_HISENSE	(1 << 6)
++	#define m_REJECT_RX_BROADCAST	(1 << 5)
++	#define m_BUSFREETIME_ENABLE	(1 << 2)
++	#define m_REJECT_RX				(1 << 1)
++	#define m_START_TX				(1 << 0)
++
++#define CEC_DATA		0xd1
++#define CEC_TX_OFFSET	0xd2
++#define CEC_RX_OFFSET	0xd3
++#define CEC_CLK_H		0xd4
++#define CEC_CLK_L		0xd5
++#define CEC_TX_LENGTH	0xd6
++#define CEC_RX_LENGTH	0xd7
++#define CEC_TX_INT_MASK	0xd8
++	#define m_TX_DONE			(1 << 3)
++	#define m_TX_NOACK			(1 << 2)
++	#define m_TX_BROADCAST_REJ	(1 << 1)
++	#define m_TX_BUSNOTFREE		(1 << 0)
++
++#define CEC_RX_INT_MASK 0xd9
++	#define m_RX_LA_ERR			(1 << 4)
++	#define m_RX_GLITCH			(1 << 3)
++	#define m_RX_DONE			(1 << 0)
++
++#define CEC_TX_INT		0xda
++#define CEC_RX_INT		0xdb
++#define CEC_BUSFREETIME_L	0xdc
++#define CEC_BUSFREETIME_H	0xdd
++#define CEC_LOGICADDR		0xde
++/*------END------ HDMI CEC CTRL------END-------*/
++
++
+ static inline int hdmi_readl(struct rk_hdmi_device *hdmi_dev, u16 offset,
+ 			     u32 *val)
+ {
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi.h b/drivers/video/rockchip/hdmi/rk_hdmi.h
+index 1fb8943776f6..6ff89a998cfc 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi.h
++++ b/drivers/video/rockchip/hdmi/rk_hdmi.h
+@@ -284,6 +284,7 @@ struct hdmi_edid {
+ 	struct hdmi_audio *audio;	/* Device supported audio info */
+ 	int audio_num;			/* Device supported audio type number */
+ 	int base_audio_support;		/* Device supported base audio */
++	unsigned int  cecaddress;                       //CEC physical address
+ };
+ 
+ /* RK HDMI Video Configure Parameters */
+@@ -361,11 +362,16 @@ struct hdmi {
+ 	int (*set_vif) (struct hdmi *hdmi, struct rk_screen *screen,
+ 			bool connect);
+ 
+-	/* call back for hdcp operatoion */
++	/* call back for hdcp operation */
+ 	void (*hdcp_cb) (void);
+ 	void (*hdcp_irq_cb) (int);
+ 	int (*hdcp_power_on_cb) (void);
+ 	void (*hdcp_power_off_cb) (void);
++
++	/*call back for cec operation*/
++	void (*cec_irq) (void);
++	void (*cec_set_device_pa) (int);
++	int (*cec_enumerate) (void);
+ };
+ 
+ #define hdmi_err(dev, format, arg...)		\
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_edid.c b/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
+index e0238ff47970..7921c8f5e11a 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
+@@ -223,6 +223,10 @@ static int hdmi_edid_parse_cea_sdb(unsigned char *buf, struct hdmi_edid *pedid)
+ 	if (IEEEOUI == 0x0c03)
+ 		pedid->sink_hdmi = 1;
+ 
++	pedid->cecaddress = buf[cur_offset + 5];
++	pedid->cecaddress |= buf[cur_offset + 4] << 8;
++	hdmi_edid_debug("[EDID-CEA] CEC Physical addres is 0x%08x.\n", pedid->cecaddress);
++
+ 	if (count > 5) {
+ 		pedid->deepcolor = (buf[6] >> 3) & 0x0F;
+ 		supports_ai = buf[6] >> 7;
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_task.c b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+index 2a2317b57075..ba88a132145a 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_task.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+@@ -217,6 +217,10 @@ void hdmi_work(struct work_struct *work)
+ 		case READ_PARSE_EDID:
+ 			rc = hdmi_sys_parse_edid(hdmi);
+ 			if (rc == HDMI_ERROR_SUCESS) {
++				if(hdmi->cec_set_device_pa)
++					hdmi->cec_set_device_pa(hdmi->edid.cecaddress);
++				if(hdmi->cec_enumerate)
++					hdmi->cec_enumerate();
+ 				hdmi->state = SYSTEM_CONFIG;
+ 				kobject_uevent_env(&hdmi->dev->kobj, KOBJ_ADD,
+ 						   envp);
+-- 
+2.35.3
+

@@ -1,0 +1,169 @@
+From a8acee31a13d1391cb0d0e168f0a078861fcef45 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Fri, 1 Apr 2011 21:06:33 +0800
+Subject: [PATCH] rk29: add usb detect support
+
+---
+ arch/arm/mach-rk29/Makefile             |  1 +
+ arch/arm/mach-rk29/include/mach/board.h | 17 ++++++---
+ arch/arm/mach-rk29/usb_detect.c         | 48 +++++++++++++++++++++++++
+ drivers/input/keyboard/rk29_keys.c      | 18 ++++++++++
+ 4 files changed, 80 insertions(+), 4 deletions(-)
+ create mode 100644 arch/arm/mach-rk29/usb_detect.c
+
+diff --git a/arch/arm/mach-rk29/Makefile b/arch/arm/mach-rk29/Makefile
+index 295047ac01c4..398be7942d47 100644
+--- a/arch/arm/mach-rk29/Makefile
++++ b/arch/arm/mach-rk29/Makefile
+@@ -4,6 +4,7 @@ obj-y += early_printk.o
+ ifndef CONFIG_DEBUG_LL
+ obj-y += ../kernel/debug.o
+ endif
++obj-$(CONFIG_USB_GADGET) += usb_detect.o
+ obj-$(CONFIG_PM) += pm.o
+ obj-$(CONFIG_CPU_FREQ) += cpufreq.o
+ obj-$(CONFIG_RK29_VPU) += vpu.o vpu_mem.o
+diff --git a/arch/arm/mach-rk29/include/mach/board.h b/arch/arm/mach-rk29/include/mach/board.h
+index abe5778cf62a..1b773db16b0a 100755
+--- a/arch/arm/mach-rk29/include/mach/board.h
++++ b/arch/arm/mach-rk29/include/mach/board.h
+@@ -15,14 +15,13 @@
+ #ifndef __ASM_ARCH_RK29_BOARD_H
+ #define __ASM_ARCH_RK29_BOARD_H
+ 
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/i2c.h>
+ #include <linux/types.h>
+ #include <linux/timer.h>
+ #include <linux/notifier.h>
+ 
+-/* platform device data structures */
+-struct platform_device;
+-struct i2c_client;
+-
+ /*spi*/
+ struct spi_cs_gpio {
+ 	const char *name;
+@@ -244,4 +243,14 @@ void __init rk29_clock_init(void);
+ #define BOOT_MODE_OFFMODE_CHARGING	5
+ int board_boot_mode(void);
+ 
++/* for USB detection */
++#ifdef CONFIG_USB_GADGET
++int board_usb_detect_init(unsigned gpio, unsigned long flags);
++#else
++static int inline board_usb_detect_init(unsigned, unsigned long) { return 0; }
++#endif
++
++/* for wakeup Android */
++void rk28_send_wakeup_key(void);
++
+ #endif
+diff --git a/arch/arm/mach-rk29/usb_detect.c b/arch/arm/mach-rk29/usb_detect.c
+new file mode 100644
+index 000000000000..51339a520899
+--- /dev/null
++++ b/arch/arm/mach-rk29/usb_detect.c
+@@ -0,0 +1,48 @@
++#include <linux/wakelock.h>
++#include <linux/workqueue.h>
++#include <linux/interrupt.h>
++#include <linux/gpio.h>
++#include <mach/board.h>
++
++static void do_wakeup(struct work_struct *work)
++{
++	rk28_send_wakeup_key();
++}
++
++static DECLARE_DELAYED_WORK(wakeup_work, do_wakeup);
++static bool wakelock_inited;
++static struct wake_lock usb_wakelock;
++
++static irqreturn_t detect_irq_handler(int irq, void *dev_id)
++{
++        wake_lock_timeout(&usb_wakelock, 10 * HZ);
++	schedule_delayed_work(&wakeup_work, HZ / 10);
++        return IRQ_HANDLED;
++}
++
++int board_usb_detect_init(unsigned gpio, unsigned long flags)
++{
++	int ret;
++	int irq = gpio_to_irq(gpio);
++
++	ret = gpio_request(gpio, "usb_detect");
++	if (ret < 0) {
++		pr_err("%s: gpio_request(%d) failed\n", __func__, gpio);
++		return ret;
++	}
++
++	if (!wakelock_inited)
++		wake_lock_init(&usb_wakelock, WAKE_LOCK_SUSPEND, "usb_detect");
++
++	gpio_direction_input(gpio);
++	ret = request_irq(irq, detect_irq_handler, flags, "usb_detect", NULL);
++	if (ret < 0) {
++		pr_err("%s: request_irq(%d) failed\n", __func__, irq);
++		gpio_free(gpio);
++		return ret;
++	}
++	enable_irq_wake(irq);
++
++	return 0;
++}
++
+diff --git a/drivers/input/keyboard/rk29_keys.c b/drivers/input/keyboard/rk29_keys.c
+index bf4dd4bb4996..a5f2d0fdeac7 100755
+--- a/drivers/input/keyboard/rk29_keys.c
++++ b/drivers/input/keyboard/rk29_keys.c
+@@ -57,6 +57,19 @@ struct rk29_keys_drvdata {
+ 	struct rk29_button_data data[0];
+ };
+ 
++static struct input_dev *input_dev;
++
++void rk28_send_wakeup_key(void)
++{
++	if (!input_dev)
++		return;
++
++	input_report_key(input_dev, KEY_WAKEUP, 1);
++	input_sync(input_dev);
++	input_report_key(input_dev, KEY_WAKEUP, 0);
++	input_sync(input_dev);
++}
++
+ static void keys_long_press_timer(unsigned long _data)
+ {
+ 	int state;
+@@ -282,6 +295,8 @@ static int __devinit keys_probe(struct platform_device *pdev)
+ 		input_set_capability(input, type, button->code);
+ 	}
+ 
++	input_set_capability(input, EV_KEY, KEY_WAKEUP);
++
+ 	error = input_register_device(input);
+ 	if (error) {
+ 		pr_err("gpio-keys: Unable to register input device, "
+@@ -291,6 +306,8 @@ static int __devinit keys_probe(struct platform_device *pdev)
+ 
+ 	device_init_wakeup(&pdev->dev, wakeup);
+ 	error = device_create_file(&pdev->dev, &dev_attr_get_adc_value);
++
++	input_dev = input;
+ 	return error;
+ 
+  fail2:
+@@ -317,6 +334,7 @@ static int __devexit keys_remove(struct platform_device *pdev)
+ 	struct input_dev *input = ddata->input;
+ 	int i;
+ 
++	input_dev = NULL;
+ 	device_init_wakeup(&pdev->dev, 0);
+ 
+ 	for (i = 0; i < pdata->nbuttons; i++) {
+-- 
+2.35.3
+

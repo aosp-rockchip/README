@@ -1,0 +1,119 @@
+From 25797ef9e128c89909e01c42fd8fbf687b3c3735 Mon Sep 17 00:00:00 2001
+From: Liang Chen <cl@rock-chips.com>
+Date: Mon, 2 Dec 2019 20:59:19 +0800
+Subject: [PATCH] video: rockchip: mpp: probe driver later if regulator is not
+ ready
+
+The regulator may not ready when probe video driver, then the video
+driver will probe failed. We need probe video driver again if
+get_regulator() return -EPROBE_DEFER, so return -EPROBE_DEFER to
+the probe.
+
+Change-Id: Ibd60f0397af7e5d8ef79d05b44d40fd66722d53b
+Signed-off-by: Liang Chen <cl@rock-chips.com>
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c | 12 ++++---
+ drivers/video/rockchip/mpp/mpp_rkvdec.c | 45 ++++++++++++++-----------
+ 2 files changed, 34 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index da0105a8571f..ce2bc906dbc4 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -1074,12 +1074,16 @@ int mpp_dev_probe(struct mpp_dev *mpp,
+ 		dev_err(dev, "failed to attach iommu: %ld\n",
+ 			PTR_ERR(mpp->iommu_info));
+ 	}
+-	if (mpp->hw_ops->init)
+-		mpp->hw_ops->init(mpp);
++	if (mpp->hw_ops->init) {
++		ret = mpp->hw_ops->init(mpp);
++		if (ret)
++			goto failed_init;
++	}
+ 	pm_runtime_put_sync(dev);
+ 
+-	return 0;
+-
++	return ret;
++failed_init:
++	pm_runtime_put_sync(dev);
+ failed:
+ 	destroy_workqueue(mpp->workq);
+ 	device_init_wakeup(dev, false);
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index ccecec00905f..7d763e87d508 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -1120,13 +1120,33 @@ static int rkvdec_devfreq_init(struct mpp_dev *mpp)
+ 	int ret = 0;
+ 	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
+ 
++	dec->parent_devfreq = devfreq_get_devfreq_by_phandle(mpp->dev, 0);
++	if (IS_ERR_OR_NULL(dec->parent_devfreq)) {
++		ret = PTR_ERR(dec->parent_devfreq);
++		if (ret == -EPROBE_DEFER) {
++			dev_warn(mpp->dev, "parent devfreq is not ready, retry\n");
++
++			return ret;
++		}
++	} else {
++		dec->devfreq_nb.notifier_call = devfreq_notifier_call;
++		devm_devfreq_register_notifier(mpp->dev,
++					       dec->parent_devfreq,
++					       &dec->devfreq_nb,
++					       DEVFREQ_TRANSITION_NOTIFIER);
++	}
++
+ 	dec->vdd = devm_regulator_get_optional(mpp->dev, "vcodec");
+ 	if (IS_ERR_OR_NULL(dec->vdd)) {
+-		dev_warn(mpp->dev, "no regulator for %s\n",
+-			 dev_name(mpp->dev));
+-		dec->vdd = NULL;
+-		ret = -EINVAL;
+-		goto done;
++		ret = PTR_ERR(dec->vdd);
++		if (ret == -EPROBE_DEFER) {
++			dev_warn(mpp->dev, "vcodec regulator not ready, retry\n");
++
++			return ret;
++		}
++		dev_warn(mpp->dev, "no regulator for vcodec\n");
++
++		return 0;
+ 	} else {
+ 		struct devfreq_dev_status *stat;
+ 
+@@ -1153,19 +1173,6 @@ static int rkvdec_devfreq_init(struct mpp_dev *mpp)
+ 			goto done;
+ 	}
+ 
+-	dec->parent_devfreq = devfreq_get_devfreq_by_phandle(mpp->dev, 0);
+-	if (IS_ERR_OR_NULL(dec->parent_devfreq)) {
+-		dev_warn(mpp->dev, "parent devfreq is error\n");
+-		dec->parent_devfreq = NULL;
+-		ret = -EINVAL;
+-		goto done;
+-	} else {
+-		dec->devfreq_nb.notifier_call = devfreq_notifier_call;
+-		devm_devfreq_register_notifier(mpp->dev,
+-					       dec->parent_devfreq,
+-					       &dec->devfreq_nb,
+-					       DEVFREQ_TRANSITION_NOTIFIER);
+-	}
+ 	/* power simplle init */
+ 	ret = power_model_simple_init(mpp);
+ 	if (!ret && dec->devfreq) {
+@@ -1528,7 +1535,7 @@ static int rkvdec_probe(struct platform_device *pdev)
+ 	ret = mpp_dev_probe(mpp, pdev);
+ 	if (ret) {
+ 		dev_err(dev, "probe sub driver failed\n");
+-		return -EINVAL;
++		return ret;
+ 	}
+ 
+ 	ret = devm_request_threaded_irq(dev, mpp->irq,
+-- 
+2.35.3
+

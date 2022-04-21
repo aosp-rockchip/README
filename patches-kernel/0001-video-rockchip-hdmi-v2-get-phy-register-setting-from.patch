@@ -1,0 +1,201 @@
+From fa03aa63c8e1094feecd11eb0edf3423b46ebdac Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Thu, 8 Oct 2015 14:36:23 +0800
+Subject: [PATCH] video: rockchip: hdmi: v2: get phy register setting from dts
+
+We can configurate phy setting in dts node "rockchip,phy_table"
+with following format:
+
+<maxfreq pre-emphasis slopeboost clklevel data0level data1level data2level>
+
+Phy setting table must list from low freq to high freq and cover
+all supported frequency, for example:
+
+&hdmi {
+	status = "okay";
+	rockchip,phy_table =
+		<165000000 0 0 17 17 17 17>,
+		<340000000 0 0 14 17 17 17>,
+		<594000000 0 0 9 17 17 17>;
+};
+
+If dts node is not exist, we use default setting defined in code.
+
+Change-Id: I06731419057a2a8cf4d210bf566b1206edc39ea1
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+---
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c    | 18 ++++++-
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h    | 13 +++++
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c | 51 +++++++++++++------
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h |  6 +--
+ 4 files changed, 68 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+index a8c6bd7a65e2..b1bd085db5fe 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+@@ -401,6 +401,20 @@ static int rockchip_hdmiv2_parse_dt(struct hdmi_dev *hdmi_dev)
+ 	} else {
+ 		rk_hdmi_property.defaultmode = HDMI_VIDEO_DEFAULT_MODE;
+ 	}
++	if (of_get_property(np, "rockchip,phy_table", &val)) {
++		hdmi_dev->phy_table = kmalloc(val, GFP_KERNEL);
++		if (!hdmi_dev->phy_table) {
++			pr_err("kmalloc phy table %d error\n", val);
++			return -ENOMEM;
++		}
++		hdmi_dev->phy_table_size =
++				val / sizeof(struct hdmi_dev_phy_para);
++		of_property_read_u32_array(np, "rockchip,phy_table",
++					   (u32 *)hdmi_dev->phy_table,
++					   val / sizeof(u32));
++	} else {
++		pr_info("hdmi phy_table not exist\n");
++	}
+ 	#ifdef CONFIG_MFD_SYSCON
+ 	hdmi_dev->grf_base =
+ 		syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
+@@ -424,7 +438,8 @@ static int rockchip_hdmiv2_probe(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, hdmi_dev);
+ 	hdmi_dev->dev = &pdev->dev;
+ 
+-	rockchip_hdmiv2_parse_dt(hdmi_dev);
++	if (rockchip_hdmiv2_parse_dt(hdmi_dev))
++		goto failed;
+ 
+ 	/*request and remap iomem*/
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -537,6 +552,7 @@ static int rockchip_hdmiv2_probe(struct platform_device *pdev)
+ failed1:
+ 	rockchip_hdmi_unregister(hdmi_dev->hdmi);
+ failed:
++	kfree(hdmi_dev->phy_table);
+ 	kfree(hdmi_dev);
+ 	hdmi_dev = NULL;
+ 	dev_err(&pdev->dev, "rk3288 hdmi probe error.\n");
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+index 1bb9561a1a33..930d6d36238f 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+@@ -13,6 +13,16 @@
+ #define HDMIDBG(format, ...)
+ #endif
+ 
++struct hdmi_dev_phy_para {
++	u32 maxfreq;
++	int pre_emphasis;
++	int slopeboost;
++	int clk_level;
++	int data0_level;
++	int data1_level;
++	int data2_level;
++};
++
+ struct hdmi_dev {
+ 	void __iomem		*regbase;
+ 	int			regbase_phy;
+@@ -53,5 +63,8 @@ struct hdmi_dev {
+ 	void			(*hdcp2_en)(int);
+ 	void			(*hdcp2_reset)(void);
+ 	void			(*hdcp2_start)(void);
++
++	struct hdmi_dev_phy_para *phy_table;
++	int			phy_table_size;
+ };
+ #endif /*__RK32_HDMI_H__*/
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index 0e669262c5a3..59c2955fdcb3 100755
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -486,28 +486,48 @@ static int rockchip_hdmiv2_config_phy(struct hdmi_dev *hdmi_dev)
+ 					  phy_mpll->gmp_cntrl));
+ 	}
+ 
+-	rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_CLKSYMCTRL,
+-				  v_OVERRIDE(1) | v_SLOPEBOOST(0) |
+-				  v_TX_SYMON(1) | v_TX_TRAON(0) |
+-				  v_TX_TRBON(0) | v_CLK_SYMON(1));
+-	if (hdmi_dev->tmdsclk > 340000000) {
+-		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_TERM_RESIS,
+-					  v_TX_TERM(R50_OHMS));
+-		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_VLEVCTRL,
+-					  v_SUP_TXLVL(9) |
+-					  v_SUP_CLKLVL(17));
+-	} else {
+-		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_TERM_RESIS,
+-					  v_TX_TERM(R100_OHMS));
+-		if (hdmi_dev->tmdsclk > 165000000)
++	if (hdmi_dev->phy_table) {
++		for (i = 0; i < hdmi_dev->phy_table_size; i++)
++			if (hdmi_dev->tmdsclk <= hdmi_dev->phy_table[i].maxfreq)
++				break;
++	}
++	if (i == hdmi_dev->phy_table_size) {
++		pr_info("%s use default phy settings\n", __func__);
++		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_CLKSYMCTRL,
++					  v_OVERRIDE(1) | v_SLOPEBOOST(0) |
++					  v_TX_SYMON(1) | v_CLK_SYMON(1) |
++					  v_PREEMPHASIS(0));
++		if (hdmi_dev->tmdsclk > 340000000)
+ 			rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_VLEVCTRL,
++						  v_SUP_TXLVL(9) |
++						  v_SUP_CLKLVL(17));
++		else if (hdmi_dev->tmdsclk > 165000000)
++			rockchip_hdmiv2_write_phy(hdmi_dev,
++						  PHYTX_VLEVCTRL,
+ 						  v_SUP_TXLVL(14) |
+ 						  v_SUP_CLKLVL(17));
+ 		else
+-			rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_VLEVCTRL,
++			rockchip_hdmiv2_write_phy(hdmi_dev,
++						  PHYTX_VLEVCTRL,
+ 						  v_SUP_TXLVL(18) |
+ 						  v_SUP_CLKLVL(17));
++	} else {
++		stat = v_OVERRIDE(1) | v_TX_SYMON(1) | v_CLK_SYMON(1) |
++		       v_PREEMPHASIS(hdmi_dev->phy_table[i].pre_emphasis) |
++		       v_SLOPEBOOST(hdmi_dev->phy_table[i].slopeboost);
++		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_CLKSYMCTRL, stat);
++
++		stat = v_SUP_CLKLVL(hdmi_dev->phy_table[i].clk_level) |
++		       v_SUP_TXLVL(hdmi_dev->phy_table[i].data0_level);
++		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_VLEVCTRL, stat);
+ 	}
++
++	if (hdmi_dev->tmdsclk > 340000000)
++		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_TERM_RESIS,
++					  v_TX_TERM(R50_OHMS));
++	else
++		rockchip_hdmiv2_write_phy(hdmi_dev, PHYTX_TERM_RESIS,
++					  v_TX_TERM(R100_OHMS));
+ 	/* rockchip_hdmiv2_write_phy(hdmi_dev, 0x05, 0x8000); */
+ 	if (hdmi_dev->tmdsclk_ratio_change)
+ 		msleep(100);
+@@ -521,6 +541,7 @@ static int rockchip_hdmiv2_config_phy(struct hdmi_dev *hdmi_dev)
+ 	*/
+ 	/* check if the PHY PLL is locked */
+ 	#define PHY_TIMEOUT	10000
++	i = 0;
+ 	while (i++ < PHY_TIMEOUT) {
+ 		if ((i % 10) == 0) {
+ 			stat = hdmi_readl(hdmi_dev, PHY_STAT0);
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+index e1c7b6d27e6a..bfde5ef4fb00 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.h
+@@ -1472,10 +1472,8 @@ enum {
+ #define v_SLOPEBOOST(n)		(((n)&0x03) << 4)
+ #define m_TX_SYMON		(0x01 << 3)
+ #define v_TX_SYMON(n)		(((n)&0x01) << 3)
+-#define m_TX_TRAON		(0x01 << 2)
+-#define v_TX_TRAON(n)		(((n)&0x01) << 2)
+-#define m_TX_TRBON		(0x01 << 1)
+-#define v_TX_TRBON(n)		(((n)&0x01) << 1)
++#define m_PREEMPHASIS		(0x03 << 1)
++#define v_PREEMPHASIS(n)	(((n)&0x03) << 1)
+ #define m_CLK_SYMON		(0x01 << 0)
+ #define v_CLK_SYMON(n)		(((n)&0x01) << 0)
+ 
+-- 
+2.35.3
+

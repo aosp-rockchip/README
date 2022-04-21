@@ -1,0 +1,102 @@
+From 77780b2dd88b520c3768c5c3ff7213fe052f2e48 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Thu, 21 Mar 2019 09:45:31 +0800
+Subject: [PATCH] mmc: core: Add mmc_sd_shutdown support for SD as main disk
+
+The ROM code for Rockchip platform never support detecting
+SD 3.0 mode, so if the SD card contains system image running
+into SD 3.0 mode in kernel, it will fails to reboot.
+
+The problem is SD 3.0 mode is using 1.8V signal and could only
+be switched back into 2.0 mode by power cycle. If the customed
+board could not switch off its power rail, the ROM code can't
+soft reset the SD.
+
+Add mmc_sd_shutdown to workaround this special case and don't
+bother normal SD cards used as external disk by checking the
+RESTRICT_CARD_TYPE_MMC flag.
+
+Conflicts:
+	drivers/mmc/core/sd.c
+
+Change-Id: I4c3d3111c0bce0ad3cd4f0c6592ff595d7015afe
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/core/sd.c | 54 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/core/sd.c b/drivers/mmc/core/sd.c
+index 04738359ec02..9bf527107aaf 100644
+--- a/drivers/mmc/core/sd.c
++++ b/drivers/mmc/core/sd.c
+@@ -1150,6 +1150,58 @@ static int _mmc_sd_suspend(struct mmc_host *host)
+ 	return err;
+ }
+ 
++static int _mmc_sd_shutdown(struct mmc_host *host)
++{
++	int err = 0;
++
++	BUG_ON(!host);
++	BUG_ON(!host->card);
++
++	mmc_claim_host(host);
++
++	if (mmc_card_suspended(host->card))
++		goto out;
++
++	if (!mmc_host_is_spi(host))
++		err = mmc_deselect_cards(host);
++
++	if (!err) {
++		mmc_power_off(host);
++		mmc_card_set_suspended(host->card);
++	}
++
++	/*
++	 * mmc_sd_shutdown is used for SD card, so what we need
++	 * is to make sure we set signal voltage to initial state
++	 * if it's used as main disk. RESTRICT_CARD_TYPE_MMC is
++	 * combined into host->restrict_caps via DT for SD cards
++	 * running system image.
++	 */
++	if (host->restrict_caps & RESTRICT_CARD_TYPE_EMMC) {
++		host->ios.signal_voltage = MMC_SIGNAL_VOLTAGE_330;
++		host->ios.vdd = fls(host->ocr_avail) - 1;
++		mmc_regulator_set_vqmmc(host, &host->ios);
++		pr_info("Set signal voltage to initial state\n");
++	}
++
++out:
++	mmc_release_host(host);
++	return err;
++}
++
++static int mmc_sd_shutdown(struct mmc_host *host)
++{
++	int err;
++
++	err = _mmc_sd_shutdown(host);
++	if (!err) {
++		pm_runtime_disable(&host->card->dev);
++		pm_runtime_set_suspended(&host->card->dev);
++	}
++
++	return err;
++}
++
+ /*
+  * Callback for suspend
+  */
+@@ -1244,7 +1296,7 @@ static const struct mmc_bus_ops mmc_sd_ops = {
+ 	.suspend = mmc_sd_suspend,
+ 	.resume = mmc_sd_resume,
+ 	.alive = mmc_sd_alive,
+-	.shutdown = mmc_sd_suspend,
++	.shutdown = mmc_sd_shutdown,
+ 	.hw_reset = mmc_sd_hw_reset,
+ };
+ 
+-- 
+2.35.3
+

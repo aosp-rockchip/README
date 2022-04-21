@@ -1,0 +1,248 @@
+From 1dc03aa0c157d2e3daa2c84fde2fc4cd857b37cb Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Mon, 14 Sep 2020 21:33:54 +0800
+Subject: [PATCH] media: rockchip: isp/ispp procfs add work info
+
+Change-Id: I297e7075abdbf83ae056406a928bc247acf6c1e2
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/csi.c     | 12 +++-
+ drivers/media/platform/rockchip/isp/csi.h     |  4 ++
+ drivers/media/platform/rockchip/isp/procfs.c  | 60 +++++++++++++------
+ drivers/media/platform/rockchip/isp/rkisp.c   |  2 +-
+ drivers/media/platform/rockchip/ispp/procfs.c | 36 ++++++-----
+ 5 files changed, 81 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index ded417065b40..eabf6424403f 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -133,6 +133,10 @@ static int rkisp_csi_s_stream(struct v4l2_subdev *sd, int on)
+ 	struct rkisp_device *dev = csi->ispdev;
+ 
+ 	memset(csi->tx_first, 0, sizeof(csi->tx_first));
++	csi->frame_cnt = -1;
++	csi->frame_cnt_x1 = -1;
++	csi->frame_cnt_x2 = -1;
++	csi->frame_cnt_x3 = -1;
+ 
+ 	if (!IS_HDR_RDBK(dev->hdr.op_mode))
+ 		return 0;
+@@ -474,7 +478,13 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 	rkisp_dmarx_get_frame(dev, &cur_frame_id, NULL, true);
+ 	if (dma2frm > 2)
+ 		dma2frm = 2;
+-
++	if (dma2frm == 2)
++		csi->frame_cnt_x3++;
++	else if (dma2frm == 1)
++		csi->frame_cnt_x2++;
++	else
++		csi->frame_cnt_x1++;
++	csi->frame_cnt++;
+ 	/* configure hdr params in rdbk mode */
+ 	rkisp_params_cfg(params_vdev, cur_frame_id, dma2frm + 1);
+ 
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 230b0f0a7c82..c49c2328faa5 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -81,6 +81,10 @@ struct rkisp_csi_device {
+ 	struct kfifo rdbk_kfifo;
+ 	spinlock_t rdbk_lock;
+ 	int max_pad;
++	int frame_cnt;
++	int frame_cnt_x1;
++	int frame_cnt_x2;
++	int frame_cnt_x3;
+ 	u32 rd_mode;
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
+ 	u8 tx_first[HDR_DMA_MAX];
+diff --git a/drivers/media/platform/rockchip/isp/procfs.c b/drivers/media/platform/rockchip/isp/procfs.c
+index 96375ec68645..41aa0bf27abe 100644
+--- a/drivers/media/platform/rockchip/isp/procfs.c
++++ b/drivers/media/platform/rockchip/isp/procfs.c
+@@ -35,38 +35,64 @@ static int isp_show(struct seq_file *p, void *v)
+ 		   RKISP_DRIVER_VERSION >> 16,
+ 		   (RKISP_DRIVER_VERSION & 0xff00) >> 8,
+ 		   RKISP_DRIVER_VERSION & 0x00ff);
++	for (val = 0; val < dev->hw_dev->num_clks; val++) {
++		seq_printf(p, "%-10s %ld\n",
++			   dev->hw_dev->match_data->clks[val],
++			   clk_get_rate(dev->hw_dev->clks[val]));
++	}
++	if (!(dev->isp_state & ISP_START))
++		return 0;
++
++	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
++		   "Interrupt",
++		   dev->isp_isr_cnt,
++		   dev->isp_err_cnt);
++
+ 	if (sensor && sensor->fi.interval.numerator)
+ 		val = sensor->fi.interval.denominator / sensor->fi.interval.numerator;
+-	seq_printf(p, "%-10s %s Format:%s Size:%dx%d@%dfps Offset(%d,%d) | RDBK_X%d(frame:%d rate:%dms)\n",
++	seq_printf(p, "%-10s %s Format:%s Size:%dx%d@%dfps Offset(%d,%d)\n",
+ 		   "Input",
+ 		   sensor ? sensor->sd->name : NULL,
+ 		   sdev->in_fmt.name,
+ 		   sdev->in_crop.width, sdev->in_crop.height, val,
+-		   sdev->in_crop.left, sdev->in_crop.top,
+-		   dev->csi_dev.rd_mode - 3,
+-		   dev->dmarx_dev.cur_frame.id,
+-		   (u32)(dev->dmarx_dev.cur_frame.timestamp - dev->dmarx_dev.pre_frame.timestamp) / 1000 / 1000);
+-	seq_printf(p, "%-10s rkispp%d Format:%s%s Size:%dx%d (frame:%d rate:%dms)\n",
++		   sdev->in_crop.left, sdev->in_crop.top);
++	if (IS_HDR_RDBK(dev->hdr.op_mode))
++		seq_printf(p, "%-10s mode:frame%d (frame:%d rate:%dms %s) cnt(total:%d X1:%d X2:%d X3:%d)\n",
++			   "Isp Read",
++			   dev->csi_dev.rd_mode - 3,
++			   dev->dmarx_dev.cur_frame.id,
++			   (u32)(dev->dmarx_dev.cur_frame.timestamp - dev->dmarx_dev.pre_frame.timestamp) / 1000 / 1000,
++			   (dev->isp_state & ISP_FRAME_END) ? "idle" : "working",
++			   dev->csi_dev.frame_cnt,
++			   dev->csi_dev.frame_cnt_x1,
++			   dev->csi_dev.frame_cnt_x2,
++			   dev->csi_dev.frame_cnt_x3);
++	seq_printf(p, "%-10s rkispp%d %s Format:%s%s Size:%dx%d (frame:%d rate:%dms)\n",
+ 		   "Output",
+ 		   dev->dev_id,
++		   dev->br_dev.en ? "ON" : "OFF",
+ 		   (dev->br_dev.work_mode & ISP_ISPP_FBC) ? "FBC" : "YUV",
+ 		   (dev->br_dev.work_mode & ISP_ISPP_422) ? "422" : "420",
+ 		   dev->br_dev.crop.width,
+ 		   dev->br_dev.crop.height,
+ 		   dev->br_dev.dbg.id,
+ 		   dev->br_dev.dbg.interval / 1000 / 1000);
+-	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
+-		   "Interrupt",
+-		   dev->isp_isr_cnt,
+-		   dev->isp_err_cnt);
+-	for (val = 0; val < dev->hw_dev->num_clks; val++) {
+-		seq_printf(p, "%-10s %ld\n",
+-			   dev->hw_dev->match_data->clks[val],
+-			   clk_get_rate(dev->hw_dev->clks[val]));
+-	}
++	for (val = 0; val < RKISP_MAX_STREAM; val++) {
++		struct rkisp_stream *stream = &dev->cap_dev.stream[val];
+ 
+-	if (!(dev->isp_state & ISP_START))
+-		return 0;
++		if (!stream->streaming)
++			continue;
++		seq_printf(p, "%-10s %s Format:%c%c%c%c Size:%dx%d frame:%d\n",
++			   "Output",
++			   stream->vnode.vdev.name,
++			   stream->out_fmt.pixelformat,
++			   stream->out_fmt.pixelformat >> 8,
++			   stream->out_fmt.pixelformat >> 16,
++			   stream->out_fmt.pixelformat >> 24,
++			   stream->out_fmt.width,
++			   stream->out_fmt.height,
++			   atomic_read(&stream->sequence) - 1);
++	}
+ 
+ 	val = rkisp_read(dev, ISP_DPCC0_MODE, false);
+ 	seq_printf(p, "%-10s %s(0x%x)\n", "DPCC0", (val & 1) ? "ON" : "OFF", val);
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 6a3525843306..c81cd9506996 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -999,7 +999,7 @@ static int rkisp_isp_start(struct rkisp_device *dev)
+ 
+ 	dev->isp_err_cnt = 0;
+ 	dev->isp_isr_cnt = 0;
+-	dev->isp_state = ISP_START;
++	dev->isp_state = ISP_START | ISP_FRAME_END;
+ 
+ 	/* XXX: Is the 1000us too long?
+ 	 * CIF spec says to wait for sufficient time after enabling
+diff --git a/drivers/media/platform/rockchip/ispp/procfs.c b/drivers/media/platform/rockchip/ispp/procfs.c
+index 3596ee217480..f9e113fbf239 100644
+--- a/drivers/media/platform/rockchip/ispp/procfs.c
++++ b/drivers/media/platform/rockchip/ispp/procfs.c
+@@ -24,6 +24,18 @@ static int ispp_show(struct seq_file *p, void *v)
+ 		   RKISPP_DRIVER_VERSION >> 16,
+ 		   (RKISPP_DRIVER_VERSION & 0xff00) >> 8,
+ 		   RKISPP_DRIVER_VERSION & 0x00ff);
++	for (val = 0; val < dev->hw_dev->clks_num; val++) {
++		seq_printf(p, "%-10s %ld\n",
++			   dev->hw_dev->match_data->clks[val],
++			   clk_get_rate(dev->hw_dev->clks[val]));
++	}
++	if (state != ISPP_START)
++		return 0;
++
++	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
++		   "Interrupt",
++		   dev->isr_cnt,
++		   dev->isr_err_cnt);
+ 	seq_printf(p, "%-10s rkisp%d Format:%s%s Size:%dx%d (frame:%d rate:%dms delay:%dms)\n",
+ 		   "Input",
+ 		   dev->dev_id,
+@@ -51,26 +63,26 @@ static int ispp_show(struct seq_file *p, void *v)
+ 			   stream->dbg.interval / 1000 / 1000,
+ 			   stream->dbg.delay / 1000 / 1000);
+ 	}
+-	if (state != ISPP_START)
+-		return 0;
+ 
+ 	val = rkispp_read(dev, RKISPP_TNR_CORE_CTRL);
+-	seq_printf(p, "%-10s %s(0x%x) (mode: %s) (global gain: %s) (frame:%d time:%dms) CNT:0x%x STATE:0x%x\n",
++	seq_printf(p, "%-10s %s(0x%x) (mode: %s) (global gain: %s) (frame:%d time:%dms %s) CNT:0x%x STATE:0x%x\n",
+ 		   "TNR",
+ 		   (val & 1) ? "ON" : "OFF", val,
+ 		   (val & SW_TNR_MODE_SHD) ? "3to1" : "2to1",
+ 		   (val & SW_TNR_GLB_GAIN_EN_SHD) ? "enable" : "disable",
+ 		   dev->stream_vdev.tnr.dbg.id,
+ 		   dev->stream_vdev.tnr.dbg.interval / 1000 / 1000,
++		   dev->stream_vdev.tnr.is_end ? "idle" : "working",
+ 		   rkispp_read(dev, RKISPP_TNR_TILE_CNT),
+ 		   rkispp_read(dev, RKISPP_TNR_STATE));
+ 	val = rkispp_read(dev, RKISPP_NR_UVNR_CTRL_PARA);
+-	seq_printf(p, "%-10s %s(0x%x) (external gain: %s) (frame:%d time:%dms) 0x%x:0x%x 0x%x:0x%x\n",
++	seq_printf(p, "%-10s %s(0x%x) (external gain: %s) (frame:%d time:%dms %s) 0x%x:0x%x 0x%x:0x%x\n",
+ 		   "NR",
+ 		   (val & 1) ? "ON" : "OFF", val,
+ 		   (val & SW_NR_GAIN_BYPASS) ? "disable" : "enable",
+ 		   dev->stream_vdev.nr.dbg.id,
+ 		   dev->stream_vdev.nr.dbg.interval / 1000 / 1000,
++		   dev->stream_vdev.nr.is_end ? "idle" : "working",
+ 		   RKISPP_NR_BLOCK_CNT, rkispp_read(dev, RKISPP_NR_BLOCK_CNT),
+ 		   RKISPP_NR_BUFFER_READY, rkispp_read(dev, RKISPP_NR_BUFFER_READY));
+ 	val = rkispp_read(dev, RKISPP_SHARP_CORE_CTRL);
+@@ -81,25 +93,21 @@ static int ispp_show(struct seq_file *p, void *v)
+ 		   (val & SW_SHP_ALPHA_ADP_EN) ? "ON" : "OFF",
+ 		   RKISPP_SHARP_TILE_IDX, rkispp_read(dev, RKISPP_SHARP_TILE_IDX));
+ 	val = rkispp_read(dev, RKISPP_FEC_CORE_CTRL);
+-	seq_printf(p, "%-10s %s(0x%x) (frame:%d time:%dms) 0x%x:0x%x\n",
++	seq_printf(p, "%-10s %s(0x%x) (frame:%d time:%dms %s) 0x%x:0x%x\n",
+ 		   "FEC",
+ 		   (val & 1) ? "ON" : "OFF", val,
+ 		   dev->stream_vdev.fec.dbg.id,
+ 		   dev->stream_vdev.fec.dbg.interval / 1000 / 1000,
++		   dev->stream_vdev.fec.is_end ? "idle" : "working",
+ 		   RKISPP_FEC_DMA_STATUS, rkispp_read(dev, RKISPP_FEC_DMA_STATUS));
+ 	val = rkispp_read(dev, RKISPP_ORB_CORE_CTRL);
+ 	seq_printf(p, "%-10s %s(0x%x)\n",
+ 		   "ORB",
+ 		   (val & 1) ? "ON" : "OFF", val);
+-	seq_printf(p, "%-10s Cnt:%d ErrCnt:%d\n",
+-		   "Interrupt",
+-		   dev->isr_cnt,
+-		   dev->isr_err_cnt);
+-	for (val = 0; val < dev->hw_dev->clks_num; val++) {
+-		seq_printf(p, "%-10s %ld\n",
+-			   dev->hw_dev->match_data->clks[val],
+-			   clk_get_rate(dev->hw_dev->clks[val]));
+-	}
++	seq_printf(p, "%-10s %s Cnt:%d\n",
++		   "Monitor",
++		   dev->stream_vdev.monitor.is_en ? "ON" : "OFF",
++		   dev->stream_vdev.monitor.retry);
+ 	return 0;
+ }
+ 
+-- 
+2.35.3
+

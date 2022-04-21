@@ -1,0 +1,284 @@
+From c1dea417c78077390aecb8e8851b437d8e515a53 Mon Sep 17 00:00:00 2001
+From: Wu Liang feng <wulf@rock-chips.com>
+Date: Wed, 24 Aug 2016 15:08:19 +0800
+Subject: [PATCH] usb: dwc3: support runtime power management for rockchip
+ platform
+
+This patch adds runtime power management support for rockchip platform.
+It depends on extcon notifier to do runtime resume and runtime suspend.
+And since the dwc3 core dev is the only child of dwc3 rockchip dev, so
+we need to ensure dwc3 core dev enter runtime suspend befer put dwc3
+rockchip dev in runtime suspend. And after do runtime resume dwc3 core
+dev, the PM core will resume dwc3 rockchip dev prior to dwc3 core dev
+resume. With this patch, we can power off USB3 power domain and disable
+clocks in runtime suspend.
+
+Change-Id: Ib529889a8603d12dcdce80e9e0716be44c028bd3
+Signed-off-by: Wu Liang feng <wulf@rock-chips.com>
+---
+ drivers/usb/dwc3/core.c          |  2 +-
+ drivers/usb/dwc3/core.h          |  1 -
+ drivers/usb/dwc3/dwc3-rockchip.c | 86 +++++++++++++++-----------------
+ 3 files changed, 40 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 19254eb77beb..cc8f5abfac09 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -405,7 +405,7 @@ static void dwc3_cache_hwparams(struct dwc3 *dwc)
+  * initialized. The PHY interfaces and the PHYs get initialized together with
+  * the core in dwc3_core_init.
+  */
+-int dwc3_phy_setup(struct dwc3 *dwc)
++static int dwc3_phy_setup(struct dwc3 *dwc)
+ {
+ 	u32 reg;
+ 	int ret;
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index f403fee2cc43..d11303373a9b 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1120,7 +1120,6 @@ struct dwc3_gadget_ep_cmd_params {
+ /* prototypes */
+ void dwc3_set_mode(struct dwc3 *dwc, u32 mode);
+ u32 dwc3_core_fifo_space(struct dwc3_ep *dep, u8 type);
+-int dwc3_phy_setup(struct dwc3 *dwc);
+ 
+ /* check whether we are on the DWC_usb31 core */
+ static inline bool dwc3_is_usb31(struct dwc3 *dwc)
+diff --git a/drivers/usb/dwc3/dwc3-rockchip.c b/drivers/usb/dwc3/dwc3-rockchip.c
+index 74b5dc2f2e99..b18851443536 100644
+--- a/drivers/usb/dwc3/dwc3-rockchip.c
++++ b/drivers/usb/dwc3/dwc3-rockchip.c
+@@ -91,8 +91,6 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 		if (WARN_ON(dwc->dr_mode == USB_DR_MODE_HOST))
+ 			return;
+ 
+-		reset_control_deassert(rockchip->otg_rst);
+-
+ 		pm_runtime_get_sync(dwc->dev);
+ 
+ 		spin_lock_irqsave(&dwc->lock, flags);
+@@ -100,8 +98,6 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 		dwc3_set_mode(dwc, DWC3_GCTL_PRTCAP_DEVICE);
+ 		spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+-		pm_runtime_put_sync(dwc->dev);
+-
+ 		dev_info(rockchip->dev, "USB peripheral connected\n");
+ 	} else if (extcon_get_cable_state_(edev, EXTCON_USB_HOST) > 0) {
+ 		if (dwc->connected)
+@@ -126,7 +122,7 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 
+ 		reset_control_deassert(rockchip->otg_rst);
+ 
+-		dwc3_phy_setup(dwc);
++		pm_runtime_get_sync(dwc->dev);
+ 
+ 		hcd = dev_get_drvdata(&dwc->xhci->dev);
+ 
+@@ -159,13 +155,14 @@ static void dwc3_rockchip_otg_extcon_evt_work(struct work_struct *work)
+ 			phy_power_off(dwc->usb2_generic_phy);
+ 			phy_power_off(dwc->usb3_generic_phy);
+ 
+-			reset_control_assert(rockchip->otg_rst);
+ 		}
+ 
+ 		spin_lock_irqsave(&dwc->lock, flags);
+ 		dwc->connected = false;
+ 		spin_unlock_irqrestore(&dwc->lock, flags);
+ 
++		pm_runtime_put_sync(dwc->dev);
++
+ 		dev_info(rockchip->dev, "USB unconnected\n");
+ 	}
+ }
+@@ -256,14 +253,6 @@ static int dwc3_rockchip_probe(struct platform_device *pdev)
+ 	rockchip->dev = dev;
+ 	rockchip->edev = NULL;
+ 
+-	pm_runtime_set_active(dev);
+-	pm_runtime_enable(dev);
+-	ret = pm_runtime_get_sync(dev);
+-	if (ret < 0) {
+-		dev_err(dev, "get_sync failed with err %d\n", ret);
+-		goto err1;
+-	}
+-
+ 	for (i = 0; i < rockchip->num_clocks; i++) {
+ 		struct clk	*clk;
+ 
+@@ -271,9 +260,7 @@ static int dwc3_rockchip_probe(struct platform_device *pdev)
+ 		if (IS_ERR(clk)) {
+ 			while (--i >= 0)
+ 				clk_put(rockchip->clks[i]);
+-			ret = PTR_ERR(clk);
+-
+-			goto err1;
++			return PTR_ERR(clk);
+ 		}
+ 
+ 		ret = clk_prepare_enable(clk);
+@@ -284,42 +271,50 @@ static int dwc3_rockchip_probe(struct platform_device *pdev)
+ 			}
+ 			clk_put(clk);
+ 
+-			goto err1;
++			return ret;
+ 		}
+ 
+ 		rockchip->clks[i] = clk;
+ 	}
+ 
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++	ret = pm_runtime_get_sync(dev);
++	if (ret < 0) {
++		dev_err(dev, "get_sync failed with err %d\n", ret);
++		goto err1;
++	}
++
+ 	rockchip->otg_rst = devm_reset_control_get(dev, "usb3-otg");
+ 	if (IS_ERR(rockchip->otg_rst)) {
+ 		dev_err(dev, "could not get reset controller\n");
+ 		ret = PTR_ERR(rockchip->otg_rst);
+-		goto err2;
++		goto err1;
+ 	}
+ 
+ 	ret = dwc3_rockchip_extcon_register(rockchip);
+ 	if (ret < 0)
+-		goto err2;
++		goto err1;
+ 
+ 	child = of_get_child_by_name(np, "dwc3");
+ 	if (!child) {
+ 		dev_err(dev, "failed to find dwc3 core node\n");
+ 		ret = -ENODEV;
+-		goto err3;
++		goto err2;
+ 	}
+ 
+ 	/* Allocate and initialize the core */
+ 	ret = of_platform_populate(np, NULL, NULL, dev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to create dwc3 core\n");
+-		goto err3;
++		goto err2;
+ 	}
+ 
+ 	child_pdev = of_find_device_by_node(child);
+ 	if (!child_pdev) {
+ 		dev_err(dev, "failed to find dwc3 core device\n");
+ 		ret = -ENODEV;
+-		goto err4;
++		goto err3;
+ 	}
+ 
+ 	rockchip->dwc = platform_get_drvdata(child_pdev);
+@@ -339,26 +334,27 @@ static int dwc3_rockchip_probe(struct platform_device *pdev)
+ 				usb_remove_hcd(hcd);
+ 			}
+ 		}
++
++		pm_runtime_put_sync(dev);
+ 	}
+ 
+ 	return ret;
+ 
+-err4:
+-	of_platform_depopulate(dev);
+-
+ err3:
+-	dwc3_rockchip_extcon_unregister(rockchip);
++	of_platform_depopulate(dev);
+ 
+ err2:
+-	for (i = 0; i < rockchip->num_clocks; i++) {
+-		clk_disable_unprepare(rockchip->clks[i]);
+-		clk_put(rockchip->clks[i]);
+-	}
++	dwc3_rockchip_extcon_unregister(rockchip);
+ 
+ err1:
+ 	pm_runtime_put_sync(dev);
+ 	pm_runtime_disable(dev);
+ 
++	for (i = 0; i < rockchip->num_clocks; i++) {
++		clk_unprepare(rockchip->clks[i]);
++		clk_put(rockchip->clks[i]);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -368,11 +364,6 @@ static int dwc3_rockchip_remove(struct platform_device *pdev)
+ 	struct device		*dev = &pdev->dev;
+ 	int			i;
+ 
+-	for (i = 0; i < rockchip->num_clocks; i++) {
+-		clk_disable_unprepare(rockchip->clks[i]);
+-		clk_put(rockchip->clks[i]);
+-	}
+-
+ 	dwc3_rockchip_extcon_unregister(rockchip);
+ 
+ 	of_platform_depopulate(dev);
+@@ -380,11 +371,16 @@ static int dwc3_rockchip_remove(struct platform_device *pdev)
+ 	pm_runtime_put_sync(dev);
+ 	pm_runtime_disable(dev);
+ 
++	for (i = 0; i < rockchip->num_clocks; i++) {
++		clk_unprepare(rockchip->clks[i]);
++		clk_put(rockchip->clks[i]);
++	}
++
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_PM_SLEEP
+-static int dwc3_rockchip_suspend(struct device *dev)
++#ifdef CONFIG_PM
++static int dwc3_rockchip_runtime_suspend(struct device *dev)
+ {
+ 	struct dwc3_rockchip	*rockchip = dev_get_drvdata(dev);
+ 	int			i;
+@@ -395,7 +391,7 @@ static int dwc3_rockchip_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
+-static int dwc3_rockchip_resume(struct device *dev)
++static int dwc3_rockchip_runtime_resume(struct device *dev)
+ {
+ 	struct dwc3_rockchip	*rockchip = dev_get_drvdata(dev);
+ 	int			i;
+@@ -403,22 +399,18 @@ static int dwc3_rockchip_resume(struct device *dev)
+ 	for (i = 0; i < rockchip->num_clocks; i++)
+ 		clk_enable(rockchip->clks[i]);
+ 
+-	/* runtime set active to reflect active state. */
+-	pm_runtime_disable(dev);
+-	pm_runtime_set_active(dev);
+-	pm_runtime_enable(dev);
+-
+ 	return 0;
+ }
+ 
+ static const struct dev_pm_ops dwc3_rockchip_dev_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(dwc3_rockchip_suspend, dwc3_rockchip_resume)
++	SET_RUNTIME_PM_OPS(dwc3_rockchip_runtime_suspend,
++			   dwc3_rockchip_runtime_resume, NULL)
+ };
+ 
+-#define DEV_PM_OPS	(&dwc3_rockchip_dev_pm_ops)
++#define DEV_PM_OPS      (&dwc3_rockchip_dev_pm_ops)
+ #else
+ #define DEV_PM_OPS	NULL
+-#endif /* CONFIG_PM_SLEEP */
++#endif /* CONFIG_PM */
+ 
+ static const struct of_device_id rockchip_dwc3_match[] = {
+ 	{ .compatible = "rockchip,rk3399-dwc3" },
+-- 
+2.35.3
+

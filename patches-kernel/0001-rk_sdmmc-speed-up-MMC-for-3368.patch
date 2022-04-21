@@ -1,0 +1,338 @@
+From dadac3a32b5a4ec3d39b569b5817bd51a76d5695 Mon Sep 17 00:00:00 2001
+From: lintao <lintao@rock-chips.com>
+Date: Fri, 27 Feb 2015 11:19:15 +0800
+Subject: [PATCH] rk_sdmmc: speed up MMC for 3368
+
+   Test with p9-818 board, without DM for ext4 mount option.
+
+Signed-off-by: lintao <lintao@rock-chips.com>
+---
+ arch/arm64/boot/dts/rk3368-p9_818.dts |  8 +--
+ arch/arm64/boot/dts/rk3368.dtsi       |  9 ++--
+ drivers/mmc/host/dw_mmc-rockchip.c    | 72 ++++++++++++++++++++-------
+ drivers/mmc/host/rk_sdmmc.c           | 13 ++++-
+ drivers/mmc/host/rk_sdmmc.h           | 10 ++++
+ include/linux/mmc/rk_mmc.h            |  3 ++
+ 6 files changed, 89 insertions(+), 26 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rk3368-p9_818.dts b/arch/arm64/boot/dts/rk3368-p9_818.dts
+index c31c4b1701bd..5a22ae61f651 100755
+--- a/arch/arm64/boot/dts/rk3368-p9_818.dts
++++ b/arch/arm64/boot/dts/rk3368-p9_818.dts
+@@ -185,16 +185,16 @@
+ };
+ 
+ &emmc {
+-	clock-frequency = <100000000>;
+-	clock-freq-min-max = <400000 100000000>;
++	clock-frequency = <150000000>;
++	clock-freq-min-max = <400000 150000000>;
+ 
+ 	supports-highspeed;
+ 	supports-emmc;
+ 	bootpart-no-access;
+ 
+ 	//supports-tSD;
+-	//supports-DDR_MODE; //you should set the two value in your project. only close in RK3288-SDK board.
+-	//caps2-mmc-hs200;
++	supports-DDR_MODE; //you should set the two value in your project. only close in RK3288-SDK board.
++	caps2-mmc-hs200;
+ 
+ 	ignore-pm-notify;
+ 	keep-power-in-suspend;
+diff --git a/arch/arm64/boot/dts/rk3368.dtsi b/arch/arm64/boot/dts/rk3368.dtsi
+index 7ddb088545df..9783d301ce6b 100755
+--- a/arch/arm64/boot/dts/rk3368.dtsi
++++ b/arch/arm64/boot/dts/rk3368.dtsi
+@@ -334,20 +334,21 @@
+ 	};
+ 
+ 	emmc: rksdmmc@ff0f0000 {
+-		compatible = "rockchip,rk_mmc", "rockchip,rk32xx-sdmmc";
++		compatible = "rockchip,rk_mmc", "rockchip,rk3368-sdmmc";
+ 		reg = <0x0 0xff0f0000 0x0 0x4000>;
+ 		interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 		clocks = <&clk_emmc>, <&clk_gates21 2>;
+ 		clock-names = "clk_mmc", "hclk_mmc";
++		rockchip,grf = <&grf>;
+ 		num-slots = <1>;
+ 		fifo-depth = <0x100>;
+ 		bus-width = <8>;
+ 	};
+ 
+ 	sdmmc: rksdmmc@ff0c0000 {
+-		compatible = "rockchip,rk_mmc", "rockchip,rk32xx-sdmmc";
++		compatible = "rockchip,rk_mmc", "rockchip,rk3368-sdmmc";
+ 		reg = <0x0 0xff0c0000 0x0 0x4000>;
+ 		interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH>;
+ 		#address-cells = <1>;
+@@ -358,13 +359,14 @@
+ 		cd-gpios = <&gpio2 GPIO_B3 GPIO_ACTIVE_HIGH>;/*CD GPIO*/
+ 		clocks = <&clk_sdmmc0>, <&clk_gates21 0>;
+ 		clock-names = "clk_mmc", "hclk_mmc";
++		rockchip,grf = <&grf>;
+ 		num-slots = <1>;
+ 		fifo-depth = <0x100>;
+ 		bus-width = <4>;
+ 	};
+ 
+ 	sdio: rksdmmc@ff0d0000 {
+-		compatible = "rockchip,rk_mmc", "rockchip,rk32xx-sdmmc";
++		compatible = "rockchip,rk_mmc", "rockchip,rk3368-sdmmc";
+ 		reg = <0x0 0xff0d0000 0x0 0x4000>;
+ 		interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
+ 		#address-cells = <1>;
+@@ -374,6 +376,7 @@
+ 		pinctrl-1 = <&sdio0_gpio>;
+ 		clocks = <&clk_sdio0>, <&clk_gates21 1>;
+ 		clock-names = "clk_mmc", "hclk_mmc";
++		rockchip,grf = <&grf>;
+ 		num-slots = <1>;
+ 		fifo-depth = <0x100>;
+ 		bus-width = <4>;
+diff --git a/drivers/mmc/host/dw_mmc-rockchip.c b/drivers/mmc/host/dw_mmc-rockchip.c
+index bacca5ea0a9c..f71d34db5fd3 100755
+--- a/drivers/mmc/host/dw_mmc-rockchip.c
++++ b/drivers/mmc/host/dw_mmc-rockchip.c
+@@ -21,6 +21,8 @@
+ #include <linux/rockchip/cpu.h>
+ #include <linux/rockchip/cru.h>
+ #include <linux/delay.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ #include "rk_sdmmc.h"
+ #include "dw_mmc-pltfm.h"
+ #include "../../clk/rockchip/clk-ops.h"
+@@ -79,13 +81,6 @@ enum{
+         SLEW_RATE_FAST = 1,
+ };
+ 
+-/* Variations in Rockchip specific dw-mshc controller */
+-enum dw_mci_rockchip_type {
+-	DW_MCI_TYPE_RK3188,
+-	DW_MCI_TYPE_RK3288,
+-	DW_MCI_TYPE_RK3036,
+-	DW_MCI_TYPE_RK312X,
+-};
+ 
+ /* Rockchip implementation specific driver private data */
+ struct dw_mci_rockchip_priv_data {
+@@ -112,6 +107,9 @@ static struct dw_mci_rockchip_compatible {
+ 	},{
+ 		.compatible	= "rockchip,rk312x-sdmmc",
+ 		.ctrl_type	= DW_MCI_TYPE_RK312X,
++	},{
++		.compatible     = "rockchip,rk3368-sdmmc",
++		.ctrl_type      = DW_MCI_TYPE_RK3368,
+ 	},
+ };
+ 
+@@ -128,8 +126,12 @@ static int dw_mci_rockchip_priv_init(struct dw_mci *host)
+ 
+ 	for(idx = 0; idx < ARRAY_SIZE(rockchip_compat); idx++){
+                 if(of_device_is_compatible(host->dev->of_node,
+-                                rockchip_compat[idx].compatible))
++                                rockchip_compat[idx].compatible)) {
+ 			priv->ctrl_type = rockchip_compat[idx].ctrl_type;
++			host->cid = priv->ctrl_type;
++			host->grf = syscon_regmap_lookup_by_phandle(host->dev->of_node,
++								"rockchip,grf");
++		}
+ 	}
+ 
+ 	host->priv = priv;
+@@ -142,7 +144,8 @@ static int dw_mci_rockchip_setup_clock(struct dw_mci *host)
+ 
+ 	if ((priv->ctrl_type == DW_MCI_TYPE_RK3288) ||
+                 (priv->ctrl_type == DW_MCI_TYPE_RK3036) ||
+-                (priv->ctrl_type == DW_MCI_TYPE_RK312X))
++                (priv->ctrl_type == DW_MCI_TYPE_RK312X) ||
++		(priv->ctrl_type == DW_MCI_TYPE_RK3368))
+ 		host->bus_hz /= (priv->ciu_div + 1);
+ 
+ 	return 0;
+@@ -185,6 +188,9 @@ static inline void dw_mci_rockchip_set_delaynum(struct dw_mci *host, u8 con_id,
+                 con_id, tuning_type, regs, mmc_hostname(host->mmc));
+ 
+         cru_writel(regs, CRU_SDMMC_CON(con_id, tuning_type));
++
++	MMC_DBG_INFO_FUNC(host->mmc,"CRU_SDMMC_CON(con_id, tuning_type) = 0x%x, regs = 0x%x [%s]",
++	                CRU_SDMMC_CON(con_id, tuning_type), cru_readl(CRU_SDMMC_CON(con_id, tuning_type)), mmc_hostname(host->mmc));
+ }
+ 
+ static inline void dw_mci_rockchip_set_degree(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 phase)
+@@ -200,6 +206,8 @@ static inline void dw_mci_rockchip_set_degree(struct dw_mci *host, u8 con_id, u8
+                 con_id, tuning_type, regs, mmc_hostname(host->mmc));
+ 	
+ 	cru_writel(regs, CRU_SDMMC_CON(con_id, tuning_type));
++	MMC_DBG_INFO_FUNC(host->mmc,"CRU_SDMMC_CON(con_id, tuning_type) = 0x%x, regs = 0x%x [%s]",
++		CRU_SDMMC_CON(con_id, tuning_type), cru_readl(CRU_SDMMC_CON(con_id, tuning_type)), mmc_hostname(host->mmc));
+ }
+ 
+ static inline void dw_mci_rockchip_turning_sel(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 mode)
+@@ -267,14 +275,34 @@ static void dw_mci_rockchip_load_signal_integrity(struct dw_mci *host, u32 sr, u
+                         grf_writel(0x000c0006, 0x01e4); /* GPIO3B1 */
+                         grf_writel(0x003f0015, 0x01e8); /* GPIO3C2-C0 */
+                 }
+-        }
++        } else if (host->cid == DW_MCI_TYPE_RK3368) {
++		 if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
++			regmap_write(host->grf, 0x21c, 0xff000000 | (drv << 14) | (drv << 12) |
++						(drv << 10) | (drv << 8)); /* GPIO2D4-D7 */
++			regmap_write(host->grf, 0x220, 0x000f0000 | (drv << 0) | (drv << 2)); /* GPIO3A0-A1 */
++		}else if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD) {
++		        regmap_write(host->grf, 0x210, 0xfc000000 | (drv << 10) | (drv << 12) | (drv << 14)); /* GPIO2A5-A7 */
++			regmap_write(host->grf, 0x214, 0x003f0000 | (drv << 0) | (drv << 2) | (drv << 4)); /* GPIO2B0-2 */
++		}else if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_EMMC) {
++			regmap_write(host->grf, 0x208, 0xfff00000 | (drv << 4) | (drv << 6) | (drv << 8) | (drv << 10) 
++								| (drv << 12) | (drv << 14)); /* GPIO1C2-C7 */
++			regmap_write(host->grf, 0x20c, 0x003f0000 | (drv << 0) | (drv << 2) | (drv << 4)); /* GPIO1D0-D2 */
++			regmap_write(host->grf, 0x210, 0x03000000 | (drv << 8)); /* GPIO2A4 */
++		}
++	}
+ 
+ }
+-static void dw_mci_rockchip_load_tuning_base(void)
++static void dw_mci_rockchip_load_tuning_base(struct dw_mci *host)
+ {
+         /* load tuning base */
+-        if(cpu_is_rk3288())
++        if (cpu_is_rk3288()) {
+                 cru_tuning_base =  RK3288_CRU_SDMMC_CON0;
++	} else if (host->cid == DW_MCI_TYPE_RK3368) {
++		if (IS_ERR(host->grf))
++			pr_err("rk_sdmmc: dts couldn't find grf regmap\n");
++
++		cru_tuning_base =  0x400;
++	}
+ }
+ 
+ static int inline __dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
+@@ -339,7 +367,7 @@ static int dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
+ 
+ 	MMC_DBG_INFO_FUNC(host->mmc,"execute tuning:  [%s]", mmc_hostname(host->mmc));
+ 
+-	dw_mci_rockchip_load_tuning_base();
++	dw_mci_rockchip_load_tuning_base(host);
+ 
+ 	blk_test = kmalloc(blksz, GFP_KERNEL);
+ 	if (!blk_test)
+@@ -381,8 +409,8 @@ static int dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
+                                         "execute tuning: TOO LARGE STEP![%s]", mmc_hostname(host->mmc));
+                 }
+                 MMC_DBG_INFO_FUNC(host->mmc,
+-                                "execute tuning: SOC is UNKNOWN, step = %d[%s]",
+-                                step, mmc_hostname(host->mmc));
++                                "execute tuning: SOC id is %d, step = %d[%s]",
++                                host->cid, step, mmc_hostname(host->mmc));
+         }
+ 
+ re_phase:
+@@ -394,7 +422,7 @@ static int dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
+ 
+         dw_mci_rockchip_load_signal_integrity(host, SLEW_RATE_SLOW, default_drv);
+         /* Loop degree from 0 ~ 270 */
+-        for(start_degree = SDMMC_SHIFT_DEGREE_0; start_degree < SDMMC_SHIFT_DEGREE_270; start_degree++){
++        for(start_degree = SDMMC_SHIFT_DEGREE_0; start_degree <= SDMMC_SHIFT_DEGREE_270; start_degree++){
+                 dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, start_degree);
+                 if(0 == __dw_mci_rockchip_execute_tuning(slot, opcode, blk_test, blksz)){
+                         if(!memcmp(blk_pattern, blk_test, blksz)){
+@@ -458,7 +486,17 @@ static int dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
+                 ret = 0;
+ 		goto done;  
+                 #endif       
+-        }else if((candidates_degree[0]==SDMMC_SHIFT_DEGREE_0) 
++        }else if((candidates_degree[0]==SDMMC_SHIFT_DEGREE_0)
++		&& (candidates_degree[1]==SDMMC_SHIFT_DEGREE_180)
++		&& (candidates_degree[2]==SDMMC_SHIFT_DEGREE_270)){
++		MMC_DBG_INFO_FUNC(host->mmc,
++			"execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_0 AND SDMMC_SHIFT_DEGREE_180 AND SDMMC_SHIFT_DEGREE_270[%s]",
++			mmc_hostname(host->mmc));
++		dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_180);
++		dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
++		ret = 0;
++		goto done;
++	}else if((candidates_degree[0]==SDMMC_SHIFT_DEGREE_0) 
+                 && (candidates_degree[1]==SDMMC_SHIFT_DEGREE_180)){
+ 
+                 MMC_DBG_INFO_FUNC(host->mmc,
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index 15966783dbca..1d9e5a3f5071 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -46,6 +46,8 @@
+ #include <linux/clk-private.h>
+ #include <linux/rockchip/cpu.h>
+ #include <linux/rfkill-wlan.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ #include "rk_sdmmc.h"
+ #include "rk_sdmmc_dbg.h"
+ #include <linux/regulator/rockchip_io_vol_domain.h>
+@@ -1804,12 +1806,17 @@ static void dw_mci_do_grf_io_domain_switch(struct dw_mci *host, u32 voltage)
+                         break;
+         }
+ 
+-        if(cpu_is_rk3288()){
++        if (cpu_is_rk3288()) {
+                 if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD)	   
+                         grf_writel((voltage << 7) | (1 << 23), RK3288_GRF_IO_VSEL);
+                 else
+                         return ;
+-        }else{
++        } else if (host->cid == DW_MCI_TYPE_RK3368) {
++		if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD)
++			 regmap_write(host->grf, 0x900, (voltage << 6) | (1 << 22));	
++		else
++			return;
++	} else {
+                 MMC_DBG_ERR_FUNC(host->mmc,"%s : unknown chip [%s]\n",
+                                         __FUNCTION__, mmc_hostname(host->mmc));
+         }
+@@ -4181,6 +4188,8 @@ int dw_mci_resume(struct dw_mci *host)
+                 else if(cpu_is_rk312x())
+                         /* RK3036_GRF_SOC_CON0 is compatible with rk312x, tmp setting */
+                         grf_writel(((1 << 8) << 16) | (0 << 8), RK3036_GRF_SOC_CON0);
++		else if(host->cid == DW_MCI_TYPE_RK3368)
++			regmap_write(host->grf, 0x43c, ((1 << 13) << 16) | (0 << 13));
+ 	}
+ 	if(host->vmmc){
+ 		ret = regulator_enable(host->vmmc);
+diff --git a/drivers/mmc/host/rk_sdmmc.h b/drivers/mmc/host/rk_sdmmc.h
+index d3ed86bb6a20..f4ed8e440d1e 100755
+--- a/drivers/mmc/host/rk_sdmmc.h
++++ b/drivers/mmc/host/rk_sdmmc.h
+@@ -344,4 +344,14 @@ struct dw_mci_drv_data {
+ 	int		(*execute_tuning)(struct dw_mci_slot *slot, u32 opcode,
+ 					struct dw_mci_tuning_data *tuning_data);
+ };
++
++/* Variations in Rockchip specific dw-mshc controller */
++enum dw_mci_rockchip_type {
++         DW_MCI_TYPE_RK3188,
++         DW_MCI_TYPE_RK3288,
++         DW_MCI_TYPE_RK3036,
++         DW_MCI_TYPE_RK312X,
++         DW_MCI_TYPE_RK3368,
++};
++
+ #endif /* _DW_MMC_H_ */
+diff --git a/include/linux/mmc/rk_mmc.h b/include/linux/mmc/rk_mmc.h
+index 5c9118fd9877..6f02751efca9 100755
+--- a/include/linux/mmc/rk_mmc.h
++++ b/include/linux/mmc/rk_mmc.h
+@@ -214,6 +214,9 @@ struct dw_mci {
+ 	struct pinctrl_state	*pins_default; /* Function port */
+ 	struct pinctrl_state	*pins_idle;    /* Gpio port */
+ 	struct pinctrl_state    *pins_udbg;    /* uart_dbg port */
++
++	u32	cid;
++	struct regmap	*grf;
+ };
+ 
+ /* DMA ops for Internal/External DMAC interface */
+-- 
+2.35.3
+

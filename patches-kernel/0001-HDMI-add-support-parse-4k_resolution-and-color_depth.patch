@@ -1,0 +1,314 @@
+From a2aee5d5d8337afa40261be3df53450d4ad33f1f Mon Sep 17 00:00:00 2001
+From: zwl <zwl@rock-chips.com>
+Date: Wed, 23 Apr 2014 22:42:01 +0800
+Subject: [PATCH] HDMI: add support parse 4k_resolution and color_depth from
+ EDID
+
+---
+ drivers/video/rockchip/hdmi/rk_hdmi.h      |  23 +++-
+ drivers/video/rockchip/hdmi/rk_hdmi_edid.c | 134 +++++++++++++++------
+ drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c |  39 ++++++
+ drivers/video/rockchip/hdmi/rk_hdmi_task.c |  17 +--
+ 4 files changed, 157 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi.h b/drivers/video/rockchip/hdmi/rk_hdmi.h
+index 8fa6345db7a1..ed7b8a199f50 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi.h
++++ b/drivers/video/rockchip/hdmi/rk_hdmi.h
+@@ -139,6 +139,14 @@ enum {
+ 	HDMI_COLOR_YCbCr444
+ };
+ 
++/*HDMI Video Color Depth*/
++enum {
++	HDMI_COLOR_DEPTH_8BIT = 0x1,
++	HDMI_COLOR_DEPTH_10BIT = 0x2,
++	HDMI_COLOR_DEPTH_12BIT = 0x4,
++	HDMI_COLOR_DEPTH_16BIT = 0x8
++};
++
+ /* HDMI Audio type */
+ enum hdmi_audio_type
+ {
+@@ -238,6 +246,15 @@ struct hdmi_edid {
+ 	unsigned char ycbcr444;				//Display device support YCbCr444
+ 	unsigned char ycbcr422;				//Display device support YCbCr422
+ 	unsigned char deepcolor;			//bit3:DC_48bit; bit2:DC_36bit; bit1:DC_30bit; bit0:DC_Y444;
++	unsigned char latency_fields_present;
++	unsigned char i_latency_fields_present;
++	unsigned char video_latency;
++	unsigned char audio_latency;
++	unsigned char interlaced_video_latency;
++	unsigned char interlaced_audio_latency;
++	unsigned char video_present;			//have additional video format abount 4k and/or 3d
++	unsigned char support_3d;			//3D format support
++	unsigned int maxtmdsclock;			//max tmds clock freq support
+ 	struct fb_monspecs	*specs;			//Device spec
+ 	struct list_head modelist;			//Device supported display mode list
+ 	struct hdmi_audio *audio;			//Device supported audio info
+@@ -252,7 +269,10 @@ struct hdmi_video_para {
+ 	int input_color;	//input video color mode
+ 	int output_mode;	//output hdmi or dvi
+ 	int output_color;	//output video color mode
+-	int format_3d;
++	unsigned char format_3d;		//output 3d format
++	unsigned char color_depth;	//color depth: 8bit; 10bit; 12bit; 16bit;
++	unsigned char pixel_repet;	//pixel repettion
++	unsigned char pixel_pack_phase;	//pixel packing default phase
+ };
+ 
+ struct hdmi {
+@@ -337,6 +357,7 @@ extern struct hdmi_video_timing * hdmi_find_mode(int vic);
+ extern int hdmi_find_best_mode(struct hdmi* hdmi_drv, int vic);
+ extern int hdmi_ouputmode_select(struct hdmi *hdmi_drv, int edid_ok);
+ extern int hdmi_switch_fb(struct hdmi *hdmi_drv, int vic);
++extern int hdmi_init_video_para(struct hdmi *hdmi_drv, struct hdmi_video_para *video);
+ extern void hdmi_work(struct work_struct *work);
+ extern void hdmi_register_display_sysfs(struct hdmi *hdmi_drv, struct device *parent);
+ extern void hdmi_unregister_display_sysfs(struct hdmi *hdmi_drv);
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_edid.c b/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
+index 31ca48b7bbab..e4293a14921f 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_edid.c
+@@ -147,7 +147,11 @@ static int hdmi_edid_get_cea_svd(unsigned char *buf, struct hdmi_edid *pedid)
+ 	for(i = 0; i < count; i++)
+ 	{
+ 		hdmi_edid_debug("[EDID-CEA] %02x VID %d native %d\n", buf[1 + i], buf[1 + i] & 0x7f, buf[1 + i] >> 7);
++	#ifndef HDMI_VERSION_2
+ 		vic = buf[1 + i] & 0x7f;
++	#else
++		vic = buf[1 + i] & 0xff;
++	#endif
+ 		for(j = 0; j < ARRAY_SIZE(double_aspect_vic); j++)
+ 		{
+ 			if(vic == double_aspect_vic[j])
+@@ -192,14 +196,101 @@ static int hdmi_edid_parse_cea_sad(unsigned char *buf, struct hdmi_edid *pedid)
+ 	}
+ 	return E_HDMI_EDID_SUCCESS;
+ }
++
++//Parse CEA Vendor Specific Data Block
++static int hdmi_edid_parse_cea_sdb(unsigned char * buf, struct hdmi_edid *pedid)
++{
++	unsigned int count = 0, cur_offset = 0, i = 0;
++	unsigned int IEEEOUI = 0;
++	unsigned int supports_ai,  dc_48bit, dc_36bit, dc_30bit, dc_y444;
++	unsigned int len_3d, len_4k;
++	unsigned char vic = 0;
++	const struct fb_videomode *mode;
++
++	count = buf[0] & 0x1F;
++	IEEEOUI = buf[3];
++	IEEEOUI <<= 8;
++	IEEEOUI += buf[2];
++	IEEEOUI <<= 8;
++	IEEEOUI += buf[1];
++	hdmi_edid_debug("[EDID-CEA] IEEEOUI is 0x%08x.\n", IEEEOUI);
++	if(IEEEOUI == 0x0c03)
++		pedid->sink_hdmi = 1;
++
++	if (count > 5) {
++		pedid->deepcolor = (buf[6] >> 3) & 0x0F;
++		supports_ai = buf[6] >> 7;
++		dc_48bit = (buf[6] >> 6) & 0x1;
++		dc_36bit = (buf[6] >> 5) & 0x1;
++		dc_30bit = (buf[6] >> 4) & 0x1;
++		dc_y444 = (buf[6] >> 3) & 0x1;
++		hdmi_edid_debug("[EDID-CEA] supports_ai %d dc_48bit %d dc_36bit %d dc_30bit %d dc_y444 %d \n", supports_ai, dc_48bit, dc_36bit, dc_30bit, dc_y444);
++	}
++	if (count > 6) {
++		pedid->maxtmdsclock = buf[7] * 5000000;
++	}
++	if (count > 7) {
++		pedid->latency_fields_present = (buf[8] & 0x80) ? 1 : 0;
++		pedid->i_latency_fields_present = (buf[8] & 0x40) ? 1 : 0;
++		pedid->video_present = (buf[8] & 0x20) ? 1 : 0;
++	}
++
++	cur_offset = 9;
++	if (count >= cur_offset) {
++		if (pedid->latency_fields_present == 1) {
++			pedid->video_latency = buf[cur_offset++];
++			pedid->audio_latency = buf[cur_offset++];
++		}
++		if(count >= cur_offset && pedid->i_latency_fields_present) {
++			pedid->interlaced_video_latency = buf[cur_offset++];
++			pedid->interlaced_audio_latency = buf[cur_offset++];
++		}
++	}
++
++	if(pedid->video_present == 0)
++		return E_HDMI_EDID_SUCCESS;
++
++	if (count >= cur_offset) {
++		pedid->support_3d = (buf[cur_offset++] & 0x80) ? 1 : 0;
++
++		len_4k = (buf[cur_offset] >> 5) & 0x07;
++		len_3d = buf[cur_offset] & 0x1F;
++		cur_offset++;
++	}
++	if (count >= cur_offset && len_4k > 0) {
++		for(i = 0; i < len_4k; i++) {
++		#ifndef HDMI_VERSION_2
++			vic = buf[cur_offset + i] & 0x7f;
++			if (vic > 0 && vic < 5) {
++				vic = (vic == 4) ? 98 : (96 - vic);
++			}
++			hdmi_edid_debug("[EDID-CEA] %02x VID %d native %d\n", buf[cur_offset + i], vic, buf[cur_offset + i] >> 7);
++		#else
++			vic = buf[cur_offset + i] & 0xff;
++			hdmi_edid_debug("[EDID-CEA] %02x VID %d native %d\n", buf[cur_offset + i], vic);
++		#endif
++			if (vic) {
++				mode = hdmi_vic_to_videomode(vic);
++				if (mode) {
++					hdmi_add_videomode(mode, &pedid->modelist);
++				}
++			}
++		}
++		cur_offset += i;
++	}
++	if (count >= cur_offset && pedid->support_3d && len_3d > 0) {
++		//TODO Daisen wait to add
++	}
++
++	return E_HDMI_EDID_SUCCESS;
++}
++
+ // Parse CEA 861 Serial Extension.
+ static int hdmi_edid_parse_extensions_cea(unsigned char *buf, struct hdmi_edid *pedid)
+ {
+ 	unsigned int ddc_offset, native_dtd_num, cur_offset = 4;
+ 	unsigned int underscan_support, baseaudio_support;
+-	unsigned int tag, IEEEOUI = 0;
+-//	unsigned int supports_ai,  dc_48bit, dc_36bit, dc_30bit, dc_y444;
+-//	unsigned char vic;
++	unsigned int tag;
+ 	
+ 	if(buf == NULL)
+ 		return E_HDMI_EDID_PARAM;
+@@ -238,42 +329,7 @@ static int hdmi_edid_parse_extensions_cea(unsigned char *buf, struct hdmi_edid *
+ 				break;
+ 			case 0x03:	// Vendor Specific Data Block
+ 				hdmi_edid_debug("[EDID-CEA] It is a Vendor Specific Data Block.\n");
+-
+-				IEEEOUI = buf[cur_offset + 2 + 1];
+-				IEEEOUI <<= 8;
+-				IEEEOUI += buf[cur_offset + 1 + 1];
+-				IEEEOUI <<= 8;
+-				IEEEOUI += buf[cur_offset + 1];
+-				hdmi_edid_debug("[EDID-CEA] IEEEOUI is 0x%08x.\n", IEEEOUI);
+-				if(IEEEOUI == 0x0c03)
+-					pedid->sink_hdmi = 1;
+-//				if(count > 5)
+-//				{
+-//					pedid->deepcolor = (buf[cur_offset + 5] >> 3) & 0x0F;
+-//					supports_ai = buf[cur_offset + 5] >> 7;
+-//					dc_48bit = (buf[cur_offset + 5] >> 6) & 0x1;
+-//					dc_36bit = (buf[cur_offset + 5] >> 5) & 0x1;
+-//					dc_30bit = (buf[cur_offset + 5] >> 4) & 0x1;
+-//					dc_y444 = (buf[cur_offset + 5] >> 3) & 0x1;
+-//					hdmi_edid_debug("[EDID-CEA] supports_ai %d dc_48bit %d dc_36bit %d dc_30bit %d dc_y444 %d \n", supports_ai, dc_48bit, dc_36bit, dc_30bit, dc_y444);
+-//				}
+-//				if(count > 6)
+-//					pedid->maxtmdsclock = buf[cur_offset + 6] * 5000000;
+-//				if(count > 7)
+-//				{
+-//					pedid->latency_fields_present = (buf[cur_offset + 7] & 0x80) ? 1:0;
+-//					pedid->i_latency_fields_present = (buf[cur_offset + 7] & 0x40) ? 1:0;
+-//				}
+-//				if(count > 9 && pedid->latency_fields_present)
+-//				{
+-//					pedid->video_latency = buf[cur_offset + 8];
+-//					pedid->audio_latency = buf[cur_offset + 9];
+-//				}
+-//				if(count > 11 && pedid->i_latency_fields_present)
+-//				{
+-//					pedid->interlaced_video_latency = buf[cur_offset + 10];
+-//					pedid->interlaced_audio_latency = buf[cur_offset + 11];
+-//				}
++				hdmi_edid_parse_cea_sdb(buf + cur_offset, pedid);
+ 				break;		
+ 			case 0x05:	// VESA DTC Data Block
+ 				hdmi_edid_debug("[EDID-CEA] It is a VESA DTC Data Block.\n");
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+index b0a68006e004..0e5976f5c206 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_lcdc.c
+@@ -543,6 +543,45 @@ int hdmi_switch_fb(struct hdmi *hdmi, int vic)
+ 	return rc;
+ }
+ 
++/**
++ * hdmi_init_video_para: init video_para variable
++ *
++ * NOTES:
++ *This parameters should be modified according to need by user
++ */
++int hdmi_init_video_para(struct hdmi *hdmi_drv, struct hdmi_video_para *video)
++{
++	memset(video, 0, sizeof(struct hdmi_video_para));
++	video->vic = hdmi_drv->vic;
++	video->input_mode = VIDEO_INPUT_RGB_YCBCR_444;
++	video->input_color = VIDEO_INPUT_COLOR_RGB;//VIDEO_INPUT_COLOR_YCBCR
++	video->output_mode = hdmi_drv->edid.sink_hdmi;
++	video->format_3d = 0; 	/*TODO modify according to EDID if need*/
++	video->pixel_repet = 0;
++
++	if (hdmi_drv->edid.deepcolor & HDMI_COLOR_DEPTH_16BIT)
++		video->color_depth = HDMI_COLOR_DEPTH_16BIT;
++	else if (hdmi_drv->edid.deepcolor & HDMI_COLOR_DEPTH_12BIT)
++		video->color_depth = HDMI_COLOR_DEPTH_12BIT;
++	else if (hdmi_drv->edid.deepcolor & HDMI_COLOR_DEPTH_10BIT)
++		video->color_depth = HDMI_COLOR_DEPTH_10BIT;
++	else
++		video->color_depth = HDMI_COLOR_DEPTH_8BIT;
++
++	if (hdmi_drv->edid.ycbcr444)
++		video->output_color = VIDEO_OUTPUT_YCBCR444;
++	else if (hdmi_drv->edid.ycbcr422)
++		video->output_color = VIDEO_OUTPUT_YCBCR422;
++	else
++		video->output_color = VIDEO_OUTPUT_RGB444;
++
++	/*For DVI, output RGB*/
++	if (hdmi_drv->edid.sink_hdmi == 0)
++		video->output_color = VIDEO_OUTPUT_RGB444;
++
++	return 0;
++}
++
+ /**
+  * hdmi_drv_register: init hdmi_drv variable
+  *
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_task.c b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+index 4a99f1e92f79..9d5c585f1500 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi_task.c
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_task.c
+@@ -248,22 +248,7 @@ void hdmi_work(struct work_struct *work)
+ 				break;
+ 			case CONFIG_VIDEO:
+ 				hdmi->display = HDMI_DISABLE;
+-				video.vic = hdmi->vic;
+-				video.input_mode = VIDEO_INPUT_RGB_YCBCR_444;
+-				video.input_color = VIDEO_INPUT_COLOR_RGB;//VIDEO_INPUT_COLOR_YCBCR
+-				video.output_mode = hdmi->edid.sink_hdmi;
+-				video.format_3d = 0; //TODO modify read from EDID
+-				
+-				if(hdmi->edid.ycbcr444)
+-					video.output_color = VIDEO_OUTPUT_YCBCR444;
+-				else if(hdmi->edid.ycbcr422)
+-					video.output_color = VIDEO_OUTPUT_YCBCR422;
+-				else
+-					video.output_color = VIDEO_OUTPUT_RGB444;
+-				// For DVI, output RGB
+-				if(hdmi->edid.sink_hdmi == 0)
+-					video.output_color = VIDEO_OUTPUT_RGB444;
+-				
++				hdmi_init_video_para(hdmi, &video);
+ 				rc = hdmi->config_video(hdmi, &video);
+ 				if(rc == HDMI_ERROR_SUCESS)
+ 				{
+-- 
+2.35.3
+

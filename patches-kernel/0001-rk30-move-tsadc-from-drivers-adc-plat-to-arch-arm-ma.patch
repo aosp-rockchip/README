@@ -1,0 +1,877 @@
+From 27e79c3bf42b310cda6bea7e840d6ebd6951e2f5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Tue, 27 Mar 2012 14:04:14 +0800
+Subject: [PATCH] rk30: move tsadc from drivers/adc/plat/ to
+ arch/arm/mach-rk30/
+
+---
+ arch/arm/mach-rk30/Makefile   |   1 +
+ arch/arm/mach-rk30/devices.c  |   4 -
+ arch/arm/mach-rk30/tsadc.c    | 250 +++++++++++++++++++
+ drivers/adc/plat/Kconfig      |   6 -
+ drivers/adc/plat/Makefile     |   1 -
+ drivers/adc/plat/rk30_tsadc.c | 442 ----------------------------------
+ drivers/adc/plat/rk30_tsadc.h |  80 ------
+ 7 files changed, 251 insertions(+), 533 deletions(-)
+ create mode 100644 arch/arm/mach-rk30/tsadc.c
+ delete mode 100755 drivers/adc/plat/rk30_tsadc.c
+ delete mode 100755 drivers/adc/plat/rk30_tsadc.h
+
+diff --git a/arch/arm/mach-rk30/Makefile b/arch/arm/mach-rk30/Makefile
+index 129cfa1de19f..ecbb333066af 100644
+--- a/arch/arm/mach-rk30/Makefile
++++ b/arch/arm/mach-rk30/Makefile
+@@ -8,6 +8,7 @@ obj-y += iomux.o
+ obj-y += pmu.o
+ obj-y += reset.o
+ obj-y += timer.o
++obj-y += tsadc.o
+ obj-$(CONFIG_FIQ) += fiq.o
+ obj-$(CONFIG_SMP) += platsmp.o headsmp.o
+ obj-$(CONFIG_HOTPLUG_CPU) += hotplug.o
+diff --git a/arch/arm/mach-rk30/devices.c b/arch/arm/mach-rk30/devices.c
+index 99156fb52572..06534f3bb227 100755
+--- a/arch/arm/mach-rk30/devices.c
++++ b/arch/arm/mach-rk30/devices.c
+@@ -51,7 +51,6 @@ struct platform_device device_adc = {
+ };
+ #endif
+ 
+-#ifdef CONFIG_TSADC_RK30
+ static struct resource rk30_tsadc_resource[] = {
+ 	{
+ 		.start	= IRQ_TSADC,
+@@ -71,7 +70,6 @@ struct platform_device device_tsadc = {
+ 	.num_resources	= ARRAY_SIZE(rk30_tsadc_resource),
+ 	.resource	= rk30_tsadc_resource,
+ };
+-#endif
+ 
+ static u64 dma_dmamask = DMA_BIT_MASK(32);
+ 
+@@ -1079,9 +1077,7 @@ static int __init rk30_init_devices(void)
+ #ifdef CONFIG_ADC_RK30
+ 	platform_device_register(&device_adc);
+ #endif
+-#ifdef CONFIG_TSADC_RK30
+ 	platform_device_register(&device_tsadc);
+-#endif
+ 	rk30_init_sdmmc();
+ #if defined(CONFIG_FIQ_DEBUGGER) && defined(DEBUG_UART_PHYS)
+ 	rk_serial_debug_init(DEBUG_UART_BASE, IRQ_UART0 + CONFIG_RK_DEBUG_UART, IRQ_UART_SIGNAL, -1);
+diff --git a/arch/arm/mach-rk30/tsadc.c b/arch/arm/mach-rk30/tsadc.c
+new file mode 100644
+index 000000000000..86794765ad80
+--- /dev/null
++++ b/arch/arm/mach-rk30/tsadc.c
+@@ -0,0 +1,250 @@
++/*
++ * Copyright (C) 2012 ROCKCHIP, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License.
++*/
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/err.h>
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/delay.h>
++#include <linux/slab.h>
++
++#define TSADC_DATA		0x00
++#define TSADC_DATA_MASK		0xfff
++
++#define TSADC_STAS		0x04
++#define TSADC_STAS_BUSY		(1 << 0)
++#define TSADC_STAS_BUSY_MASK	(1 << 0)
++
++#define TSADC_CTRL		0x08
++#define TSADC_CTRL_CH(ch)	((ch) << 0)
++#define TSADC_CTRL_POWER_UP	(1 << 3)
++#define TSADC_CTRL_START	(1 << 4)
++#define TSADC_CTRL_IRQ_ENABLE	(1 << 5)
++#define TSADC_CTRL_IRQ_STATUS	(1 << 6)
++
++#define TSADC_DLY_PU_SOC	0x0C
++
++#define TSADC_CLK_RATE		50000 /* 50KHz */
++
++struct tsadc_table
++{
++	int code;
++	int temp;
++};
++
++static const struct tsadc_table table[] =
++{
++	{TSADC_DATA_MASK, -40},
++
++	{3800, -40},
++	{3792, -35},
++	{3783, -30},
++	{3774, -25},
++	{3765, -20},
++	{3756, -15},
++	{3747, -10},
++	{3737, -5},
++	{3728, 0},
++	{3718, 5},
++
++	{3708, 10},
++	{3698, 15},
++	{3688, 20},
++	{3678, 25},
++	{3667, 30},
++	{3656, 35},
++	{3645, 40},
++	{3634, 45},
++	{3623, 50},
++	{3611, 55},
++
++	{3600, 60},
++	{3588, 65},
++	{3575, 70},
++	{3563, 75},
++	{3550, 80},
++	{3537, 85},
++	{3524, 90},
++	{3510, 95},
++	{3496, 100},
++	{3482, 105},
++
++	{3467, 110},
++	{3452, 115},
++	{3437, 120},
++	{3421, 125},
++
++	{0, 125},
++};
++
++struct rk30_tsadc_device {
++	void __iomem		*regs;
++	struct clk		*clk;
++	struct clk		*pclk;
++	struct resource		*ioarea;
++};
++
++static struct rk30_tsadc_device *g_dev;
++
++static u32 tsadc_readl(u32 offset)
++{
++	return readl_relaxed(g_dev->regs + offset);
++}
++
++static void tsadc_writel(u32 val, u32 offset)
++{
++	writel_relaxed(val, g_dev->regs + offset);
++}
++
++static void rk30_tsadc_get(unsigned int chn, int *temp, int *code)
++{
++	*temp = 0;
++	*code = 0;
++
++	if (!g_dev || chn > 1)
++		return;
++
++	clk_enable(g_dev->pclk);
++	clk_enable(g_dev->clk);
++
++	msleep(10);
++	tsadc_writel(0, TSADC_CTRL);
++	tsadc_writel(TSADC_CTRL_POWER_UP | TSADC_CTRL_CH(chn), TSADC_CTRL);
++	msleep(10);
++	if ((tsadc_readl(TSADC_STAS) & TSADC_STAS_BUSY_MASK) != TSADC_STAS_BUSY) {
++		int i;
++		*code = tsadc_readl(TSADC_DATA) & TSADC_DATA_MASK;
++		for (i = 0; i < ARRAY_SIZE(table) - 1; i++) {
++			if ((*code) <= table[i].code && (*code) > table[i + 1].code) {
++				*temp = table[i].temp + (table[i + 1].temp - table[i].temp) * (table[i].code - (*code)) / (table[i].code - table[i + 1].code);
++			}
++		}
++	}
++	tsadc_writel(0, TSADC_CTRL);
++	msleep(10);
++
++	clk_disable(g_dev->clk);
++	clk_disable(g_dev->pclk);
++}
++
++int rk30_tsadc_get_temp(unsigned int chn)
++{
++	int temp, code;
++
++	rk30_tsadc_get(chn, &temp, &code);
++	return temp;
++}
++EXPORT_SYMBOL(rk30_tsadc_get_temp);
++
++static int rk30_tsadc_get_temp0(char *buffer, struct kernel_param *kp)
++{
++	int temp, code;
++	rk30_tsadc_get(0, &temp, &code);
++	return sprintf(buffer, "temp: %d code: %d", temp, code);
++}
++module_param_call(temp0, NULL, rk30_tsadc_get_temp0, NULL, S_IRUGO);
++
++static int rk30_tsadc_get_temp1(char *buffer, struct kernel_param *kp)
++{
++	int temp, code;
++	rk30_tsadc_get(1, &temp, &code);
++	return sprintf(buffer, "temp: %d code: %d", temp, code);
++}
++module_param_call(temp1, NULL, rk30_tsadc_get_temp1, NULL, S_IRUGO);
++
++static int __init rk30_tsadc_probe(struct platform_device *pdev)
++{
++	struct rk30_tsadc_device *dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	struct resource *res;
++	int ret;
++
++	if (!dev) {
++		dev_err(&pdev->dev, "failed to alloc mem\n");
++		return -ENOMEM;
++	}
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(&pdev->dev, "cannot find IO resource\n");
++		ret = -ENOENT;
++		goto err1;
++	}
++
++	dev->ioarea = request_mem_region(res->start, (res->end - res->start) + 1, pdev->name);
++	if (!dev->ioarea) {
++		dev_err(&pdev->dev, "cannot request IO\n");
++		ret = -ENXIO;
++		goto err1;
++	}
++
++	dev->regs = ioremap(res->start, (res->end - res->start) + 1);
++	if (!dev->regs) {
++		dev_err(&pdev->dev, "cannot map IO\n");
++		ret = -ENXIO;
++		goto err2;
++	}
++
++	dev->clk = clk_get(NULL, "tsadc");
++	if (IS_ERR(dev->clk)) {
++		dev_err(&pdev->dev, "failed to get clk\n");
++		ret = PTR_ERR(dev->clk);
++		goto err3;
++	}
++
++	ret = clk_set_rate(dev->clk, TSADC_CLK_RATE);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to set clk\n");
++		goto err4;
++	}
++
++	dev->pclk = clk_get(NULL, "pclk_tsadc");
++	if (IS_ERR(dev->pclk)) {
++		dev_err(&pdev->dev, "failed to get pclk\n");
++		ret = PTR_ERR(dev->clk);
++		goto err4;
++	}
++
++	platform_set_drvdata(pdev, dev);
++	g_dev = dev;
++
++	dev_info(&pdev->dev, "initialized\n");
++
++	return 0;
++
++err4:
++	clk_put(dev->clk);
++err3:
++	iounmap(dev->regs);
++err2:
++	release_resource(dev->ioarea);
++err1:
++	kfree(dev);
++	return ret;
++}
++
++static struct platform_driver rk30_tsadc_driver = {
++	.driver		= {
++		.name	= "rk30-tsadc",
++		.owner	= THIS_MODULE,
++	},
++};
++
++static int __init rk30_tsadc_init(void)
++{
++	return platform_driver_probe(&rk30_tsadc_driver, rk30_tsadc_probe);
++}
++rootfs_initcall(rk30_tsadc_init);
++
++MODULE_DESCRIPTION("Driver for TSADC");
++MODULE_AUTHOR("lw, lw@rock-chips.com");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/adc/plat/Kconfig b/drivers/adc/plat/Kconfig
+index ac0fd467e568..390639868fd7 100644
+--- a/drivers/adc/plat/Kconfig
++++ b/drivers/adc/plat/Kconfig
+@@ -28,9 +28,3 @@ config ADC_RK30
+ 	help
+ 		This supports the use of the ADC interface on rk30 processors.
+ endchoice
+-
+-config TSADC_RK30
+-	bool "RK30 tsadc interface"
+-        depends on ARCH_RK30
+-	help
+-		This supports the use of the TSADC interface on rk30 processors.
+diff --git a/drivers/adc/plat/Makefile b/drivers/adc/plat/Makefile
+index 2dfec1fd600f..02831d738541 100644
+--- a/drivers/adc/plat/Makefile
++++ b/drivers/adc/plat/Makefile
+@@ -4,4 +4,3 @@
+ obj-$(CONFIG_ADC_RK28)	+= rk28_adc.o
+ obj-$(CONFIG_ADC_RK29)	+= rk29_adc.o
+ obj-$(CONFIG_ADC_RK30)	+= rk30_adc.o
+-obj-$(CONFIG_TSADC_RK30)	+= rk30_tsadc.o
+diff --git a/drivers/adc/plat/rk30_tsadc.c b/drivers/adc/plat/rk30_tsadc.c
+deleted file mode 100755
+index 8d9a971d0bb9..000000000000
+--- a/drivers/adc/plat/rk30_tsadc.c
++++ /dev/null
+@@ -1,442 +0,0 @@
+-/* drivers/adc/chips/rk30_tadc.c
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License.
+-*/
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/device.h>
+-#include <linux/platform_device.h>
+-#include <linux/err.h>
+-#include <linux/clk.h>
+-#include <linux/interrupt.h>
+-#include <linux/io.h>
+-#include <linux/adc.h>
+-#include <linux/delay.h>
+-#include <linux/slab.h>
+-
+-
+-#include "rk30_tsadc.h"
+-
+-//#define ADC_TEST
+-#define ADC_POLL	1	//if no tsadc intterupt
+-
+-struct rk30_tsadc_device {
+-	int			 irq;
+-	void __iomem		*regs;
+-	struct clk *		clk;
+-	struct resource		*ioarea;
+-	struct adc_host		*adc;
+-};
+-static void rk30_tsadc_start(struct adc_host *adc)
+-{
+-	struct rk30_tsadc_device *dev  = adc_priv(adc);	
+-	int chn = adc->cur->chn;
+-	
+-	writel(0, dev->regs + ADC_CTRL);
+-	writel(ADC_CTRL_POWER_UP|ADC_CTRL_CH(chn), dev->regs + ADC_CTRL);
+-	udelay(SAMPLE_RATE);
+-
+-	writel(readl(dev->regs + ADC_CTRL)|ADC_CTRL_IRQ_ENABLE|ADC_CTRL_START, 
+-		dev->regs + ADC_CTRL);
+-	return;
+-}
+-
+-static void rk30_tsadc_start_poll(struct adc_host *adc)
+-{
+-	struct rk30_tsadc_device *dev  = adc_priv(adc);	
+-	int chn = adc->cur->chn;
+-	
+-	writel(0, dev->regs + ADC_CTRL);
+-	writel(ADC_CTRL_POWER_UP|ADC_CTRL_CH(chn), dev->regs + ADC_CTRL);
+-	udelay(SAMPLE_RATE);
+-
+-	writel(readl(dev->regs + ADC_CTRL)|ADC_CTRL_START, 
+-		dev->regs + ADC_CTRL);
+-	return;
+-}
+-
+-static void rk30_tsadc_stop(struct adc_host *adc)
+-{
+-	struct rk30_tsadc_device *dev  = adc_priv(adc);
+-	
+-	writel(0, dev->regs + ADC_CTRL);
+-}
+-static int rk30_tsadc_read(struct adc_host *adc)
+-{
+-	struct rk30_tsadc_device *dev  = adc_priv(adc);
+-
+-	udelay(SAMPLE_RATE);
+-	return readl(dev->regs + ADC_DATA) & ADC_DATA_MASK;
+-}
+-static irqreturn_t rk30_tsadc_irq(int irq, void *data)
+-{
+-	struct rk30_tsadc_device *dev = data;
+-	adc_core_irq_handle(dev->adc);
+-	return IRQ_HANDLED;
+-}
+-static const struct adc_ops rk30_tsadc_ops = {
+-	.start		= rk30_tsadc_start,
+-	.stop		= rk30_tsadc_stop,
+-	.read		= rk30_tsadc_read,
+-};
+-
+-
+-#ifdef ADC_TEST
+-struct adc_test_data {
+-	struct adc_client client[2];
+-	struct timer_list timer;
+-	struct work_struct 	timer_work;
+-};
+-static void callback_test(struct adc_client *client, void *param, int result)
+-{
+-	int i = 0;
+-	for(i=0;i<2;i++)
+-	dev_info(client[i].adc->dev, "[chn=%d] async_read = %d\n", client[i].chn, result);
+-	return;
+-}
+-static void adc_timer(unsigned long data)
+-{
+-	//int sync_read = 0;
+-	 struct adc_test_data *test=(struct adc_test_data *)data;
+-	
+-	//sync_read = adc_sync_read(test->client);
+-	//dev_info(test->client->adc->dev, "[chn%d] sync_read = %d\n", 0, sync_read);
+-	schedule_work(&test->timer_work);
+-	add_timer(&test->timer);
+-}
+-
+-static void adc_timer_work(struct work_struct *work)
+-{	
+-	struct adc_test_data *test = container_of(work, struct adc_test_data,
+-						timer_work);
+-	int i = 0;
+-#if ADC_POLL
+-	int ret = 0, count = 0;
+-	struct adc_host *adc = test->client[i].adc;
+-	struct rk30_tsadc_device *dev  = adc_priv(adc);
+-	adc->cur = &test->client[i];
+-	rk30_tsadc_start(adc);
+-	while(1)
+-	{	
+-		udelay(SAMPLE_RATE);
+-		ret = readl(dev->regs + ADC_STAS);
+-		if(!(ret & ADC_STAS_BUSY))
+-		{	
+-			rk30_tsadc_stop(adc);
+-			break;
+-		}
+-		if(count++ > 10)
+-		{
+-			rk30_tsadc_stop(adc);
+-			printk("%s:timeout\n",__func__);
+-			break;
+-		}
+-	}
+-	
+-	sync_read = readl(dev->regs + ADC_DATA);
+-	dev_info(test->client[i].adc->dev, "[chn=%d] sync_read = %d\n", i, sync_read);
+-#else	
+-	int sync_read = 0;
+-	for(i=0;i<2;i++)
+-	{	
+-		adc_async_read(&test->client[i]);	
+-		sync_read = adc_sync_read(&test->client[i]);		
+-		dev_info(test->client[i].adc->dev, "[chn=%d] sync_read = %d\n", i, sync_read);
+-	}
+-#endif
+-}
+-
+-static int rk30_tsadc_test(void)
+-{
+-	struct adc_test_data *test = NULL;
+-	int i = 0;
+-	test = kzalloc(sizeof(struct adc_test_data), GFP_KERNEL);
+-	for(i=0;i<2;i++)
+-	test->client[i] = *adc_register(i, callback_test, NULL);
+-
+-	INIT_WORK(&test->timer_work, adc_timer_work);
+-	setup_timer(&test->timer, adc_timer, (unsigned long)test);
+-	test->timer.expires  = jiffies + 200;
+-	add_timer(&test->timer);
+-	
+-	return 0;
+-}
+-#endif
+-
+-#if 1
+-struct temp_sample_data {
+-	struct adc_client client[2];
+-	struct timer_list timer;
+-	struct work_struct 	timer_work;
+-};
+-static struct temp_sample_data *gtemp;
+-static void callback(struct adc_client *client, void *param, int result)
+-{
+-	int i = 0;
+-	for(i=0; i<2; i++)
+-	dev_info(client[i].adc->dev, "[chn=%d] async_read = %d\n", client[i].chn, result);
+-	return;
+-}
+-
+-static int rk30_temp_sample_init(void)
+-{
+-	struct temp_sample_data *temp = NULL;	
+-	int i = 0;
+-	temp = kzalloc(sizeof(struct temp_sample_data), GFP_KERNEL);
+-	if (!temp){
+-		printk("%s:no memory for adc request\n",__func__);
+-		return -ENOMEM;
+-	}
+-	
+-	for(i=0; i<2; i++)
+-	temp->client[i] = *adc_register(i, callback, NULL);
+-	gtemp = temp;
+-	return 0;
+-
+-}
+-
+-
+-int rk30_temp_sample(int chn, int *result)
+-{
+-	int sync_read = 0;
+-	int i = 0, num = 0;
+-#if ADC_POLL
+-	int ret = 0, count = 0;	
+-	struct temp_sample_data *temp = gtemp;	
+-	struct adc_host *adc;
+-	struct rk30_tsadc_device *dev;
+-	chn &= 0x01;	//0 or 1
+-	adc = temp->client[chn].adc;
+-	dev = adc_priv(adc);
+-	adc->cur = &temp->client[chn];
+-	rk30_tsadc_start_poll(adc);
+-	while(1)
+-	{	
+-		udelay(SAMPLE_RATE);
+-		ret = readl(dev->regs + ADC_STAS);
+-		if(!(ret & ADC_STAS_BUSY))
+-		{	
+-			rk30_tsadc_stop(adc);
+-			break;
+-		}
+-		if(count++ > 20)
+-		{
+-			rk30_tsadc_stop(adc);
+-			printk("%s:timeout\n",__func__);
+-			break;
+-		}
+-	}
+-	
+-	sync_read = readl(dev->regs + ADC_DATA);
+-	//dev_info(temp->client[chn].adc->dev, "[chn=%d] sync_read = %d\n", chn, sync_read);
+-#else
+-	adc_async_read(&gtemp->client[chn]);
+-	sync_read = adc_sync_read(&gtemp->client[chn]);
+-	dev_info(gtemp->client[chn].adc->dev, "[chn=%d] sync_read = %d\n", chn, sync_read);
+-#endif
+-	//get temperature according to ADC value
+-	num = sizeof(table_code_to_temp)/sizeof(struct tsadc_table);	
+-	for(i=0; i<num-1;i++)
+-	{
+-		if((sync_read >= table_code_to_temp[i+1].code) && (sync_read < table_code_to_temp[i].code))
+-		{
+-			*result = table_code_to_temp[i+1].temp;
+-			return 0;
+-		}
+-	}
+-
+-	if(sync_read <= table_code_to_temp[num-1].code)
+-	{
+-		*result = table_code_to_temp[num-1].temp;		
+-		printk("%s:temperature is out of table\n",__func__);
+-		return -1;
+-	}
+-	else if(sync_read >= table_code_to_temp[0].code)
+-	{
+-		*result = table_code_to_temp[0].temp;
+-		printk("%s:temperature is out of table\n",__func__);
+-		return -1;
+-	}
+-
+-	return -1;
+-		
+-}
+-
+-EXPORT_SYMBOL(rk30_temp_sample);
+-
+-#endif
+-
+-static int rk30_tsadc_probe(struct platform_device *pdev)
+-{
+-	struct adc_host *adc = NULL;
+-	struct rk30_tsadc_device *dev;
+-	struct resource *res;
+-	int ret;
+-
+-	adc = adc_alloc_host(sizeof(struct rk30_tsadc_device), &pdev->dev);
+-	if (!adc)
+-		return -ENOMEM;
+-	spin_lock_init(&adc->lock);
+-	adc->dev = &pdev->dev;
+-	adc->is_suspended = 0;
+-	adc->ops = &rk30_tsadc_ops;
+-	dev = adc_priv(adc);
+-	dev->adc = adc;
+-	dev->irq = platform_get_irq(pdev, 0);
+-	if (dev->irq <= 0) {
+-		dev_err(&pdev->dev, "failed to get adc irq\n");
+-		ret = -ENOENT;
+-		goto err_alloc;
+-	}
+-
+-	ret = request_irq(dev->irq, rk30_tsadc_irq, 0, pdev->name, dev);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev, "failed to attach adc irq\n");
+-		goto err_alloc;
+-	}
+-
+-	dev->clk = clk_get(&pdev->dev, "saradc");
+-	if (IS_ERR(dev->clk)) {
+-		dev_err(&pdev->dev, "failed to get adc clock\n");
+-		ret = PTR_ERR(dev->clk);
+-		//goto err_irq;
+-	}
+-
+-	//ret = clk_set_rate(dev->clk, ADC_CLK_RATE * 1000 * 1000);
+-	//if(ret < 0) {
+-	//	dev_err(&pdev->dev, "failed to set adc clk\n");
+-		//goto err_clk;
+-	//}
+-	clk_enable(dev->clk);
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(&pdev->dev, "cannot find IO resource\n");
+-		ret = -ENOENT;
+-		goto err_clk;
+-	}
+-	dev->ioarea = request_mem_region(res->start, (res->end - res->start) + 1, 
+-									pdev->name);
+-	if(dev->ioarea == NULL) {
+-		dev_err(&pdev->dev, "cannot request IO\n");
+-		ret = -ENXIO;
+-		goto err_clk;
+-	}
+-	dev->regs = ioremap(res->start, (res->end - res->start) + 1);
+-	if (!dev->regs) {
+-		dev_err(&pdev->dev, "cannot map IO\n");
+-		ret = -ENXIO;
+-		goto err_ioarea;
+-	}
+-	platform_set_drvdata(pdev, dev);
+-	dev_info(&pdev->dev, "rk30 adc: driver initialized\n");
+-	return 0;
+-// err_iomap:
+-//	iounmap(dev->regs);
+-
+- err_ioarea:
+-	release_resource(dev->ioarea);
+-	kfree(dev->ioarea);
+-	clk_disable(dev->clk);
+-
+- err_clk:
+-	clk_put(dev->clk);
+-
+- err_irq:
+-	free_irq(dev->irq, dev);
+-
+- err_alloc:
+-	adc_free_host(dev->adc);
+-	return ret;
+-}
+-
+-static int rk30_tsadc_remove(struct platform_device *pdev)
+-{
+-	struct rk30_tsadc_device *dev = platform_get_drvdata(pdev);
+-
+-	iounmap(dev->regs);
+-	release_resource(dev->ioarea);
+-	kfree(dev->ioarea);
+-	free_irq(dev->irq, dev);
+-	clk_disable(dev->clk);
+-	clk_put(dev->clk);
+-	adc_free_host(dev->adc);
+-
+-	return 0;
+-}
+-
+-#ifdef CONFIG_PM
+-static int rk30_tsadc_suspend(struct platform_device *pdev, pm_message_t state)
+-{
+-	struct rk30_tsadc_device *dev = platform_get_drvdata(pdev);
+-
+-	dev->adc->is_suspended = 1;
+-	return 0;
+-}
+-
+-static int rk30_tsadc_resume(struct platform_device *pdev)
+-{
+-	struct rk30_tsadc_device *dev = platform_get_drvdata(pdev);
+-
+-	dev->adc->is_suspended = 0;
+-	return 0;
+-}
+-
+-#else
+-#define rk30_tsadc_suspend NULL
+-#define rk30_tsadc_resume NULL
+-#endif
+-
+-static struct platform_driver rk30_tsadc_driver = {
+-	.driver		= {
+-		.name	= "rk30-tsadc",
+-		.owner	= THIS_MODULE,
+-	},
+-	.probe		= rk30_tsadc_probe,
+-	.remove		= __devexit_p(rk30_tsadc_remove),
+-	.suspend	= rk30_tsadc_suspend,
+-	.resume		= rk30_tsadc_resume,
+-};
+-
+-static int __init rk30_tsadc_init(void)
+-{
+-	return platform_driver_register(&rk30_tsadc_driver);
+-}
+-subsys_initcall(rk30_tsadc_init);
+-
+-static void __exit rk30_tsadc_exit(void)
+-{
+-	platform_driver_unregister(&rk30_tsadc_driver);
+-}
+-module_exit(rk30_tsadc_exit);
+-
+-MODULE_DESCRIPTION("Driver for TSADC");
+-MODULE_AUTHOR("lw, lw@rock-chips.com");
+-MODULE_LICENSE("GPL");
+-
+-static int __init rk30_temp_init(void)
+-{
+-	int ret = 0;
+-	ret = rk30_temp_sample_init();
+-#ifdef ADC_TEST	
+-	rk30_tsadc_test();
+-#endif	
+-	printk("%s:initialized\n",__func__);
+-	return ret;
+-}
+-
+-static void __exit rk30_temp_exit(void)
+-{
+-	int i = 0;
+-	struct temp_sample_data *temp = gtemp;
+-	for(i=0; i<2; i++)
+-	adc_unregister(&temp->client[i]);
+-	kfree(temp);
+-}
+-
+-module_init(rk30_temp_init);
+-module_exit(rk30_temp_exit);
+-
+diff --git a/drivers/adc/plat/rk30_tsadc.h b/drivers/adc/plat/rk30_tsadc.h
+deleted file mode 100755
+index eb52e51a0235..000000000000
+--- a/drivers/adc/plat/rk30_tsadc.h
++++ /dev/null
+@@ -1,80 +0,0 @@
+-/* drivers/adc/chips/rk29_adc.h
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- *
+-*/
+-
+-#ifndef __ASM_RK30_ADC_H
+-#define __ASM_RK30_ADC_H
+-
+-#define ADC_DATA		0x00
+-#define ADC_DATA_MASK		0x3ff
+-
+-#define ADC_STAS		0x04
+-#define ADC_STAS_BUSY		(1<<0)
+-
+-#define ADC_CTRL		0x08
+-#define ADC_CTRL_CH(ch)		(0x07 - ((ch)<<0))
+-#define ADC_CTRL_POWER_UP	(1<<3)
+-#define ADC_CTRL_START		(1<<4)
+-#define ADC_CTRL_IRQ_ENABLE	(1<<5)
+-#define ADC_CTRL_IRQ_STATUS	(1<<6)
+-
+-#define ADC_DLY_PU_SOC		0x0C 
+-
+-#define ADC_CLK_RATE		1  //1M
+-#define SAMPLE_RATE		(20/ADC_CLK_RATE)  //20 CLK
+-
+-struct tsadc_table
+-{
+-	int code;
+-	int temp;
+-};
+-
+-static struct tsadc_table table_code_to_temp[] =
+-{
+-	{3800, -40},
+-	{3792, -35},
+-	{3783, -30},
+-	{3774, -25},
+-	{3765, -20},
+-	{3756, -15},
+-	{3747, -10},
+-	{3737, -5},
+-	{3728, 0},
+-	{3718, 5},
+-	
+-	{3708, 10},
+-	{3698, 15},
+-	{3688, 20},
+-	{3678, 25},
+-	{3667, 30},
+-	{3656, 35},
+-	{3645, 40},
+-	{3634, 45},
+-	{3623, 50},
+-	{3611, 55},
+-	
+-	{3600, 60},
+-	{3588, 65},
+-	{3575, 70},
+-	{3563, 75},
+-	{3550, 80},
+-	{3537, 85},
+-	{3524, 90},
+-	{3510, 95},
+-	{3496, 100},
+-	{3482, 105},
+-	
+-	{3467, 110},
+-	{3452, 115},
+-	{3437, 120},
+-	{3421, 125},
+-
+-};
+-
+-
+-
+-#endif /* __ASM_RK30_ADC_H */
+-- 
+2.35.3
+

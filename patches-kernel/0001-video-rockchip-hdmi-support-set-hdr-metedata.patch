@@ -1,0 +1,304 @@
+From 03c69056bc8f287bd329e61016978c048af020f0 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Tue, 27 Dec 2016 11:53:14 +0800
+Subject: [PATCH] video: rockchip: hdmi: support set hdr metedata
+
+Use following command to set hdr metadata:
+
+cd /sys/class/display/HDMI
+echo "hdrmdata=1 2 3 4 5 6 7 8 9 10 11 12" > color
+
+Use following command to get current hdr metadata
+
+cat /sys/class/display/HDMI/color
+
+Change-Id: I81a5000801b558728689be912c1a642f3b237e65
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+(cherry picked from commit 09210b8aa1881935d31be8a4d9e2574a026512b3)
+---
+ .../video/rockchip/hdmi/rockchip-hdmi-core.c  | 63 +++++++++++++++----
+ .../video/rockchip/hdmi/rockchip-hdmi-sysfs.c | 29 ++++++++-
+ drivers/video/rockchip/hdmi/rockchip-hdmi.h   | 28 +++++----
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c | 15 +++--
+ 4 files changed, 104 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+index fcd6ae99f9f5..cf6933bc3fbc 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+@@ -200,19 +200,11 @@ static void hdmi_wq_set_video(struct hdmi *hdmi)
+ 		video->eotf = 0;
+ 	} else {
+ 		video->vic = hdmi->vic & HDMI_VIC_MASK;
+-		video->eotf = 0;
+-		if (hdmi->eotf) {
+-			if (hdmi->eotf & hdmi->edid.hdr.hdrinfo.eotf) {
+-				video->eotf = hdmi->eotf;
+-			} else {
+-				pr_err("sink eotf %x not support eotf %x\n",
+-				       hdmi->edid.hdr.hdrinfo.eotf,
+-				       hdmi->eotf);
+-				if (hdmi->edid.hdr.hdrinfo.eotf &
+-				    EOTF_TRADITIONAL_GMMA_SDR)
+-					video->eotf = EOTF_TRADITIONAL_GMMA_SDR;
+-			}
+-		}
++
++		if (hdmi->eotf & hdmi->edid.hdr.hdrinfo.eotf)
++			video->eotf = hdmi->eotf;
++		else
++			video->eotf = 0;
+ 		/* ST_2084 must be 10bit and bt2020 */
+ 		if (video->eotf & EOTF_ST_2084) {
+ 			if (deepcolor & HDMI_DEEP_COLOR_30BITS)
+@@ -236,6 +228,48 @@ static void hdmi_wq_set_video(struct hdmi *hdmi)
+ 		hdmi->ops->setvideo(hdmi, video);
+ }
+ 
++static void hdmi_wq_set_hdr(struct hdmi *hdmi)
++{
++	struct hdmi_video *video = &hdmi->video;
++	int deepcolor = 8;
++
++	if (hdmi->vic & HDMI_VIDEO_YUV420)
++		deepcolor = hdmi->edid.deepcolor_420;
++	else
++		deepcolor = hdmi->edid.deepcolor;
++
++	if ((hdmi->property->feature & SUPPORT_DEEP_10BIT) &&
++	    (deepcolor & HDMI_DEEP_COLOR_30BITS) &&
++	     hdmi->colordepth == 10)
++		deepcolor = 10;
++
++	if (deepcolor == video->color_output_depth &&
++	    hdmi->ops->sethdr && hdmi->ops->setavi &&
++	    hdmi->edid.sink_hdmi) {
++		if (hdmi->eotf & hdmi->edid.hdr.hdrinfo.eotf)
++			video->eotf = hdmi->eotf;
++		else
++			video->eotf = 0;
++
++		/* ST_2084 must be 10bit and bt2020 */
++		if (video->eotf & EOTF_ST_2084) {
++			if (video->color_output > HDMI_COLOR_RGB_16_235)
++				video->colorimetry =
++					HDMI_COLORIMETRY_EXTEND_BT_2020_YCC;
++			else
++				video->colorimetry =
++					HDMI_COLORIMETRY_EXTEND_BT_2020_RGB;
++		} else {
++			video->colorimetry = hdmi->colorimetry;
++		}
++		hdmi_set_lcdc(hdmi);
++		hdmi->ops->sethdr(hdmi, hdmi->eotf, &hdmi->hdr);
++		hdmi->ops->setavi(hdmi, video);
++	} else {
++		hdmi_submit_work(hdmi, HDMI_SET_COLOR, 0, 0);
++	}
++}
++
+ static void hdmi_wq_parse_edid(struct hdmi *hdmi)
+ {
+ 	struct hdmi_edid *pedid;
+@@ -531,6 +565,9 @@ static void hdmi_work_queue(struct work_struct *work)
+ 		hdmi_wq_set_audio(hdmi);
+ 		hdmi_wq_set_output(hdmi, hdmi->mute);
+ 		break;
++	case HDMI_SET_HDR:
++		hdmi_wq_set_hdr(hdmi);
++		break;
+ 	case HDMI_ENABLE_HDCP:
+ 		if (hdmi->hotplug == HDMI_HPD_ACTIVATED && hdmi->ops->hdcp_cb)
+ 			hdmi->ops->hdcp_cb(hdmi);
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+index 2f9147e461c8..b27f0712f486 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-sysfs.c
+@@ -225,6 +225,14 @@ static int hdmi_get_color(struct rk_display_device *device, char *buf)
+ 		      "Supported EOTF: 0x%x\n", hdmi->edid.hdr.hdrinfo.eotf);
+ 	i += snprintf(buf + i, PAGE_SIZE - i,
+ 		      "Current EOTF: 0x%x\n", hdmi->eotf);
++	i += snprintf(buf + i, PAGE_SIZE - i,
++		      "HDR MeteData: %d %d %d %d %d %d %d %d %d %d %d %d\n",
++		      hdmi->hdr.prim_x0, hdmi->hdr.prim_y0,
++		      hdmi->hdr.prim_x1, hdmi->hdr.prim_y1,
++		      hdmi->hdr.prim_x2, hdmi->hdr.prim_y2,
++		      hdmi->hdr.white_px, hdmi->hdr.white_py,
++		      hdmi->hdr.max_dml, hdmi->hdr.min_dml,
++		      hdmi->hdr.max_cll, hdmi->hdr.max_fall);
+ 	return i;
+ }
+ 
+@@ -253,6 +261,8 @@ static int hdmi_set_color(struct rk_display_device *device,
+ 			 hdmi->colordepth, value);
+ 		if (hdmi->colordepth != value)
+ 			hdmi->colordepth = value;
++		else
++			return 0;
+ 	} else if (!strncmp(buf, "colorimetry", 11)) {
+ 		if (sscanf(buf, "colorimetry=%d", &value) == -1)
+ 			return -1;
+@@ -260,6 +270,8 @@ static int hdmi_set_color(struct rk_display_device *device,
+ 			 hdmi->colorimetry, value);
+ 		if (hdmi->colorimetry != value)
+ 			hdmi->colorimetry = value;
++		else
++			return 0;
+ 	} else if (!strncmp(buf, "hdr", 3)) {
+ 		if (sscanf(buf, "hdr=%d", &value) == -1)
+ 			return -1;
+@@ -267,8 +279,23 @@ static int hdmi_set_color(struct rk_display_device *device,
+ 			hdmi->eotf, value);
+ 		if (hdmi->eotf != value &&
+ 		    (value & hdmi->edid.hdr.hdrinfo.eotf ||
+-		     value == 0))
++		     value == 0)) {
+ 			hdmi->eotf = value;
++			if (hdmi->hotplug == HDMI_HPD_ACTIVATED)
++				hdmi_submit_work(hdmi, HDMI_SET_HDR, 0, 0);
++		}
++		return 0;
++	} else if (!strncmp(buf, "hdrmdata", 8)) {
++		value = sscanf(buf,
++			       "hdrmdata=%u %u %u %u %u %u %u %u %u %u %u %u",
++			       &hdmi->hdr.prim_x0, &hdmi->hdr.prim_y0,
++			       &hdmi->hdr.prim_x1, &hdmi->hdr.prim_y1,
++			       &hdmi->hdr.prim_x2, &hdmi->hdr.prim_y2,
++			       &hdmi->hdr.white_px, &hdmi->hdr.white_py,
++			       &hdmi->hdr.max_dml, &hdmi->hdr.min_dml,
++			       &hdmi->hdr.max_cll, &hdmi->hdr.max_fall);
++		if (value == -1)
++			return -1;
+ 		else
+ 			return 0;
+ 	} else {
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi.h b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+index f44f336921d3..1e788b9dae3e 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+@@ -293,18 +293,18 @@ enum hdmi_hdr_eotf {
+ };
+ 
+ struct hdmi_hdr_metadata {
+-	u16	prim_x0;
+-	u16	prim_y0;
+-	u16	prim_x1;
+-	u16	prim_y1;
+-	u16	prim_x2;
+-	u16	prim_y2;
+-	u16	white_px;
+-	u16	white_py;
+-	u16	max_dml;
+-	u16	min_dml;
+-	u16	max_cll;		/*max content light level*/
+-	u16	max_fall;		/*max frame-average light level*/
++	u32	prim_x0;
++	u32	prim_y0;
++	u32	prim_x1;
++	u32	prim_y1;
++	u32	prim_x2;
++	u32	prim_y2;
++	u32	white_px;
++	u32	white_py;
++	u32	max_dml;
++	u32	min_dml;
++	u32	max_cll;		/*max content light level*/
++	u32	max_fall;		/*max frame-average light level*/
+ };
+ 
+ struct hdmi_hdr {
+@@ -406,6 +406,8 @@ struct hdmi_ops {
+ 	int (*setmute)(struct hdmi *, int);
+ 	int (*setvsi)(struct hdmi *, unsigned char, unsigned char);
+ 	int (*setcec)(struct hdmi *);
++	void (*sethdr)(struct hdmi *, int, struct hdmi_hdr_metadata *);
++	void (*setavi)(struct hdmi *, struct hdmi_video *);
+ 	/* call back for hdcp operatoion */
+ 	void (*hdcp_cb)(struct hdmi *);
+ 	void (*hdcp_auth2nd)(struct hdmi *);
+@@ -492,6 +494,7 @@ struct hdmi {
+ 	int vic;			/* HDMI output video information code*/
+ 	int mode_3d;			/* HDMI output video 3d mode*/
+ 	int eotf;			/* HDMI HDR EOTF */
++	struct hdmi_hdr_metadata hdr;	/* HDMI HDR MedeData */
+ 	struct hdmi_audio audio;	/* HDMI output audio information.*/
+ 	struct hdmi_video video;	/* HDMI output video information.*/
+ 	int xscale;
+@@ -556,6 +559,7 @@ struct hdmi {
+ #define HDMI_SET_COLOR			(HDMI_SYSFS_SRC		| 10)
+ #define HDMI_ENABLE_HDCP		(HDMI_SYSFS_SRC		| 11)
+ #define HDMI_HDCP_AUTH_2ND		(HDMI_IRQ_SRC		| 12)
++#define HDMI_SET_HDR			(HDMI_SYSFS_SRC		| 13)
+ 
+ #define HDMI_DEFAULT_SCALE		95
+ #define HDMI_AUTO_CONFIG		false
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index 81510d6a64e7..9fa812cd57f2 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -1483,9 +1483,10 @@ static int hdmi_dev_read_edid(struct hdmi *hdmi, int block, unsigned char *buff)
+ 	return ret;
+ }
+ 
+-static void hdmi_dev_config_avi(struct hdmi_dev *hdmi_dev,
++static void hdmi_dev_config_avi(struct hdmi *hdmi,
+ 				struct hdmi_video *vpara)
+ {
++	struct hdmi_dev *hdmi_dev = hdmi->property->priv;
+ 	unsigned char colorimetry, ext_colorimetry = 0, aspect_ratio, y1y0;
+ 	unsigned char rgb_quan_range = AVI_QUANTIZATION_RANGE_DEFAULT;
+ 
+@@ -1610,10 +1611,12 @@ static int hdmi_dev_config_vsi(struct hdmi *hdmi,
+ #define HDR_LSB(n) ((n) & 0xff)
+ #define HDR_MSB(n) (((n) & 0xff00) >> 8)
+ 
+-static void hdmi_dev_config_hdr(struct hdmi_dev *hdmi_dev,
++static void hdmi_dev_config_hdr(struct hdmi *hdmi,
+ 				int eotf,
+ 				struct hdmi_hdr_metadata *hdr)
+ {
++	struct hdmi_dev *hdmi_dev = hdmi->property->priv;
++
+ 	/* hdr is supportted after disignid = 0x21 */
+ 	if (!hdmi_dev || hdmi_readl(hdmi_dev, DESIGN_ID) < 0x21)
+ 		return;
+@@ -1776,7 +1779,7 @@ static int hdmi_dev_config_video(struct hdmi *hdmi, struct hdmi_video *vpara)
+ 		return -1;
+ 
+ 	if (vpara->sink_hdmi == OUTPUT_HDMI) {
+-		hdmi_dev_config_avi(hdmi_dev, vpara);
++		hdmi_dev_config_avi(hdmi, vpara);
+ 		hdmi_dev_config_spd(hdmi, hdmi_dev->vendor_name,
+ 				    hdmi_dev->product_name,
+ 				    hdmi_dev->deviceinfo);
+@@ -1796,7 +1799,7 @@ static int hdmi_dev_config_video(struct hdmi *hdmi, struct hdmi_video *vpara)
+ 					    vpara->vic,
+ 					    HDMI_VIDEO_FORMAT_NORMAL);
+ 		}
+-		hdmi_dev_config_hdr(hdmi_dev, vpara->eotf, NULL);
++		hdmi_dev_config_hdr(hdmi, vpara->eotf, &hdmi->hdr);
+ 		dev_info(hdmi->dev, "[%s] success output HDMI.\n", __func__);
+ 	} else {
+ 		dev_info(hdmi->dev, "[%s] success output DVI.\n", __func__);
+@@ -2092,7 +2095,7 @@ static int hdmi_dev_control_output(struct hdmi *hdmi, int enable)
+ 					     v_FC_CLR_AVMUTE(0));
+ 				vpara.vic = hdmi->vic;
+ 				vpara.color_output = HDMI_COLOR_RGB_0_255;
+-				hdmi_dev_config_avi(hdmi_dev, &vpara);
++				hdmi_dev_config_avi(hdmi, &vpara);
+ 				while ((!hdmi_readl(hdmi_dev, IH_FC_STAT1)) &
+ 				       m_AVI_INFOFRAME) {
+ 					usleep_range(900, 1000);
+@@ -2174,7 +2177,9 @@ void rockchip_hdmiv2_dev_init_ops(struct hdmi_ops *ops)
+ 		ops->setvideo	= hdmi_dev_config_video;
+ 		ops->setaudio	= hdmi_dev_config_audio;
+ 		ops->setmute	= hdmi_dev_control_output;
++		ops->setavi	= hdmi_dev_config_avi;
+ 		ops->setvsi	= hdmi_dev_config_vsi;
++		ops->sethdr	= hdmi_dev_config_hdr;
+ 	}
+ }
+ 
+-- 
+2.35.3
+

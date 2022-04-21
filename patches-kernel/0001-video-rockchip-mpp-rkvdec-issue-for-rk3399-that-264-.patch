@@ -1,0 +1,181 @@
+From bd1bd4072a4e550dccfa60ca59b3a59b59ad2eed Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Wed, 17 Jun 2020 16:59:58 +0800
+Subject: [PATCH] video: rockchip: mpp: rkvdec issue for rk3399 that 264 switch
+ vp9
+
+in rk3399 rkvdec, after 264 task run, 264 hardware may remain state,
+and it cannot clear completely. Case this, when last task is 264
+and current is vp9, vp9 affect decode error. Thus, it should reset
+hardware before task run, when 264 switch vp9.
+
+Change-Id: Ie038f9de8533d15cd828f5fdde7634f278fbd061
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c |  7 ++-
+ drivers/video/rockchip/mpp/mpp_common.h |  4 ++
+ drivers/video/rockchip/mpp/mpp_rkvdec.c | 59 ++++++++++++++++++++++++-
+ 3 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 734541329ab6..d63a5404f502 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -57,7 +57,6 @@ struct mpp_msg_v1 {
+ };
+ 
+ static void mpp_free_task(struct kref *ref);
+-static int mpp_dev_reset(struct mpp_dev *mpp);
+ 
+ /* task queue schedule */
+ static int
+@@ -181,7 +180,7 @@ mpp_taskqueue_trigger_work(struct mpp_taskqueue *queue,
+ 	return 0;
+ }
+ 
+-static int mpp_power_on(struct mpp_dev *mpp)
++int mpp_power_on(struct mpp_dev *mpp)
+ {
+ 	pm_runtime_get_sync(mpp->dev);
+ 	pm_stay_awake(mpp->dev);
+@@ -192,7 +191,7 @@ static int mpp_power_on(struct mpp_dev *mpp)
+ 	return 0;
+ }
+ 
+-static int mpp_power_off(struct mpp_dev *mpp)
++int mpp_power_off(struct mpp_dev *mpp)
+ {
+ 	if (mpp->hw_ops->power_off)
+ 		mpp->hw_ops->power_off(mpp);
+@@ -466,7 +465,7 @@ mpp_reset_control_get(struct mpp_dev *mpp, const char *name)
+ 	return NULL;
+ }
+ 
+-static int mpp_dev_reset(struct mpp_dev *mpp)
++int mpp_dev_reset(struct mpp_dev *mpp)
+ {
+ 	dev_info(mpp->dev, "resetting...\n");
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_common.h b/drivers/video/rockchip/mpp/mpp_common.h
+index c17e73e614fd..3f48d7290430 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.h
++++ b/drivers/video/rockchip/mpp/mpp_common.h
+@@ -419,6 +419,10 @@ int mpp_dev_probe(struct mpp_dev *mpp,
+ 		  struct platform_device *pdev);
+ int mpp_dev_remove(struct mpp_dev *mpp);
+ 
++int mpp_power_on(struct mpp_dev *mpp);
++int mpp_power_off(struct mpp_dev *mpp);
++int mpp_dev_reset(struct mpp_dev *mpp);
++
+ irqreturn_t mpp_dev_irq(int irq, void *param);
+ irqreturn_t mpp_dev_isr_sched(int irq, void *param);
+ 
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvdec.c b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+index 8399e56e2075..8f7ffb7b2b3e 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvdec.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvdec.c
+@@ -199,6 +199,9 @@ struct rkvdec_dev {
+ 	unsigned long aclk_devf;
+ 	unsigned long clk_core_devf;
+ 	unsigned long clk_cabac_devf;
++	/* record last infos */
++	u32 last_fmt;
++	bool had_reset;
+ };
+ 
+ /*
+@@ -852,6 +855,34 @@ static void *rkvdec_alloc_task(struct mpp_session *session,
+ 	return NULL;
+ }
+ 
++static void *rkvdec_prepare_with_reset(struct mpp_dev *mpp,
++				       struct mpp_task *mpp_task)
++{
++	struct mpp_task *out_task = NULL;
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++
++	mutex_lock(&mpp->queue->running_lock);
++	out_task = list_empty(&mpp->queue->running_list) ? mpp_task : NULL;
++	mutex_unlock(&mpp->queue->running_lock);
++
++	if (out_task && !dec->had_reset) {
++		struct rkvdec_task *task = to_rkvdec_task(out_task);
++		u32 fmt = RKVDEC_GET_FORMAT(task->reg[RKVDEC_REG_SYS_CTRL_INDEX]);
++
++		/* in 3399 3228 and 3229 chips, when 264 switch vp9,
++		 * hardware will timeout, and can't recover problem.
++		 * so reset it when 264 switch vp9, before hardware run.
++		 */
++		if (dec->last_fmt == RKVDEC_FMT_H264D && fmt == RKVDEC_FMT_VP9D) {
++			mpp_power_on(mpp);
++			mpp_dev_reset(mpp);
++			mpp_power_off(mpp);
++		}
++	}
++
++	return out_task;
++}
++
+ static int rkvdec_run(struct mpp_dev *mpp,
+ 		      struct mpp_task *mpp_task)
+ {
+@@ -1028,6 +1059,19 @@ static int rkvdec_finish(struct mpp_dev *mpp,
+ 	return 0;
+ }
+ 
++static int rkvdec_finish_with_record_info(struct mpp_dev *mpp,
++					  struct mpp_task *mpp_task)
++{
++	struct rkvdec_dev *dec = to_rkvdec_dev(mpp);
++	struct rkvdec_task *task = to_rkvdec_task(mpp_task);
++
++	rkvdec_finish(mpp, mpp_task);
++	dec->last_fmt = RKVDEC_GET_FORMAT(task->reg[RKVDEC_REG_SYS_CTRL_INDEX]);
++	dec->had_reset = (atomic_read(&mpp->reset_request) > 0) ? true : false;
++
++	return 0;
++}
++
+ static int rkvdec_result(struct mpp_dev *mpp,
+ 			 struct mpp_task *mpp_task,
+ 			 struct mpp_task_msgs *msgs)
+@@ -1588,7 +1632,7 @@ static struct mpp_hw_ops rkvdec_3399_hw_ops = {
+ 	.get_freq = rkvdec_get_freq,
+ 	.set_freq = rkvdec_set_freq,
+ 	.reduce_freq = rkvdec_reduce_freq,
+-	.reset = rkvdec_sip_reset,
++	.reset = rkvdec_reset,
+ };
+ 
+ static struct mpp_hw_ops rkvdec_3368_hw_ops = {
+@@ -1632,6 +1676,17 @@ static struct mpp_dev_ops rkvdec_3328_dev_ops = {
+ 	.free_task = rkvdec_free_task,
+ };
+ 
++static struct mpp_dev_ops rkvdec_3399_dev_ops = {
++	.alloc_task = rkvdec_alloc_task,
++	.prepare = rkvdec_prepare_with_reset,
++	.run = rkvdec_run,
++	.irq = rkvdec_irq,
++	.isr = rkvdec_isr,
++	.finish = rkvdec_finish_with_record_info,
++	.result = rkvdec_result,
++	.free_task = rkvdec_free_task,
++};
++
+ static const struct mpp_dev_var rk_hevcdec_data = {
+ 	.device_type = MPP_DEVICE_HEVC_DEC,
+ 	.hw_info = &rk_hevcdec_hw_info,
+@@ -1669,7 +1724,7 @@ static const struct mpp_dev_var rkvdec_3399_data = {
+ 	.hw_info = &rkvdec_v1_hw_info,
+ 	.trans_info = rkvdec_v1_trans,
+ 	.hw_ops = &rkvdec_3399_hw_ops,
+-	.dev_ops = &rkvdec_v1_dev_ops,
++	.dev_ops = &rkvdec_3399_dev_ops,
+ };
+ 
+ static const struct mpp_dev_var rkvdec_3328_data = {
+-- 
+2.35.3
+

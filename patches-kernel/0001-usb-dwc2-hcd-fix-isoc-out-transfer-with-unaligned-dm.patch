@@ -1,0 +1,135 @@
+From 86d92b45248721b4ef37e740ebef8dcdbcf38d91 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Sun, 26 Apr 2020 17:30:44 +0800
+Subject: [PATCH] usb: dwc2: hcd: fix isoc out transfer with unaligned dma
+ address
+
+This DWC2 driver has handled the unaligned DMA address problem
+for urb->transfer_buffer and split in transfer. But it still
+has problem to handle the isoc out transfer with unaligned DMA
+address.
+
+I test an USB Audio device which supports 24bits 96KHz 3LE format:
+
+usb 1-1: new full-speed USB device number 2 using dwc2
+usb 1-1: New USB device found, idVendor=21b4, idProduct=0083, bcdDevice= 1.06
+usb 1-1: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+usb 1-1: Product: AudioQuest DragonFly Black v1.5
+usb 1-1: Manufacturer: AudioQuest
+usb 1-1: SerialNumber: AQDFBL0100023815
+
+When play 24bits 96KHz WAV file, noise occurs.
+
+The rootcause is that the DWC2 controller use internal DMA to
+transfer USB audio data, and the DMA address of data buffer must
+be 4 bytes aligned, otherwise, the dwc2 will fail to transfer the
+data. In this test case, the USB audio may transfer 572 bytes or
+582 bytes in one usb transaction. And one URB contains multiple
+usb transactions, if the DWC2 transfer the 582 Bytes in the middle
+of the URB, the DMA address will not be 4 bytes aligned.
+
+This patch allocates new aligned buf for isoc out transfer with
+unaligned DMA address.
+
+For isoc split out transfer, this patch sets the start schedule at
+the 2 * DWC2_SLICES_PER_UFRAME to transfer the SSPLIT-begin OUT
+transaction like EHCI controller. Without this patch, the SSPLIT-begin
+OUT transaction starts in the seventh microframe, and this makes the
+USB HUB unhappy. This patch sets the the SSPLIT-begin OUT transaction
+starts in the first microframe.
+
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+Change-Id: I251ccf804e062312f9bd348552493f3bab504beb
+---
+ drivers/usb/dwc2/hcd.c       | 31 +++++++++++++++++++++++--------
+ drivers/usb/dwc2/hcd_queue.c |  8 +++++++-
+ 2 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 2b543c8a76ef..7e1e366dc56e 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -2648,10 +2648,13 @@ static void dwc2_hc_init_xfer(struct dwc2_hsotg *hsotg,
+ 	}
+ }
+ 
+-static int dwc2_alloc_split_dma_aligned_buf(struct dwc2_hsotg *hsotg,
+-					    struct dwc2_qh *qh,
+-					    struct dwc2_host_chan *chan)
++static int dwc2_alloc_qh_dma_aligned_buf(struct dwc2_hsotg *hsotg,
++					 struct dwc2_qh *qh,
++					 struct dwc2_qtd *qtd,
++					 struct dwc2_host_chan *chan)
+ {
++	u32 offset;
++
+ 	if (!hsotg->unaligned_cache ||
+ 	    chan->max_packet > DWC2_KMEM_UNALIGNED_BUF_SIZE)
+ 		return -ENOMEM;
+@@ -2663,6 +2666,18 @@ static int dwc2_alloc_split_dma_aligned_buf(struct dwc2_hsotg *hsotg,
+ 			return -ENOMEM;
+ 	}
+ 
++	if (!chan->ep_is_in) {
++		if (qh->do_split) {
++			offset = chan->xfer_dma - qtd->urb->dma;
++			memcpy(qh->dw_align_buf, (u8 *)qtd->urb->buf + offset,
++			       (chan->xfer_len > 188 ? 188 : chan->xfer_len));
++		} else {
++			offset = chan->xfer_dma - qtd->urb->dma;
++			memcpy(qh->dw_align_buf, (u8 *)qtd->urb->buf + offset,
++			       chan->xfer_len);
++		}
++	}
++
+ 	qh->dw_align_buf_dma = dma_map_single(hsotg->dev, qh->dw_align_buf,
+ 					      DWC2_KMEM_UNALIGNED_BUF_SIZE,
+ 					      DMA_FROM_DEVICE);
+@@ -2867,10 +2882,10 @@ static int dwc2_assign_and_init_hc(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
+ 	dwc2_hc_init_xfer(hsotg, chan, qtd);
+ 
+ 	/* For non-dword aligned buffers */
+-	if (hsotg->params.host_dma && qh->do_split &&
+-	    chan->ep_is_in && (chan->xfer_dma & 0x3)) {
++	if (hsotg->params.host_dma && (chan->xfer_dma & 0x3) &&
++	    chan->ep_type == USB_ENDPOINT_XFER_ISOC) {
+ 		dev_vdbg(hsotg->dev, "Non-aligned buffer\n");
+-		if (dwc2_alloc_split_dma_aligned_buf(hsotg, qh, chan)) {
++		if (dwc2_alloc_qh_dma_aligned_buf(hsotg, qh, qtd, chan)) {
+ 			dev_err(hsotg->dev,
+ 				"Failed to allocate memory to handle non-aligned buffer\n");
+ 			/* Add channel back to free list */
+@@ -2884,8 +2899,8 @@ static int dwc2_assign_and_init_hc(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
+ 		}
+ 	} else {
+ 		/*
+-		 * We assume that DMA is always aligned in non-split
+-		 * case or split out case. Warn if not.
++		 * We assume that DMA is always aligned in other case,
++		 * Warn if not.
+ 		 */
+ 		WARN_ON_ONCE(hsotg->params.host_dma &&
+ 			     (chan->xfer_dma & 0x3));
+diff --git a/drivers/usb/dwc2/hcd_queue.c b/drivers/usb/dwc2/hcd_queue.c
+index 68bbac64b753..9d2b92a3721b 100644
+--- a/drivers/usb/dwc2/hcd_queue.c
++++ b/drivers/usb/dwc2/hcd_queue.c
+@@ -730,8 +730,14 @@ static int dwc2_uframe_schedule_split(struct dwc2_hsotg *hsotg,
+ 	 * Note that this will tend to front-load the high speed schedule.
+ 	 * We may eventually want to try to avoid this by either considering
+ 	 * both schedules together or doing some sort of round robin.
++	 *
++	 * For isoc split out, start schedule at the 2 * DWC2_SLICES_PER_UFRAME
++	 * to transfer SSPLIT-begin OUT transaction like EHCI controller.
+ 	 */
+-	ls_search_slice = 0;
++	if (qh->ep_type == USB_ENDPOINT_XFER_ISOC && !qh->ep_is_in)
++		ls_search_slice = 2 * DWC2_SLICES_PER_UFRAME;
++	else
++		ls_search_slice = 0;
+ 
+ 	while (ls_search_slice < DWC2_LS_SCHEDULE_SLICES) {
+ 		int start_s_uframe;
+-- 
+2.35.3
+

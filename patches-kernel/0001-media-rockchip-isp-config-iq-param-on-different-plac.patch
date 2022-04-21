@@ -1,0 +1,605 @@
+From 7c60625d66171ea6df7cd72b05b990196d60bcd4 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Fri, 10 Apr 2020 12:45:44 +0800
+Subject: [PATCH] media: rockchip: isp: config iq param on different place
+
+rdbk mode:
+1. config iq param effecting immediately before each stream start;
+2. config iq param effecting on next frame at last v start of current frame;
+
+other mode:
+1. config iq param on each frame end;
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: I10178c2f62fe6792b359434324e16e307cdf7620
+---
+ drivers/media/platform/rockchip/isp/csi.c     |   6 +
+ .../media/platform/rockchip/isp/isp_params.c  |  23 +-
+ .../media/platform/rockchip/isp/isp_params.h  |  25 +-
+ .../platform/rockchip/isp/isp_params_v1x.c    |   4 +-
+ .../platform/rockchip/isp/isp_params_v2x.c    | 247 +++++++++++-------
+ .../platform/rockchip/isp/isp_params_v2x.h    |   4 +-
+ drivers/media/platform/rockchip/isp/rkisp.c   |   4 +-
+ include/uapi/linux/rkisp2-config.h            |   1 +
+ 8 files changed, 206 insertions(+), 108 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index f828bc1cfbde..226831419836 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -436,6 +436,8 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ {
+ 	struct rkisp_device *dev = csi->ispdev;
+ 	void __iomem *addr = dev->base_addr + CSI2RX_CTRL0;
++	struct rkisp_isp_params_vdev *params_vdev = &dev->params_vdev;
++	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev);
+ 
+ 	if (dma2frm > 2)
+ 		dma2frm = 2;
+@@ -451,6 +453,10 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	default://other no support readback
+ 		return;
+ 	}
++
++	/* configure hdr params in rdbk mode */
++	rkisp_params_cfg(params_vdev, cur_frame_id, dma2frm + 1);
++
+ 	/* not using isp V_START irq to generate sof event */
+ 	csi->filt_state[CSI_F_VS] = dma2frm + 1;
+ 	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
+diff --git a/drivers/media/platform/rockchip/isp/isp_params.c b/drivers/media/platform/rockchip/isp/isp_params.c
+index bc336878c345..695528125e74 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params.c
++++ b/drivers/media/platform/rockchip/isp/isp_params.c
+@@ -178,6 +178,12 @@ static void rkisp_params_vb2_stop_streaming(struct vb2_queue *vq)
+ 		buf = NULL;
+ 	}
+ 
++	if (params_vdev->cur_buf) {
++		buf = params_vdev->cur_buf;
++		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
++		params_vdev->cur_buf = NULL;
++	}
++
+ 	/* clean module params */
+ 	params_vdev->ops->clear_first_param(params_vdev);
+ }
+@@ -189,6 +195,7 @@ rkisp_params_vb2_start_streaming(struct vb2_queue *queue, unsigned int count)
+ 	unsigned long flags;
+ 
+ 	params_vdev->hdrtmo_en = false;
++	params_vdev->cur_buf = NULL;
+ 	spin_lock_irqsave(&params_vdev->config_lock, flags);
+ 	params_vdev->streamon = true;
+ 	spin_unlock_irqrestore(&params_vdev->config_lock, flags);
+@@ -282,6 +289,14 @@ static void rkisp_uninit_params_vdev(struct rkisp_isp_params_vdev *params_vdev)
+ 		rkisp_uninit_params_vdev_v2x(params_vdev);
+ }
+ 
++void rkisp_params_cfg(struct rkisp_isp_params_vdev *params_vdev,
++		      u32 frame_id, u32 rdbk_times)
++{
++	if (params_vdev->ops->param_cfg)
++		params_vdev->ops->param_cfg(params_vdev, frame_id,
++					    rdbk_times, RKISP_PARAMS_IMD);
++}
++
+ void rkisp_params_isr(struct rkisp_isp_params_vdev *params_vdev,
+ 		      u32 isp_mis)
+ {
+@@ -289,14 +304,14 @@ void rkisp_params_isr(struct rkisp_isp_params_vdev *params_vdev,
+ }
+ 
+ /* Not called when the camera active, thus not isr protection. */
+-void rkisp_params_configure_isp(struct rkisp_isp_params_vdev *params_vdev,
+-				struct ispsd_in_fmt *in_fmt,
+-				enum v4l2_quantization quantization)
++void rkisp_params_first_cfg(struct rkisp_isp_params_vdev *params_vdev,
++			    struct ispsd_in_fmt *in_fmt,
++			    enum v4l2_quantization quantization)
+ {
+ 	params_vdev->quantization = quantization;
+ 	params_vdev->raw_type = in_fmt->bayer_pat;
+ 	params_vdev->in_mbus_code = in_fmt->mbus_code;
+-	params_vdev->ops->config_isp(params_vdev);
++	params_vdev->ops->first_cfg(params_vdev);
+ }
+ 
+ /* Not called when the camera active, thus not isr protection. */
+diff --git a/drivers/media/platform/rockchip/isp/isp_params.h b/drivers/media/platform/rockchip/isp/isp_params.h
+index 0deaa609b355..7b2eec8b9578 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params.h
++++ b/drivers/media/platform/rockchip/isp/isp_params.h
+@@ -8,15 +8,22 @@
+ #include <linux/rk-preisp.h>
+ #include "common.h"
+ 
++enum rkisp_params_type {
++	RKISP_PARAMS_ALL,
++	RKISP_PARAMS_IMD,
++	RKISP_PARAMS_SHD,
++};
++
+ struct rkisp_isp_params_vdev;
+ struct rkisp_isp_params_ops {
+ 	void (*save_first_param)(struct rkisp_isp_params_vdev *params_vdev, void *param);
+ 	void (*clear_first_param)(struct rkisp_isp_params_vdev *params_vdev);
+ 	void (*get_param_size)(struct rkisp_isp_params_vdev *params_vdev, unsigned int sizes[]);
+-	void (*config_isp)(struct rkisp_isp_params_vdev *params_vdev);
++	void (*first_cfg)(struct rkisp_isp_params_vdev *params_vdev);
+ 	void (*disable_isp)(struct rkisp_isp_params_vdev *params_vdev);
+-	void (*isr_hdl)(struct rkisp_isp_params_vdev *params_vdev,
+-			u32 isp_mis);
++	void (*isr_hdl)(struct rkisp_isp_params_vdev *params_vdev, u32 isp_mis);
++	void (*param_cfg)(struct rkisp_isp_params_vdev *params_vdev, u32 frame_id,
++			  u32 rdbk_times, enum rkisp_params_type type);
+ };
+ 
+ /*
+@@ -50,12 +57,15 @@ struct rkisp_isp_params_vdev {
+ 	void *priv_ops;
+ 	void *priv_cfg;
+ 	void *priv_val;
++
++	struct rkisp_buffer *cur_buf;
++	u32 rdbk_times;
+ };
+ 
+ /* config params before ISP streaming */
+-void rkisp_params_configure_isp(struct rkisp_isp_params_vdev *params_vdev,
+-				struct ispsd_in_fmt *in_fmt,
+-				enum v4l2_quantization quantization);
++void rkisp_params_first_cfg(struct rkisp_isp_params_vdev *params_vdev,
++			    struct ispsd_in_fmt *in_fmt,
++			    enum v4l2_quantization quantization);
+ void rkisp_params_disable_isp(struct rkisp_isp_params_vdev *params_vdev);
+ 
+ int rkisp_register_params_vdev(struct rkisp_isp_params_vdev *params_vdev,
+@@ -66,4 +76,7 @@ void rkisp_unregister_params_vdev(struct rkisp_isp_params_vdev *params_vdev);
+ 
+ void rkisp_params_isr(struct rkisp_isp_params_vdev *params_vdev, u32 isp_mis);
+ 
++void rkisp_params_cfg(struct rkisp_isp_params_vdev *params_vdev,
++		      u32 frame_id, u32 rdbk_times);
++
+ #endif /* _RKISP_ISP_PARAM_H */
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v1x.c b/drivers/media/platform/rockchip/isp/isp_params_v1x.c
+index 9ce356dd28c2..17cdfb0bd630 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v1x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v1x.c
+@@ -2181,7 +2181,7 @@ static const struct cifisp_afc_config afc_params_default_config = {
+ };
+ 
+ /* Not called when the camera active, thus not isr protection. */
+-static void rkisp1_params_configure_isp_v1x(struct rkisp_isp_params_vdev *params_vdev)
++static void rkisp1_params_first_cfg_v1x(struct rkisp_isp_params_vdev *params_vdev)
+ {
+ 	struct rkisp_isp_params_v1x_ops *ops =
+ 		(struct rkisp_isp_params_v1x_ops *)params_vdev->priv_ops;
+@@ -2349,7 +2349,7 @@ static struct rkisp_isp_params_ops rkisp_isp_params_ops_tbl = {
+ 	.save_first_param = rkisp1_save_first_param_v1x,
+ 	.clear_first_param = rkisp1_clear_first_param_v1x,
+ 	.get_param_size = rkisp1_get_param_size_v1x,
+-	.config_isp = rkisp1_params_configure_isp_v1x,
++	.first_cfg = rkisp1_params_first_cfg_v1x,
+ 	.disable_isp = rkisp1_params_disable_isp_v1x,
+ 	.isr_hdl = rkisp1_params_isr_v1x,
+ };
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.c b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+index 384365eebd51..e89000d8144c 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.c
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.c
+@@ -2909,32 +2909,36 @@ isp_rawhst3_enable(struct rkisp_isp_params_vdev *params_vdev,
+ 
+ static void
+ isp_hdrmge_config(struct rkisp_isp_params_vdev *params_vdev,
+-		  const struct isp2x_hdrmge_cfg *arg)
++		  const struct isp2x_hdrmge_cfg *arg, enum rkisp_params_type type)
+ {
+ 	u32 value;
+ 	int i;
+ 
+-	value = ISP2X_PACK_2SHORT(arg->gain0, arg->gain0_inv);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN0);
++	if (type == RKISP_PARAMS_SHD || type == RKISP_PARAMS_ALL) {
++		value = ISP2X_PACK_2SHORT(arg->gain0, arg->gain0_inv);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN0);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->gain1, arg->gain1_inv);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN1);
++		value = ISP2X_PACK_2SHORT(arg->gain1, arg->gain1_inv);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN1);
+ 
+-	value = arg->gain2;
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN2);
++		value = arg->gain2;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_GAIN2);
++	}
+ 
+-	value = ISP2X_PACK_4BYTE(arg->ms_dif_0p8, arg->ms_diff_0p15,
+-				 arg->lm_dif_0p9, arg->lm_dif_0p15);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_CONS_DIFF);
++	if (type == RKISP_PARAMS_IMD || type == RKISP_PARAMS_ALL) {
++		value = ISP2X_PACK_4BYTE(arg->ms_dif_0p8, arg->ms_diff_0p15,
++					 arg->lm_dif_0p9, arg->lm_dif_0p15);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_CONS_DIFF);
+ 
+-	for (i = 0; i < ISP2X_HDRMGE_L_CURVE_NUM; i++) {
+-		value = ISP2X_PACK_2SHORT(arg->curve.curve_0[i], arg->curve.curve_1[i]);
+-		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_DIFF_Y0 + 4 * i);
+-	}
++		for (i = 0; i < ISP2X_HDRMGE_L_CURVE_NUM; i++) {
++			value = ISP2X_PACK_2SHORT(arg->curve.curve_0[i], arg->curve.curve_1[i]);
++			rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_DIFF_Y0 + 4 * i);
++		}
+ 
+-	for (i = 0; i < ISP2X_HDRMGE_E_CURVE_NUM; i++) {
+-		value = arg->e_y[i];
+-		rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_OVER_Y0 + 4 * i);
++		for (i = 0; i < ISP2X_HDRMGE_E_CURVE_NUM; i++) {
++			value = arg->e_y[i];
++			rkisp_iowrite32(params_vdev, value, ISP_HDRMGE_OVER_Y0 + 4 * i);
++		}
+ 	}
+ }
+ 
+@@ -3016,77 +3020,94 @@ isp_rawnr_enable(struct rkisp_isp_params_vdev *params_vdev,
+ 
+ static void
+ isp_hdrtmo_config(struct rkisp_isp_params_vdev *params_vdev,
+-		  const struct isp2x_hdrtmo_cfg *arg)
++		  const struct isp2x_hdrtmo_cfg *arg, enum rkisp_params_type type)
+ {
+ 	u8 big_en, nobig_en;
+ 	u32 value;
+ 
+-	big_en = arg->big_en & 0x01;
+-	nobig_en = arg->nobig_en & 0x01;
+-	if (isp_param_get_insize(params_vdev) > ISP2X_NOBIG_OVERFLOW_SIZE) {
+-		big_en = 1;
+-		nobig_en = 0;
++	if (type == RKISP_PARAMS_SHD || type == RKISP_PARAMS_ALL) {
++		value = rkisp_ioread32(params_vdev, ISP_HDRTMO_CTRL_CFG);
++		value &= 0xff;
++		value |= (arg->expl_lgratio & 0xFFFF) << 16 |
++			 (arg->lgscl_ratio & 0xFF) << 8;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CTRL_CFG);
++
++		value = ISP2X_PACK_2SHORT(arg->lgscl, arg->lgscl_inv);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_SCL);
+ 	}
+ 
+-	value = rkisp_ioread32(params_vdev, ISP_HDRTMO_CTRL);
+-	value &= ISP_HDRTMO_EN;
+-	value |= (arg->cnt_vsize & 0x1FFF) << 16 |
+-		 (arg->gain_ld_off2 & 0x0F) << 12 |
+-		 (arg->gain_ld_off1 & 0x0F) << 8 |
+-		 (big_en & 0x01) << 5 |
+-		 (nobig_en & 0x01) << 4 |
+-		 (arg->newhst_en & 0x01) << 2 |
+-		 (arg->cnt_mode & 0x01) << 1;
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CTRL);
+-
+-	value = (arg->expl_lgratio & 0xFFFF) << 16 |
+-		(arg->lgscl_ratio & 0xFF) << 8 |
+-		(arg->cfg_alpha & 0xFF);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CTRL_CFG);
++	if (type == RKISP_PARAMS_IMD || type == RKISP_PARAMS_ALL) {
++		big_en = arg->big_en & 0x01;
++		nobig_en = arg->nobig_en & 0x01;
++		if (isp_param_get_insize(params_vdev) > ISP2X_NOBIG_OVERFLOW_SIZE) {
++			big_en = 1;
++			nobig_en = 0;
++		}
+ 
+-	value = ISP2X_PACK_2SHORT(arg->set_palpha, arg->set_gainoff);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG0);
++		value = rkisp_ioread32(params_vdev, ISP_HDRTMO_CTRL);
++		value &= ISP_HDRTMO_EN;
++		value |= (arg->cnt_vsize & 0x1FFF) << 16 |
++			 (arg->gain_ld_off2 & 0x0F) << 12 |
++			 (arg->gain_ld_off1 & 0x0F) << 8 |
++			 (big_en & 0x01) << 5 |
++			 (nobig_en & 0x01) << 4 |
++			 (arg->newhst_en & 0x01) << 2 |
++			 (arg->cnt_mode & 0x01) << 1;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CTRL);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->set_lgmin, arg->set_lgmax);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG1);
++		/*
++		 * expl_lgratio/lgscl_ratio will reconfigure in vs
++		 * when rx perform 'back read' for the last time.
++		 *
++		 * expl_lgratio[31:16] is fixed at 0x0 and
++		 * lgscl_ratio[15:8] is fixed at 0x80
++		 * during rx perform 'back read', so set value to 0x8000.
++		 */
++		value = 0x8000;
++		value |= arg->cfg_alpha & 0xFF;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CTRL_CFG);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->set_lgmean, arg->set_weightkey);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG2);
++		value = ISP2X_PACK_2SHORT(arg->set_palpha, arg->set_gainoff);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG0);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->set_lgrange0, arg->set_lgrange1);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG3);
++		value = ISP2X_PACK_2SHORT(arg->set_lgmin, arg->set_lgmax);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG1);
+ 
+-	value = arg->set_lgavgmax;
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG4);
++		value = ISP2X_PACK_2SHORT(arg->set_lgmean, arg->set_weightkey);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG2);
+ 
+-	value = (arg->clipgap1_i & 0x0F) << 28 |
+-		(arg->clipgap0_i & 0x0F) << 24 |
+-		(arg->clipratio1 & 0xFF) << 16 |
+-		(arg->clipratio0 & 0xFF) << 8 |
+-		(arg->ratiol & 0xFF);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CLIPRATIO);
++		value = ISP2X_PACK_2SHORT(arg->set_lgrange0, arg->set_lgrange1);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG3);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->lgscl, arg->lgscl_inv);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_SCL);
++		value = arg->set_lgavgmax;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_CFG4);
+ 
+-	value = arg->lgmax;
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_MAX);
++		value = (arg->clipgap1_i & 0x0F) << 28 |
++			(arg->clipgap0_i & 0x0F) << 24 |
++			(arg->clipratio1 & 0xFF) << 16 |
++			(arg->clipratio0 & 0xFF) << 8 |
++			(arg->ratiol & 0xFF);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_CLIPRATIO);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->hist_min, arg->hist_low);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_HIST_LOW);
++		value = arg->lgmax;
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_LG_MAX);
+ 
+-	value = (arg->hist_shift & 0x07) << 28 |
+-		(arg->hist_0p3 & 0x07FF) << 16 |
+-		(arg->hist_high & 0x3FFF);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_HIST_HIGH);
++		value = ISP2X_PACK_2SHORT(arg->hist_min, arg->hist_low);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_HIST_LOW);
+ 
+-	value = (arg->palpha_lwscl & 0x3F) << 26 |
+-		(arg->palpha_lw0p5 & 0x03FF) << 16 |
+-		(arg->palpha_0p18 & 0x03FF);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_PALPHA);
++		value = (arg->hist_shift & 0x07) << 28 |
++			(arg->hist_0p3 & 0x07FF) << 16 |
++			(arg->hist_high & 0x3FFF);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_HIST_HIGH);
+ 
+-	value = ISP2X_PACK_2SHORT(arg->maxpalpha, arg->maxgain);
+-	rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_MAXGAIN);
++		value = (arg->palpha_lwscl & 0x3F) << 26 |
++			(arg->palpha_lw0p5 & 0x03FF) << 16 |
++			(arg->palpha_0p18 & 0x03FF);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_PALPHA);
++
++		value = ISP2X_PACK_2SHORT(arg->maxpalpha, arg->maxgain);
++		rkisp_iowrite32(params_vdev, value, ISP_HDRTMO_MAXGAIN);
++	}
+ }
+ 
+ static void
+@@ -3536,7 +3557,7 @@ struct rkisp_isp_params_v2x_ops rkisp_v2x_isp_params_ops = {
+ 
+ static __maybe_unused
+ void __isp_isr_other_config(struct rkisp_isp_params_vdev *params_vdev,
+-			    const struct isp2x_isp_params_cfg *new_params)
++			    const struct isp2x_isp_params_cfg *new_params, enum rkisp_params_type type)
+ {
+ 	u64 module_en_update, module_cfg_update, module_ens;
+ 	struct rkisp_isp_params_v2x_ops *ops =
+@@ -3688,7 +3709,7 @@ void __isp_isr_other_config(struct rkisp_isp_params_vdev *params_vdev,
+ 	    (module_cfg_update & ISP2X_MODULE_HDRMGE)) {
+ 		if ((module_cfg_update & ISP2X_MODULE_HDRMGE))
+ 			ops->hdrmge_config(params_vdev,
+-				&new_params->others.hdrmge_cfg);
++				&new_params->others.hdrmge_cfg, type);
+ 
+ 		if (module_en_update & ISP2X_MODULE_HDRMGE) {
+ 			ops->hdrmge_enable(params_vdev,
+@@ -3712,7 +3733,7 @@ void __isp_isr_other_config(struct rkisp_isp_params_vdev *params_vdev,
+ 	    (module_cfg_update & ISP2X_MODULE_HDRTMO)) {
+ 		if ((module_cfg_update & ISP2X_MODULE_HDRTMO))
+ 			ops->hdrtmo_config(params_vdev,
+-				&new_params->others.hdrtmo_cfg);
++				&new_params->others.hdrtmo_cfg, type);
+ 
+ 		if (module_en_update & ISP2X_MODULE_HDRTMO) {
+ 			ops->hdrtmo_enable(params_vdev,
+@@ -3781,7 +3802,7 @@ void __isp_isr_other_config(struct rkisp_isp_params_vdev *params_vdev,
+ 
+ static __maybe_unused
+ void __isp_isr_meas_config(struct rkisp_isp_params_vdev *params_vdev,
+-			   struct isp2x_isp_params_cfg *new_params)
++			   struct isp2x_isp_params_cfg *new_params, enum rkisp_params_type type)
+ {
+ 	u64 module_en_update, module_cfg_update, module_ens;
+ 	struct rkisp_isp_params_v2x_ops *ops =
+@@ -3954,7 +3975,7 @@ void __preisp_isr_update_hdrae_para(struct rkisp_isp_params_vdev *params_vdev,
+ 
+ /* Not called when the camera active, thus not isr protection. */
+ static void
+-rkisp_params_configure_isp_v2x(struct rkisp_isp_params_vdev *params_vdev)
++rkisp_params_first_cfg_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ {
+ 	struct device *dev = params_vdev->dev->dev;
+ 	struct rkisp_isp_params_v2x_ops *ops =
+@@ -3979,8 +4000,8 @@ rkisp_params_configure_isp_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ 	priv_val->tmo_en = 0;
+ 	priv_val->lsc_en = 0;
+ 	priv_val->mge_en = 0;
+-	__isp_isr_other_config(params_vdev, &params_vdev->isp2x_params);
+-	__isp_isr_meas_config(params_vdev, &params_vdev->isp2x_params);
++	__isp_isr_other_config(params_vdev, &params_vdev->isp2x_params, RKISP_PARAMS_ALL);
++	__isp_isr_meas_config(params_vdev, &params_vdev->isp2x_params, RKISP_PARAMS_ALL);
+ 	__preisp_isr_update_hdrae_para(params_vdev, &params_vdev->isp2x_params);
+ 	spin_unlock(&params_vdev->config_lock);
+ }
+@@ -4069,46 +4090,88 @@ rkisp_params_disable_isp_v2x(struct rkisp_isp_params_vdev *params_vdev)
+ }
+ 
+ static void
+-rkisp_params_isr_v2x(struct rkisp_isp_params_vdev *params_vdev,
+-		     u32 isp_mis)
++rkisp_params_cfg_v2x(struct rkisp_isp_params_vdev *params_vdev,
++		     u32 frame_id, u32 rdbk_times, enum rkisp_params_type type)
+ {
+-	struct isp2x_isp_params_cfg *new_params;
+-	struct rkisp_buffer *cur_buf = NULL;
+-	u32 cur_frame_id = rkisp_dmarx_get_frame_id(params_vdev->dev);
++	struct isp2x_isp_params_cfg *new_params = NULL;
++	struct rkisp_buffer *cur_buf = params_vdev->cur_buf;
++	struct rkisp_device *dev = params_vdev->dev;
+ 
+ 	spin_lock(&params_vdev->config_lock);
+ 	if (!params_vdev->streamon)
+ 		goto unlock;
+ 
+-	/* get one empty buffer */
+-	if (!list_empty(&params_vdev->params))
++	/* get buffer by frame_id */
++	while (!list_empty(&params_vdev->params) && !cur_buf) {
+ 		cur_buf = list_first_entry(&params_vdev->params,
+-					   struct rkisp_buffer, queue);
++				struct rkisp_buffer, queue);
++
++		if (!IS_HDR_RDBK(dev->hdr.op_mode))
++			break;
++
++		new_params = (struct isp2x_isp_params_cfg *)(cur_buf->vaddr[0]);
++		if (new_params->frame_id < frame_id) {
++			list_del(&cur_buf->queue);
++			vb2_buffer_done(&cur_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
++			cur_buf = NULL;
++			continue;
++		} else if (new_params->frame_id == frame_id) {
++			list_del(&cur_buf->queue);
++		} else {
++			cur_buf = NULL;
++		}
++		break;
++	}
++
+ 	if (!cur_buf)
+ 		goto unlock;
+ 
+ 	new_params = (struct isp2x_isp_params_cfg *)(cur_buf->vaddr[0]);
+-	if (isp_mis & CIF_ISP_FRAME) {
+-		list_del(&cur_buf->queue);
+-
+-		__isp_isr_other_config(params_vdev, new_params);
+-		__isp_isr_meas_config(params_vdev, new_params);
++	__isp_isr_other_config(params_vdev, new_params, type);
++	__isp_isr_meas_config(params_vdev, new_params, type);
+ 
+-		cur_buf->vb.sequence = cur_frame_id;
++	if (type != RKISP_PARAMS_IMD) {
+ 		vb2_buffer_done(&cur_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
++		cur_buf = NULL;
++	} else {
++		params_vdev->rdbk_times = rdbk_times;
+ 	}
+ 
+ unlock:
++	params_vdev->cur_buf = cur_buf;
+ 	spin_unlock(&params_vdev->config_lock);
+ }
+ 
++static void
++rkisp_params_isr_v2x(struct rkisp_isp_params_vdev *params_vdev,
++		     u32 isp_mis)
++{
++	struct rkisp_device *dev = params_vdev->dev;
++	u32 cur_frame_id = rkisp_dmarx_get_frame_id(dev);
++
++	if (isp_mis & CIF_ISP_V_START) {
++		if (!params_vdev->cur_buf)
++			return;
++
++		params_vdev->rdbk_times--;
++		if (IS_HDR_RDBK(dev->hdr.op_mode) && !params_vdev->rdbk_times) {
++			rkisp_params_cfg_v2x(params_vdev, cur_frame_id, 0, RKISP_PARAMS_SHD);
++			return;
++		}
++	}
++
++	if ((isp_mis & CIF_ISP_FRAME) && !IS_HDR_RDBK(dev->hdr.op_mode))
++		rkisp_params_cfg_v2x(params_vdev, cur_frame_id, 0, RKISP_PARAMS_ALL);
++}
++
+ static struct rkisp_isp_params_ops rkisp_isp_params_ops_tbl = {
+ 	.save_first_param = rkisp_save_first_param_v2x,
+ 	.clear_first_param = rkisp_clear_first_param_v2x,
+ 	.get_param_size = rkisp_get_param_size_v2x,
+-	.config_isp = rkisp_params_configure_isp_v2x,
++	.first_cfg = rkisp_params_first_cfg_v2x,
+ 	.disable_isp = rkisp_params_disable_isp_v2x,
+ 	.isr_hdl = rkisp_params_isr_v2x,
++	.param_cfg = rkisp_params_cfg_v2x,
+ };
+ 
+ void rkisp_init_params_vdev_v2x(struct rkisp_isp_params_vdev *params_vdev)
+diff --git a/drivers/media/platform/rockchip/isp/isp_params_v2x.h b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+index 1f5f392bfc1e..7ca025f3c911 100644
+--- a/drivers/media/platform/rockchip/isp/isp_params_v2x.h
++++ b/drivers/media/platform/rockchip/isp/isp_params_v2x.h
+@@ -286,7 +286,7 @@ struct rkisp_isp_params_v2x_ops {
+ 	void (*rawhst3_enable)(struct rkisp_isp_params_vdev *params_vdev,
+ 			       bool en);
+ 	void (*hdrmge_config)(struct rkisp_isp_params_vdev *params_vdev,
+-			      const struct isp2x_hdrmge_cfg *arg);
++			      const struct isp2x_hdrmge_cfg *arg, enum rkisp_params_type type);
+ 	void (*hdrmge_enable)(struct rkisp_isp_params_vdev *params_vdev,
+ 			      bool en);
+ 	void (*rawnr_config)(struct rkisp_isp_params_vdev *params_vdev,
+@@ -294,7 +294,7 @@ struct rkisp_isp_params_v2x_ops {
+ 	void (*rawnr_enable)(struct rkisp_isp_params_vdev *params_vdev,
+ 			     bool en);
+ 	void (*hdrtmo_config)(struct rkisp_isp_params_vdev *params_vdev,
+-			      const struct isp2x_hdrtmo_cfg *arg);
++			      const struct isp2x_hdrtmo_cfg *arg, enum rkisp_params_type type);
+ 	void (*hdrtmo_enable)(struct rkisp_isp_params_vdev *params_vdev,
+ 			      bool en);
+ 	void (*gic_config)(struct rkisp_isp_params_vdev *params_vdev,
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 2571af816070..5b715520e63b 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -626,8 +626,8 @@ static int rkisp_config_isp(struct rkisp_device *dev)
+ 	if (out_fmt->fmt_type == FMT_BAYER)
+ 		rkisp_params_disable_isp(&dev->params_vdev);
+ 	else
+-		rkisp_params_configure_isp(&dev->params_vdev, in_fmt,
+-					   dev->isp_sdev.quantization);
++		rkisp_params_first_cfg(&dev->params_vdev, in_fmt,
++				       dev->isp_sdev.quantization);
+ 
+ 	return 0;
+ }
+diff --git a/include/uapi/linux/rkisp2-config.h b/include/uapi/linux/rkisp2-config.h
+index 92158b625aa3..2c084180b16c 100644
+--- a/include/uapi/linux/rkisp2-config.h
++++ b/include/uapi/linux/rkisp2-config.h
+@@ -1382,6 +1382,7 @@ struct isp2x_isp_params_cfg {
+ 	u64 module_ens;
+ 	u64 module_cfg_update;
+ 
++	u32 frame_id;
+ 	struct isp2x_isp_meas_cfg meas;
+ 	struct isp2x_isp_other_cfg others;	// must be last item
+ } __attribute__ ((packed));
+-- 
+2.35.3
+

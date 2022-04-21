@@ -1,0 +1,625 @@
+From e74d506f57baa8ae1752aa6f26c30feec4f16eac Mon Sep 17 00:00:00 2001
+From: chenzhi <cz@rock-chips.com>
+Date: Tue, 25 Mar 2014 14:33:45 +0800
+Subject: [PATCH] ethernet: gmac with rgmii interface works
+
+---
+ arch/arm/boot/dts/rk3288-tb.dts               |   6 +
+ arch/arm/boot/dts/rk3288.dtsi                 |   6 +-
+ drivers/net/ethernet/rockchip/gmac/Makefile   |   2 +-
+ .../ethernet/rockchip/gmac/rk_gmac_phy_ctl.c  | 197 ----------------
+ drivers/net/ethernet/rockchip/gmac/stmmac.h   |  14 +-
+ .../net/ethernet/rockchip/gmac/stmmac_main.c  |  26 ++-
+ .../ethernet/rockchip/gmac/stmmac_platform.c  | 213 +++++++++++++++++-
+ 7 files changed, 238 insertions(+), 226 deletions(-)
+ delete mode 100755 drivers/net/ethernet/rockchip/gmac/rk_gmac_phy_ctl.c
+
+diff --git a/arch/arm/boot/dts/rk3288-tb.dts b/arch/arm/boot/dts/rk3288-tb.dts
+index 137058d921a6..2530a5063d39 100755
+--- a/arch/arm/boot/dts/rk3288-tb.dts
++++ b/arch/arm/boot/dts/rk3288-tb.dts
+@@ -161,7 +161,13 @@
+ 			};
+ 		};
+ 	};
++};
+ 
++&gmac {
++//	power_ctl_by = "gpio";	//"gpio" "pmu"
++	power-gpio = <&gpio0 GPIO_A6 GPIO_ACTIVE_HIGH>;
++//	power-pmu = "act_ldo"
++	reset-gpio = <&gpio4 GPIO_A7 GPIO_ACTIVE_HIGH>;
+ };
+ 
+ &pinctrl {
+diff --git a/arch/arm/boot/dts/rk3288.dtsi b/arch/arm/boot/dts/rk3288.dtsi
+index 150f6f318f76..05ceb3ebf923 100755
+--- a/arch/arm/boot/dts/rk3288.dtsi
++++ b/arch/arm/boot/dts/rk3288.dtsi
+@@ -490,7 +490,7 @@
+ 			<&clk_vepu 300000000>, <&clk_vdpu 300000000>,
+ 			<&clk_edp 200000000>, <&clk_isp 200000000>,
+ 			<&clk_isp_jpe 400000000>, <&clk_tsp 80000000>,
+-			<&clk_tspout 80000000>, <&clk_mac 50000000>;
++			<&clk_tspout 80000000>, <&clk_mac 125000000>;
+ 	};
+ 
+ 	i2c0: i2c@ff650000 {
+@@ -947,8 +947,8 @@
+ 		reg = <0xff290000 0x10000>;
+ 		interrupts = <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH>;  /*irq=59*/
+ 		interrupt-names = "macirq";
+-		phy-mode = "rmii";
+-		//phy-mode = "gmii";
++		//phy-mode = "rmii";
++		phy-mode = "rgmii";
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&mac_clk &mac_txpins &mac_rxpins &mac_mdpins>;
+ 	};
+diff --git a/drivers/net/ethernet/rockchip/gmac/Makefile b/drivers/net/ethernet/rockchip/gmac/Makefile
+index ce1099b142b5..7abf9db73cc2 100755
+--- a/drivers/net/ethernet/rockchip/gmac/Makefile
++++ b/drivers/net/ethernet/rockchip/gmac/Makefile
+@@ -1,4 +1,4 @@
+-obj-$(CONFIG_RK_GMAC_ETH) += stmmac.o rk_gmac_phy_ctl.o
++obj-$(CONFIG_RK_GMAC_ETH) += stmmac.o
+ stmmac-$(CONFIG_RK_GMAC_ETH) += stmmac_platform.o
+ stmmac-$(CONFIG_STMMAC_PCI) += stmmac_pci.o
+ stmmac-objs:= stmmac_main.o stmmac_ethtool.o stmmac_mdio.o ring_mode.o	\
+diff --git a/drivers/net/ethernet/rockchip/gmac/rk_gmac_phy_ctl.c b/drivers/net/ethernet/rockchip/gmac/rk_gmac_phy_ctl.c
+deleted file mode 100755
+index 7b83533cbb7b..000000000000
+--- a/drivers/net/ethernet/rockchip/gmac/rk_gmac_phy_ctl.c
++++ /dev/null
+@@ -1,197 +0,0 @@
+-
+-#include <linux/clk.h>
+-#include <linux/crc32.h>
+-#include <linux/delay.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/etherdevice.h>
+-#include <linux/init.h>
+-#include <linux/io.h>
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/moduleparam.h>
+-#include <linux/netdevice.h>
+-#include <linux/phy.h>
+-#include <linux/platform_device.h>
+-#include <linux/slab.h>
+-#include <linux/types.h>
+-#include <linux/wakelock.h>
+-#include <linux/version.h>
+-#include <linux/gpio.h>
+-#include <linux/of_gpio.h>
+-#include <asm/irq.h>
+-#include <linux/interrupt.h>
+-#include <linux/completion.h>
+-
+-#include <linux/rockchip/iomap.h>
+-#include <linux/rockchip/grf.h>
+-
+-#include "stmmac.h"
+-
+-
+-struct gmac_phy_data {
+-	int power_io;
+-	int power_io_enable;
+-};
+-struct gmac_phy_data g_gmac_phy_data;
+-
+-#define grf_readl(offset)	readl_relaxed(RK_GRF_VIRT + offset)
+-#define grf_writel(v, offset)	do { writel_relaxed(v, RK_GRF_VIRT + offset); dsb(); } while (0)
+-
+-// RK3288_GRF_SOC_CON1
+-#define GMAC_PHY_INTF_SEL_RGMII ((0x01C0 << 16) | (0x0040))
+-#define GMAC_PHY_INTF_SEL_RMII  ((0x01C0 << 16) | (0x0100))
+-#define GMAC_FLOW_CTRL          ((0x0200 << 16) | (0x0200))
+-#define GMAC_FLOW_CTRL_CLR      ((0x0200 << 16) | (0x0000))
+-#define GMAC_SPEED_10M          ((0x0400 << 16) | (0x0400))
+-#define GMAC_SPEED_100M         ((0x0400 << 16) | (0x0000))
+-#define GMAC_RMII_CLK_25M       ((0x0800 << 16) | (0x0800))
+-#define GMAC_RMII_CLK_2_5M      ((0x0800 << 16) | (0x0000))
+-#define GMAC_CLK_125M           ((0x3000 << 16) | (0x0000))
+-#define GMAC_CLK_25M            ((0x3000 << 16) | (0x3000))
+-#define GMAC_CLK_2_5M           ((0x3000 << 16) | (0x2000))
+-#define GMAC_RMII_MODE          ((0x4000 << 16) | (0x4000))
+-
+-// RK3288_GRF_SOC_CON3
+-#define GMAC_CLK_TX_DL_CFG(val) ((0x007F << 16) | (val))           // 7bit
+-#define GMAC_CLK_RX_DL_CFG(val) ((0x007F << 16) | (val<<7))        // 7bit
+-#define GMAC_TXCLK_DLY_ENABLE   ((0x4000 << 16) | (0x4000)) 
+-#define GMAC_TXCLK_DLY_DISABLE  ((0x4000 << 16) | (0x0000))
+-#define GMAC_RXCLK_DLY_ENABLE   ((0x8000 << 16) | (0x8000)) 
+-#define GMAC_RXCLK_DLY_DISABLE  ((0x8000 << 16) | (0x0000)) 
+-
+-static int rk_gmac_register_init(void)
+-{
+-	printk("enter %s \n",__func__);
+-	
+-	//select rmii
+-	grf_writel(GMAC_PHY_INTF_SEL_RMII, RK3288_GRF_SOC_CON1);
+-
+-	return 0;
+-}
+-
+-static int rk_gmac_power_control(int enable)
+-{
+-	struct gmac_phy_data *pdata = &g_gmac_phy_data;
+-	
+-	printk("enter %s ,enable = %d \n",__func__,enable);
+-	if (enable) {
+-		if (gpio_is_valid(pdata->power_io)) {
+-			gpio_direction_output(pdata->power_io, pdata->power_io_enable);
+-			gpio_set_value(pdata->power_io, pdata->power_io_enable);
+-		}	
+-	}else {
+-		if (gpio_is_valid(pdata->power_io)) {
+-			gpio_direction_output(pdata->power_io, !pdata->power_io_enable);
+-			gpio_set_value(pdata->power_io, !pdata->power_io_enable);
+-		}
+-	}
+-	return 0;
+-}
+-
+-static int rk_gmac_io_init(struct device *device)
+-{
+-	printk("enter %s \n",__func__);
+-
+-	// iomux
+-	
+-	// clock enable
+-	
+-	// phy power on
+-	rk_gmac_power_control(1);
+-
+-	return 0;
+-}
+-
+-static int rk_gmac_io_deinit(struct device *device)
+-{
+-	printk("enter %s \n",__func__);
+-	
+-	// clock disable
+-	
+-	// phy power down
+-	rk_gmac_power_control(0);
+-	
+-	return 0;
+-}
+-
+-static int rk_gmac_speed_switch(int speed)
+-{
+-	printk("%s: speed = %d\n", __func__, speed);
+-
+-	return 0;
+-}
+-
+-struct rk_gmac_platform_data rk_board_gmac_data = {
+-	.gmac_register_init = rk_gmac_register_init,
+-	.gmac_io_init = rk_gmac_io_init,
+-	.gmac_io_deinit = rk_gmac_io_deinit,
+-	.gmac_speed_switch = rk_gmac_speed_switch,
+-};
+-
+-static int gmac_phy_probe(struct platform_device *pdev)
+-{
+-	struct gmac_phy_data *pdata = pdev->dev.platform_data;
+-	enum of_gpio_flags flags;
+-	int ret = 0, err;
+-	struct device_node *node = pdev->dev.of_node;
+-
+-    printk("enter %s \n",__func__);
+-	if (!pdata) {
+-		pdata = &g_gmac_phy_data;
+-
+-		pdata->power_io = of_get_named_gpio_flags(node, "power-gpios", 0, &flags);
+-		if (!gpio_is_valid(pdata->power_io)) {
+-			printk("%s: Get power-gpios failed.\n", __func__);
+-			return -EINVAL;
+-		}
+-		
+-		if(flags & OF_GPIO_ACTIVE_LOW)
+-			pdata->power_io_enable = 0;
+-		else
+-			pdata->power_io_enable = 1;
+-	}
+-	
+-	// disable power
+-	/*err = gpio_request(pdata->power_io, "gmac_phy_power");
+-	if (err) {
+-		printk("%s: Request gmac phy power pin failed.\n", __func__);
+-		return -EINVAL;
+-	}*/	
+-	
+-	gpio_direction_output(pdata->power_io, !pdata->power_io_enable);
+-	gpio_set_value(pdata->power_io, !pdata->power_io_enable);
+-
+-	return ret;
+-}
+-
+-static int gmac_phy_remove(struct platform_device *pdev)
+-{
+-	struct gmac_phy_data *pdata = pdev->dev.platform_data;
+-	
+-	printk("enter %s \n",__func__);
+-	if (gpio_is_valid(pdata->power_io))
+-		gpio_free(pdata->power_io);
+-		
+-	return 0;
+-}
+-
+-static struct of_device_id gmac_phy_of_match[] = {
+-	{ .compatible = "rockchip,gmac-phy" },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(of, gmac_phy_of_match);
+-
+-static struct platform_driver gmac_phy_driver = {
+-	.driver		= {
+-		.name		= "rockchip,gmac-phy",
+-		.owner		= THIS_MODULE,
+-		.of_match_table	= of_match_ptr(gmac_phy_of_match),
+-	},
+-	.probe		= gmac_phy_probe,
+-	.remove		= gmac_phy_remove,
+-};
+-
+-module_platform_driver(gmac_phy_driver);
+-
+-MODULE_DESCRIPTION("GMAC PHY Power Driver");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac.h b/drivers/net/ethernet/rockchip/gmac/stmmac.h
+index e0914aa19899..d536f96caed5 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac.h
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac.h
+@@ -107,18 +107,16 @@ struct stmmac_priv {
+ 	u32 adv_ts;
+ 	int use_riwt;
+ 	spinlock_t ptp_lock;
+-	struct rk_gmac_platform_data *rk_pdata;
+ };
+ 
+-struct rk_gmac_platform_data {
+-    int (*gmac_register_init)(void);
+-    int (*gmac_io_init)(struct device *device);
+-    int (*gmac_io_deinit)(struct device *device);
+-    int(*gmac_speed_switch)(int speed);
++struct bsp_priv {
++	char pwr_ctl_by[8];
++	int power_io;
++	int reset_io;
++	int phy_iface;
++	int (*phy_power_on)(struct plat_stmmacenet_data *plat, int enable);
+ };
+ 
+-extern struct rk_gmac_platform_data rk_board_gmac_data;
+-
+ extern int phyaddr;
+ 
+ extern int stmmac_mdio_unregister(struct net_device *ndev);
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac_main.c b/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
+index 24b0d07aa2e7..15482c498239 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac_main.c
+@@ -248,10 +248,6 @@ static inline void stmmac_hw_fix_mac_speed(struct stmmac_priv *priv)
+ 
+ 	if (likely(priv->plat->fix_mac_speed))
+ 		priv->plat->fix_mac_speed(priv->plat->bsp_priv, phydev->speed);
+-
+-	if (priv->rk_pdata->gmac_speed_switch) {
+-		priv->rk_pdata->gmac_speed_switch(phydev->speed);
+-	}
+ }
+ 
+ /**
+@@ -1575,13 +1571,16 @@ static int stmmac_open(struct net_device *dev)
+ 
+ 	clk_prepare_enable(priv->stmmac_clk);
+ 
+-	if (priv->rk_pdata->gmac_io_init) {
+-		priv->rk_pdata->gmac_io_init(priv->device);
++	if ((priv->plat) && (priv->plat->bsp_priv)) {
++		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
++		if ((bsp_priv) && (bsp_priv->phy_power_on)) {
++			bsp_priv->phy_power_on(priv->plat, 1);
++		}
+ 	}
+ 
+ 	stmmac_check_ether_addr(priv);
+ 
+-	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
++	if (priv->pcs != STMMAC_PCS_SGMII && priv->pcs != STMMAC_PCS_TBI &&
+ 	    priv->pcs != STMMAC_PCS_RTBI) {
+ 		ret = stmmac_init_phy(dev);
+ 		if (ret) {
+@@ -1767,8 +1766,11 @@ static int stmmac_release(struct net_device *dev)
+ 
+ 	stmmac_release_ptp(priv);
+ 
+-	if (priv->rk_pdata->gmac_io_deinit) {
+-		priv->rk_pdata->gmac_io_deinit(priv->device);
++	if ((priv->plat) && (priv->plat->bsp_priv)) {
++		struct bsp_priv * bsp_priv = priv->plat->bsp_priv;
++		if ((bsp_priv) && (bsp_priv->phy_power_on)) {
++			bsp_priv->phy_power_on(priv->plat, 0);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -2715,7 +2717,7 @@ struct stmmac_priv *stmmac_dvr_probe(struct device *device,
+ 		goto error_netdev_register;
+ 	}
+ 
+-	priv->stmmac_clk = clk_get(priv->device, STMMAC_RESOURCE_NAME);
++	priv->stmmac_clk = clk_get(priv->device, "clk_mac"/*STMMAC_RESOURCE_NAME*/);
+ 	if (IS_ERR(priv->stmmac_clk)) {
+ 		pr_warn("%s: warning: cannot get CSR clock\n", __func__);
+ 		goto error_clk_get;
+@@ -2734,7 +2736,7 @@ struct stmmac_priv *stmmac_dvr_probe(struct device *device,
+ 
+ 	stmmac_check_pcs_mode(priv);
+ 
+-	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
++	if (priv->pcs != STMMAC_PCS_SGMII && priv->pcs != STMMAC_PCS_TBI &&
+ 	    priv->pcs != STMMAC_PCS_RTBI) {
+ 		/* MDIO bus Registration */
+ 		ret = stmmac_mdio_register(ndev);
+@@ -2775,7 +2777,7 @@ int stmmac_dvr_remove(struct net_device *ndev)
+ 	priv->hw->dma->stop_tx(priv->ioaddr);
+ 
+ 	stmmac_set_mac(priv->ioaddr, false);
+-	if (priv->pcs != STMMAC_PCS_RGMII && priv->pcs != STMMAC_PCS_TBI &&
++	if (priv->pcs != STMMAC_PCS_SGMII && priv->pcs != STMMAC_PCS_TBI &&
+ 	    priv->pcs != STMMAC_PCS_RTBI)
+ 		stmmac_mdio_unregister(ndev);
+ 	netif_carrier_off(ndev);
+diff --git a/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c b/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
+index 48c69791b0bd..9c1e4f7da906 100755
+--- a/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
++++ b/drivers/net/ethernet/rockchip/gmac/stmmac_platform.c
+@@ -26,7 +26,201 @@
+ #include <linux/io.h>
+ #include <linux/of.h>
+ #include <linux/of_net.h>
++#include <linux/gpio.h>
++#include <linux/of_gpio.h>
+ #include "stmmac.h"
++#include <linux/rockchip/iomap.h>
++#include <linux/rockchip/grf.h>
++
++#define grf_readl(offset)	readl_relaxed(RK_GRF_VIRT + offset)
++#define grf_writel(v, offset)	do { writel_relaxed(v, RK_GRF_VIRT + offset); dsb(); } while (0)
++
++// RK3288_GRF_SOC_CON1
++#define GMAC_PHY_INTF_SEL_RGMII ((0x01C0 << 16) | (0x0040))
++#define GMAC_PHY_INTF_SEL_RMII  ((0x01C0 << 16) | (0x0100))
++#define GMAC_FLOW_CTRL          ((0x0200 << 16) | (0x0200))
++#define GMAC_FLOW_CTRL_CLR      ((0x0200 << 16) | (0x0000))
++#define GMAC_SPEED_10M          ((0x0400 << 16) | (0x0400))
++#define GMAC_SPEED_100M         ((0x0400 << 16) | (0x0000))
++#define GMAC_RMII_CLK_25M       ((0x0800 << 16) | (0x0800))
++#define GMAC_RMII_CLK_2_5M      ((0x0800 << 16) | (0x0000))
++#define GMAC_CLK_125M           ((0x3000 << 16) | (0x0000))
++#define GMAC_CLK_25M            ((0x3000 << 16) | (0x3000))
++#define GMAC_CLK_2_5M           ((0x3000 << 16) | (0x2000))
++#define GMAC_RMII_MODE          ((0x4000 << 16) | (0x4000))
++#define GMAC_RMII_MODE_CLR      ((0x4000 << 16) | (0x0000))
++
++// RK3288_GRF_SOC_CON3
++#define GMAC_TXCLK_DLY_ENABLE   ((0x4000 << 16) | (0x4000))
++#define GMAC_TXCLK_DLY_DISABLE  ((0x4000 << 16) | (0x0000))
++#define GMAC_RXCLK_DLY_ENABLE   ((0x8000 << 16) | (0x8000))
++#define GMAC_RXCLK_DLY_DISABLE  ((0x8000 << 16) | (0x0000))
++#if 0
++#define GMAC_CLK_RX_DL_CFG	((0x3F80 << 16) | (0x0800))
++#define GMAC_CLK_TX_DL_CFG	((0x007F << 16) | (0x0040))
++#else
++#define GMAC_CLK_RX_DL_CFG(val) ((0x3F80 << 16) | (val<<7))        // 7bit
++#define GMAC_CLK_TX_DL_CFG(val) ((0x007F << 16) | (val))           // 7bit
++#endif
++struct bsp_priv g_bsp_priv;
++
++static int phy_power_on(struct plat_stmmacenet_data *plat, int enable)
++{
++	struct bsp_priv * bsp_priv;
++
++	printk("enter %s ,enable = %d \n",__func__,enable);
++
++	if ((plat) && (plat->bsp_priv)) {
++		bsp_priv = plat->bsp_priv;
++	} else {
++		printk("ERROR: platform data or private data is NULL. %s\n", __FUNCTION__);
++		return -1;
++	}
++
++	if (enable) {
++		//power on
++		if (gpio_is_valid(bsp_priv->power_io)) {
++			gpio_direction_output(bsp_priv->power_io, 0);
++			gpio_set_value(bsp_priv->power_io, 1);
++		}
++
++		//reset
++		if (gpio_is_valid(bsp_priv->reset_io)) {
++			gpio_direction_output(bsp_priv->reset_io, 0);
++			gpio_set_value(bsp_priv->reset_io, 0);
++			msleep(10);
++			gpio_set_value(bsp_priv->reset_io, 1);
++		}
++	} else {
++		//power off
++		if (gpio_is_valid(bsp_priv->power_io)) {
++			gpio_direction_output(bsp_priv->power_io, 0);
++			gpio_set_value(bsp_priv->power_io, 0);
++		}
++	}
++
++	return 0;
++}
++
++int stmmc_pltfr_init(struct platform_device *pdev) {
++	struct pinctrl_state *gmac_state;
++	int phy_iface;
++	int err;
++
++	printk("enter func %s...\n", __func__);
++
++//iomux
++#if 0
++	if ((pdev->dev.pins) && (pdev->dev.pins->p)) {
++		gmac_state = pinctrl_lookup_state(pdev->dev.pins->p, "default");
++		if (IS_ERR(gmac_state)) {
++				dev_err(&pdev->dev, "no gmc pinctrl state\n");
++				return -1;
++		}
++
++		pinctrl_select_state(pdev->dev.pins->p, gmac_state);
++	}
++#endif
++
++	struct bsp_priv * bsp_priv = &g_bsp_priv;
++	phy_iface = bsp_priv->phy_iface;
++//power
++	if (!gpio_is_valid(bsp_priv->power_io)) {
++		printk("%s: ERROR: Get power-gpio failed.\n", __func__);
++		//return -EINVAL;
++	}
++
++	err = gpio_request(bsp_priv->power_io, "gmac_phy_power");
++	if (err) {
++		printk("%s: ERROR: Request gmac phy power pin failed.\n", __func__);
++		//return -EINVAL;
++	}
++
++	if (!gpio_is_valid(bsp_priv->reset_io)) {
++		printk("%s: ERROR: Get reset-gpio failed.\n", __func__);
++		//return -EINVAL;
++	}
++
++	err = gpio_request(bsp_priv->reset_io, "gmac_phy_reset");
++	if (err) {
++		printk("%s: ERROR: Request gmac phy reset pin failed.\n", __func__);
++		//return -EINVAL;
++	}
++
++//rmii or rgmii
++	if (phy_iface & PHY_INTERFACE_MODE_RGMII) {
++		printk("init for RGMII\n");
++		grf_writel(GMAC_PHY_INTF_SEL_RGMII, RK3288_GRF_SOC_CON1);
++		grf_writel(GMAC_RMII_MODE_CLR, RK3288_GRF_SOC_CON1);
++		grf_writel(GMAC_RXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);
++		grf_writel(GMAC_TXCLK_DLY_ENABLE, RK3288_GRF_SOC_CON3);
++		grf_writel(GMAC_CLK_RX_DL_CFG(0x10), RK3288_GRF_SOC_CON3);
++		grf_writel(GMAC_CLK_TX_DL_CFG(0x40), RK3288_GRF_SOC_CON3);
++	} else if (phy_iface & PHY_INTERFACE_MODE_RMII) {
++		printk("init for RMII\n");
++		grf_writel(GMAC_PHY_INTF_SEL_RMII, RK3288_GRF_SOC_CON1);
++		grf_writel(GMAC_RMII_MODE, RK3288_GRF_SOC_CON1);
++	} else {
++		printk("ERROR: NO interface defined!\n");
++	}
++
++	return 0;
++}
++
++void * stmmc_pltfr_fix_mac_speed(void *priv, unsigned int speed){
++	printk("enter func %s...\n", __func__);
++	struct bsp_priv * bsp_priv = priv;
++	int interface;
++
++	printk("fix speed to %d\n", speed);
++
++	if (bsp_priv) {
++		interface = bsp_priv->phy_iface;
++	}
++
++	if (interface & PHY_INTERFACE_MODE_RGMII) {
++		printk("fix speed for RGMII\n");
++
++		switch (speed) {
++			case 10: {
++				grf_writel(GMAC_CLK_2_5M, RK3288_GRF_SOC_CON1);
++				break;
++			}
++			case 100: {
++				grf_writel(GMAC_CLK_25M, RK3288_GRF_SOC_CON1);
++				break;
++			}
++			case 1000: {
++				grf_writel(GMAC_CLK_125M, RK3288_GRF_SOC_CON1);
++				break;
++			}
++			default: {
++				printk("ERROR: speed %d is not defined!\n");
++			}
++		}
++
++	} else if (interface & PHY_INTERFACE_MODE_RMII) {
++		printk("fix speed for RMII\n");
++		switch (speed) {
++			case 10: {
++				grf_writel(GMAC_RMII_CLK_2_5M, RK3288_GRF_SOC_CON1);
++				break;
++			}
++			case 100: {
++				grf_writel(GMAC_RMII_CLK_25M, RK3288_GRF_SOC_CON1);
++				break;
++			}
++			default: {
++				printk("ERROR: speed %d is not defined!\n");
++			}
++		}
++	} else {
++		printk("ERROR: NO interface defined!\n");
++	}
++
++	return NULL;
++}
++
+ 
+ #ifdef CONFIG_OF
+ static int stmmac_probe_config_dt(struct platform_device *pdev,
+@@ -34,6 +228,7 @@ static int stmmac_probe_config_dt(struct platform_device *pdev,
+ 				  const char **mac)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
++	enum of_gpio_flags flags;
+ 
+ 	if (!np)
+ 		return -ENODEV;
+@@ -44,6 +239,19 @@ static int stmmac_probe_config_dt(struct platform_device *pdev,
+ 					   sizeof(struct stmmac_mdio_bus_data),
+ 					   GFP_KERNEL);
+ 
++	plat->init = stmmc_pltfr_init;
++	plat->fix_mac_speed = stmmc_pltfr_fix_mac_speed;
++
++	g_bsp_priv.reset_io = 
++			of_get_named_gpio_flags(np, "reset-gpio", 0, &flags);
++	g_bsp_priv.power_io = 
++			of_get_named_gpio_flags(np, "power-gpio", 0, &flags);
++
++	g_bsp_priv.phy_iface = plat->interface;
++	g_bsp_priv.phy_power_on = phy_power_on;
++
++	plat->bsp_priv = &g_bsp_priv;
++
+ 	/*
+ 	 * Currently only the properties needed on SPEAr600
+ 	 * are provided. All other properties should be added
+@@ -149,11 +357,6 @@ static int stmmac_pltfr_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, priv->dev);
+ 
+-	priv->rk_pdata = &rk_board_gmac_data;
+-	if (priv->rk_pdata->gmac_register_init) {
+-		priv->rk_pdata->gmac_register_init();
+-	}
+-
+ 	pr_debug("STMMAC platform driver registration completed");
+ 
+ 	return 0;
+-- 
+2.35.3
+

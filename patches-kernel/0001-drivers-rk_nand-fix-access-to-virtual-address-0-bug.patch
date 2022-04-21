@@ -1,0 +1,161 @@
+From 060a7cf7a7989933873ba8037a6e32f383ecbefd Mon Sep 17 00:00:00 2001
+From: Yifeng Zhao <zyf@rock-chips.com>
+Date: Tue, 22 Oct 2019 10:11:14 +0800
+Subject: [PATCH] drivers: rk_nand: fix access to virtual address 0 bug
+
+The write or read request buffers may or may not be a highmem
+page highmem or not allocated page, so the page->virtual will be
+NULL, kmap it always need.
+
+BUG:
+[   25.928352] Unable to handle kernel paging request at virtual address 0
+[   31.721348] pgd = a13fe17e
+[   31.724062] [0] *pgd=00000000
+[   31.727651] Internal error: Oops: 5 [#1] PREEMPT SMP ARM
+[   31.732966] Modules linked in:
+
+Change-Id: Icdbb052bb488ecc10be1c8a8b0ca954f65c17474
+Signed-off-by: Yifeng Zhao <zyf@rock-chips.com>
+---
+ drivers/rk_nand/rk_nand_blk.c | 72 +++++++++++++++++++----------------
+ 1 file changed, 39 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/rk_nand/rk_nand_blk.c b/drivers/rk_nand/rk_nand_blk.c
+index eab565d53fab..78d4fb26537d 100644
+--- a/drivers/rk_nand/rk_nand_blk.c
++++ b/drivers/rk_nand/rk_nand_blk.c
+@@ -207,7 +207,13 @@ static int req_check_buffer_align(struct request *req, char **pbuf)
+ 	char *nextbuffer = 0;
+ 
+ 	rq_for_each_segment(bv, req, iter) {
++		/* high mem return 0 and using kernel buffer */
++		if (PageHighMem(bv.bv_page))
++			return 0;
++
+ 		buffer = page_address(bv.bv_page) + bv.bv_offset;
++		if (!buffer)
++			return 0;
+ 		if (!firstbuf)
+ 			firstbuf = buffer;
+ 		nr_vec++;
+@@ -225,12 +231,11 @@ static int nand_blktrans_thread(void *arg)
+ 	struct request_queue *rq = nandr->rq;
+ 	struct request *req = NULL;
+ 	int ftl_gc_status = 0;
+-	char *buf;
++	char *buf, *page_buf;
+ 	struct req_iterator rq_iter;
+ 	struct bio_vec bvec;
+ 	unsigned long long sector_index = ULLONG_MAX;
+ 	unsigned long totle_nsect;
+-	unsigned long rq_len = 0;
+ 	int rw_flag = 0;
+ 	int req_empty_times = 0;
+ 	int op;
+@@ -286,7 +291,6 @@ static int nand_blktrans_thread(void *arg)
+ 		dev = req->rq_disk->private_data;
+ 		totle_nsect = (req->__data_len) >> 9;
+ 		sector_index = blk_rq_pos(req);
+-		rq_len = 0;
+ 		buf = 0;
+ 		res = 0;
+ 
+@@ -321,9 +325,23 @@ static int nand_blktrans_thread(void *arg)
+ 			continue;
+ 		}
+ 
+-		if (rw_flag == READ && mtd_read_temp_buffer) {
++		if (mtd_read_temp_buffer) {
+ 			buf = mtd_read_temp_buffer;
+ 			req_check_buffer_align(req, &buf);
++
++			if (rw_flag == WRITE && buf == mtd_read_temp_buffer) {
++				char *p = buf;
++
++				rq_for_each_segment(bvec, req, rq_iter) {
++					page_buf = kmap_atomic(bvec.bv_page);
++					memcpy(p,
++					       page_buf + bvec.bv_offset,
++					       bvec.bv_len);
++					p += bvec.bv_len;
++					kunmap_atomic(page_buf);
++				}
++			}
++
+ 			spin_unlock_irq(rq->queue_lock);
+ 			res = nand_dev_transfer(dev,
+ 						sector_index,
+@@ -332,53 +350,41 @@ static int nand_blktrans_thread(void *arg)
+ 						rw_flag,
+ 						totle_nsect);
+ 			spin_lock_irq(rq->queue_lock);
+-			if (buf == mtd_read_temp_buffer) {
++
++			if (rw_flag == READ && buf == mtd_read_temp_buffer) {
+ 				char *p = buf;
+ 
+ 				rq_for_each_segment(bvec, req, rq_iter) {
+-					memcpy(page_address(bvec.bv_page) +
+-					       bvec.bv_offset,
++					page_buf = kmap_atomic(bvec.bv_page);
++
++					memcpy(page_buf + bvec.bv_offset,
+ 					       p,
+ 					       bvec.bv_len);
+ 					p += bvec.bv_len;
++					kunmap_atomic(page_buf);
+ 				}
+ 			}
++			__blk_end_request_all(req, res);
++			req = NULL;
+ 		} else {
+-			rq_for_each_segment(bvec, req, rq_iter) {
+-				if ((page_address(bvec.bv_page)
+-					+ bvec.bv_offset)
+-					== (buf + rq_len)) {
+-					rq_len += bvec.bv_len;
+-				} else {
+-					if (rq_len) {
+-						spin_unlock_irq(rq->queue_lock);
+-						res = nand_dev_transfer(dev,
+-								sector_index,
+-								rq_len >> 9,
+-								buf,
+-								rw_flag,
+-								totle_nsect);
+-						spin_lock_irq(rq->queue_lock);
+-					}
+-					sector_index += rq_len >> 9;
+-					buf = (page_address(bvec.bv_page) +
+-						bvec.bv_offset);
+-					rq_len = bvec.bv_len;
+-				}
+-			}
+-			if (rq_len) {
++			while (req) {
++				sector_index = blk_rq_pos(req);
++				totle_nsect = blk_rq_cur_bytes(req);
++				buf = kmap_atomic(bio_page(req->bio)) +
++					   bio_offset(req->bio);
+ 				spin_unlock_irq(rq->queue_lock);
+ 				res = nand_dev_transfer(dev,
+ 							sector_index,
+-							rq_len >> 9,
++							totle_nsect,
+ 							buf,
+ 							rw_flag,
+ 							totle_nsect);
+ 				spin_lock_irq(rq->queue_lock);
++				kunmap_atomic(buf);
++				if (!__blk_end_request_cur(req, res))
++					req = NULL;
+ 			}
+ 		}
+-		__blk_end_request_all(req, res);
+-		req = NULL;
+ 	}
+ 	pr_info("nand th quited\n");
+ 	nandr->nand_th_quited = 1;
+-- 
+2.35.3
+

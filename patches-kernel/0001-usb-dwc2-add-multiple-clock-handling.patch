@@ -1,0 +1,126 @@
+From 596e8972fdf6bc2ca5662e8441eea7f4c0c2ea5a Mon Sep 17 00:00:00 2001
+From: Frank Wang <frank.wang@rock-chips.com>
+Date: Thu, 5 Jan 2017 15:08:57 +0800
+Subject: [PATCH] usb: dwc2: add multiple clock handling
+
+Originally, dwc2 just handle one clock named otg, however, it may have
+two or more clock need to manage for some new SoCs, so this adds
+change clk to clk's array of dwc2_hsotg to handle more clocks operation.
+
+Change-Id: I661297ef908d9eace2215205018fa94d12cea128
+Signed-off-by: Frank Wang <frank.wang@rock-chips.com>
+---
+ drivers/usb/dwc2/core.h     |  5 ++++-
+ drivers/usb/dwc2/platform.c | 38 ++++++++++++++++++++++++-------------
+ 2 files changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index c50f462c61a2..f6093a1846eb 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -121,6 +121,9 @@ static inline void dwc2_writel(u32 value, void __iomem *addr)
+ /* Maximum number of Endpoints/HostChannels */
+ #define MAX_EPS_CHANNELS	16
+ 
++/* Maximum number of dwc2 clocks */
++#define DWC2_MAX_CLKS 3
++
+ /* dwc2-hsotg declarations */
+ static const char * const dwc2_hsotg_supply_names[] = {
+ 	"vusb_d",               /* digital USB supply, 1.2V */
+@@ -868,7 +871,7 @@ struct dwc2_hsotg {
+ 	spinlock_t lock;
+ 	void *priv;
+ 	int     irq;
+-	struct clk *clk;
++	struct clk *clks[DWC2_MAX_CLKS];
+ 
+ 	unsigned int queuing_high_bandwidth:1;
+ 	unsigned int srp_success:1;
+diff --git a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+index 0cb69c439d3a..60ffcb62c0d4 100644
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -249,17 +249,20 @@ static int dwc2_get_dr_mode(struct dwc2_hsotg *hsotg)
+ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
+ {
+ 	struct platform_device *pdev = to_platform_device(hsotg->dev);
+-	int ret;
++	int clk, ret;
+ 
+ 	ret = regulator_bulk_enable(ARRAY_SIZE(hsotg->supplies),
+ 				    hsotg->supplies);
+ 	if (ret)
+ 		return ret;
+ 
+-	if (hsotg->clk) {
+-		ret = clk_prepare_enable(hsotg->clk);
+-		if (ret)
++	for (clk = 0; clk < DWC2_MAX_CLKS && hsotg->clks[clk]; clk++) {
++		ret = clk_prepare_enable(hsotg->clks[clk]);
++		if (ret) {
++			while (--clk >= 0)
++				clk_disable_unprepare(hsotg->clks[clk]);
+ 			return ret;
++		}
+ 	}
+ 
+ 	if (hsotg->uphy)
+@@ -294,7 +297,7 @@ int dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
+ static int __dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
+ {
+ 	struct platform_device *pdev = to_platform_device(hsotg->dev);
+-	int ret = 0;
++	int clk, ret = 0;
+ 
+ 	if (hsotg->uphy)
+ 		usb_phy_shutdown(hsotg->uphy);
+@@ -308,8 +311,9 @@ static int __dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (hsotg->clk)
+-		clk_disable_unprepare(hsotg->clk);
++	for (clk = DWC2_MAX_CLKS - 1; clk >= 0; clk--)
++		if (hsotg->clks[clk])
++			clk_disable_unprepare(hsotg->clks[clk]);
+ 
+ 	ret = regulator_bulk_disable(ARRAY_SIZE(hsotg->supplies),
+ 				     hsotg->supplies);
+@@ -343,7 +347,7 @@ static void dwc2_reset_phy_work(struct work_struct *data)
+ 
+ static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
+ {
+-	int i, ret;
++	int i, clk, ret;
+ 
+ 	/* Set default UTMI width */
+ 	hsotg->phyif = GUSBCFG_PHYIF16;
+@@ -399,11 +403,19 @@ static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
+ 			hsotg->phyif = GUSBCFG_PHYIF8;
+ 	}
+ 
+-	/* Clock */
+-	hsotg->clk = devm_clk_get(hsotg->dev, "otg");
+-	if (IS_ERR(hsotg->clk)) {
+-		hsotg->clk = NULL;
+-		dev_dbg(hsotg->dev, "cannot get otg clock\n");
++	for (clk = 0; clk < DWC2_MAX_CLKS; clk++) {
++		hsotg->clks[clk] = of_clk_get(hsotg->dev->of_node, clk);
++		if (IS_ERR(hsotg->clks[clk])) {
++			ret = PTR_ERR(hsotg->clks[clk]);
++			if (ret == -EPROBE_DEFER) {
++				while (--clk >= 0)
++					clk_put(hsotg->clks[clk]);
++				return ret;
++			}
++
++			hsotg->clks[clk] = NULL;
++			break;
++		}
+ 	}
+ 
+ 	/* Regulators */
+-- 
+2.35.3
+

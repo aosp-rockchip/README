@@ -1,0 +1,186 @@
+From 5d4c3d2b2fe28d924e6da8bed42d53b552689f9b Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 15 Jan 2020 11:55:17 +0800
+Subject: [PATCH] media: rockchip: isp: fix release buf error
+
+Change-Id: Ice2b0722121a8a687570a84d7b0ffc660042153b
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/capture.c | 57 +++++++++----------
+ drivers/media/platform/rockchip/isp/dmarx.c   | 34 +++++++----
+ 2 files changed, 50 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index d3b22af5965f..fd45eeedf9ce 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -2032,14 +2032,38 @@ static void rkisp_destroy_dummy_buf(struct rkisp_stream *stream)
+ 	hdr_destroy_buf(dev);
+ }
+ 
++static void destroy_buf_queue(struct rkisp_stream *stream,
++			      enum vb2_buffer_state state)
++{
++	unsigned long lock_flags = 0;
++	struct rkisp_buffer *buf;
++
++	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
++	if (stream->curr_buf) {
++		list_add_tail(&stream->curr_buf->queue, &stream->buf_queue);
++		if (stream->curr_buf == stream->next_buf)
++			stream->next_buf = NULL;
++		stream->curr_buf = NULL;
++	}
++	if (stream->next_buf) {
++		list_add_tail(&stream->next_buf->queue, &stream->buf_queue);
++		stream->next_buf = NULL;
++	}
++	while (!list_empty(&stream->buf_queue)) {
++		buf = list_first_entry(&stream->buf_queue,
++			struct rkisp_buffer, queue);
++		list_del(&buf->queue);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++	spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
++}
++
+ static void rkisp_stop_streaming(struct vb2_queue *queue)
+ {
+ 	struct rkisp_stream *stream = queue->drv_priv;
+ 	struct rkisp_vdev_node *node = &stream->vnode;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+-	struct rkisp_buffer *buf;
+-	unsigned long lock_flags = 0;
+ 	int ret;
+ 
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+@@ -2054,24 +2078,7 @@ static void rkisp_stop_streaming(struct vb2_queue *queue)
+ 			 ret);
+ 
+ 	/* release buffers */
+-	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+-	if (stream->curr_buf) {
+-		list_add_tail(&stream->curr_buf->queue, &stream->buf_queue);
+-		if (stream->curr_buf == stream->next_buf)
+-			stream->next_buf = NULL;
+-		stream->curr_buf = NULL;
+-	}
+-	if (stream->next_buf) {
+-		list_add_tail(&stream->next_buf->queue, &stream->buf_queue);
+-		stream->next_buf = NULL;
+-	}
+-	while (!list_empty(&stream->buf_queue)) {
+-		buf = list_first_entry(&stream->buf_queue,
+-				       struct rkisp_buffer, queue);
+-		list_del(&buf->queue);
+-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+-	}
+-	spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
++	destroy_buf_queue(stream, VB2_BUF_STATE_ERROR);
+ 
+ 	ret = dev->pipe.close(&dev->pipe);
+ 	if (ret < 0)
+@@ -2124,7 +2131,6 @@ rkisp_start_streaming(struct vb2_queue *queue, unsigned int count)
+ 	struct rkisp_vdev_node *node = &stream->vnode;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+-	unsigned int i;
+ 	int ret = -1;
+ 
+ 	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
+@@ -2201,14 +2207,7 @@ rkisp_start_streaming(struct vb2_queue *queue, unsigned int count)
+ destroy_dummy_buf:
+ 	rkisp_destroy_dummy_buf(stream);
+ buffer_done:
+-	for (i = 0; i < queue->num_buffers; ++i) {
+-		struct vb2_buffer *vb;
+-
+-		vb = queue->bufs[i];
+-		if (vb->state == VB2_BUF_STATE_ACTIVE)
+-			vb2_buffer_done(vb, VB2_BUF_STATE_QUEUED);
+-	}
+-
++	destroy_buf_queue(stream, VB2_BUF_STATE_QUEUED);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 8b111e7b3427..09e453b2cf2c 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -436,14 +436,12 @@ static void rkisp_buf_queue(struct vb2_buffer *vb)
+ 	spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+ }
+ 
+-static void dmarx_stop_streaming(struct vb2_queue *queue)
++static void destroy_buf_queue(struct rkisp_stream *stream,
++			      enum vb2_buffer_state state)
+ {
+-	struct rkisp_stream *stream = queue->drv_priv;
+ 	struct rkisp_buffer *buf;
+ 	unsigned long lock_flags = 0;
+ 
+-	dmarx_stop(stream);
+-
+ 	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+ 	if (stream->curr_buf) {
+ 		list_add_tail(&stream->curr_buf->queue, &stream->buf_queue);
+@@ -453,34 +451,46 @@ static void dmarx_stop_streaming(struct vb2_queue *queue)
+ 		buf = list_first_entry(&stream->buf_queue,
+ 			struct rkisp_buffer, queue);
+ 		list_del(&buf->queue);
+-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
+ 	}
+ 	spin_unlock_irqrestore(&stream->vbq_lock, lock_flags);
+ }
+ 
++static void dmarx_stop_streaming(struct vb2_queue *queue)
++{
++	struct rkisp_stream *stream = queue->drv_priv;
++
++	dmarx_stop(stream);
++	destroy_buf_queue(stream, VB2_BUF_STATE_ERROR);
++}
++
+ static int dmarx_start_streaming(struct vb2_queue *queue,
+ 				 unsigned int count)
+ {
+ 	struct rkisp_stream *stream = queue->drv_priv;
+ 	struct rkisp_device *dev = stream->ispdev;
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+-	int ret = 0;
++	int ret = -1;
++
++	if (WARN_ON(stream->streaming))
++		return -EBUSY;
+ 
+ 	if (atomic_read(&dev->open_cnt) < 2) {
+ 		v4l2_err(v4l2_dev,
+ 			 "other stream should enable first\n");
+-		return -EINVAL;
++		goto free_buf_queue;
+ 	}
+ 
+-	if (WARN_ON(stream->streaming))
+-		return -EBUSY;
+-
+ 	ret = dmarx_start(stream);
+-	if (ret < 0)
++	if (ret < 0) {
+ 		v4l2_err(v4l2_dev,
+ 			 "start dmarx stream:%d failed\n",
+ 			 stream->id);
+-
++		goto free_buf_queue;
++	}
++	return 0;
++free_buf_queue:
++	destroy_buf_queue(stream, VB2_BUF_STATE_QUEUED);
+ 	return ret;
+ }
+ 
+-- 
+2.35.3
+

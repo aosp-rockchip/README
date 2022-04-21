@@ -1,0 +1,2348 @@
+From 4b8c63300163d627121a0e887a62973c32772723 Mon Sep 17 00:00:00 2001
+From: qjb <qjb@rock-chips.com>
+Date: Wed, 7 Jan 2015 11:56:55 +0800
+Subject: [PATCH] TrustZone: Add TrustZone Driver    Add the communication with
+ the TLK interface driver.
+
+---
+ security/Kconfig                   |   1 +
+ security/Makefile                  |   2 +
+ security/tlk_driver/Kconfig        |  20 +
+ security/tlk_driver/Makefile       |  30 ++
+ security/tlk_driver/ote_asm.S      |  74 +++
+ security/tlk_driver/ote_comms.c    | 548 ++++++++++++++++++++
+ security/tlk_driver/ote_device.c   | 769 +++++++++++++++++++++++++++++
+ security/tlk_driver/ote_fs.c       | 175 +++++++
+ security/tlk_driver/ote_log.c      | 204 ++++++++
+ security/tlk_driver/ote_protocol.h | 341 +++++++++++++
+ security/tlk_driver/ote_types.h    |  79 +++
+ 11 files changed, 2243 insertions(+)
+ create mode 100644 security/tlk_driver/Kconfig
+ create mode 100644 security/tlk_driver/Makefile
+ create mode 100644 security/tlk_driver/ote_asm.S
+ create mode 100644 security/tlk_driver/ote_comms.c
+ create mode 100644 security/tlk_driver/ote_device.c
+ create mode 100644 security/tlk_driver/ote_fs.c
+ create mode 100644 security/tlk_driver/ote_log.c
+ create mode 100644 security/tlk_driver/ote_protocol.h
+ create mode 100644 security/tlk_driver/ote_types.h
+
+diff --git a/security/Kconfig b/security/Kconfig
+index e9c6ac724fef..daf99282efc4 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -122,6 +122,7 @@ source security/smack/Kconfig
+ source security/tomoyo/Kconfig
+ source security/apparmor/Kconfig
+ source security/yama/Kconfig
++source security/tlk_driver/Kconfig
+ 
+ source security/integrity/Kconfig
+ 
+diff --git a/security/Makefile b/security/Makefile
+index c26c81e92571..fa723812ad85 100644
+--- a/security/Makefile
++++ b/security/Makefile
+@@ -28,3 +28,5 @@ obj-$(CONFIG_CGROUP_DEVICE)		+= device_cgroup.o
+ # Object integrity file lists
+ subdir-$(CONFIG_INTEGRITY)		+= integrity
+ obj-$(CONFIG_INTEGRITY)			+= integrity/built-in.o
++
++obj-y					+= tlk_driver/
+diff --git a/security/tlk_driver/Kconfig b/security/tlk_driver/Kconfig
+new file mode 100644
+index 000000000000..6803cbff98e3
+--- /dev/null
++++ b/security/tlk_driver/Kconfig
+@@ -0,0 +1,20 @@
++
++
++
++config TRUSTED_LITTLE_KERNEL
++	bool "Enable Open Trusted Execution driver"
++	depends on ARM_TRUSTZONE
++	default y
++	help
++	  This option adds kernel support for communication with the
++	  Trusted LK secure OS monitor/runtime support.
++	  If you are unsure how to answer this question, answer N.
++
++config TRUST_OS_LOGGER
++	bool "Enable TLK logs in linux kmsg"
++	depends on TRUSTED_LITTLE_KERNEL
++	default y
++	help
++	 This option adds support in the kernel driver to read the logs
++	 from the secure world and make them available as a part of kmsg.
++
+diff --git a/security/tlk_driver/Makefile b/security/tlk_driver/Makefile
+new file mode 100644
+index 000000000000..9ab4168f7e11
+--- /dev/null
++++ b/security/tlk_driver/Makefile
+@@ -0,0 +1,30 @@
++#
++# Copyright (c) 2013-2014, NVIDIA Corporation. All rights reserved.
++#
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 2 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along
++# with this program; if not, write to the Free Software Foundation, Inc.,
++# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++#
++
++tlk_driver-objs += ote_device.o
++tlk_driver-objs += ote_comms.o
++tlk_driver-objs += ote_fs.o
++tlk_driver-objs += ote_asm.o
++tlk_driver-objs += ote_log.o
++
++ifeq ($(CONFIG_ARM),y)
++plus_sec := $(call as-instr,.arch_extension sec,+sec)
++AFLAGS_ote_asm.o :=-Wa,-march=armv7-a$(plus_sec)
++endif
++
++obj-$(CONFIG_TRUSTED_LITTLE_KERNEL) += tlk_driver.o
+diff --git a/security/tlk_driver/ote_asm.S b/security/tlk_driver/ote_asm.S
+new file mode 100644
+index 000000000000..2c5563ba7ed8
+--- /dev/null
++++ b/security/tlk_driver/ote_asm.S
+@@ -0,0 +1,74 @@
++/*
++ * Copyright (c) 2014, NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/linkage.h>
++#include <linux/init.h>
++
++#ifdef CONFIG_ARM64
++
++ENTRY(tlk_irq_handler)
++	mov	x0, #0x5
++	movk	x0, #0x3200, lsl #16	// TE_SMC_NS_IRQ_DONE
++	smc	#0
++	ret
++ENDPROC(tlk_irq_handler)
++
++/* uint32_t tlk_generic_smc(uint32_t arg0, uint32_t arg1, uint32_t arg2) */
++ENTRY(_tlk_generic_smc)
++	smc	#0
++	ret
++ENDPROC(_tlk_generic_smc)
++
++	/* allows MAX_EXT_SMC_ARGS (r0-r11) to be passed in registers */
++
++/* uint32_t tlk_extended_smc(uint32_t *regs) */
++ENTRY(_tlk_extended_smc)
++	/*
++	 * Allows MAX_EXT_SMC_ARGS (r0-r11) to be passed in registers
++	 * (for aarch64, these are scratch, so no need to save them)
++	 */
++	mov	x12, x0
++	ldp	x0, x1, [x12], #16
++	ldp	x2, x3, [x12], #16
++	ldp	x4, x5, [x12], #16
++	ldp	x6, x7, [x12], #16
++	ldp	x8, x9, [x12], #16
++	ldp	x10, x11, [x12], #16
++	smc	#0
++	ret
++ENDPROC(_tlk_extended_smc)
++
++#else
++
++ENTRY(tlk_irq_handler)
++	movw	r0, #0x5
++	movt	r0, #0x3200	@ TE_SMC_NS_IRQ_DONE
++	mov	r1, #0
++	mov	r2, #0
++	smc	#0
++ENDPROC(tlk_irq_handler)
++
++ENTRY(_tlk_generic_smc)
++	smc	#0
++	mov	pc, lr
++ENDPROC(_tlk_generic_smc)
++
++ENTRY(_tlk_extended_smc)
++	stmfd	sp!, {r4-r12}	@ save reg state
++	mov	r12, r0		@ reg ptr to r12
++	ldmia	r12, {r0-r11}	@ load arg regs
++	smc	#0
++	ldmfd	sp!, {r4-r12}	@ restore saved regs
++ENDPROC(_tlk_extended_smc)
++
++#endif
+diff --git a/security/tlk_driver/ote_comms.c b/security/tlk_driver/ote_comms.c
+new file mode 100644
+index 000000000000..9954d194069c
+--- /dev/null
++++ b/security/tlk_driver/ote_comms.c
+@@ -0,0 +1,548 @@
++/*
++ * Copyright (c) 2012-2014 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#include <linux/atomic.h>
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/printk.h>
++#include <linux/ioctl.h>
++#include <linux/sched.h>
++#include <linux/mm.h>
++#include <linux/pagemap.h>
++#include <asm/smp_plat.h>
++
++#include "ote_protocol.h"
++
++bool verbose_smc;
++core_param(verbose_smc, verbose_smc, bool, 0644);
++
++#define SET_RESULT(req, r, ro)	{ req->result = r; req->result_origin = ro; }
++
++static struct te_shmem_desc *te_add_shmem_desc(void *buffer, size_t size,
++		struct tlk_context *context)
++{
++	struct te_shmem_desc *shmem_desc = NULL;
++	shmem_desc = kzalloc(sizeof(struct te_shmem_desc), GFP_KERNEL);
++	if (shmem_desc) {
++		INIT_LIST_HEAD(&(shmem_desc->list));
++		shmem_desc->buffer = buffer;
++		shmem_desc->size = size;
++		list_add_tail(&shmem_desc->list, &(context->shmem_alloc_list));
++	}
++
++	return shmem_desc;
++}
++
++static int te_pin_mem_buffers(void *buffer, size_t size,
++		struct tlk_context *context)
++{
++	struct te_shmem_desc *shmem_desc = NULL;
++	int ret = 0;
++
++	shmem_desc = te_add_shmem_desc(buffer, size, context);
++	if (!shmem_desc) {
++		pr_err("%s: te_add_shmem_desc Failed\n", __func__);
++		ret = OTE_ERROR_OUT_OF_MEMORY;
++		goto error;
++	}
++
++	return OTE_SUCCESS;
++error:
++	return ret;
++}
++
++static int te_setup_temp_buffers(struct te_request *request,
++		struct tlk_context *context)
++{
++	uint32_t i;
++	int ret = OTE_SUCCESS;
++	struct te_oper_param *params = request->params;
++
++	for (i = 0; i < request->params_size; i++) {
++		switch (params[i].type) {
++		case TE_PARAM_TYPE_NONE:
++		case TE_PARAM_TYPE_INT_RO:
++		case TE_PARAM_TYPE_INT_RW:
++			break;
++		case TE_PARAM_TYPE_MEM_RO:
++		case TE_PARAM_TYPE_MEM_RW:
++			ret = te_pin_mem_buffers(
++				params[i].u.Mem.base,
++				params[i].u.Mem.len,
++				context);
++			if (ret < 0) {
++				pr_err("%s failed with err (%d)\n",
++					__func__, ret);
++				ret = OTE_ERROR_BAD_PARAMETERS;
++				break;
++			}
++			break;
++		default:
++			pr_err("%s: OTE_ERROR_BAD_PARAMETERS\n", __func__);
++			ret = OTE_ERROR_BAD_PARAMETERS;
++			break;
++		}
++	}
++	return ret;
++}
++
++static int te_setup_temp_buffers_compat(struct te_request_compat *request,
++		struct tlk_context *context)
++{
++	uint32_t i;
++	int ret = OTE_SUCCESS;
++	struct te_oper_param_compat *params;
++
++	params = (struct te_oper_param_compat *)(uintptr_t)request->params;
++	for (i = 0; i < request->params_size; i++) {
++		switch (params[i].type) {
++		case TE_PARAM_TYPE_NONE:
++		case TE_PARAM_TYPE_INT_RO:
++		case TE_PARAM_TYPE_INT_RW:
++			break;
++		case TE_PARAM_TYPE_MEM_RO:
++		case TE_PARAM_TYPE_MEM_RW:
++			ret = te_pin_mem_buffers(
++				(void *)(uintptr_t)params[i].u.Mem.base,
++				params[i].u.Mem.len,
++				context);
++			if (ret < 0) {
++				pr_err("%s failed with err (%d)\n",
++					__func__, ret);
++				ret = OTE_ERROR_BAD_PARAMETERS;
++				break;
++			}
++			break;
++		default:
++			pr_err("%s: OTE_ERROR_BAD_PARAMETERS\n", __func__);
++			ret = OTE_ERROR_BAD_PARAMETERS;
++			break;
++		}
++	}
++	return ret;
++}
++
++static void te_del_shmem_desc(void *buffer, struct tlk_context *context)
++{
++	struct te_shmem_desc *shmem_desc, *tmp_shmem_desc;
++
++	list_for_each_entry_safe(shmem_desc, tmp_shmem_desc,
++		&(context->shmem_alloc_list), list) {
++		if (shmem_desc->buffer == buffer) {
++			list_del(&shmem_desc->list);
++			kfree(shmem_desc);
++		}
++	}
++}
++
++/*
++ * Deregister previously initialized shared memory
++ */
++void te_unregister_memory(void *buffer,
++	struct tlk_context *context)
++{
++	if (!(list_empty(&(context->shmem_alloc_list))))
++		te_del_shmem_desc(buffer, context);
++	else
++		pr_err("No buffers to unpin\n");
++}
++
++static void te_unpin_temp_buffers(struct te_request *request,
++	struct tlk_context *context)
++{
++	uint32_t i;
++	struct te_oper_param *params = request->params;
++
++	for (i = 0; i < request->params_size; i++) {
++		switch (params[i].type) {
++		case TE_PARAM_TYPE_NONE:
++		case TE_PARAM_TYPE_INT_RO:
++		case TE_PARAM_TYPE_INT_RW:
++			break;
++		case TE_PARAM_TYPE_MEM_RO:
++		case TE_PARAM_TYPE_MEM_RW:
++			te_unregister_memory(params[i].u.Mem.base, context);
++			break;
++		default:
++			pr_err("%s: OTE_ERROR_BAD_PARAMETERS\n", __func__);
++			break;
++		}
++	}
++}
++
++static void te_unpin_temp_buffers_compat(struct te_request_compat *request,
++	struct tlk_context *context)
++{
++	uint32_t i;
++	struct te_oper_param_compat *params;
++
++	params = (struct te_oper_param_compat *)(uintptr_t)request->params;
++	for (i = 0; i < request->params_size; i++) {
++		switch (params[i].type) {
++		case TE_PARAM_TYPE_NONE:
++		case TE_PARAM_TYPE_INT_RO:
++		case TE_PARAM_TYPE_INT_RW:
++			break;
++		case TE_PARAM_TYPE_MEM_RO:
++		case TE_PARAM_TYPE_MEM_RW:
++			te_unregister_memory(
++				(void *)(uintptr_t)params[i].u.Mem.base,
++				context);
++			break;
++		default:
++			pr_err("%s: OTE_ERROR_BAD_PARAMETERS\n", __func__);
++			break;
++		}
++	}
++}
++
++#ifdef CONFIG_SMP
++cpumask_t saved_cpu_mask;
++static void switch_cpumask_to_cpu0(void)
++{
++	long ret;
++	cpumask_t local_cpu_mask = CPU_MASK_NONE;
++
++	cpu_set(0, local_cpu_mask);
++	cpumask_copy(&saved_cpu_mask, tsk_cpus_allowed(current));
++	ret = sched_setaffinity(0, &local_cpu_mask);
++	if (ret)
++		pr_err("sched_setaffinity #1 -> 0x%lX", ret);
++}
++
++static void restore_cpumask(void)
++{
++	long ret = sched_setaffinity(0, &saved_cpu_mask);
++	if (ret)
++		pr_err("sched_setaffinity #2 -> 0x%lX", ret);
++}
++#else
++static inline void switch_cpumask_to_cpu0(void) {};
++static inline void restore_cpumask(void) {};
++#endif
++
++uint32_t tlk_generic_smc(uint32_t arg0, uintptr_t arg1, uintptr_t arg2)
++{
++	uint32_t retval;
++
++	switch_cpumask_to_cpu0();
++ 
++	retval = _tlk_generic_smc(arg0, arg1, arg2); 
++ 
++	while (retval == TE_ERROR_PREEMPT_BY_IRQ ||
++	       retval == TE_ERROR_PREEMPT_BY_FS) {
++		if (retval == TE_ERROR_PREEMPT_BY_IRQ) {
++			retval = _tlk_generic_smc((60 << 24), 0, 0);
++		} else {
++			tlk_ss_op();
++			retval = _tlk_generic_smc(TE_SMC_SS_REQ_COMPLETE, 0, 0);
++		}
++	}
++
++	restore_cpumask();
++
++	/* Print TLK logs if any */
++	ote_print_logs();
++
++	return retval;
++}
++
++uint32_t tlk_extended_smc(uintptr_t *regs)
++{
++	uint32_t retval;
++
++	switch_cpumask_to_cpu0();
++
++	retval = _tlk_extended_smc(regs);
++	while (retval == 0xFFFFFFFD)
++		retval = _tlk_generic_smc((60 << 24), 0, 0);
++
++	restore_cpumask();
++
++	/* Print TLK logs if any */
++	ote_print_logs();
++
++	return retval;
++}
++
++/*
++ * Do an SMC call
++ */
++static void do_smc(struct te_request *request, struct tlk_device *dev)
++{
++	uint32_t smc_args;
++	uint32_t smc_params = 0;
++
++	if (dev->req_param_buf) {
++		smc_args = (char *)request - dev->req_param_buf;
++		if (request->params)
++			smc_params = (char *)request->params -
++						dev->req_param_buf;
++	} else {
++		smc_args = (uint32_t)virt_to_phys(request);
++		if (request->params)
++			smc_params = (uint32_t)virt_to_phys(request->params);
++	}
++
++	tlk_generic_smc(request->type, smc_args, smc_params);
++}
++
++/*
++ * Do an SMC call
++ */
++static void do_smc_compat(struct te_request_compat *request,
++			  struct tlk_device *dev)
++{
++	uint32_t smc_args;
++	uint32_t smc_params = 0;
++
++	smc_args = (char *)request - dev->req_param_buf;
++	if (request->params) {
++		smc_params =
++			(char *)(uintptr_t)request->params - dev->req_param_buf;
++	}
++
++	tlk_generic_smc(request->type, smc_args, smc_params);
++}
++
++struct tlk_smc_work_args {
++	uint32_t arg0;
++	uint32_t arg1;
++	uint32_t arg2;
++};
++
++static long tlk_generic_smc_on_cpu0(void *args)
++{
++	struct tlk_smc_work_args *work;
++	int cpu = cpu_logical_map(smp_processor_id());
++	uint32_t retval;
++
++	BUG_ON(cpu != 0);
++
++	work = (struct tlk_smc_work_args *)args;
++	retval = _tlk_generic_smc(work->arg0, work->arg1, work->arg2);
++	while (retval == 0xFFFFFFFD)
++		retval = _tlk_generic_smc((60 << 24), 0, 0);
++	return retval;
++}
++
++/*
++ * VPR programming SMC
++ *
++ * This routine is called both from normal threads and worker threads.
++ * The worker threads are per-cpu and have PF_NO_SETAFFINITY set, so
++ * any calls to sched_setaffinity will fail.
++ *
++ * If it's a worker thread on CPU0, just invoke the SMC directly. If
++ * it's running on a non-CPU0, use work_on_cpu() to schedule the SMC
++ * on CPU0.
++ */
++int te_set_vpr_params(void *vpr_base, size_t vpr_size)
++{
++	uint32_t retval;
++
++	/* Share the same lock used when request is send from user side */
++	mutex_lock(&smc_lock);
++
++	if (current->flags &
++	    (PF_WQ_WORKER | PF_NO_SETAFFINITY | PF_KTHREAD)) {
++		struct tlk_smc_work_args work_args;
++		int cpu = cpu_logical_map(smp_processor_id());
++
++		work_args.arg0 = TE_SMC_PROGRAM_VPR;
++		work_args.arg1 = (uint32_t)vpr_base;
++		work_args.arg2 = vpr_size;
++
++		/* workers don't change CPU. depending on the CPU, execute
++		 * directly or sched work */
++		if (cpu == 0 && (current->flags & PF_WQ_WORKER))
++			retval = tlk_generic_smc_on_cpu0(&work_args);
++		else
++			retval = work_on_cpu(0,
++					tlk_generic_smc_on_cpu0, &work_args);
++	} else {
++		retval = tlk_generic_smc(TE_SMC_PROGRAM_VPR,
++					(uintptr_t)vpr_base, vpr_size);
++	}
++
++	mutex_unlock(&smc_lock);
++
++	if (retval != OTE_SUCCESS) {
++		pr_err("te_set_vpr_params failed err (0x%x)\n", retval);
++		return -EINVAL;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(te_set_vpr_params);
++
++/*
++ * Open session SMC (supporting client-based te_open_session() calls)
++ */
++void te_open_session(struct te_opensession *cmd,
++		     struct te_request *request,
++		     struct tlk_context *context)
++{
++	int ret;
++
++	ret = te_setup_temp_buffers(request, context);
++	if (ret != OTE_SUCCESS) {
++		pr_err("te_setup_temp_buffers failed err (0x%x)\n", ret);
++		SET_RESULT(request, ret, OTE_RESULT_ORIGIN_API);
++		return;
++	}
++
++	memcpy(&request->dest_uuid,
++	       &cmd->dest_uuid,
++	       sizeof(struct te_service_id));
++
++	pr_info("OPEN_CLIENT_SESSION: 0x%x 0x%x 0x%x 0x%x\n",
++		request->dest_uuid[0],
++		request->dest_uuid[1],
++		request->dest_uuid[2],
++		request->dest_uuid[3]);
++
++	request->type = TE_SMC_OPEN_SESSION;
++
++	do_smc(request, context->dev);
++
++	te_unpin_temp_buffers(request, context);
++}
++
++/*
++ * Close session SMC (supporting client-based te_close_session() calls)
++ */
++void te_close_session(struct te_closesession *cmd,
++		      struct te_request *request,
++		      struct tlk_context *context)
++{
++	request->session_id = cmd->session_id;
++	request->type = TE_SMC_CLOSE_SESSION;
++
++	do_smc(request, context->dev);
++	if (request->result)
++		pr_info("Error closing session: %08x\n", request->result);
++}
++
++/*
++ * Launch operation SMC (supporting client-based te_launch_operation() calls)
++ */
++void te_launch_operation(struct te_launchop *cmd,
++			 struct te_request *request,
++			 struct tlk_context *context)
++{
++	int ret;
++
++	ret = te_setup_temp_buffers(request, context);
++	if (ret != OTE_SUCCESS) {
++		pr_err("te_setup_temp_buffers failed err (0x%x)\n", ret);
++		SET_RESULT(request, ret, OTE_RESULT_ORIGIN_API);
++		return;
++	}
++
++	request->session_id = cmd->session_id;
++	request->command_id = cmd->operation.command;
++	request->type = TE_SMC_LAUNCH_OPERATION;
++
++	do_smc(request, context->dev);
++
++	te_unpin_temp_buffers(request, context);
++}
++
++/*
++ * Open session SMC (supporting client-based te_open_session() calls)
++ */
++void te_open_session_compat(struct te_opensession_compat *cmd,
++			    struct te_request_compat *request,
++			    struct tlk_context *context)
++{
++	int ret;
++
++	ret = te_setup_temp_buffers_compat(request, context);
++	if (ret != OTE_SUCCESS) {
++		pr_err("te_setup_temp_buffers failed err (0x%x)\n", ret);
++		SET_RESULT(request, ret, OTE_RESULT_ORIGIN_API);
++		return;
++	}
++
++	memcpy(&request->dest_uuid,
++	       &cmd->dest_uuid,
++	       sizeof(struct te_service_id));
++
++	pr_info("OPEN_CLIENT_SESSION_COMPAT: 0x%x 0x%x 0x%x 0x%x\n",
++		request->dest_uuid[0],
++		request->dest_uuid[1],
++		request->dest_uuid[2],
++		request->dest_uuid[3]);
++
++	request->type = TE_SMC_OPEN_SESSION;
++
++	do_smc_compat(request, context->dev);
++
++	te_unpin_temp_buffers_compat(request, context);
++}
++
++/*
++ * Close session SMC (supporting client-based te_close_session() calls)
++ */
++void te_close_session_compat(struct te_closesession_compat *cmd,
++			     struct te_request_compat *request,
++			     struct tlk_context *context)
++{
++	request->session_id = cmd->session_id;
++	request->type = TE_SMC_CLOSE_SESSION;
++
++	do_smc_compat(request, context->dev);
++	if (request->result)
++		pr_info("Error closing session: %08x\n", request->result);
++}
++
++/*
++ * Launch operation SMC (supporting client-based te_launch_operation() calls)
++ */
++void te_launch_operation_compat(struct te_launchop_compat *cmd,
++				struct te_request_compat *request,
++				struct tlk_context *context)
++{
++	int ret;
++
++	ret = te_setup_temp_buffers_compat(request, context);
++	if (ret != OTE_SUCCESS) {
++		pr_err("te_setup_temp_buffers failed err (0x%x)\n", ret);
++		SET_RESULT(request, ret, OTE_RESULT_ORIGIN_API);
++		return;
++	}
++
++	request->session_id = cmd->session_id;
++	request->command_id = cmd->operation.command;
++	request->type = TE_SMC_LAUNCH_OPERATION;
++
++	do_smc_compat(request, context->dev);
++
++	te_unpin_temp_buffers_compat(request, context);
++}
++
++static int __init tlk_register_irq_handler(void)
++{
++	tlk_generic_smc(TE_SMC_REGISTER_IRQ_HANDLER,
++		(uintptr_t)tlk_irq_handler, 0);
++	return 0;
++}
++
++arch_initcall(tlk_register_irq_handler);
+diff --git a/security/tlk_driver/ote_device.c b/security/tlk_driver/ote_device.c
+new file mode 100644
+index 000000000000..32a2b65bf36e
+--- /dev/null
++++ b/security/tlk_driver/ote_device.c
+@@ -0,0 +1,769 @@
++/*
++ * Copyright (c) 2013-2014 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#include <linux/atomic.h>
++#include <linux/uaccess.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/printk.h>
++#include <linux/ioctl.h>
++#include <linux/miscdevice.h>
++#include <linux/mm.h>
++#include <asm/cacheflush.h>
++#include <asm/outercache.h>
++#include <linux/list.h>
++#include <linux/dma-mapping.h>
++
++#include "ote_protocol.h"
++
++#define SET_ANSWER(a, r, ro)	{ a.result = r; a.result_origin = ro; }
++
++struct tlk_device tlk_dev;
++DEFINE_MUTEX(smc_lock);
++
++static int te_create_free_cmd_list(struct tlk_device *dev)
++{
++	int cmd_desc_count, ret = 0;
++	struct te_cmd_req_desc *req_desc;
++	struct te_cmd_req_desc_compat *req_desc_compat;
++	int bitmap_size;
++	bool use_reqbuf;
++
++	/*
++	 * Check if new shared req/param register SMC is supported.
++	 *
++	 * If it is, TLK can map in the shared req/param buffers and do_smc
++	 * only needs to send the offsets within each (with cache coherency
++	 * being maintained by HW through an NS mapping).
++	 *
++	 * If the SMC support is not yet present, then fallback to the old
++	 * mode of writing to an uncached buffer to maintain coherency (and
++	 * phys addresses are passed in do_smc).
++	 */
++	dev->req_param_buf = NULL;
++	use_reqbuf = !tlk_generic_smc(TE_SMC_REGISTER_REQ_BUF, 0, 0);
++
++	if (use_reqbuf) {
++		dev->req_param_buf = kmalloc((2 * PAGE_SIZE), GFP_KERNEL);
++
++		/* requests in the first page, params in the second */
++		dev->req_addr   = (struct te_request *) dev->req_param_buf;
++		dev->param_addr = (struct te_oper_param *)
++					(dev->req_param_buf + PAGE_SIZE);
++
++		tlk_generic_smc(TE_SMC_REGISTER_REQ_BUF,
++				(uintptr_t)dev->req_addr, (2 * PAGE_SIZE));
++	} else {
++		dev->req_addr = dma_alloc_coherent(NULL, PAGE_SIZE,
++					&dev->req_addr_phys, GFP_KERNEL);
++		dev->param_addr = dma_alloc_coherent(NULL, PAGE_SIZE,
++					&dev->param_addr_phys, GFP_KERNEL);
++	}
++
++	if (!dev->req_addr || !dev->param_addr || !dev->req_param_buf) {
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	/* requests in the first page, params in the second */
++	dev->req_addr_compat   = (struct te_request_compat *)
++					dev->req_param_buf;
++	dev->param_addr_compat = (struct te_oper_param_compat *)
++					(dev->req_param_buf + PAGE_SIZE);
++
++	/* alloc param bitmap allocator */
++	bitmap_size = BITS_TO_LONGS(TE_PARAM_MAX) * sizeof(long);
++	dev->param_bitmap = kzalloc(bitmap_size, GFP_KERNEL);
++
++	for (cmd_desc_count = 0;
++		cmd_desc_count < TE_CMD_DESC_MAX; cmd_desc_count++) {
++
++		req_desc = kzalloc(sizeof(struct te_cmd_req_desc), GFP_KERNEL);
++		if (req_desc == NULL) {
++			pr_err("Failed to allocate cmd req descriptor\n");
++			ret = -ENOMEM;
++			goto error;
++		}
++		req_desc->req_addr = dev->req_addr + cmd_desc_count;
++		INIT_LIST_HEAD(&(req_desc->list));
++
++		/* Add the cmd param descriptor to free list */
++		list_add_tail(&req_desc->list, &(dev->free_cmd_list));
++	}
++
++	for (cmd_desc_count = 0;
++		cmd_desc_count < TE_CMD_DESC_MAX_COMPAT; cmd_desc_count++) {
++
++		req_desc_compat = kzalloc(sizeof(struct te_cmd_req_desc_compat),
++				GFP_KERNEL);
++		if (req_desc_compat == NULL) {
++			pr_err("Failed to allocate cmd req descriptor\n");
++			ret = -ENOMEM;
++			goto error;
++		}
++		req_desc_compat->req_addr =
++			dev->req_addr_compat + cmd_desc_count;
++		INIT_LIST_HEAD(&(req_desc_compat->list));
++
++		/* Add the cmd param descriptor to free list */
++		list_add_tail(&req_desc_compat->list, &(dev->free_cmd_list));
++	}
++
++error:
++	return ret;
++}
++
++static struct te_oper_param *te_get_free_params(struct tlk_device *dev,
++	unsigned int nparams)
++{
++	struct te_oper_param *params = NULL;
++	int idx, nbits;
++
++	if (nparams) {
++		nbits = get_count_order(nparams);
++		idx = bitmap_find_free_region(dev->param_bitmap,
++				TE_PARAM_MAX, nbits);
++		if (idx >= 0)
++			params = dev->param_addr + idx;
++	}
++	return params;
++}
++
++static void te_put_free_params(struct tlk_device *dev,
++	struct te_oper_param *params, uint32_t nparams)
++{
++	int idx, nbits;
++
++	idx = (params - dev->param_addr);
++	nbits = get_count_order(nparams);
++	bitmap_release_region(dev->param_bitmap, idx, nbits);
++}
++
++static struct te_oper_param_compat *
++	te_get_free_params_compat(struct tlk_device *dev, unsigned int nparams)
++{
++	struct te_oper_param_compat *params = NULL;
++	int idx, nbits;
++
++	if (nparams) {
++		nbits = get_count_order(nparams);
++		idx = bitmap_find_free_region(dev->param_bitmap,
++				TE_PARAM_MAX, nbits);
++		if (idx >= 0)
++			params = dev->param_addr_compat + idx;
++	}
++	return params;
++}
++
++static void te_put_free_params_compat(struct tlk_device *dev,
++	struct te_oper_param_compat *params, uint32_t nparams)
++{
++	int idx, nbits;
++
++	idx = (params - dev->param_addr_compat);
++	nbits = get_count_order(nparams);
++	bitmap_release_region(dev->param_bitmap, idx, nbits);
++}
++
++static struct te_cmd_req_desc *te_get_free_cmd_desc(struct tlk_device *dev)
++{
++	struct te_cmd_req_desc *cmd_desc = NULL;
++
++	if (!(list_empty(&(dev->free_cmd_list)))) {
++		cmd_desc = list_first_entry(&(dev->free_cmd_list),
++				struct te_cmd_req_desc, list);
++		list_del(&(cmd_desc->list));
++		list_add_tail(&cmd_desc->list, &(dev->used_cmd_list));
++	}
++	return cmd_desc;
++}
++
++static void te_put_used_cmd_desc(struct tlk_device *dev,
++	struct te_cmd_req_desc *cmd_desc)
++{
++	struct te_cmd_req_desc *param_desc, *tmp_param_desc;
++
++	if (cmd_desc) {
++		list_for_each_entry_safe(param_desc, tmp_param_desc,
++				&(dev->used_cmd_list), list) {
++			if (cmd_desc->req_addr == param_desc->req_addr) {
++				list_del(&param_desc->list);
++				list_add_tail(&param_desc->list,
++					&(dev->free_cmd_list));
++			}
++		}
++	}
++}
++
++static struct te_cmd_req_desc_compat *
++te_get_free_cmd_desc_compat(struct tlk_device *dev)
++{
++	struct te_cmd_req_desc_compat *cmd_desc = NULL;
++
++	if (!(list_empty(&(dev->free_cmd_list)))) {
++		cmd_desc = list_first_entry(&(dev->free_cmd_list),
++				struct te_cmd_req_desc_compat, list);
++		list_del(&(cmd_desc->list));
++		list_add_tail(&cmd_desc->list, &(dev->used_cmd_list));
++	}
++	return cmd_desc;
++}
++
++static void te_put_used_cmd_desc_compat(struct tlk_device *dev,
++	struct te_cmd_req_desc_compat *cmd_desc)
++{
++	struct te_cmd_req_desc_compat *param_desc, *tmp_param_desc;
++
++	if (cmd_desc) {
++		list_for_each_entry_safe(param_desc, tmp_param_desc,
++				&(dev->used_cmd_list), list) {
++			if (cmd_desc->req_addr == param_desc->req_addr) {
++				list_del(&param_desc->list);
++				list_add_tail(&param_desc->list,
++					&(dev->free_cmd_list));
++			}
++		}
++	}
++}
++
++static void __attribute__((unused)) te_print_cmd_list(
++	struct tlk_device *dev, int used_list)
++{
++	struct te_cmd_req_desc *param_desc;
++
++	if (!used_list) {
++		pr_info("Printing free cmd list\n");
++		if (!(list_empty(&(dev->free_cmd_list)))) {
++			list_for_each_entry(param_desc, &(dev->free_cmd_list),
++					list)
++				pr_info("Phys addr for cmd req desc (%p)\n",
++					param_desc->req_addr);
++		}
++	} else {
++		pr_info("Printing used cmd list\n");
++		if (!(list_empty(&(dev->used_cmd_list)))) {
++			list_for_each_entry(param_desc, &(dev->used_cmd_list),
++					list)
++				pr_info("Phys addr for cmd req desc (%p)\n",
++					param_desc->req_addr);
++		}
++	}
++}
++
++static int tlk_device_open(struct inode *inode, struct file *file)
++{
++	struct tlk_context *context;
++	int ret = 0;
++
++	context = kzalloc(sizeof(struct tlk_context), GFP_KERNEL);
++	if (!context) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	context->dev = &tlk_dev;
++	INIT_LIST_HEAD(&(context->shmem_alloc_list));
++
++	file->private_data = context;
++	return 0;
++error:
++	return ret;
++}
++
++static int tlk_device_release(struct inode *inode, struct file *file)
++{
++	kfree(file->private_data);
++	file->private_data = NULL;
++	return 0;
++}
++
++static int copy_params_from_user(struct te_request *req,
++	struct te_operation *operation)
++{
++	struct te_oper_param *param_array;
++	struct te_oper_param *user_param;
++	uint32_t i;
++
++	if (operation->list_count == 0)
++		return 0;
++
++	param_array = req->params;
++	if (param_array == NULL) {
++		pr_err("param_array empty\n");
++		return 1;
++	}
++
++	user_param = operation->list_head;
++	for (i = 0; i < operation->list_count && user_param != NULL; i++) {
++		if (copy_from_user(param_array + i, user_param,
++					sizeof(struct te_oper_param))) {
++			pr_err("Failed to copy operation parameter:%d, %p, " \
++					"list_count: %d\n",
++					i, user_param, operation->list_count);
++			return 1;
++		}
++		user_param = param_array[i].next_ptr_user;
++	}
++	return 0;
++}
++
++static int copy_params_to_user(struct te_request *req,
++	struct te_operation *operation)
++{
++	struct te_oper_param *param_array;
++	struct te_oper_param *user_param;
++	uint32_t i;
++
++	if (operation->list_count == 0)
++		return 0;
++
++	param_array = req->params;
++	if (param_array == NULL) {
++		pr_err("param_array empty\n");
++		return 1;
++	}
++
++	user_param = operation->list_head;
++	for (i = 0; i < req->params_size; i++) {
++		if (copy_to_user(user_param, param_array + i,
++					sizeof(struct te_oper_param))) {
++			pr_err("Failed to copy back parameter:%d %p\n", i,
++					user_param);
++			return 1;
++		}
++		user_param = param_array[i].next_ptr_user;
++	}
++	return 0;
++}
++
++static long te_handle_trustedapp_ioctl(struct file *file,
++	unsigned int ioctl_num, unsigned long ioctl_param)
++{
++	long err = 0;
++	union te_cmd cmd;
++	void *ptr_user_answer = NULL;
++	struct te_operation *operation = NULL;
++	struct te_oper_param *params = NULL;
++	struct te_answer answer;
++	struct te_request *request;
++
++	struct te_cmd_req_desc *cmd_desc = NULL;
++	struct tlk_context *context = file->private_data;
++	struct tlk_device *dev = context->dev;
++
++	if (copy_from_user(&cmd, (void __user *)ioctl_param,
++				sizeof(union te_cmd))) {
++		pr_err("Failed to copy command request\n");
++		err = -EFAULT;
++		goto error;
++	}
++
++	memset(&answer, 0, sizeof(struct te_answer));
++
++	switch (ioctl_num) {
++	case TE_IOCTL_OPEN_CLIENT_SESSION:
++		operation = &cmd.opensession.operation;
++		ptr_user_answer = (void *)cmd.opensession.answer;
++
++		cmd_desc = te_get_free_cmd_desc(dev);
++		params = te_get_free_params(dev, operation->list_count);
++
++		if (!cmd_desc || (operation->list_count && !params)) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc/params\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request));
++
++		request->params = params;
++		request->params_size = operation->list_count;
++
++		if (copy_params_from_user(request, operation)) {
++			err = -EFAULT;
++			pr_info("failed to copy params from user\n");
++			goto error;
++		}
++
++		te_open_session(&cmd.opensession, request, context);
++
++		SET_ANSWER(answer, request->result, request->result_origin);
++		answer.session_id = request->session_id;
++		break;
++
++	case TE_IOCTL_CLOSE_CLIENT_SESSION:
++		ptr_user_answer = (void *)cmd.closesession.answer;
++		cmd_desc = te_get_free_cmd_desc(dev);
++		if (!cmd_desc) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request));
++
++		/* close session cannot fail */
++		te_close_session(&cmd.closesession, request, context);
++		break;
++
++	case TE_IOCTL_LAUNCH_OPERATION:
++		operation = &cmd.launchop.operation;
++		ptr_user_answer = (void *)cmd.launchop.answer;
++
++		cmd_desc = te_get_free_cmd_desc(dev);
++		params = te_get_free_params(dev, operation->list_count);
++
++		if (!cmd_desc || (operation->list_count && !params)) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc/params\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request));
++
++		request->params = params;
++		request->params_size = operation->list_count;
++
++		if (copy_params_from_user(request, operation)) {
++			err = -EFAULT;
++			pr_info("failed to copy params from user\n");
++			goto error;
++		}
++
++		te_launch_operation(&cmd.launchop, request, context);
++
++		SET_ANSWER(answer, request->result, request->result_origin);
++		break;
++
++	default:
++		pr_err("Invalid IOCTL Cmd\n");
++		err = -EINVAL;
++		goto error;
++	}
++	if (ptr_user_answer && !err) {
++		if (copy_to_user(ptr_user_answer, &answer,
++			sizeof(struct te_answer))) {
++			pr_err("Failed to copy answer\n");
++			err = -EFAULT;
++		}
++	}
++	if (request->params && !err) {
++		if (copy_params_to_user(request, operation)) {
++			pr_err("Failed to copy return params\n");
++			err = -EFAULT;
++		}
++	}
++
++error:
++	if (cmd_desc)
++		te_put_used_cmd_desc(dev, cmd_desc);
++	if (params)
++		te_put_free_params(dev, params, operation->list_count);
++	return err;
++}
++
++static int copy_params_from_user_compat(struct te_request_compat *req,
++	struct te_operation_compat *operation)
++{
++	struct te_oper_param_compat *param_array;
++	struct te_oper_param_compat *user_param;
++	uint32_t i;
++
++	if (operation->list_count == 0)
++		return 0;
++
++	param_array = (struct te_oper_param_compat *)(uintptr_t)req->params;
++	if (param_array == NULL) {
++		pr_err("param_array empty\n");
++		return 1;
++	}
++
++	user_param = (struct te_oper_param_compat *)(uintptr_t)
++		operation->list_head;
++	for (i = 0; i < operation->list_count && user_param != NULL; i++) {
++		if (copy_from_user(param_array + i, user_param,
++					sizeof(struct te_oper_param_compat))) {
++			pr_err("Failed to copy operation parameter:%d, %p, " \
++					"list_count: %d\n",
++					i, user_param, operation->list_count);
++			return 1;
++		}
++		user_param = (struct te_oper_param_compat *)(uintptr_t)
++			param_array[i].next_ptr_user;
++	}
++	return 0;
++}
++
++static int copy_params_to_user_compat(struct te_request_compat *req,
++	struct te_operation_compat *operation)
++{
++	struct te_oper_param_compat *param_array;
++	struct te_oper_param_compat *user_param;
++	uint32_t i;
++
++	if (operation->list_count == 0)
++		return 0;
++
++	param_array =
++		(struct te_oper_param_compat *)(uintptr_t)req->params;
++	if (param_array == NULL) {
++		pr_err("param_array empty\n");
++		return 1;
++	}
++
++	user_param =
++		(struct te_oper_param_compat *)(uintptr_t)operation->list_head;
++	for (i = 0; i < req->params_size; i++) {
++		if (copy_to_user(user_param, param_array + i,
++					sizeof(struct te_oper_param_compat))) {
++			pr_err("Failed to copy back parameter:%d %p\n", i,
++					user_param);
++			return 1;
++		}
++		user_param = (struct te_oper_param_compat *)(uintptr_t)
++			param_array[i].next_ptr_user;
++	}
++	return 0;
++}
++
++static long te_handle_trustedapp_ioctl_compat(struct file *file,
++	unsigned int ioctl_num, unsigned long ioctl_param)
++{
++	long err = 0;
++	union te_cmd_compat cmd_compat;
++	struct te_operation_compat *operation = NULL;
++	struct te_oper_param_compat *params = NULL;
++	struct te_request_compat *request;
++	void __user *ptr_user_answer = NULL;
++	struct te_answer answer;
++	struct te_cmd_req_desc_compat *cmd_desc = NULL;
++	struct tlk_context *context = file->private_data;
++	struct tlk_device *dev = context->dev;
++
++	if (copy_from_user(&cmd_compat, (void __user *)ioctl_param,
++				sizeof(union te_cmd_compat))) {
++		pr_err("Failed to copy command request\n");
++		err = -EFAULT;
++		goto error;
++	}
++
++	memset(&answer, 0, sizeof(struct te_answer));
++
++	switch (ioctl_num) {
++	case TE_IOCTL_OPEN_CLIENT_SESSION_COMPAT:
++		operation = &cmd_compat.opensession.operation;
++		ptr_user_answer = (void *)(uintptr_t)
++					cmd_compat.opensession.answer;
++
++		cmd_desc = te_get_free_cmd_desc_compat(dev);
++		params = te_get_free_params_compat(dev, operation->list_count);
++
++		if (!cmd_desc || (operation->list_count && !params)) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc/params\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request_compat));
++
++		request->params = (uintptr_t)params;
++		request->params_size = operation->list_count;
++
++		if (copy_params_from_user_compat(request, operation)) {
++			err = -EFAULT;
++			pr_info("failed to copy params from user\n");
++			goto error;
++		}
++
++		te_open_session_compat(&cmd_compat.opensession,
++					request, context);
++
++		SET_ANSWER(answer, request->result, request->result_origin);
++		answer.session_id = request->session_id;
++		break;
++
++	case TE_IOCTL_CLOSE_CLIENT_SESSION_COMPAT:
++		ptr_user_answer = (void *)(uintptr_t)
++					cmd_compat.closesession.answer;
++		cmd_desc = te_get_free_cmd_desc_compat(dev);
++		if (!cmd_desc) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request_compat));
++
++		/* close session cannot fail */
++		te_close_session_compat(&cmd_compat.closesession,
++					request, context);
++		break;
++
++	case TE_IOCTL_LAUNCH_OPERATION_COMPAT:
++		operation = &cmd_compat.launchop.operation;
++		ptr_user_answer = (void *)(uintptr_t)cmd_compat.launchop.answer;
++
++		cmd_desc = te_get_free_cmd_desc_compat(dev);
++		params = te_get_free_params_compat(dev, operation->list_count);
++
++		if (!cmd_desc || (operation->list_count && !params)) {
++			SET_ANSWER(answer,
++				   OTE_ERROR_OUT_OF_MEMORY,
++				   OTE_RESULT_ORIGIN_COMMS);
++			pr_err("failed to get cmd_desc/params\n");
++			goto error;
++		}
++
++		request = cmd_desc->req_addr;
++		memset(request, 0, sizeof(struct te_request_compat));
++
++		request->params = (uintptr_t)params;
++		request->params_size = operation->list_count;
++
++		if (copy_params_from_user_compat(request, operation)) {
++			err = -EFAULT;
++			pr_info("failed to copy params from user\n");
++			goto error;
++		}
++
++		te_launch_operation_compat(&cmd_compat.launchop,
++						request, context);
++
++		SET_ANSWER(answer, request->result, request->result_origin);
++		break;
++
++	default:
++		pr_err("Invalid IOCTL Cmd\n");
++		err = -EINVAL;
++		goto error;
++	}
++	if (ptr_user_answer && !err) {
++		if (copy_to_user(ptr_user_answer, &answer,
++			sizeof(struct te_answer))) {
++			pr_err("Failed to copy answer\n");
++			err = -EFAULT;
++		}
++	}
++	if (request->params && !err) {
++		if (copy_params_to_user_compat(request, operation)) {
++			pr_err("Failed to copy return params\n");
++			err = -EFAULT;
++		}
++	}
++
++error:
++	if (cmd_desc)
++		te_put_used_cmd_desc_compat(dev, cmd_desc);
++	if (params)
++		te_put_free_params_compat(dev, params, operation->list_count);
++	return err;
++}
++
++static long tlk_device_ioctl(struct file *file, unsigned int ioctl_num,
++	unsigned long ioctl_param)
++{
++	int err;
++
++	switch (ioctl_num) {
++	case TE_IOCTL_OPEN_CLIENT_SESSION:
++	case TE_IOCTL_CLOSE_CLIENT_SESSION:
++	case TE_IOCTL_LAUNCH_OPERATION:
++		mutex_lock(&smc_lock);
++		err = te_handle_trustedapp_ioctl(file, ioctl_num, ioctl_param);
++		mutex_unlock(&smc_lock);
++		break;
++
++	case TE_IOCTL_OPEN_CLIENT_SESSION_COMPAT:
++	case TE_IOCTL_CLOSE_CLIENT_SESSION_COMPAT:
++	case TE_IOCTL_LAUNCH_OPERATION_COMPAT:
++		mutex_lock(&smc_lock);
++		err = te_handle_trustedapp_ioctl_compat(file, ioctl_num,
++							ioctl_param);
++		mutex_unlock(&smc_lock);
++		break;
++
++	case TE_IOCTL_SS_NEW_REQ_LEGACY:
++	case TE_IOCTL_SS_REQ_COMPLETE_LEGACY:
++		err = te_handle_ss_ioctl_legacy(file, ioctl_num, ioctl_param);
++		break;
++
++	case TE_IOCTL_SS_NEW_REQ:
++	case TE_IOCTL_SS_REQ_COMPLETE:
++		err = te_handle_ss_ioctl(file, ioctl_num, ioctl_param);
++		break;
++
++	default:
++		pr_err("%s: Invalid IOCTL (0x%x) id 0x%x max 0x%lx\n",
++			__func__, ioctl_num, _IOC_NR(ioctl_num),
++			(unsigned long)TE_IOCTL_MAX_NR);
++		err = -EINVAL;
++		break;
++	}
++
++	return err;
++}
++
++/*
++ * tlk_driver function definitions.
++ */
++static const struct file_operations tlk_device_fops = {
++	.owner = THIS_MODULE,
++	.open = tlk_device_open,
++	.release = tlk_device_release,
++	.unlocked_ioctl = tlk_device_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl = tlk_device_ioctl,
++#endif
++};
++
++struct miscdevice tlk_misc_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "tlk_device",
++	.fops = &tlk_device_fops,
++};
++
++static int __init tlk_init(void)
++{
++	int ret;
++
++	INIT_LIST_HEAD(&(tlk_dev.used_cmd_list));
++	INIT_LIST_HEAD(&(tlk_dev.free_cmd_list));
++
++	ret = te_create_free_cmd_list(&tlk_dev);
++	if (ret != 0)
++		return ret;
++
++	return misc_register(&tlk_misc_device);
++}
++
++module_init(tlk_init);
+diff --git a/security/tlk_driver/ote_fs.c b/security/tlk_driver/ote_fs.c
+new file mode 100644
+index 000000000000..f58bdd64aecb
+--- /dev/null
++++ b/security/tlk_driver/ote_fs.c
+@@ -0,0 +1,175 @@
++/*
++ * Copyright (c) 2013-2014 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/list.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include <linux/bitops.h>
++#include <linux/uaccess.h>
++#include <linux/dma-mapping.h>
++
++#include "ote_protocol.h"
++
++static DECLARE_COMPLETION(req_ready);
++static DECLARE_COMPLETION(req_complete);
++
++static struct te_ss_op_legacy *ss_op_shmem_legacy;
++static struct te_ss_op *ss_op_shmem;
++static uint32_t ss_op_size;
++
++static void indicate_ss_op_complete(void)
++{
++	tlk_generic_smc(TE_SMC_SS_REQ_COMPLETE, 0, 0);
++}
++
++int te_handle_ss_ioctl_legacy(struct file *file, unsigned int ioctl_num,
++	unsigned long ioctl_param)
++{
++	switch (ioctl_num) {
++	case TE_IOCTL_SS_NEW_REQ_LEGACY:
++		/* wait for a new request */
++		if (wait_for_completion_interruptible(&req_ready))
++			return -ENODATA;
++
++		/* transfer pending request to daemon's buffer */
++		if (copy_to_user((void __user *)ioctl_param, ss_op_shmem_legacy,
++					ss_op_size)) {
++			pr_err("copy_to_user failed for new request\n");
++			return -EFAULT;
++		}
++		break;
++
++	case TE_IOCTL_SS_REQ_COMPLETE_LEGACY: /* request complete */
++		if (copy_from_user(ss_op_shmem_legacy,
++			(void __user *)ioctl_param, ss_op_size)) {
++			pr_err("copy_from_user failed for request\n");
++			return -EFAULT;
++		}
++
++		/* signal the producer */
++		complete(&req_complete);
++		break;
++	}
++
++	return 0;
++}
++
++void tlk_ss_op_legacy(uint32_t size)
++{
++	/* store size of request */
++	ss_op_size = size;
++
++	/* signal consumer */
++	complete(&req_ready);
++
++	/* wait for the consumer's signal */
++	wait_for_completion(&req_complete);
++
++	/* signal completion to the secure world */
++	indicate_ss_op_complete();
++}
++
++static int __init tlk_ss_init_legacy(void)
++{
++	dma_addr_t ss_op_shmem_dma;
++
++	/* allocate shared memory buffer */
++	ss_op_shmem_legacy = dma_alloc_coherent(NULL,
++		sizeof(struct te_ss_op_legacy), &ss_op_shmem_dma, GFP_KERNEL);
++	if (!ss_op_shmem_legacy) {
++		pr_err("%s: no memory available for fs operations\n", __func__);
++		return -ENOMEM;
++	}
++
++	tlk_generic_smc(TE_SMC_SS_REGISTER_HANDLER_LEGACY,
++		(uintptr_t)tlk_ss_op_legacy, (uintptr_t)ss_op_shmem_legacy);
++
++	return 0;
++}
++
++arch_initcall(tlk_ss_init_legacy);
++
++int te_handle_ss_ioctl(struct file *file, unsigned int ioctl_num,
++	unsigned long ioctl_param)
++{
++	switch (ioctl_num) {
++	case TE_IOCTL_SS_NEW_REQ:
++		/* wait for a new request */
++		if (wait_for_completion_interruptible(&req_ready))
++			return -ENODATA;
++
++		/* transfer pending request to daemon's buffer */
++		if (copy_to_user((void __user *)ioctl_param, ss_op_shmem->data,
++					ss_op_shmem->req_size)) {
++			pr_err("copy_to_user failed for new request\n");
++			return -EFAULT;
++		}
++		break;
++
++	case TE_IOCTL_SS_REQ_COMPLETE: /* request complete */
++		if (copy_from_user(ss_op_shmem->data,
++			(void __user *)ioctl_param, ss_op_shmem->req_size)) {
++			pr_err("copy_from_user failed for request\n");
++			return -EFAULT;
++		}
++
++		/* signal the producer */
++		complete(&req_complete);
++		break;
++	}
++
++	return 0;
++}
++
++void tlk_ss_op(void)
++{
++	/* signal consumer */
++	complete(&req_ready);
++
++	/* wait for the consumer's signal */
++	wait_for_completion(&req_complete);
++}
++
++static int __init tlk_ss_init(void)
++{
++	dma_addr_t ss_op_shmem_dma;
++	int32_t ret;
++
++	/* allocate shared memory buffer */
++	ss_op_shmem = dma_alloc_coherent(NULL, sizeof(struct te_ss_op),
++			&ss_op_shmem_dma, GFP_KERNEL);
++	if (!ss_op_shmem) {
++		pr_err("%s: no memory available for fs operations\n", __func__);
++		return -ENOMEM;
++	}
++
++	ret = tlk_generic_smc(TE_SMC_SS_REGISTER_HANDLER,
++			(uintptr_t)ss_op_shmem, 0);
++	if (ret != 0) {
++		dma_free_coherent(NULL, sizeof(struct te_ss_op),
++			(void *)ss_op_shmem, ss_op_shmem_dma);
++		ss_op_shmem = NULL;
++		return -ENOTSUPP;
++	}
++
++	return 0;
++}
++
++arch_initcall(tlk_ss_init);
+diff --git a/security/tlk_driver/ote_log.c b/security/tlk_driver/ote_log.c
+new file mode 100644
+index 000000000000..0e8f6b290f30
+--- /dev/null
++++ b/security/tlk_driver/ote_log.c
+@@ -0,0 +1,204 @@
++/*
++ * Copyright (c) 2013-2014 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/list.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include <linux/bitops.h>
++#include <linux/uaccess.h>
++
++#include <asm/page.h>
++#include <linux/dma-mapping.h>
++#include <linux/string.h>
++
++#include "ote_protocol.h"
++
++#define LOGBUF_SIZE 8192
++
++struct circular_buffer {
++	uint32_t size; /* Indicates the total size of the buffer */
++	uint32_t start; /* Starting point of valid data in buffer */
++	uint32_t end; /* First character which is empty (can be written to) */
++	uint32_t overflow; /* Indicator whether buffer has overwritten itself */
++	char *buf;
++};
++
++#if defined(CONFIG_OTE_ENABLE_LOGGER)
++
++static int ote_logging_enabled;
++struct circular_buffer *cb;
++
++/*
++ * Initialize the shared buffer for TLK logging.
++ * The shared buffer is allocated in DMA memory to get uncached memory
++ * since TLK directly writes to the physical address of the shared buffer.
++ * The structure is declared in DMA memory too since it's members will
++ * also be updated by the TLK directly to their physical addresses.
++ */
++static int circ_buf_init(struct circular_buffer **cbptr)
++{
++
++	dma_addr_t tp;
++
++	*cbptr = (struct circular_buffer *) dma_alloc_coherent(NULL,
++			sizeof(struct circular_buffer), &tp, GFP_KERNEL);
++	if (!*cbptr) {
++		pr_err("%s: no memory avaiable for circular buffer struct\n",
++			__func__);
++		return -ENOMEM;
++	}
++	memset(*cbptr, 0, sizeof(struct circular_buffer));
++
++	(*cbptr)->start = 0;
++	(*cbptr)->end = 0;
++	(*cbptr)->size = LOGBUF_SIZE;
++
++	(*cbptr)->buf = (char *) dma_alloc_coherent(NULL, LOGBUF_SIZE,
++			&tp, GFP_KERNEL);
++	if (!(*cbptr)->buf) {
++			pr_err("%s: no memory avaiable for shared buffer\n",
++				__func__);
++		/* Frees the memory allocated using dma_alloc_coherent */
++			dma_free_coherent(NULL,
++				sizeof(struct circular_buffer), cbptr, tp);
++			return -ENOMEM;
++	}
++	memset((*cbptr)->buf, 0, LOGBUF_SIZE);
++
++	(*cbptr)->overflow = 0;
++
++	return 0;
++}
++
++/*
++ * Copy the contents of the circular buffer into a char buffer in order.
++ * This helps to treat the buffer like a string and use it to tokenize it
++ * into lines, tag and display it.
++ */
++static int circ_buf_copy(struct circular_buffer *cb, char *text)
++{
++	if (cb->end == cb->start)
++		return 0;
++
++	if (cb->end > cb->start) {
++		if (abs(cb->end - cb->start) > LOGBUF_SIZE) {
++			pr_err("%s: cbuf pointers corrupted\n", __func__);
++			return -EINVAL;
++		}
++
++		memcpy(text, cb->buf + cb->start, cb->end - cb->start);
++
++	} else if (cb->start > cb->end) {
++		if (abs(cb->end - cb->start) > LOGBUF_SIZE) {
++			pr_err("%s: cbuf pointers corrupted\n", __func__);
++			return -EINVAL;
++		}
++
++		memcpy(text, cb->buf + cb->start, cb->size - cb->start);
++		memcpy(text + cb->size - cb->start, cb->buf, cb->end);
++
++	}
++
++	return 0;
++}
++
++/*
++ * Function which prints TLK logs.
++ * Tokenizes the TLK logs into lines, tags each line
++ * and prints it out to kmsg file.
++ */
++void ote_print_logs(void)
++{
++	char *text = NULL;
++	char *temp = NULL;
++	char *buffer = NULL;
++
++	if (!ote_logging_enabled)
++		return;
++
++	buffer = kzalloc(LOGBUF_SIZE, GFP_KERNEL);
++	BUG_ON(!buffer);
++
++	/* This detects if the buffer proved to be too small to hold the data.
++	 * If buffer is not large enough, it overwrites it's oldest data,
++	 * This warning serves to alert the user to possibly use a bigger buffer
++	 */
++	if (cb->overflow == 1) {
++		pr_info("\n[TLK] **WARNING** TLK buffer overwritten.\n\n");
++		cb->overflow = 0;
++	}
++
++	if (circ_buf_copy(cb, buffer) != 0) {
++		kfree(buffer);
++		return;
++	}
++	cb->buf[cb->end] = '\0';
++
++	/* In case no delimiter was found,
++	 * the token is taken to be the entire string *stringp,
++	 * and *stringp is made NULL.
++	 */
++	text = buffer;
++	temp = strsep(&text, "\n");
++	while (temp != NULL) {
++		if (strnlen(temp, LOGBUF_SIZE))
++			pr_info("[TLK] %s\n", temp);
++		temp = strsep(&text, "\n");
++	}
++
++	/* Indicate that buffer is empty */
++	cb->start = cb->end;
++	kfree(buffer);
++}
++#else
++void ote_print_logs(void) {}
++#endif
++
++/*
++ * Call function to initialize circular buffer.
++ * An SMC is made to send the virtual address of the structure to
++ * the secure OS.
++ */
++static int __init ote_logger_init(void)
++{
++	uintptr_t smc_args[MAX_EXT_SMC_ARGS];
++
++#if defined(CONFIG_OTE_ENABLE_LOGGER)
++	if (circ_buf_init(&cb) != 0)
++		return -1;
++
++	smc_args[0] = TE_SMC_INIT_LOGGER;
++	smc_args[1] = (uintptr_t)cb;
++
++	/* enable logging only if secure firmware supports it */
++	if (!tlk_generic_smc(smc_args[0], smc_args[1], 0))
++		ote_logging_enabled = 1;
++
++	ote_print_logs();
++#else
++	smc_args[0] = TE_SMC_INIT_LOGGER;
++	smc_args[1] = 0;
++	tlk_generic_smc(smc_args[0], smc_args[1], 0);
++#endif
++
++	return 0;
++}
++
++arch_initcall(ote_logger_init);
+diff --git a/security/tlk_driver/ote_protocol.h b/security/tlk_driver/ote_protocol.h
+new file mode 100644
+index 000000000000..608ee8981e7c
+--- /dev/null
++++ b/security/tlk_driver/ote_protocol.h
+@@ -0,0 +1,341 @@
++/*
++ * Copyright (c) 2013-2014 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef __OTE_PROTOCOL_H__
++#define __OTE_PROTOCOL_H__
++
++#include "ote_types.h"
++
++#define TE_IOCTL_MAGIC_NUMBER ('t')
++#define TE_IOCTL_OPEN_CLIENT_SESSION \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x10, union te_cmd)
++#define TE_IOCTL_CLOSE_CLIENT_SESSION \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x11, union te_cmd)
++#define TE_IOCTL_LAUNCH_OPERATION \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x14, union te_cmd)
++
++/* ioctls using new structs (eventually to replace current ioctls) */
++#define TE_IOCTL_OPEN_CLIENT_SESSION_COMPAT \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x10, union te_cmd_compat)
++#define TE_IOCTL_CLOSE_CLIENT_SESSION_COMPAT \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x11, union te_cmd_compat)
++#define TE_IOCTL_LAUNCH_OPERATION_COMPAT \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x14, union te_cmd_compat)
++
++#define TE_IOCTL_SS_NEW_REQ_LEGACY \
++	_IOR(TE_IOCTL_MAGIC_NUMBER,  0x20, struct te_ss_op_legacy)
++#define TE_IOCTL_SS_REQ_COMPLETE_LEGACY \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x21, struct te_ss_op_legacy)
++
++/* ioctls using new SS structs (eventually to replace current SS ioctls) */
++#define TE_IOCTL_SS_NEW_REQ \
++	_IOR(TE_IOCTL_MAGIC_NUMBER,  0x20, struct te_ss_op)
++#define TE_IOCTL_SS_REQ_COMPLETE \
++	_IOWR(TE_IOCTL_MAGIC_NUMBER, 0x21, struct te_ss_op)
++
++#define TE_IOCTL_MIN_NR	_IOC_NR(TE_IOCTL_OPEN_CLIENT_SESSION)
++#define TE_IOCTL_MAX_NR	_IOC_NR(TE_IOCTL_SS_REQ_COMPLETE)
++
++/* shared buffer is 2 pages: 1st are requests, 2nd are params */
++#define TE_CMD_DESC_MAX	(PAGE_SIZE / sizeof(struct te_request))
++#define TE_PARAM_MAX	(PAGE_SIZE / sizeof(struct te_oper_param))
++
++#define TE_CMD_DESC_MAX_COMPAT \
++	(PAGE_SIZE / sizeof(struct te_request_compat))
++#define TE_PARAM_MAX_COMPAT \
++	(PAGE_SIZE / sizeof(struct te_oper_param_compat))
++
++#define MAX_EXT_SMC_ARGS	12
++
++extern struct mutex smc_lock;
++extern struct tlk_device tlk_dev;
++
++uint32_t _tlk_generic_smc(uint32_t arg0, uintptr_t arg1, uintptr_t arg2);
++uint32_t tlk_generic_smc(uint32_t arg0, uintptr_t arg1, uintptr_t arg2);
++uint32_t _tlk_extended_smc(uintptr_t *args);
++uint32_t tlk_extended_smc(uintptr_t *args);
++void tlk_irq_handler(void);
++
++/* errors returned by secure world in reponse to SMC calls */
++enum {
++	TE_ERROR_PREEMPT_BY_IRQ = 0xFFFFFFFD,
++	TE_ERROR_PREEMPT_BY_FS = 0xFFFFFFFE,
++};
++
++struct tlk_device {
++	struct te_request *req_addr;
++	dma_addr_t req_addr_phys;
++	struct te_oper_param *param_addr;
++	dma_addr_t param_addr_phys;
++
++	struct te_request_compat *req_addr_compat;
++	struct te_oper_param_compat *param_addr_compat;
++
++	char *req_param_buf;
++
++	unsigned long *param_bitmap;
++
++	struct list_head used_cmd_list;
++	struct list_head free_cmd_list;
++};
++
++struct te_cmd_req_desc {
++	struct te_request *req_addr;
++	struct list_head list;
++};
++
++struct te_cmd_req_desc_compat {
++	struct te_request_compat *req_addr;
++	struct list_head list;
++};
++
++struct te_shmem_desc {
++	struct list_head list;
++	void *buffer;
++	size_t size;
++	unsigned int mem_type;
++};
++
++struct tlk_context {
++	struct tlk_device *dev;
++	struct list_head shmem_alloc_list;
++};
++
++enum {
++	/* Trusted Application Calls */
++	TE_SMC_OPEN_SESSION		= 0x30000001,
++	TE_SMC_CLOSE_SESSION		= 0x30000002,
++	TE_SMC_LAUNCH_OPERATION		= 0x30000003,
++
++	/* Trusted OS calls */
++	TE_SMC_REGISTER_REQ_BUF		= 0x32000002,
++	TE_SMC_REGISTER_IRQ_HANDLER	= 0x32000004,
++	TE_SMC_NS_IRQ_DONE		= 0x32000005,
++	TE_SMC_INIT_LOGGER		= 0x32000007,
++	TE_SMC_SS_REGISTER_HANDLER_LEGACY	= 0x32000008,
++	TE_SMC_SS_REQ_COMPLETE		= 0x32000009,
++	TE_SMC_SS_REGISTER_HANDLER	= 0x32000010,
++
++	/* SIP (SOC specific) calls.  */
++	TE_SMC_PROGRAM_VPR		= 0x82000003,
++};
++
++enum {
++	TE_PARAM_TYPE_NONE	= 0,
++	TE_PARAM_TYPE_INT_RO    = 1,
++	TE_PARAM_TYPE_INT_RW    = 2,
++	TE_PARAM_TYPE_MEM_RO    = 3,
++	TE_PARAM_TYPE_MEM_RW    = 4,
++};
++
++struct te_oper_param {
++	uint32_t index;
++	uint32_t type;
++	union {
++		struct {
++			uint32_t val;
++		} Int;
++		struct {
++			void  *base;
++			uint32_t len;
++		} Mem;
++	} u;
++	void *next_ptr_user;
++};
++
++struct te_oper_param_compat {
++	uint32_t index;
++	uint32_t type;
++	union {
++		struct {
++			uint32_t val;
++		} Int;
++		struct {
++			uint64_t base;
++			uint32_t len;
++		} Mem;
++	} u;
++	uint64_t next_ptr_user;
++};
++
++struct te_operation {
++	uint32_t command;
++	struct te_oper_param *list_head;
++	/* Maintain a pointer to tail of list to easily add new param node */
++	struct te_oper_param *list_tail;
++	uint32_t list_count;
++	uint32_t status;
++	uint32_t iterface_side;
++};
++
++struct te_service_id {
++	uint32_t time_low;
++	uint16_t time_mid;
++	uint16_t time_hi_and_version;
++	uint8_t clock_seq_and_node[8];
++};
++
++/*
++ * OpenSession
++ */
++struct te_opensession {
++	struct te_service_id dest_uuid;
++	struct te_operation operation;
++	uint32_t answer;
++};
++
++/*
++ * CloseSession
++ */
++struct te_closesession {
++	uint32_t	session_id;
++	uint32_t	answer;
++};
++
++/*
++ * LaunchOperation
++ */
++struct te_launchop {
++	uint32_t		session_id;
++	struct te_operation	operation;
++	uint32_t		answer;
++};
++
++union te_cmd {
++	struct te_opensession	opensession;
++	struct te_closesession	closesession;
++	struct te_launchop	launchop;
++};
++
++/*
++ * Compat versions of the original structs (eventually to replace
++ * the old structs, once the lib/TLK kernel changes are in).
++ */
++struct te_operation_compat {
++	uint32_t	command;
++	uint32_t	status;
++	uint64_t	list_head;
++	uint64_t	list_tail;
++	uint32_t	list_count;
++	uint32_t	interface_side;
++};
++
++/*
++ * OpenSession
++ */
++struct te_opensession_compat {
++	struct te_service_id		dest_uuid;
++	struct te_operation_compat	operation;
++	uint64_t			answer;
++};
++
++/*
++ * CloseSession
++ */
++struct te_closesession_compat {
++	uint32_t	session_id;
++	uint64_t	answer;
++};
++
++/*
++ * LaunchOperation
++ */
++struct te_launchop_compat {
++	uint32_t			session_id;
++	struct te_operation_compat	operation;
++	uint64_t			answer;
++};
++
++union te_cmd_compat {
++	struct te_opensession_compat	opensession;
++	struct te_closesession_compat	closesession;
++	struct te_launchop_compat	launchop;
++};
++
++struct te_request {
++	uint32_t		type;
++	uint32_t		session_id;
++	uint32_t		command_id;
++	struct te_oper_param	*params;
++	uint32_t		params_size;
++	uint32_t		dest_uuid[4];
++	uint32_t		result;
++	uint32_t		result_origin;
++};
++
++struct te_request_compat {
++	uint32_t		type;
++	uint32_t		session_id;
++	uint32_t		command_id;
++	uint64_t		params;
++	uint32_t		params_size;
++	uint32_t		dest_uuid[4];
++	uint32_t		result;
++	uint32_t		result_origin;
++};
++
++struct te_answer {
++	uint32_t	result;
++	uint32_t	session_id;
++	uint32_t	result_origin;
++};
++
++void te_open_session(struct te_opensession *cmd,
++	struct te_request *request,
++	struct tlk_context *context);
++
++void te_close_session(struct te_closesession *cmd,
++	struct te_request *request,
++	struct tlk_context *context);
++
++void te_launch_operation(struct te_launchop *cmd,
++	struct te_request *request,
++	struct tlk_context *context);
++
++void te_open_session_compat(struct te_opensession_compat *cmd,
++	struct te_request_compat *request,
++	struct tlk_context *context);
++
++void te_close_session_compat(struct te_closesession_compat *cmd,
++	struct te_request_compat *request,
++	struct tlk_context *context);
++
++void te_launch_operation_compat(struct te_launchop_compat *cmd,
++	struct te_request_compat *request,
++	struct tlk_context *context);
++
++#define SS_OP_MAX_DATA_SIZE	0x1000
++struct te_ss_op {
++	uint32_t	req_size;
++	uint8_t		data[SS_OP_MAX_DATA_SIZE];
++};
++
++struct te_ss_op_legacy {
++	uint8_t		data[SS_OP_MAX_DATA_SIZE];
++};
++
++int te_handle_ss_ioctl_legacy(struct file *file, unsigned int ioctl_num,
++		unsigned long ioctl_param);
++int te_handle_ss_ioctl(struct file *file, unsigned int ioctl_num,
++		unsigned long ioctl_param);
++int te_handle_fs_ioctl(struct file *file, unsigned int ioctl_num,
++		unsigned long ioctl_param);
++void ote_print_logs(void);
++void tlk_ss_op(void);
++
++#endif
+diff --git a/security/tlk_driver/ote_types.h b/security/tlk_driver/ote_types.h
+new file mode 100644
+index 000000000000..593400f7a03a
+--- /dev/null
++++ b/security/tlk_driver/ote_types.h
+@@ -0,0 +1,79 @@
++/*
++ * Copyright (c) 2013 NVIDIA Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef __OTE_TYPES_H__
++#define __OTE_TYPES_H__
++
++/*
++ * Return Codes
++ */
++enum {
++	/* Success */
++	OTE_SUCCESS			= 0x00000000,
++	OTE_ERROR_NO_ERROR		= OTE_SUCCESS,
++	/* Non-specific cause */
++	OTE_ERROR_GENERIC		= 0xFFFF0000,
++	/* Access priviledge not sufficient */
++	OTE_ERROR_ACCESS_DENIED		= 0xFFFF0001,
++	/* The operation was cancelled */
++	OTE_ERROR_CANCEL		= 0xFFFF0002,
++	/* Concurrent accesses conflict */
++	OTE_ERROR_ACCESS_CONFLICT	= 0xFFFF0003,
++	/* Too much data for req was passed */
++	OTE_ERROR_EXCESS_DATA		= 0xFFFF0004,
++	/* Input data was of invalid format */
++	OTE_ERROR_BAD_FORMAT		= 0xFFFF0005,
++	/* Input parameters were invalid */
++	OTE_ERROR_BAD_PARAMETERS	= 0xFFFF0006,
++	/* Oper invalid in current state */
++	OTE_ERROR_BAD_STATE		= 0xFFFF0007,
++	/* The req data item not found */
++	OTE_ERROR_ITEM_NOT_FOUND	= 0xFFFF0008,
++	/* The req oper not implemented */
++	OTE_ERROR_NOT_IMPLEMENTED	= 0xFFFF0009,
++	/* The req oper not supported */
++	OTE_ERROR_NOT_SUPPORTED		= 0xFFFF000A,
++	/* Expected data was missing */
++	OTE_ERROR_NO_DATA		= 0xFFFF000B,
++	/* System ran out of resources */
++	OTE_ERROR_OUT_OF_MEMORY		= 0xFFFF000C,
++	/* The system is busy */
++	OTE_ERROR_BUSY			= 0xFFFF000D,
++	/* Communication failed */
++	OTE_ERROR_COMMUNICATION		= 0xFFFF000E,
++	/* A security fault was detected */
++	OTE_ERROR_SECURITY		= 0xFFFF000F,
++	/* The supplied buffer is too short */
++	OTE_ERROR_SHORT_BUFFER		= 0xFFFF0010,
++};
++
++/*
++ * Return Code origins
++ */
++enum {
++	/* Originated from OTE Client API */
++	OTE_RESULT_ORIGIN_API = 1,
++	/* Originated from Underlying Communication Stack */
++	OTE_RESULT_ORIGIN_COMMS = 2,
++	/* Originated from Common OTE Code */
++	OTE_RESULT_ORIGIN_KERNEL = 3,
++	/* Originated from Trusted APP Code */
++	OTE_RESULT_ORIGIN_TRUSTED_APP = 4,
++};
++
++#endif
+-- 
+2.35.3
+

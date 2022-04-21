@@ -1,0 +1,378 @@
+From 51f1725a153ca79214d04ddbf3739f11e232c3c3 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Mon, 15 Jun 2020 12:13:10 +0800
+Subject: [PATCH] media: rockchip: isp: support lvds interface
+
+Change-Id: I36e8c8eecd590e1862d0d6fa7dbd5f1091567020
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/dev.c     |  60 +++++------
+ drivers/media/platform/rockchip/isp/dev.h     |   1 +
+ .../media/platform/rockchip/isp/regs_v2x.h    |  18 ++++
+ drivers/media/platform/rockchip/isp/rkisp.c   | 102 +++++++++++++++---
+ 4 files changed, 136 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index aa867cb5a0a2..1f04456d2fae 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -93,7 +93,7 @@ static int __isp_pipeline_prepare(struct rkisp_pipeline *p,
+ 	p->num_subdevs = 0;
+ 	memset(p->subdevs, 0, sizeof(p->subdevs));
+ 
+-	if (!(dev->isp_inp & (INP_CSI | INP_DVP)))
++	if (!(dev->isp_inp & (INP_CSI | INP_DVP | INP_LVDS)))
+ 		return 0;
+ 
+ 	while (1) {
+@@ -121,7 +121,6 @@ static int __isp_pipeline_prepare(struct rkisp_pipeline *p,
+ 		if (me->num_pads == 1)
+ 			break;
+ 	}
+-
+ 	if (!p->num_subdevs)
+ 		return -EINVAL;
+ 
+@@ -136,7 +135,7 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
+ 	u64 data_rate;
+ 	int i;
+ 
+-	if (!(dev->isp_inp & (INP_CSI | INP_DVP))) {
++	if (!(dev->isp_inp & (INP_CSI | INP_DVP | INP_LVDS))) {
+ 		if (dev->clks[0])
+ 			clk_set_rate(dev->clks[0], 400 * 1000000UL);
+ 		return 0;
+@@ -270,55 +269,52 @@ static int rkisp_pipeline_set_stream(struct rkisp_pipeline *p, bool on)
+ static int rkisp_create_links(struct rkisp_device *dev)
+ {
+ 	unsigned int s, pad;
+-	int ret;
++	int ret = 0;
+ 
+ 	/* sensor links(or mipi-phy) */
+ 	for (s = 0; s < dev->num_sensors; ++s) {
+ 		struct rkisp_sensor_info *sensor = &dev->sensors[s];
+ 		u32 type = sensor->sd->entity.function;
++		bool en = s ? 0 : MEDIA_LNK_FL_ENABLED;
+ 
+ 		for (pad = 0; pad < sensor->sd->entity.num_pads; pad++)
+-			if (sensor->sd->entity.pads[pad].flags &
+-				MEDIA_PAD_FL_SOURCE)
++			if (sensor->sd->entity.pads[pad].flags & MEDIA_PAD_FL_SOURCE)
+ 				break;
+ 
+ 		if (pad == sensor->sd->entity.num_pads) {
+-			dev_err(dev->dev,
+-				"failed to find src pad for %s\n",
++			dev_err(dev->dev, "failed to find src pad for %s\n",
+ 				sensor->sd->name);
+-
+ 			return -ENXIO;
+ 		}
+ 
+ 		/* sensor link -> isp */
+ 		if (type == MEDIA_ENT_F_CAM_SENSOR) {
+ 			dev->isp_inp = INP_DVP;
+-			ret = media_create_pad_link(&sensor->sd->entity,
+-				pad, &dev->isp_sdev.sd.entity,
+-				RKISP_ISP_PAD_SINK,
+-				s ? 0 : MEDIA_LNK_FL_ENABLED);
++			ret = media_create_pad_link(&sensor->sd->entity, pad,
++				&dev->isp_sdev.sd.entity, RKISP_ISP_PAD_SINK, en);
+ 		} else {
+-			/* mipi-phy link -> csi -> isp */
+-			dev->isp_inp = INP_CSI;
+-			ret = media_create_pad_link(&sensor->sd->entity,
+-				pad, &dev->csi_dev.sd.entity, CSI_SINK,
+-				s ? 0 : MEDIA_LNK_FL_ENABLED);
+-			ret |= media_create_pad_link(&dev->csi_dev.sd.entity,
+-				CSI_SRC_CH0, &dev->isp_sdev.sd.entity,
+-				RKISP_ISP_PAD_SINK,
+-				s ? 0 : MEDIA_LNK_FL_ENABLED);
+-			dev->csi_dev.sink[0].linked = true;
+-			dev->csi_dev.sink[0].index = BIT(0);
+-		}
+-
+-		if (ret) {
+-			dev_err(dev->dev,
+-				"failed to create link for %s\n",
+-				sensor->sd->name);
+-			return ret;
++			v4l2_subdev_call(sensor->sd, video,
++					 g_mbus_config, &sensor->mbus);
++			if (sensor->mbus.type == V4L2_MBUS_CCP2) {
++				/* mipi-phy lvds link -> isp */
++				dev->isp_inp = INP_LVDS;
++				ret = media_create_pad_link(&sensor->sd->entity, pad,
++					&dev->isp_sdev.sd.entity, RKISP_ISP_PAD_SINK, en);
++			} else {
++				/* mipi-phy link -> csi -> isp */
++				dev->isp_inp = INP_CSI;
++				ret = media_create_pad_link(&sensor->sd->entity,
++					pad, &dev->csi_dev.sd.entity, CSI_SINK, en);
++				ret |= media_create_pad_link(&dev->csi_dev.sd.entity, CSI_SRC_CH0,
++					&dev->isp_sdev.sd.entity, RKISP_ISP_PAD_SINK, en);
++				dev->csi_dev.sink[0].linked = en;
++				dev->csi_dev.sink[0].index = BIT(0);
++			}
+ 		}
++		if (ret)
++			dev_err(dev->dev, "failed to create link for %s\n", sensor->sd->name);
+ 	}
+-	return 0;
++	return ret;
+ }
+ 
+ static int _set_pipeline_default_fmt(struct rkisp_device *dev)
+diff --git a/drivers/media/platform/rockchip/isp/dev.h b/drivers/media/platform/rockchip/isp/dev.h
+index 83501adbf3b9..f1572ecb7f65 100644
+--- a/drivers/media/platform/rockchip/isp/dev.h
++++ b/drivers/media/platform/rockchip/isp/dev.h
+@@ -100,6 +100,7 @@ enum rkisp_isp_inp {
+ 	INP_CSI = BIT(4),
+ 	INP_DVP = BIT(5),
+ 	INP_DMARX_ISP = BIT(6),
++	INP_LVDS = BIT(7),
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/rockchip/isp/regs_v2x.h b/drivers/media/platform/rockchip/isp/regs_v2x.h
+index 05fa0ae378f3..6d8487f80b53 100644
+--- a/drivers/media/platform/rockchip/isp/regs_v2x.h
++++ b/drivers/media/platform/rockchip/isp/regs_v2x.h
+@@ -15,6 +15,9 @@
+ #define CTRL_VI_IRCL					(CTRL_BASE + 0x00014)
+ #define CTRL_VI_DPCL					(CTRL_BASE + 0x00018)
+ #define CTRL_SWS_CFG					(CTRL_BASE + 0x0001c)
++#define LVDS_CTRL					(CTRL_BASE + 0x00020)
++#define LVDS_SAV_EAV_ACT				(CTRL_BASE + 0x00024)
++#define LVDS_SAV_EAV_BLK				(CTRL_BASE + 0x00028)
+ 
+ #define IMG_EFF_BASE					0x00000200
+ #define IMG_EFF_CTRL					(IMG_EFF_BASE + 0x00000)
+@@ -1736,6 +1739,9 @@
+ #define IRCL_MIPI_SW_RST		BIT(11)
+ #define IRCL_3A_SW_RST			BIT(13)
+ 
++/* VI_DPCL */
++#define VI_DPCL_IF_SEL_LVDS		BIT(8)
++
+ /* SWS_CFG */
+ #define SW_SWS_EN			BIT(0)
+ #define SW_ISP2PP_PIPE_EN		BIT(1)
+@@ -1750,6 +1756,18 @@
+ #define SW_3A_DDR_WRITE_EN		BIT(24)
+ #define SW_ISP2PP_HOLD			BIT(31)
+ 
++/* LVDS_CTRL */
++#define SW_LVDS_EN			BIT(0)
++#define SW_LVDS_MODE			BIT(1)
++#define SW_LVDS_WIDTH(a)		(((a) & 0x3) << 2)
++#define SW_LVDS_LANE_EN(a)		(((a) & 0xf) << 4)
++#define SW_LVDS_MAIN_LANE(a)		(((a) & 0x3) << 8)
++#define SW_LVDS_START_X(a)		(((a) & 0x7ff) << 10)
++#define SW_LVDS_START_Y(a)		(((a) & 0x7ff) << 21)
++
++#define SW_LVDS_SAV(a)			((a) & 0xfff)
++#define SW_LVDS_EAV(a)			(((a) & 0xfff) << 16)
++
+ /* isp interrupt */
+ #define ISP2X_OFF			BIT(0)
+ #define ISP2X_FRAME			BIT(1)
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 75db0867c433..e7f2c6d0cbf2 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -36,6 +36,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
++#include <linux/rk-camera-module.h>
+ #include <linux/videodev2.h>
+ #include <linux/vmalloc.h>
+ #include <linux/kfifo.h>
+@@ -129,7 +130,7 @@ static struct v4l2_subdev *get_remote_sensor(struct v4l2_subdev *sd)
+ 	struct media_entity *sensor_me;
+ 	struct v4l2_subdev *remote_sd = NULL;
+ 
+-	local = &sd->entity.pads[RKISP_ISP_PAD_SINK];
++	local = &sd->entity.pads[0];
+ 	if (!local)
+ 		goto end;
+ 	remote = rkisp_media_entity_remote_pad(local);
+@@ -562,7 +563,9 @@ static int rkisp_config_isp(struct rkisp_device *dev)
+ 			acq_prop = CIF_ISP_ACQ_PROP_DMA_RGB;
+ 	} else if (in_fmt->fmt_type == FMT_YUV) {
+ 		acq_mult = 2;
+-		if (sensor && sensor->mbus.type == V4L2_MBUS_CSI2) {
++		if (sensor &&
++		    (sensor->mbus.type == V4L2_MBUS_CSI2 ||
++		     sensor->mbus.type == V4L2_MBUS_CCP2)) {
+ 			isp_ctrl = CIF_ISP_CTRL_ISP_MODE_ITU601;
+ 		} else {
+ 			if (sensor && sensor->mbus.type == V4L2_MBUS_BT656)
+@@ -677,6 +680,66 @@ static int rkisp_config_dvp(struct rkisp_device *dev)
+ 	return 0;
+ }
+ 
++static int rkisp_config_lvds(struct rkisp_device *dev)
++{
++	struct rkisp_sensor_info *sensor = dev->active_sensor;
++	struct ispsd_in_fmt *in_fmt = &dev->isp_sdev.in_fmt;
++	struct rkmodule_lvds_cfg cfg;
++	struct v4l2_subdev *sd = NULL;
++	u32 ret = 0, val, lane, data;
++
++	sd = get_remote_sensor(sensor->sd);
++	ret = v4l2_subdev_call(sd, core, ioctl, RKMODULE_GET_LVDS_CFG, &cfg);
++	if (ret)
++		goto err;
++
++	switch (sensor->mbus.flags & V4L2_MBUS_CSI2_LANES) {
++	case V4L2_MBUS_CSI2_1_LANE:
++		lane = 1;
++		break;
++	case V4L2_MBUS_CSI2_2_LANE:
++		lane = 2;
++		break;
++	case V4L2_MBUS_CSI2_3_LANE:
++		lane = 3;
++		break;
++	case V4L2_MBUS_CSI2_4_LANE:
++	default:
++		lane = 4;
++	}
++	lane = BIT(lane) - 1;
++
++	switch (in_fmt->bus_width) {
++	case 8:
++		data = 0;
++		break;
++	case 10:
++		data = 1;
++		break;
++	case 12:
++		data = 2;
++		break;
++	default:
++		ret = -EINVAL;
++		goto err;
++	}
++	val = SW_LVDS_SAV(cfg.act.sav) | SW_LVDS_EAV(cfg.act.eav);
++	writel(val, dev->base_addr + LVDS_SAV_EAV_ACT);
++	val = SW_LVDS_SAV(cfg.blk.sav) | SW_LVDS_EAV(cfg.blk.eav);
++	writel(val, dev->base_addr + LVDS_SAV_EAV_BLK);
++	val = SW_LVDS_EN | SW_LVDS_WIDTH(data) | SW_LVDS_LANE_EN(lane) | cfg.mode;
++	writel(val, dev->base_addr + LVDS_CTRL);
++	v4l2_dbg(1, rkisp_debug, &dev->v4l2_dev,
++		 "lvds CTRL:0x%x ACT:0x%x BLK:0x%x\n",
++		 readl(dev->base_addr + LVDS_CTRL),
++		 readl(dev->base_addr + LVDS_SAV_EAV_ACT),
++		 readl(dev->base_addr + LVDS_SAV_EAV_BLK));
++	return ret;
++err:
++	v4l2_err(&dev->v4l2_dev, "%s error ret:%d\n", __func__, ret);
++	return ret;
++}
++
+ /* Configure MUX */
+ static int rkisp_config_path(struct rkisp_device *dev)
+ {
+@@ -684,16 +747,19 @@ static int rkisp_config_path(struct rkisp_device *dev)
+ 	struct rkisp_sensor_info *sensor = dev->active_sensor;
+ 	u32 dpcl = readl(dev->base_addr + CIF_VI_DPCL);
+ 
+-	if (sensor && (sensor->mbus.type == V4L2_MBUS_BT656 ||
+-		sensor->mbus.type == V4L2_MBUS_PARALLEL)) {
++	if (sensor &&
++	    (sensor->mbus.type == V4L2_MBUS_BT656 ||
++	     sensor->mbus.type == V4L2_MBUS_PARALLEL)) {
+ 		ret = rkisp_config_dvp(dev);
+ 		dpcl |= CIF_VI_DPCL_IF_SEL_PARALLEL;
+ 	} else if ((sensor && sensor->mbus.type == V4L2_MBUS_CSI2) ||
+-		   dev->isp_inp & (INP_RAWRD0 |
+-		   INP_RAWRD1 | INP_RAWRD2)) {
++		   dev->isp_inp & (INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2)) {
+ 		dpcl |= CIF_VI_DPCL_IF_SEL_MIPI;
+ 	} else if (dev->isp_inp == INP_DMARX_ISP) {
+ 		dpcl |= CIF_VI_DPCL_DMA_SW_ISP;
++	} else if (sensor && sensor->mbus.type == V4L2_MBUS_CCP2) {
++		ret = rkisp_config_lvds(dev);
++		dpcl |= VI_DPCL_IF_SEL_LVDS;
+ 	}
+ 
+ 	writel(dpcl, dev->base_addr + CIF_VI_DPCL);
+@@ -1588,10 +1654,12 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	if (!sd)
+ 		return -ENODEV;
+ 	dev = sd_to_isp_dev(sd);
++	if (!dev)
++		return -ENODEV;
+ 	if (!strcmp(remote->entity->name, DMA_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_DMARX];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp)
++			if (dev->isp_inp & ~INP_DMARX_ISP)
+ 				goto err;
+ 			if (dev->active_sensor)
+ 				dev->active_sensor = NULL;
+@@ -1610,7 +1678,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX0_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD0];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp == INP_DMARX_ISP)
++			if (dev->isp_inp & ~(INP_CSI | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD0;
+ 		} else {
+@@ -1619,7 +1687,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX1_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD1];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp == INP_DMARX_ISP)
++			if (dev->isp_inp & ~(INP_CSI | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD1;
+ 		} else {
+@@ -1628,7 +1696,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX2_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp == INP_DMARX_ISP)
++			if (dev->isp_inp & ~(INP_CSI | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD2;
+ 		} else {
+@@ -1650,9 +1718,17 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 		     dev->cap_dev.stream[RKISP_STREAM_MP].linked))
+ 			goto err;
+ 		dev->br_dev.linked = flags & MEDIA_LNK_FL_ENABLED;
++	} else if (!strcmp(remote->entity->name, "rockchip-mipi-dphy-rx")) {
++		if (flags & MEDIA_LNK_FL_ENABLED) {
++			if (dev->isp_inp & ~INP_LVDS)
++				goto err;
++			dev->isp_inp |= INP_LVDS;
++		} else {
++			dev->isp_inp &= ~INP_LVDS;
++		}
+ 	} else {
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp & ~(INP_DVP | rawrd))
++			if (dev->isp_inp & ~INP_DVP)
+ 				goto err;
+ 			dev->isp_inp |= INP_DVP;
+ 		} else {
+@@ -1672,8 +1748,8 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	return 0;
+ err:
+ 	v4l2_err(sd, "link error %s -> %s\n"
+-		 "\tdmaread can't work with other input\n"
+-		 "\tcsi dvp can't work together\n"
++		 "\tcsi dvp lvds dmaread can't work together\n"
++		 "\trawrd can't work with dvp lvds dmaread\n"
+ 		 "\tbridge can't work with mainpath/selfpath\n",
+ 		 local->entity->name, remote->entity->name);
+ 	return -EINVAL;
+-- 
+2.35.3
+

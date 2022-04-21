@@ -1,0 +1,143 @@
+From 2ac8753a2a059cb9667cda20bc4c2ecad23ab745 Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Thu, 15 Jan 2015 13:13:03 +0800
+Subject: [PATCH] usb: dwc_otg: fix some issues of dwc_otg_310
+
+1.disable host interrupts when id changed so that no more host
+  interrupt will happen after otg disconnect
+2.hold hcd->lock in hcd_reinit function to protect qtd list
+3.recheck USB_STATUS_ID in vbus detect thread make sure it indeed
+  in device mode
+4.fix some null pointer dereference
+5.otg disconnect threshold set to 575mv in case of disconnect
+  interrupt lose
+---
+ drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c  | 1 +
+ drivers/usb/dwc_otg_310/dwc_otg_hcd.c       | 8 +++++++-
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c | 2 ++
+ drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c | 3 +--
+ drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c | 3 ++-
+ drivers/usb/dwc_otg_310/usbdev_rk3126.c     | 6 +++---
+ 6 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+index 78bf20d2a1af..9e25e90bd470 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+@@ -389,6 +389,7 @@ int32_t dwc_otg_handle_conn_id_status_change_intr(dwc_otg_core_if_t *core_if)
+ 	gintmsk_data_t gintmsk = {.d32 = 0 };
+ 	gintsts_data_t gintsts = {.d32 = 0 };
+ 
++	dwc_otg_disable_host_interrupts(core_if);
+ 	if (core_if->usb_mode != USB_MODE_NORMAL)
+ 		goto out;
+ 
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+index 1ad27556227c..9bde3ba4da05 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd.c
+@@ -179,6 +179,8 @@ static void kill_urbs_in_qh_list(dwc_otg_hcd_t *hcd, dwc_list_link_t *qh_list)
+ 				hcd->fops->complete(hcd, qtd->urb->priv,
+ 						    qtd->urb, -DWC_E_SHUTDOWN);
+ 				dwc_otg_hcd_qtd_remove_and_free(hcd, qtd, qh);
++			} else {
++				return;
+ 			}
+ 
+ 		}
+@@ -953,6 +955,7 @@ static void dwc_otg_hcd_reinit(dwc_otg_hcd_t *hcd)
+ 	int i;
+ 	dwc_hc_t *channel;
+ 	dwc_hc_t *channel_tmp;
++	dwc_irqflags_t flags;
+ 
+ 	hcd->flags.d32 = 0;
+ 
+@@ -960,6 +963,7 @@ static void dwc_otg_hcd_reinit(dwc_otg_hcd_t *hcd)
+ 	hcd->non_periodic_channels = 0;
+ 	hcd->periodic_channels = 0;
+ 
++	DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+ 	/*
+ 	 * Put all channels in the free channel list and clean up channel
+ 	 * states.
+@@ -976,7 +980,7 @@ static void dwc_otg_hcd_reinit(dwc_otg_hcd_t *hcd)
+ 					hc_list_entry);
+ 		dwc_otg_hc_cleanup(hcd->core_if, channel);
+ 	}
+-
++	DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+ 	/* Initialize the DWC core for host mode operation. */
+ 	dwc_otg_core_host_init(hcd->core_if);
+ 
+@@ -1334,6 +1338,8 @@ static int queue_transaction(dwc_otg_hcd_t *hcd,
+ 				hc->qh->ping_state = 0;
+ 			}
+ 		} else if (!hc->xfer_started) {
++			if (!hc || !(hc->qh))
++				return -ENODEV;
+ 			dwc_otg_hc_start_transfer(hcd->core_if, hc);
+ 			hc->qh->ping_state = 0;
+ 		}
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
+index b726c90baf3c..3a48dc3e52a3 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_linux.c
+@@ -239,6 +239,8 @@ static int _complete(dwc_otg_hcd_t *hcd, void *urb_handle,
+ 		     dwc_otg_hcd_urb_t *dwc_otg_urb, int32_t status)
+ {
+ 	struct urb *urb = (struct urb *)urb_handle;
++	if (!urb)
++		return 0;
+ #ifdef DEBUG
+ 	if (CHK_DEBUG_LEVEL(DBG_HCDV | DBG_HCD_URB)) {
+ 		DWC_PRINTF("%s: urb %p, device %d, ep %d %s, status=%d\n",
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c b/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
+index faa7327943e6..353693f17643 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_hcd_queue.c
+@@ -58,8 +58,7 @@ void dwc_otg_hcd_qh_free(dwc_otg_hcd_t *hcd, dwc_otg_qh_t *qh)
+ 	/* Free each QTD in the QTD list */
+ 	DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+ 	DWC_CIRCLEQ_FOREACH_SAFE(qtd, qtd_tmp, &qh->qtd_list, qtd_list_entry) {
+-		DWC_CIRCLEQ_REMOVE(&qh->qtd_list, qtd, qtd_list_entry);
+-		dwc_otg_hcd_qtd_free(qtd);
++		dwc_otg_hcd_qtd_remove_and_free(hcd, qtd, qh);
+ 	}
+ 
+ 	if (hcd->core_if->dma_desc_enable) {
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+index d22768ce21ee..d234c06bb53f 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+@@ -1605,7 +1605,8 @@ static void dwc_otg_pcd_check_vbus_work(struct work_struct *work)
+ 	struct dwc_otg_device *otg_dev = _pcd->otg_dev;
+ 	struct dwc_otg_platform_data *pldata = otg_dev->pldata;
+ 
+-	if (pldata->get_status(USB_STATUS_BVABLID)) {
++	if (pldata->get_status(USB_STATUS_BVABLID) &&
++	    pldata->get_status(USB_STATUS_ID)) {
+ 		/* if usb not connect before ,then start connect */
+ 		if (_pcd->vbus_status == USB_BC_TYPE_DISCNT) {
+ 			printk("***************vbus detect*****************\n");
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk3126.c b/drivers/usb/dwc_otg_310/usbdev_rk3126.c
+index eff95d8a83af..d71e8c3f7134 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk3126.c
++++ b/drivers/usb/dwc_otg_310/usbdev_rk3126.c
+@@ -8,10 +8,10 @@ static void usb20otg_hw_init(void)
+ {
+ 	/* Turn off differential receiver in suspend mode */
+ 	writel(UOC_HIWORD_UPDATE(0, 1, 2),
+-		   RK_GRF_VIRT + RK312X_GRF_USBPHY0_CON6);
++	       RK_GRF_VIRT + RK312X_GRF_USBPHY0_CON6);
+ 	/* Set disconnect detection trigger point to 600mv */
+-	writel(UOC_HIWORD_UPDATE(1, 0xf, 11),
+-		   RK_GRF_VIRT + RK312X_GRF_USBPHY0_CON7);
++	writel(UOC_HIWORD_UPDATE(0, 0xf, 11),
++	       RK_GRF_VIRT + RK312X_GRF_USBPHY0_CON7);
+ 	/* other haredware init,include:
+ 	 * DRV_VBUS GPIO init */
+ 	if (gpio_is_valid(control_usb->otg_gpios->gpio)) {
+-- 
+2.35.3
+

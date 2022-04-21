@@ -1,0 +1,764 @@
+From 89c0a4a7c6772bb11e252c0d0739d14837fe5a7f Mon Sep 17 00:00:00 2001
+From: ddl <ddl@rock-chips.com>
+Date: Fri, 30 Jul 2010 18:26:22 +0800
+Subject: [PATCH] board-raho support camera and sensor ov2655
+
+---
+ arch/arm/mach-rk2818/board-raho.c         | 313 ++++++++++++++++++++++
+ arch/arm/mach-rk2818/devices.c            |  48 +++-
+ arch/arm/mach-rk2818/devices.h            |   5 +
+ drivers/fpga/spi_gpio.c                   |   2 +-
+ drivers/media/video/Kconfig               |  25 ++
+ drivers/media/video/Makefile              |   4 +
+ drivers/media/video/soc_camera.c          |  97 +++++++
+ drivers/media/video/videobuf-core.c       |   7 +-
+ drivers/media/video/videobuf-dma-contig.c |   1 +
+ include/linux/videodev2.h                 |   7 +
+ include/media/soc_camera.h                |   9 +-
+ include/media/v4l2-chip-ident.h           |   1 +
+ 12 files changed, 514 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm/mach-rk2818/board-raho.c b/arch/arm/mach-rk2818/board-raho.c
+index 40702cce4521..246964c802fb 100644
+--- a/arch/arm/mach-rk2818/board-raho.c
++++ b/arch/arm/mach-rk2818/board-raho.c
+@@ -22,6 +22,8 @@
+ #include <linux/i2c.h>
+ #include <linux/spi/spi.h>
+ #include <linux/mmc/host.h>
++#include <linux/circ_buf.h>
++#include <linux/miscdevice.h>
+ 
+ #include <mach/hardware.h>
+ #include <asm/mach-types.h>
+@@ -34,10 +36,15 @@
+ #include <mach/rk2818_iomap.h>
+ #include <mach/iomux.h>
+ #include <mach/gpio.h>
++#include <mach/spi_fpga.h>
++#include <mach/rk2818_camera.h>                          /* ddl@rock-chips.com : camera support */
+ 
+ #include <linux/mtd/nand.h>
+ #include <linux/mtd/partitions.h>
+ 
++#include <media/soc_camera.h>                               /* ddl@rock-chips.com : camera support */
++
++
+ #include "devices.h"
+ 
+ #include "../../../drivers/spi/rk2818_spim.h"
+@@ -406,6 +413,306 @@ struct rk2818_spi_chip spi_xpt2046_info = {
+ };
+ 
+ 
++/*****************************************************************************************
++ * camera  devices
++ *author: ddl@rock-chips.com
++ *****************************************************************************************/
++#if 1
++ 
++#define RK2818_CAM_POWER_PIN    FPGA_PIN_PC5//SPI_GPIO_P1_05
++#define RK2818_CAM_RESET_PIN    FPGA_PIN_PD6//SPI_GPIO_P1_14    
++
++static int rk28_sensor_init(void);
++static int rk28_sensor_deinit(void);
++
++struct rk28camera_platform_data rk28_camera_platform_data = {
++    .init = rk28_sensor_init,
++    .deinit = rk28_sensor_deinit,
++    .gpio_res = {
++        {
++            .gpio_reset = RK2818_CAM_RESET_PIN,
++            .gpio_power = RK2818_CAM_POWER_PIN,
++            .dev_name = "ov2655"
++        }, {
++            .gpio_reset = 0xFFFFFFFF,
++            .gpio_power = 0xFFFFFFFF,
++            .dev_name = NULL
++        }
++    }
++};
++
++static int rk28_sensor_init(void)
++{
++    int ret = 0, i;
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff;
++
++    printk("\n%s....%d    ******** ddl *********\n",__FUNCTION__,__LINE__);
++    
++    for (i=0; i<2; i++) { 
++        camera_reset = rk28_camera_platform_data.gpio_res[i].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[i].gpio_power; 
++        
++        if (camera_power != 0xffffffff) {            
++            ret = gpio_request(camera_power, "camera power");
++            if (ret)
++                continue;
++                
++            gpio_set_value(camera_reset, 1);
++            gpio_direction_output(camera_power, 0);   
++        }
++        
++        if (camera_reset != 0xffffffff) {
++            ret = gpio_request(camera_reset, "camera reset");
++            if (ret) {
++                if (camera_power != 0xffffffff) 
++                    gpio_free(camera_power);    
++
++                continue;
++            }
++
++            gpio_set_value(camera_reset, 0);
++            gpio_direction_output(camera_reset, 0);            
++        }
++    }
++    
++    return 0;
++}
++
++static int rk28_sensor_deinit(void)
++{
++    unsigned int i;
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff;
++
++    printk("\n%s....%d    ******** ddl *********\n",__FUNCTION__,__LINE__); 
++   
++    for (i=0; i<2; i++) { 
++        camera_reset = rk28_camera_platform_data.gpio_res[i].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[i].gpio_power; 
++        
++        if (camera_power != 0xffffffff){
++            gpio_direction_input(camera_power);
++            gpio_free(camera_power);    
++        }
++        
++        if (camera_reset != 0xffffffff)  {
++            gpio_direction_input(camera_reset);
++            gpio_free(camera_reset);    
++        }
++    }
++
++    return 0;
++}
++
++
++static int rk28_sensor_power(struct device *dev, int on)
++{
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff;
++    
++    if(rk28_camera_platform_data.gpio_res[0].dev_name &&  (strcmp(rk28_camera_platform_data.gpio_res[0].dev_name, dev_name(dev)) == 0)) {
++        camera_reset = rk28_camera_platform_data.gpio_res[0].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[0].gpio_power;
++    } else if (rk28_camera_platform_data.gpio_res[1].dev_name && (strcmp(rk28_camera_platform_data.gpio_res[1].dev_name, dev_name(dev)) == 0)) {
++        camera_reset = rk28_camera_platform_data.gpio_res[1].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[1].gpio_power;
++    }
++
++    if (camera_reset != 0xffffffff) {
++        gpio_set_value(camera_reset, !on);
++        //printk("\n%s..%s..ResetPin=%d ..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev),camera_reset, on);
++    }
++    if (camera_power != 0xffffffff)  {       
++        gpio_set_value(camera_power, !on);
++        printk("\n%s..%s..PowerPin=%d ..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev), camera_power, !on);
++    }
++    if (camera_reset != 0xffffffff) {
++        msleep(3);          /* delay 3 ms */
++        gpio_set_value(camera_reset,on);
++        printk("\n%s..%s..ResetPin= %d..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev), camera_reset, on);
++    }      
++    return 0;
++}
++#else
++
++ /*****************************************************************************************
++ * camera  devices
++ *author: ddl@rock-chips.com
++ *****************************************************************************************/
++#define RK2818_CAM_POWER_PIN    SPI_GPIO_P1_05
++#define RK2818_CAM_RESET_PIN    SPI_GPIO_P1_14    
++
++static int rk28_sensor_init(void);
++static int rk28_sensor_deinit(void);
++
++struct rk28camera_platform_data rk28_camera_platform_data = {
++    .init = rk28_sensor_init,
++    .deinit = rk28_sensor_deinit,
++    .gpio_res = {
++        {
++            .gpio_reset = RK2818_CAM_RESET_PIN,
++            .gpio_power = RK2818_CAM_POWER_PIN,
++            .gpio_flag = 0x03,
++            .dev_name = "ov2655"
++        }, {
++            .gpio_reset = 0xFFFFFFFF,
++            .gpio_power = 0xFFFFFFFF,
++            .gpio_flag = 0x00,
++            .dev_name = NULL
++        }
++    }
++};
++
++static int rk28_sensor_init(void)
++{
++    int ret = 0, i;
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff, camera_ioflag;
++
++    printk("\n%s....%d    ******** ddl *********\n",__FUNCTION__,__LINE__);
++    
++    for (i=0; i<2; i++) { 
++        camera_reset = rk28_camera_platform_data.gpio_res[i].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[i].gpio_power; 
++        camera_ioflag = rk28_camera_platform_data.gpio_res[i].gpio_flag;
++        
++        if (camera_power != 0xffffffff) {
++            if (camera_ioflag & 0x02) {                 /* ddl@rock-chips.com : fpga io extern */
++                spi_gpio_set_pinlevel(camera_power, SPI_GPIO_LOW);
++                spi_gpio_set_pindirection(camera_power, SPI_GPIO_OUT);
++            } else {
++                ret = gpio_request(camera_power, "camera power");
++                if (ret)
++                    continue;
++                    
++                gpio_set_value(camera_reset, 1);
++                gpio_direction_output(camera_power, 0);   
++            }
++        }
++        
++        if (camera_reset != 0xffffffff) {
++            if (camera_ioflag & 0x01) {
++                spi_gpio_set_pinlevel(camera_reset, SPI_GPIO_HIGH);
++                spi_gpio_set_pindirection(camera_reset, SPI_GPIO_OUT);
++            } else {
++                ret = gpio_request(camera_reset, "camera reset");
++                if (ret) {
++                    if (camera_power != 0xffffffff) 
++                        gpio_free(camera_power);    
++
++                    continue;
++                }
++                gpio_direction_output(camera_reset, 0);
++                gpio_set_value(camera_reset, 1);
++            }
++        }
++    }
++    
++    return 0;
++}
++
++static int rk28_sensor_deinit(void)
++{
++    unsigned int i;
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff,camera_ioflag;
++
++    printk("\n%s....%d    ******** ddl *********\n",__FUNCTION__,__LINE__); 
++   
++    for (i=0; i<2; i++) { 
++        camera_reset = rk28_camera_platform_data.gpio_res[i].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[i].gpio_power; 
++        camera_ioflag = rk28_camera_platform_data.gpio_res[i].gpio_flag;
++        
++        if (camera_power != 0xffffffff){
++            if  ((camera_ioflag & 0x02) == 0) {
++                gpio_direction_input(camera_power);
++                gpio_free(camera_power);    
++            } else {
++                spi_gpio_set_pinlevel(camera_power, SPI_GPIO_HIGH);
++                spi_gpio_set_pindirection(camera_power, SPI_GPIO_IN);
++            }
++        }
++        
++        if (camera_reset != 0xffffffff)  {
++            if  ((camera_ioflag & 0x01) == 0) {
++                gpio_direction_input(camera_reset);
++                gpio_free(camera_reset);    
++            } else {
++                spi_gpio_set_pinlevel(camera_reset, SPI_GPIO_HIGH);
++                spi_gpio_set_pindirection(camera_reset, SPI_GPIO_IN);
++            }
++        }
++    }
++
++    return 0;
++}
++
++
++static int rk28_sensor_power(struct device *dev, int on)
++{
++    unsigned int camera_reset=0xffffffff,camera_power=0xffffffff,camera_ioflag;
++    
++    if(rk28_camera_platform_data.gpio_res[0].dev_name &&  (strcmp(rk28_camera_platform_data.gpio_res[0].dev_name, dev_name(dev)) == 0)) {
++        camera_reset = rk28_camera_platform_data.gpio_res[0].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[0].gpio_power;
++        camera_ioflag = rk28_camera_platform_data.gpio_res[0].gpio_flag;           
++    } else if (rk28_camera_platform_data.gpio_res[1].dev_name && (strcmp(rk28_camera_platform_data.gpio_res[1].dev_name, dev_name(dev)) == 0)) {
++        camera_reset = rk28_camera_platform_data.gpio_res[1].gpio_reset;
++        camera_power = rk28_camera_platform_data.gpio_res[1].gpio_power;
++        camera_ioflag = rk28_camera_platform_data.gpio_res[1].gpio_flag;
++    }
++
++    if (camera_reset != 0xffffffff) {
++        if (camera_ioflag & 0x01) {
++            spi_gpio_set_pinlevel(camera_reset, on);
++        } else {
++            gpio_set_value(camera_reset, on);
++        }        
++        printk("\n%s..%s..ResetPin=%d ..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev),camera_reset, on);
++    }
++    if (camera_power != 0xffffffff)  {       
++        if (camera_ioflag & 0x02) {
++            spi_gpio_set_pinlevel(camera_power, !on);
++        } else {
++            gpio_set_value(camera_power, !on);
++        }
++        printk("\n%s..%s..PowerPin=%d ..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev), camera_power, !on);
++    }
++    if (camera_reset != 0xffffffff) {
++        mdelay(3);
++        if (camera_ioflag & 0x01) {
++            spi_gpio_set_pinlevel(camera_reset,on);
++        } else {
++            gpio_set_value(camera_reset,on);
++        }   
++        printk("\n%s..%s..ResetPin= %d..PinLevel = %x   ******** ddl *********\n",__FUNCTION__,dev_name(dev), camera_reset, on);
++    }        
++
++    mdelay(3000);
++
++    return 0;
++}
++
++
++#endif
++ 
++#define OV2655_IIC_ADDR 	    0x60
++static struct i2c_board_info rk2818_i2c_cam_info[] = {
++#ifdef CONFIG_SOC_CAMERA_OV2655
++	{
++		I2C_BOARD_INFO("ov2655", OV2655_IIC_ADDR>>1)
++	},
++#endif	
++};
++
++struct soc_camera_link rk2818_iclink = {
++	.bus_id		= RK28_CAM_PLATFORM_DEV_ID,
++	.power		= rk28_sensor_power,
++	.board_info	= &rk2818_i2c_cam_info[0],
++	.i2c_adapter_id	= 2,
++#ifdef CONFIG_SOC_CAMERA_OV2655	
++	.module_name	= "ov2655",
++#endif	
++};
++
++
+ /*****************************************************************************************
+  * SPI devices
+  *author: lhh
+@@ -500,6 +807,12 @@ static struct platform_device *devices[] __initdata = {
+     &rk2818_device_fb,    
+     &rk2818_device_backlight,
+ 	&rk2818_device_dsp,
++
++#ifdef CONFIG_VIDEO_RK2818
++ 	&rk2818_device_camera,      /* ddl@rock-chips.com : camera support  */
++ 	&rk2818_soc_camera_pdrv,
++ #endif
++ 
+ #ifdef CONFIG_MTD_NAND_RK2818
+ 	&rk2818_nand_device,
+ #endif
+diff --git a/arch/arm/mach-rk2818/devices.c b/arch/arm/mach-rk2818/devices.c
+index ccc428fbc703..e9c1ae8cb800 100755
+--- a/arch/arm/mach-rk2818/devices.c
++++ b/arch/arm/mach-rk2818/devices.c
+@@ -18,7 +18,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/android_pmem.h>
+ #include <linux/usb/android_composite.h>
+-
++#include <linux/delay.h>
+ #include <mach/irqs.h>
+ #include <mach/rk2818_iomap.h>
+ #include "devices.h"
+@@ -30,6 +30,10 @@
+ #include <linux/dm9000.h>
+ #include <mach/gpio.h>
+ #include <mach/rk2818_nand.h>
++#include <mach/iomux.h>
++#include <mach/rk2818_camera.h>                          /* ddl@rock-chips.com : camera support */
++#include <linux/i2c.h>                                      
++#include <media/soc_camera.h>
+ static struct resource resources_sdmmc0[] = {
+ 	{
+ 		.start 	= IRQ_NR_SDMMC0,
+@@ -272,6 +276,48 @@ struct platform_device rk2818_device_backlight = {
+         }
+ };
+ 
++/* RK2818 Camera :  ddl@rock-chips.com  */
++#ifdef CONFIG_VIDEO_RK2818
++
++static struct resource rk2818_camera_resource[] = {
++	[0] = {
++		.start = RK2818_VIP_PHYS,
++		.end   = RK2818_VIP_PHYS + RK2818_VIP_SIZE - 1,
++		.flags = IORESOURCE_MEM,
++	},
++	[1] = {
++		.start = IRQ_NR_VIP,
++		.end   = IRQ_NR_VIP,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++
++static u64 rockchip_device_camera_dmamask = 0xffffffffUL;
++
++/*platform_device : */
++struct platform_device rk2818_device_camera = {
++	.name		  = RK28_CAM_DRV_NAME,
++	.id		  = RK28_CAM_PLATFORM_DEV_ID,               /* This is used to put cameras on this interface */
++	.num_resources	  = ARRAY_SIZE(rk2818_camera_resource),
++	.resource	  = rk2818_camera_resource,
++	.dev            = {
++		.dma_mask = &rockchip_device_camera_dmamask,
++		.coherent_dma_mask = 0xffffffffUL,
++		.platform_data  = &rk28_camera_platform_data,
++	}
++};
++
++/*platform_device : soc-camera need  */
++struct platform_device rk2818_soc_camera_pdrv = {
++	.name	= "soc-camera-pdrv",
++	.id	= -1,
++	.dev	= {
++		.init_name = "ov2655",
++		.platform_data = &rk2818_iclink,
++	},
++};
++#endif 
++
+ //net device
+ /* DM9000 */
+ #ifdef CONFIG_DM9000
+diff --git a/arch/arm/mach-rk2818/devices.h b/arch/arm/mach-rk2818/devices.h
+index 631eb18b28fe..9f7613beec22 100644
+--- a/arch/arm/mach-rk2818/devices.h
++++ b/arch/arm/mach-rk2818/devices.h
+@@ -30,6 +30,9 @@ extern struct rk2818_i2c_platform_data default_i2c1_data;
+ extern struct rk2818_i2c_spi_data default_i2c2_data;
+ extern struct rk2818_i2c_spi_data default_i2c3_data;
+ 
++extern struct soc_camera_link rk2818_iclink;                /* ddl@rock-chips.com : camera support */
++extern struct rk28camera_platform_data rk28_camera_platform_data;
++
+ extern struct platform_device rk2818_device_sdmmc0;
+ extern struct platform_device rk2818_device_sdmmc1;
+ extern struct rk2818_sdmmc_platform_data default_sdmmc0_data;
+@@ -43,6 +46,8 @@ extern struct platform_device rk2818_device_adc;
+ extern struct platform_device rk2818_device_adckey;
+ extern struct platform_device rk2818_device_battery;
+ extern struct platform_device rk2818_device_backlight;
++extern struct platform_device rk2818_device_camera;             /* ddl@rock-chips.com : camera support */
++extern struct platform_device rk2818_soc_camera_pdrv;
+ extern struct platform_device rk2818_device_dsp;
+ extern struct platform_device rk2818_nand_device;
+ extern struct platform_device rk2818_device_dwc_otg;
+diff --git a/drivers/fpga/spi_gpio.c b/drivers/fpga/spi_gpio.c
+index 6113f4bc6e1c..56d5f6fe2c1f 100755
+--- a/drivers/fpga/spi_gpio.c
++++ b/drivers/fpga/spi_gpio.c
+@@ -1195,4 +1195,4 @@ void spi_gpio_irq_setup(void)
+ 
+ MODULE_DESCRIPTION("Driver for spi2gpio.");
+ MODULE_AUTHOR("luowei <lw@rock-chips.com>");
+-MODULE_LICENSE("GPL");
+\ No newline at end of file
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/video/Kconfig b/drivers/media/video/Kconfig
+index e6186b338a12..0276c9d83810 100644
+--- a/drivers/media/video/Kconfig
++++ b/drivers/media/video/Kconfig
+@@ -865,6 +865,23 @@ config SOC_CAMERA_OV772X
+ 	help
+ 	  This is a ov772x camera driver
+ 
++config SOC_CAMERA_OV2655
++	tristate "ov2655 camera support"
++	depends on SOC_CAMERA && I2C
++	help
++	  This is a ov2655 camera driver
++
++config SOC_CAMERA_OV3640
++	tristate "ov3640 camera support"
++	depends on SOC_CAMERA && I2C
++	help
++	  This is a ov3640 camera driver
++	  
++config SOC_CAMERA_OV5642
++	tristate "ov5642 camera support"
++	depends on SOC_CAMERA && I2C
++	help
++	  This is a ov5642 camera driver	 	     
+ config MX1_VIDEO
+ 	bool
+ 
+@@ -909,6 +926,14 @@ config VIDEO_OMAP2
+ 	---help---
+ 	  This is a v4l2 driver for the TI OMAP2 camera capture interface
+ 
++
++config VIDEO_RK2818
++	tristate "RK2818 Camera Sensor Interface driver"
++	depends on VIDEO_DEV && ARCH_RK2818 && SOC_CAMERA && HAS_DMA
++	select VIDEOBUF_DMA_CONTIG
++	---help---
++	  This is a v4l2 driver for the RK2818 Camera Sensor Interface	  
++
+ #
+ # USB Multimedia device configuration
+ #
+diff --git a/drivers/media/video/Makefile b/drivers/media/video/Makefile
+index e541932a789b..017e1bda9f30 100644
+--- a/drivers/media/video/Makefile
++++ b/drivers/media/video/Makefile
+@@ -78,6 +78,9 @@ obj-$(CONFIG_SOC_CAMERA_MT9T031)	+= mt9t031.o
+ obj-$(CONFIG_SOC_CAMERA_MT9V022)	+= mt9v022.o
+ obj-$(CONFIG_SOC_CAMERA_OV772X)		+= ov772x.o
+ obj-$(CONFIG_SOC_CAMERA_TW9910)		+= tw9910.o
++obj-$(CONFIG_SOC_CAMERA_OV2655)		+= ov2655.o
++obj-$(CONFIG_SOC_CAMERA_OV3640)		+= ov3640.o
++obj-$(CONFIG_SOC_CAMERA_OV5642)		+= ov5642.o
+ 
+ # And now the v4l2 drivers:
+ 
+@@ -154,6 +157,7 @@ obj-$(CONFIG_VIDEO_MX1)			+= mx1_camera.o
+ obj-$(CONFIG_VIDEO_MX3)			+= mx3_camera.o
+ obj-$(CONFIG_VIDEO_PXA27x)		+= pxa_camera.o
+ obj-$(CONFIG_VIDEO_SH_MOBILE_CEU)	+= sh_mobile_ceu_camera.o
++obj-$(CONFIG_VIDEO_RK2818)			+= rk2818_camera.o
+ 
+ obj-$(CONFIG_ARCH_DAVINCI)		+= davinci/
+ 
+diff --git a/drivers/media/video/soc_camera.c b/drivers/media/video/soc_camera.c
+index 95fdeb23c2c1..4eb5f65498b6 100644
+--- a/drivers/media/video/soc_camera.c
++++ b/drivers/media/video/soc_camera.c
+@@ -664,6 +664,40 @@ static int soc_camera_queryctrl(struct file *file, void *priv,
+ 	return -EINVAL;
+ }
+ 
++/* ddl@rock-chips.com : Add ioctrl -VIDIOC_QUERYMENU */
++static int soc_camera_querymenu(struct file *file, void *priv,
++                                struct v4l2_querymenu *qm)
++{
++    struct soc_camera_file *icf = file->private_data;
++    struct soc_camera_device *icd = icf->icd;
++    struct v4l2_queryctrl qctrl;
++    int i,j;
++    
++    qctrl.id = qm->id;
++
++    if (soc_camera_queryctrl(file,priv, &qctrl) == 0) {
++        for (i = 0; i < icd->ops->num_menus; i++) {
++            if (qm->id == icd->ops->menus[i].id) {
++                for (j=0; j<=(qctrl.maximum - qctrl.minimum); j++) {
++                
++                    if (qm->index == icd->ops->menus[i].index) {
++                        snprintf(qm->name, sizeof(qm->name), icd->ops->menus[i].name);
++                        qm->reserved = 0;
++
++                        return 0;
++                    } else {
++                        i++;
++                        if ( i >= icd->ops->num_menus)
++                            return -EINVAL;    
++                    }                    
++                }                
++            }
++        }
++    }
++    
++    return -EINVAL;
++}
++
+ static int soc_camera_g_ctrl(struct file *file, void *priv,
+ 			     struct v4l2_control *ctrl)
+ {
+@@ -704,6 +738,64 @@ static int soc_camera_s_ctrl(struct file *file, void *priv,
+ 	return v4l2_subdev_call(sd, core, s_ctrl, ctrl);
+ }
+ 
++
++ /* ddl@rock-chips.com : Add ioctrl -VIDIOC_XXX_ext_ctrl for soc-camera */
++static int soc_camera_try_ext_ctrl(struct file *file, void *priv,
++                             struct v4l2_ext_controls *ctrl)
++{
++    struct soc_camera_file *icf = file->private_data;
++    struct soc_camera_device *icd = icf->icd;
++    const struct v4l2_queryctrl *qctrl;   
++    int i;
++    
++    WARN_ON(priv != file->private_data);
++
++    if (ctrl->ctrl_class != V4L2_CTRL_CLASS_CAMERA)
++        return -EINVAL;
++
++    for (i=0; i<ctrl->count; i++) {     
++        qctrl = soc_camera_find_qctrl(icd->ops, ctrl->controls[i].id);
++        if (!qctrl)
++            return -EINVAL;
++
++        if ((ctrl->controls[i].value < qctrl->minimum) ||(ctrl->controls[i].value > qctrl->minimum))
++            return -ERANGE;
++    }
++    
++    return 0;
++}
++ /* ddl@rock-chips.com : Add ioctrl -VIDIOC_XXX_ext_ctrl for soc-camera */
++static int soc_camera_g_ext_ctrl(struct file *file, void *priv,
++                             struct v4l2_ext_controls *ctrl)
++{
++    struct soc_camera_file *icf = file->private_data;
++    struct soc_camera_device *icd = icf->icd;
++    struct v4l2_subdev *sd = soc_camera_to_subdev(icd);
++    
++    WARN_ON(priv != file->private_data);
++
++    if (ctrl->ctrl_class != V4L2_CTRL_CLASS_CAMERA)
++        return -EINVAL;
++    
++    return v4l2_subdev_call(sd, core, g_ext_ctrls, ctrl);    
++}
++ /* ddl@rock-chips.com : Add ioctrl -VIDIOC_XXX_ext_ctrl for soc-camera */
++static int soc_camera_s_ext_ctrl(struct file *file, void *priv,
++                             struct v4l2_ext_controls *ctrl)
++{
++    struct soc_camera_file *icf = file->private_data;
++    struct soc_camera_device *icd = icf->icd;
++    struct v4l2_subdev *sd = soc_camera_to_subdev(icd);
++    
++    WARN_ON(priv != file->private_data);
++
++    if (ctrl->ctrl_class != V4L2_CTRL_CLASS_CAMERA)
++        return -EINVAL;
++    
++    return v4l2_subdev_call(sd, core, s_ext_ctrls, ctrl);    
++}
++
++
+ static int soc_camera_cropcap(struct file *file, void *fh,
+ 			      struct v4l2_cropcap *a)
+ {
+@@ -1241,8 +1333,13 @@ static const struct v4l2_ioctl_ops soc_camera_ioctl_ops = {
+ 	.vidioc_streamon	 = soc_camera_streamon,
+ 	.vidioc_streamoff	 = soc_camera_streamoff,
+ 	.vidioc_queryctrl	 = soc_camera_queryctrl,
++	 .vidioc_querymenu	 = soc_camera_querymenu,                            /* ddl@rock-chips.com:   Add ioctrl - vidioc_querymenu for soc-camera */
+ 	.vidioc_g_ctrl		 = soc_camera_g_ctrl,
+ 	.vidioc_s_ctrl		 = soc_camera_s_ctrl,
++	.vidioc_g_ext_ctrls    = soc_camera_g_ext_ctrl,                                 /* ddl@rock-chips.com:   Add ioctrl - vidioc_g_ext_ctrls for soc-camera */
++	.vidioc_s_ext_ctrls    = soc_camera_s_ext_ctrl,                                 /* ddl@rock-chips.com:   Add ioctrl - vidioc_s_ext_ctrls for soc-camera */
++	.vidioc_try_ext_ctrls    = soc_camera_try_ext_ctrl,                         /* ddl@rock-chips.com:   Add ioctrl - vidioc_try_ext_ctrls for soc-camera */
++
+ 	.vidioc_cropcap		 = soc_camera_cropcap,
+ 	.vidioc_g_crop		 = soc_camera_g_crop,
+ 	.vidioc_s_crop		 = soc_camera_s_crop,
+diff --git a/drivers/media/video/videobuf-core.c b/drivers/media/video/videobuf-core.c
+index 8e93c6f25c83..1c6f0fbedbd8 100644
+--- a/drivers/media/video/videobuf-core.c
++++ b/drivers/media/video/videobuf-core.c
+@@ -259,7 +259,9 @@ static void videobuf_status(struct videobuf_queue *q, struct v4l2_buffer *b,
+ 		b->length    = vb->bsize;
+ 		break;
+ 	case V4L2_MEMORY_OVERLAY:
+-		b->m.offset  = vb->boff;
++		//b->m.offset  = vb->boff;
++		b->m.offset = vb->boff - vb->bsize* vb->i;    /* ddl@rock-chips.com : nzy modify V4L2_MEMORY_OVERLAY   */
++		b->length    = vb->bsize;
+ 		break;
+ 	}
+ 
+@@ -546,7 +548,8 @@ int videobuf_qbuf(struct videobuf_queue *q,
+ 		buf->baddr = b->m.userptr;
+ 		break;
+ 	case V4L2_MEMORY_OVERLAY:
+-		buf->boff = b->m.offset;
++		//buf->boff = b->m.offset;
++		buf->boff = b->m.offset + buf->bsize* buf->i;    /* ddl@rock-chips.com : nzy modify V4L2_MEMORY_OVERLAY   */
+ 		break;
+ 	default:
+ 		dprintk(1, "qbuf: wrong memory type\n");
+diff --git a/drivers/media/video/videobuf-dma-contig.c b/drivers/media/video/videobuf-dma-contig.c
+index c3065c4bcba9..9991381943e6 100644
+--- a/drivers/media/video/videobuf-dma-contig.c
++++ b/drivers/media/video/videobuf-dma-contig.c
+@@ -251,6 +251,7 @@ static int __videobuf_iolock(struct videobuf_queue *q,
+ 			mem->vaddr, mem->size);
+ 		break;
+ 	case V4L2_MEMORY_OVERLAY:
++		break; /* ddl@rock-chips.com : nzy modify V4L2_MEMORY_OVERLAY   */
+ 	default:
+ 		dev_dbg(q->dev, "%s memory method OVERLAY/unknown\n",
+ 			__func__);
+diff --git a/include/linux/videodev2.h b/include/linux/videodev2.h
+index b59e78c57161..2c2e6e03b11f 100644
+--- a/include/linux/videodev2.h
++++ b/include/linux/videodev2.h
+@@ -1159,6 +1159,13 @@ enum  v4l2_exposure_auto_type {
+ 
+ #define V4L2_CID_PRIVACY			(V4L2_CID_CAMERA_CLASS_BASE+16)
+ 
++/* ddl@rock-chips.com : Add ioctrl -  V4L2_CID_SCENE for camera scene control */
++#define V4L2_CID_CAMERA_CLASS_BASE_ROCK                      (V4L2_CID_CAMERA_CLASS_BASE + 30)
++#define V4L2_CID_SCENE			(V4L2_CID_CAMERA_CLASS_BASE_ROCK+1)             
++#define V4L2_CID_EFFECT			(V4L2_CID_CAMERA_CLASS_BASE_ROCK+2) 
++#define V4L2_CID_FLASH                      (V4L2_CID_CAMERA_CLASS_BASE_ROCK+3) 
++
++
+ /* FM Modulator class control IDs */
+ #define V4L2_CID_FM_TX_CLASS_BASE		(V4L2_CTRL_CLASS_FM_TX | 0x900)
+ #define V4L2_CID_FM_TX_CLASS			(V4L2_CTRL_CLASS_FM_TX | 1)
+diff --git a/include/media/soc_camera.h b/include/media/soc_camera.h
+index 3d74e60032dd..b7227075f6cd 100644
+--- a/include/media/soc_camera.h
++++ b/include/media/soc_camera.h
+@@ -196,9 +196,12 @@ struct soc_camera_ops {
+ 	int (*resume)(struct soc_camera_device *);
+ 	unsigned long (*query_bus_param)(struct soc_camera_device *);
+ 	int (*set_bus_param)(struct soc_camera_device *, unsigned long);
+-	int (*enum_input)(struct soc_camera_device *, struct v4l2_input *);
++	int (*enum_input)(struct soc_camera_device *, struct v4l2_input *);	
++	
+ 	const struct v4l2_queryctrl *controls;
++	const struct v4l2_querymenu *menus;                /* ddl@rock-chips.com : Add ioctrl -VIDIOC_QUERYMENU */
+ 	int num_controls;
++	int num_menus;      /* ddl@rock-chips.com : Add ioctrl -VIDIOC_QUERYMENU */
+ };
+ 
+ #define SOCAM_SENSE_PCLK_CHANGED	(1 << 0)
+@@ -256,6 +259,10 @@ static inline struct v4l2_queryctrl const *soc_camera_find_qctrl(
+ #define SOCAM_DATA_ACTIVE_HIGH		(1 << 14)
+ #define SOCAM_DATA_ACTIVE_LOW		(1 << 15)
+ 
++#define SOCAM_MCLK_24MHZ   (1<<29)                                      /* ddl@rock-chips.com : add  */ 
++#define SOCAM_MCLK_27MHZ   (1<<30)
++#define SOCAM_MCLK_48MHZ   (1<<31)
++
+ #define SOCAM_DATAWIDTH_MASK (SOCAM_DATAWIDTH_4 | SOCAM_DATAWIDTH_8 | \
+ 			      SOCAM_DATAWIDTH_9 | SOCAM_DATAWIDTH_10 | \
+ 			      SOCAM_DATAWIDTH_15 | SOCAM_DATAWIDTH_16)
+diff --git a/include/media/v4l2-chip-ident.h b/include/media/v4l2-chip-ident.h
+index cf16689adba7..bca6a13b5471 100644
+--- a/include/media/v4l2-chip-ident.h
++++ b/include/media/v4l2-chip-ident.h
+@@ -64,6 +64,7 @@ enum {
+ 	V4L2_IDENT_OV9650 = 254,
+ 	V4L2_IDENT_OV9655 = 255,
+ 	V4L2_IDENT_SOI968 = 256,
++	V4L2_IDENT_OV2655 = 257,                            /* ddl@rock-chips.com : ov2655 support */
+ 
+ 	/* module saa7146: reserved range 300-309 */
+ 	V4L2_IDENT_SAA7146 = 300,
+-- 
+2.35.3
+

@@ -1,0 +1,139 @@
+From 6b8580eca3687c03d4f5e436728735d3f621ebe7 Mon Sep 17 00:00:00 2001
+From: Caesar Wang <wxt@rock-chips.com>
+Date: Thu, 19 Oct 2017 17:03:35 +0800
+Subject: [PATCH] drm/rockchip: inno_hdmi: support the aclk_vio clock for
+ rk3036
+
+The aclk_vio is the vio noc, the HDMI accessed the register need this clock
+enabled first.
+
+Change-Id: Ib3073b73020e46c7d31b09225dd2bd39a289a4cc
+Signed-off-by: Caesar Wang <wxt@rock-chips.com>
+---
+ .../display/rockchip/inno_hdmi-rockchip.txt   |  6 +--
+ drivers/gpu/drm/rockchip/inno_hdmi.c          | 40 +++++++++++++++----
+ 2 files changed, 36 insertions(+), 10 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/rockchip/inno_hdmi-rockchip.txt b/Documentation/devicetree/bindings/display/rockchip/inno_hdmi-rockchip.txt
+index 8096a29f9776..8c43943fa30c 100644
+--- a/Documentation/devicetree/bindings/display/rockchip/inno_hdmi-rockchip.txt
++++ b/Documentation/devicetree/bindings/display/rockchip/inno_hdmi-rockchip.txt
+@@ -7,7 +7,7 @@ Required properties:
+ - reg:
+ 	Physical base address and length of the controller's registers.
+ - clocks, clock-names:
+-	Phandle to hdmi controller clock, name should be "pclk"
++	Phandle to hdmi controller clock, name should be "aclk" and "pclk".
+ - interrupts:
+ 	HDMI interrupt number
+ - ports:
+@@ -21,8 +21,8 @@ hdmi: hdmi@20034000 {
+ 	compatible = "rockchip,rk3036-inno-hdmi";
+ 	reg = <0x20034000 0x4000>;
+ 	interrupts = <GIC_SPI 45 IRQ_TYPE_LEVEL_HIGH>;
+-	clocks = <&cru  PCLK_HDMI>;
+-	clock-names = "pclk";
++	clocks = <&cru ACLK_VIO>, <&cru PCLK_HDMI>;
++	clock-names = "aclk", "pclk";
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&hdmi_ctl>;
+ 	status = "disabled";
+diff --git a/drivers/gpu/drm/rockchip/inno_hdmi.c b/drivers/gpu/drm/rockchip/inno_hdmi.c
+index d7b4266e1fa7..a62e06ad24f2 100644
+--- a/drivers/gpu/drm/rockchip/inno_hdmi.c
++++ b/drivers/gpu/drm/rockchip/inno_hdmi.c
+@@ -68,6 +68,7 @@ struct inno_hdmi {
+ 	struct drm_device *drm_dev;
+ 
+ 	int irq;
++	struct clk *aclk;
+ 	struct clk *pclk;
+ 	void __iomem *regs;
+ 
+@@ -1082,21 +1083,33 @@ static int inno_hdmi_bind(struct device *dev, struct device *master,
+ 	if (IS_ERR(hdmi->regs))
+ 		return PTR_ERR(hdmi->regs);
+ 
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	hdmi->aclk = devm_clk_get(hdmi->dev, "aclk");
++	if (IS_ERR(hdmi->aclk)) {
++		dev_err(hdmi->dev, "Unable to get HDMI aclk clk\n");
++		return PTR_ERR(hdmi->aclk);
++	}
++
+ 	hdmi->pclk = devm_clk_get(hdmi->dev, "pclk");
+ 	if (IS_ERR(hdmi->pclk)) {
+ 		dev_err(hdmi->dev, "Unable to get HDMI pclk clk\n");
+ 		return PTR_ERR(hdmi->pclk);
+ 	}
+ 
+-	ret = clk_prepare_enable(hdmi->pclk);
++	ret = clk_prepare_enable(hdmi->aclk);
+ 	if (ret) {
+-		dev_err(hdmi->dev, "Cannot enable HDMI pclk clock: %d\n", ret);
++		dev_err(hdmi->dev, "Cannot enable HDMI aclk clock: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
++	ret = clk_prepare_enable(hdmi->pclk);
++	if (ret) {
++		dev_err(hdmi->dev, "Cannot enable HDMI pclk clock: %d\n", ret);
++		goto err_disable_aclk;
++	}
+ 
+ 	inno_hdmi_reset(hdmi);
+ 
+@@ -1104,7 +1117,7 @@ static int inno_hdmi_bind(struct device *dev, struct device *master,
+ 	if (IS_ERR(hdmi->ddc)) {
+ 		ret = PTR_ERR(hdmi->ddc);
+ 		hdmi->ddc = NULL;
+-		return ret;
++		goto err_disable_pclk;
+ 	}
+ 
+ 	/*
+@@ -1118,7 +1131,7 @@ static int inno_hdmi_bind(struct device *dev, struct device *master,
+ 
+ 	ret = inno_hdmi_register(drm, hdmi);
+ 	if (ret)
+-		return ret;
++		goto err_disable_pclk;
+ 
+ 	dev_set_drvdata(dev, hdmi);
+ 
+@@ -1128,6 +1141,18 @@ static int inno_hdmi_bind(struct device *dev, struct device *master,
+ 	ret = devm_request_threaded_irq(dev, irq, inno_hdmi_hardirq,
+ 					inno_hdmi_irq, IRQF_SHARED,
+ 					dev_name(dev), hdmi);
++	if (ret) {
++		dev_err(hdmi->dev,
++			"failed to request hdmi irq: %d\n", ret);
++		goto err_disable_pclk;
++	}
++
++	return 0;
++
++err_disable_pclk:
++	clk_disable_unprepare(hdmi->pclk);
++err_disable_aclk:
++	clk_disable_unprepare(hdmi->aclk);
+ 
+ 	return ret;
+ }
+@@ -1141,6 +1166,7 @@ static void inno_hdmi_unbind(struct device *dev, struct device *master,
+ 	hdmi->encoder.funcs->destroy(&hdmi->encoder);
+ 
+ 	clk_disable_unprepare(hdmi->pclk);
++	clk_disable_unprepare(hdmi->aclk);
+ 	i2c_put_adapter(hdmi->ddc);
+ }
+ 
+-- 
+2.35.3
+

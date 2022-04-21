@@ -1,0 +1,250 @@
+From ccf1d13935f345a02cf47190c0c0bd8f3cfa5f52 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Sat, 21 Mar 2020 18:19:06 +0800
+Subject: [PATCH] media: rockchip: isp: make sure to start read back when isp
+ idle
+
+Change-Id: I57e527609e8f8027067c81e7a92f1b92df9cd6ee
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/csi.c   | 75 +++++++++++++++++++--
+ drivers/media/platform/rockchip/isp/csi.h   | 14 +++-
+ drivers/media/platform/rockchip/isp/rkisp.c | 18 +++--
+ 3 files changed, 89 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index c904763a5827..9c9793ea8bdc 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -3,14 +3,13 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/pm_runtime.h>
++#include <linux/rk-camera-module.h>
+ #include <media/v4l2-common.h>
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-fh.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-subdev.h>
+ #include <media/videobuf2-dma-contig.h>
+-#include <linux/dma-iommu.h>
+-#include <linux/rk-camera-module.h>
+ #include "dev.h"
+ #include "regs.h"
+ 
+@@ -419,6 +418,9 @@ int rkisp_csi_config_patch(struct rkisp_device *dev)
+ 		writel(val & SW_HDRMGE_EN, dev->base_addr + ISP_HDRTMO_BASE);
+ 		writel(0x7FFFFF7F, dev->base_addr + CSI2RX_MASK_STAT);
+ 	}
++
++	dev->csi_dev.is_first = true;
++	kfifo_reset(&dev->csi_dev.rdbk_kfifo);
+ 	return ret;
+ }
+ 
+@@ -447,11 +449,60 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	}
+ 	/* not using isp V_START irq to generate sof event */
+ 	csi->filt_state[CSI_F_VS] = dma2frm + 1;
+-	if (dma2frm)
+-		csi->read_bak = true;
+ 	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
+ }
+ 
++/* handle read back event from user or isp idle isr */
++int rkisp_csi_trigger_event(struct rkisp_csi_device *csi, void *arg)
++{
++	struct rkisp_device *dev = csi->ispdev;
++	struct kfifo *fifo = &csi->rdbk_kfifo;
++	struct isp2x_csi_trigger *trigger =
++		(struct isp2x_csi_trigger *)arg;
++	struct isp2x_csi_trigger t;
++	unsigned long lock_flags = 0;
++	int times = -1;
++
++	if (!IS_HDR_DBG(dev->hdr.op_mode))
++		return 0;
++
++	spin_lock_irqsave(&csi->rdbk_lock, lock_flags);
++	if (csi->is_first ||
++	    (trigger && csi->is_isp_end && kfifo_is_empty(fifo))) {
++		/* isp idle and no event in queue
++		 * start read back direct
++		 */
++		csi->is_first = false;
++		dev->dmarx_dev.frame_id = trigger->frame_id;
++		times = trigger->times;
++	} else if (csi->is_isp_end && !kfifo_is_empty(fifo)) {
++		/* isp idle and events in queue
++		 * out fifo then start read back
++		 * new event in fifo
++		 */
++		if (kfifo_out(fifo, &t, sizeof(t))) {
++			dev->dmarx_dev.frame_id = t.frame_id;
++			times = t.times;
++		}
++		if (trigger)
++			kfifo_in(fifo, trigger, sizeof(*trigger));
++		if (csi->is_isp_end)
++			csi->is_isp_end = false;
++	} else if (!csi->is_isp_end && trigger) {
++		/* isp on idle, new event in fifo */
++		if (!kfifo_is_full(fifo))
++			kfifo_in(fifo, trigger, sizeof(*trigger));
++		else
++			v4l2_err(&dev->v4l2_dev,
++				 "csi trigger fifo is full\n");
++	}
++	spin_unlock_irqrestore(&csi->rdbk_lock, lock_flags);
++
++	if (times >= 0)
++		rkisp_trigger_read_back(csi, times);
++	return 0;
++}
++
+ void rkisp_csi_sof(struct rkisp_device *dev, u8 id)
+ {
+ 	/* to get long frame vc_start */
+@@ -518,17 +569,28 @@ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+ 				     csi_dev->pads);
+ 	if (ret < 0)
+ 		return ret;
++
++	spin_lock_init(&csi_dev->rdbk_lock);
++	ret = kfifo_alloc(&csi_dev->rdbk_kfifo,
++			  16 * sizeof(struct isp2x_csi_trigger),
++			  GFP_KERNEL);
++	if (ret < 0) {
++		v4l2_err(v4l2_dev, "Failed to alloc csi kfifo %d", ret);
++		goto free_media;
++	}
++
+ 	sd->owner = THIS_MODULE;
+ 	v4l2_set_subdevdata(sd, csi_dev);
+ 	sd->grp_id = GRP_ID_CSI;
+ 	ret = v4l2_device_register_subdev(v4l2_dev, sd);
+ 	if (ret < 0) {
+ 		v4l2_err(v4l2_dev, "Failed to register csi subdev\n");
+-		goto free_media;
++		goto free_kfifo;
+ 	}
+ 
+ 	return 0;
+-
++free_kfifo:
++	kfifo_free(&csi_dev->rdbk_kfifo);
+ free_media:
+ 	media_entity_cleanup(&sd->entity);
+ 	return ret;
+@@ -538,6 +600,7 @@ void rkisp_unregister_csi_subdev(struct rkisp_device *dev)
+ {
+ 	struct v4l2_subdev *sd = &dev->csi_dev.sd;
+ 
++	kfifo_free(&dev->csi_dev.rdbk_kfifo);
+ 	v4l2_device_unregister_subdev(sd);
+ 	media_entity_cleanup(&sd->entity);
+ }
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 16ddbe3e2766..1c20be68170b 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -4,6 +4,8 @@
+ #ifndef _RKISP_CSI_H
+ #define _RKISP_CSI_H
+ 
++#include <linux/kfifo.h>
++
+ #define CSI_DEV_NAME DRIVER_NAME "-csi-subdev"
+ 
+ #define RKISP_HDR_DBG_MODE 0
+@@ -61,22 +63,29 @@ struct sink_info {
+ /*
+  * struct rkisp_csi_device
+  * sink: csi link enable flags
++ * rdbk_kfifo: read back event fifo
++ * rdbk_lock: lock for read back event
+  * mipi_di: Data Identifier (vc[7:6],dt[5:0])
+  * filt_state: multiframe read back mode to filt irq event
+  * tx_first: flags for dmatx first Y_STATE irq
+  * memory: compact or big/little endian byte order for tx/rx
++ * is_first: flags of first frame read back
++ * is_isp_end: flags of isp frame end
+  */
+ struct rkisp_csi_device {
+ 	struct rkisp_device *ispdev;
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pads[CSI_PAD_MAX];
+-	int max_pad;
+ 	struct sink_info sink[CSI_PAD_MAX - 1];
++	struct kfifo rdbk_kfifo;
++	spinlock_t rdbk_lock;
++	int max_pad;
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
+ 	u8 filt_state[CSI_F_MAX];
+ 	u8 tx_first[HDR_DMA_MAX];
+ 	u8 memory;
+-	bool read_bak;
++	bool is_first;
++	bool is_isp_end;
+ };
+ 
+ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+@@ -85,5 +94,6 @@ void rkisp_unregister_csi_subdev(struct rkisp_device *dev);
+ 
+ int rkisp_csi_config_patch(struct rkisp_device *dev);
+ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm);
++int rkisp_csi_trigger_event(struct rkisp_csi_device *csi, void *arg);
+ void rkisp_csi_sof(struct rkisp_device *dev, u8 id);
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 37bdbd25b77e..c5a18e3a17c7 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1579,16 +1579,11 @@ static int rkisp_isp_sd_subs_evt(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+ static long rkisp_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ {
+ 	struct rkisp_device *isp_dev = sd_to_isp_dev(sd);
+-	struct isp2x_csi_trigger *trigger;
+ 	long ret = 0;
+ 
+ 	switch (cmd) {
+ 	case RKISP_CMD_TRIGGER_READ_BACK:
+-		if (!IS_HDR_DBG(isp_dev->hdr.op_mode))
+-			break;
+-		trigger = (struct isp2x_csi_trigger *)arg;
+-		isp_dev->dmarx_dev.frame_id = trigger->frame_id;
+-		rkisp_trigger_read_back(&isp_dev->csi_dev, trigger->times);
++		rkisp_csi_trigger_event(&isp_dev->csi_dev, arg);
+ 		break;
+ 	case RKISP_CMD_CSI_MEMORY_MODE:
+ 		if (*((int *)arg) == CSI_MEM_BYTE_BE)
+@@ -1865,12 +1860,10 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 
+ 	/* start edge of v_sync */
+ 	if (isp_mis & CIF_ISP_V_START) {
++		dev->csi_dev.is_isp_end = false;
+ 		/* filt v_sync when frame read back mode */
+-		if (dev->csi_dev.read_bak) {
+-			dev->csi_dev.read_bak = false;
+-			rkisp_stats_rdbk_enable(&dev->stats_vdev, true);
+-		}
+ 		if (dev->csi_dev.filt_state[CSI_F_VS]) {
++			rkisp_stats_rdbk_enable(&dev->stats_vdev, true);
+ 			dev->csi_dev.filt_state[CSI_F_VS]--;
+ 			goto vs_skip;
+ 		}
+@@ -1975,6 +1968,11 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 	 * Do the updates in the order of the processing flow.
+ 	 */
+ 	rkisp_params_isr(&dev->params_vdev, isp_mis);
++
++	if (isp_mis & CIF_ISP_FRAME) {
++		dev->csi_dev.is_isp_end = true;
++		rkisp_csi_trigger_event(&dev->csi_dev, NULL);
++	}
+ }
+ 
+ irqreturn_t rkisp_vs_isr_handler(int irq, void *ctx)
+-- 
+2.35.3
+

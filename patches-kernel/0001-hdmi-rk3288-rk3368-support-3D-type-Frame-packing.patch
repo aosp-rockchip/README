@@ -1,0 +1,192 @@
+From 96b23c94c677af8f6c85b65e5ca919a149da9f18 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Thu, 30 Jul 2015 10:43:04 +0800
+Subject: [PATCH] hdmi:rk3288/rk3368: support 3D type Frame packing.
+
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+---
+ .../video/rockchip/hdmi/rockchip-hdmi-core.c  | 45 +++++++++++--------
+ .../video/rockchip/hdmi/rockchip-hdmi-lcdc.c  | 16 ++++++-
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c | 33 +++++++++++---
+ 3 files changed, 69 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+index 0b411b321c51..3afce0059615 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+@@ -100,22 +100,21 @@ static void hdmi_wq_set_video(struct hdmi *hdmi)
+ 		} else {
+ 			video->color_output = hdmi->colormode;
+ 		}
++		if (hdmi->vic & HDMI_VIDEO_YUV420) {
++			video->color_output = HDMI_COLOR_YCBCR420;
++			deepcolor = hdmi->edid.deepcolor_420;
++		} else {
++			deepcolor = hdmi->edid.deepcolor;
++		}
++		if ((hdmi->property->feature & SUPPORT_DEEP_10BIT) &&
++		    (deepcolor & HDMI_DEEP_COLOR_30BITS)) {
++			if (hdmi->colordepth == HDMI_DEPP_COLOR_AUTO ||
++			    hdmi->colordepth == 10)
++				video->color_output_depth = 10;
++		} else {
++			video->color_output_depth = 8;
++		}
+ 	}
+-	if (hdmi->vic & HDMI_VIDEO_YUV420) {
+-		video->color_output = HDMI_COLOR_YCBCR420;
+-		deepcolor = hdmi->edid.deepcolor_420;
+-	} else {
+-		deepcolor = hdmi->edid.deepcolor;
+-	}
+-	if ((hdmi->property->feature & SUPPORT_DEEP_10BIT) &&
+-	    (deepcolor & HDMI_DEEP_COLOR_30BITS)) {
+-		if (hdmi->colordepth == HDMI_DEPP_COLOR_AUTO ||
+-		    hdmi->colordepth == 10)
+-			video->color_output_depth = 10;
+-	} else {
+-		video->color_output_depth = 8;
+-	}
+-
+ 	pr_info("hdmi output corlor mode is %d\n", video->color_output);
+ 	video->color_input = HDMI_COLOR_RGB_0_255;
+ 	if (hdmi->property->feature & SUPPORT_YCBCR_INPUT) {
+@@ -396,13 +395,23 @@ static void hdmi_work_queue(struct work_struct *work)
+ 					   hdmi->mute & (~HDMI_AUDIO_MUTE));
+ 		break;
+ 	case HDMI_SET_3D:
+-		if (hdmi->ops->setvsi) {
+-			if (hdmi->mode_3d != HDMI_3D_NONE)
++		if (hdmi->ops->setvsi && hdmi->edid.sink_hdmi) {
++			if (hdmi->mode_3d == HDMI_3D_FRAME_PACKING ||
++			    hdmi->video.format_3d ==
++			    HDMI_3D_FRAME_PACKING) {
++				hdmi_wq_set_output(hdmi,
++						   HDMI_VIDEO_MUTE |
++						   HDMI_AUDIO_MUTE);
++				msleep(100);
++				hdmi_wq_set_video(hdmi);
++				hdmi_wq_set_output(hdmi, hdmi->mute);
++			} else if (hdmi->mode_3d != HDMI_3D_NONE) {
+ 				hdmi->ops->setvsi(hdmi, hdmi->mode_3d,
+ 						  HDMI_VIDEO_FORMAT_3D);
+-			else if ((hdmi->vic & HDMI_TYPE_MASK) == 0)
++			} else if ((hdmi->vic & HDMI_TYPE_MASK) == 0) {
+ 				hdmi->ops->setvsi(hdmi, hdmi->vic,
+ 						  HDMI_VIDEO_FORMAT_NORMAL);
++			}
+ 		}
+ 		break;
+ 	case HDMI_SET_COLOR:
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
+index 9f6bf9ef3205..d25e99e7b142 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-lcdc.c
+@@ -73,7 +73,21 @@ static int hdmi_set_info(struct rk_screen *screen, struct hdmi *hdmi)
+ 	mode = (struct fb_videomode *)&(hdmi_mode[i].mode);
+ 
+ 	screen->mode = *mode;
+-
++	if (hdmi->video.format_3d == HDMI_3D_FRAME_PACKING) {
++		screen->mode.pixclock = 2 * mode->pixclock;
++		if (mode->vmode == 0) {
++			screen->mode.yres = 2 * mode->yres +
++					mode->upper_margin +
++					mode->lower_margin +
++					mode->vsync_len;
++		} else {
++			screen->mode.yres = 2 * mode->yres +
++					    3 * (mode->upper_margin +
++						 mode->lower_margin +
++						 mode->vsync_len) + 2;
++			screen->mode.vmode = 0;
++		}
++	}
+ 	/* Pin polarity */
+ 	#ifdef CONFIG_HDMI_RK616
+ 	screen->pin_hsync = 0;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+index ba94ca1e1560..46023e399233 100755
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_hw.c
+@@ -303,8 +303,8 @@ static const struct phy_mpll_config_tab *get_phy_mpll_tab(
+ 
+ 	if (pixclock == 0)
+ 		return NULL;
+-	HDMIDBG("%s pixClock %u pixRepet %d colorDepth %d\n",
+-		__func__, pixclock, pixrepet, colordepth);
++	HDMIDBG("%s pixClock %u tmdsclk %u pixRepet %d colorDepth %d\n",
++		__func__, pixclock, tmdsclk, pixrepet, colordepth);
+ 	for (i = 0; i < ARRAY_SIZE(PHY_MPLL_TABLE); i++) {
+ 		if ((PHY_MPLL_TABLE[i].pix_clock == pixclock) &&
+ 		    (PHY_MPLL_TABLE[i].tmdsclock == tmdsclk) &&
+@@ -546,6 +546,8 @@ static int rockchip_hdmiv2_video_framecomposer(struct hdmi *hdmi_drv,
+ 	mode = &(timing->mode);
+ 	if (vpara->color_input == HDMI_COLOR_YCBCR420)
+ 		tmdsclk = mode->pixclock / 2;
++	else if (vpara->format_3d == HDMI_3D_FRAME_PACKING)
++		tmdsclk = 2 * mode->pixclock;
+ 	else
+ 		tmdsclk = mode->pixclock;
+ 	switch (vpara->color_output_depth) {
+@@ -567,7 +569,7 @@ static int rockchip_hdmiv2_video_framecomposer(struct hdmi *hdmi_drv,
+ 		vpara->color_output_depth = 8;
+ 		tmdsclk = mode->pixclock;
+ 	}
+-	pr_info("pixel clk is %u tmds clk is %u\n", mode->pixclock, tmdsclk);
++
+ 	if ((tmdsclk > 340000000 && hdmi_dev->tmdsclk < 340000000) ||
+ 	    (tmdsclk < 340000000 && hdmi_dev->tmdsclk > 340000000))
+ 		hdmi_dev->tmdsclk_ratio_change = true;
+@@ -575,10 +577,15 @@ static int rockchip_hdmiv2_video_framecomposer(struct hdmi *hdmi_drv,
+ 		hdmi_dev->tmdsclk_ratio_change = false;
+ 
+ 	hdmi_dev->tmdsclk = tmdsclk;
+-	hdmi_dev->pixelclk = mode->pixclock;
++	if (vpara->format_3d == HDMI_3D_FRAME_PACKING)
++		hdmi_dev->pixelclk = 2 * mode->pixclock;
++	else
++		hdmi_dev->pixelclk = mode->pixclock;
+ 	hdmi_dev->pixelrepeat = timing->pixelrepeat;
+ 	hdmi_dev->colordepth = vpara->color_output_depth;
+ 
++	pr_info("pixel clk is %lu tmds clk is %u\n",
++		hdmi_dev->pixelclk, hdmi_dev->tmdsclk);
+ 	/* Start/stop HDCP keepout window generation */
+ 	hdmi_msk_reg(hdmi_dev, FC_INVIDCONF,
+ 		     m_FC_HDCP_KEEPOUT, v_FC_HDCP_KEEPOUT(1));
+@@ -610,7 +617,8 @@ static int rockchip_hdmiv2_video_framecomposer(struct hdmi *hdmi_drv,
+ 		     v_FC_VSYNC_POL(vsync_pol) | v_FC_HSYNC_POL(hsync_pol) |
+ 		     v_FC_DE_POL(de_pol) | v_FC_HDMI_DVI(vpara->sink_hdmi) |
+ 		     v_FC_INTERLACE_MODE(mode->vmode));
+-	if (mode->vmode == FB_VMODE_INTERLACED)
++	if (mode->vmode == FB_VMODE_INTERLACED &&
++	    vpara->format_3d != HDMI_3D_FRAME_PACKING)
+ 		hdmi_msk_reg(hdmi_dev, FC_INVIDCONF,
+ 			     m_FC_VBLANK, v_FC_VBLANK(1));
+ 	else
+@@ -623,7 +631,20 @@ static int rockchip_hdmiv2_video_framecomposer(struct hdmi *hdmi_drv,
+ 	hdmi_writel(hdmi_dev, FC_INHACTIV1, v_FC_HACTIVE1(value >> 8));
+ 	hdmi_writel(hdmi_dev, FC_INHACTIV0, (value & 0xff));
+ 
+-	value = mode->yres;
++	if (vpara->format_3d == HDMI_3D_FRAME_PACKING) {
++		if (mode->vmode == 0)
++			value = 2 * mode->yres +
++				mode->upper_margin +
++				mode->lower_margin +
++				mode->vsync_len;
++		else
++			value = 2 * mode->yres +
++				3 * (mode->upper_margin +
++				     mode->lower_margin +
++				     mode->vsync_len) + 2;
++	} else {
++		value = mode->yres;
++	}
+ 	hdmi_writel(hdmi_dev, FC_INVACTIV1, v_FC_VACTIVE1(value >> 8));
+ 	hdmi_writel(hdmi_dev, FC_INVACTIV0, (value & 0xff));
+ 
+-- 
+2.35.3
+

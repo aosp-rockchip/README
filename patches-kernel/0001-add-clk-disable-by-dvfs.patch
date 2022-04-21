@@ -1,0 +1,571 @@
+From 32fa8beddeb3b6d9139823c4bd1e24f4a2fd8063 Mon Sep 17 00:00:00 2001
+From: xxx <xxx@rock-chips.com>
+Date: Fri, 8 Mar 2013 18:57:53 +0800
+Subject: [PATCH] add clk disable by dvfs
+
+---
+ arch/arm/mach-rk3188/dvfs.c           |  94 +++++++++++++-
+ arch/arm/plat-rk/clock.c              |  28 +++--
+ arch/arm/plat-rk/dvfs.c               | 172 ++++++++++++++++++++++++--
+ arch/arm/plat-rk/include/plat/clock.h |  11 +-
+ arch/arm/plat-rk/include/plat/dvfs.h  |  41 ++++--
+ 5 files changed, 307 insertions(+), 39 deletions(-)
+ mode change 100755 => 100644 arch/arm/mach-rk3188/dvfs.c
+ mode change 100755 => 100644 arch/arm/plat-rk/clock.c
+ mode change 100755 => 100644 arch/arm/plat-rk/dvfs.c
+ mode change 100755 => 100644 arch/arm/plat-rk/include/plat/dvfs.h
+
+diff --git a/arch/arm/mach-rk3188/dvfs.c b/arch/arm/mach-rk3188/dvfs.c
+old mode 100755
+new mode 100644
+index a228645cf56d..88f803e99dab
+--- a/arch/arm/mach-rk3188/dvfs.c
++++ b/arch/arm/mach-rk3188/dvfs.c
+@@ -27,6 +27,82 @@
+ #include <linux/io.h>
+ #include <linux/hrtimer.h>
+ 
++static int clk_disable_target(struct clk *clk, int on)
++{
++	struct clk_node *dvfs_clk;
++	int volt_new = 0, clk_volt_store = 0;
++	struct cpufreq_frequency_table clk_fv;
++	unsigned long rate_hz;
++	int ret = 0;
++
++	if (!clk) {
++		DVFS_ERR("%s is not a clk\n", __func__);
++		return -1;
++	}
++	dvfs_clk = clk_get_dvfs_info(clk);
++
++	if (!dvfs_clk || dvfs_clk->vd == NULL || IS_ERR_OR_NULL(dvfs_clk->vd->regulator)) {
++		DVFS_ERR("dvfs(%s) is not register regulator\n", dvfs_clk->name);
++		return -1;
++	}
++
++	if (dvfs_clk->vd->volt_set_flag == DVFS_SET_VOLT_FAILURE) {
++		/* It means the last time set voltage error */
++		ret = dvfs_reset_volt(dvfs_clk->vd);
++		if (ret < 0) {
++			return -1;
++		}
++	}
++
++	clk_volt_store = dvfs_clk->set_volt;	
++	// firsh up volt in this,next on clk out off this fun
++	if(on||clk_used_count(clk))
++	{
++		rate_hz = clk_get_rate(clk);
++		/* find the clk corresponding voltage */
++		if (0 != dvfs_clk_get_ref_volt(dvfs_clk, rate_hz / 1000, &clk_fv)) {
++			DVFS_ERR("dvfs(%s) rate %luhz is larger,not support\n", dvfs_clk->name, rate_hz);
++			return -1;
++		}	
++		dvfs_clk->set_volt = clk_fv.index;
++
++	}
++	else// in this clk is real disable
++	{
++		dvfs_clk->set_volt =0;	
++	}	
++	
++
++	volt_new = dvfs_vd_get_newvolt_byclk(dvfs_clk);
++
++	DVFS_DBG("**%s:clk=%s(%s),rate=%lu,clk volt=%d,vd volt=%d\n",__FUNCTION__,dvfs_clk->name,
++				on?"enable":"disable",clk_get_rate(clk)/1000,dvfs_clk->set_volt,volt_new);
++
++
++	if (volt_new == dvfs_clk->vd->cur_volt)
++		return 0;
++
++	ret = dvfs_scale_volt_direct(dvfs_clk->vd, volt_new);
++	if (ret < 0)
++	{
++		printk("%s:clk=%s set volt error\n",__FUNCTION__,dvfs_clk->name);
++
++		if(!clk_used_count(clk))	
++			dvfs_clk->set_volt = 0;
++		else
++		{
++			rate_hz = clk_get_rate(clk);
++			/* find the clk corresponding voltage */
++			if (0 != dvfs_clk_get_ref_volt(dvfs_clk, rate_hz / 1000, &clk_fv)) {
++				DVFS_ERR("dvfs(%s) rate %luhz is larger,not support\n", dvfs_clk->name, rate_hz);
++				return -1;
++			}	
++			dvfs_clk->set_volt = clk_fv.index;
++		}
++	}
++
++	return ret;
++}
+ static int rk_dvfs_clk_notifier_event(struct notifier_block *this,
+ 		unsigned long event, void *ptr)
+ {
+@@ -557,7 +633,7 @@ static struct vd_node vd_core = {
+ #else
+ 	.vd_dvfs_target	= dvfs_target_core,
+ #endif
+-
++	.vd_clk_disable_target= dvfs_vd_clk_disable_target,
+ };
+ 
+ static struct vd_node vd_rtc = {
+@@ -670,19 +746,25 @@ static struct pds_list aclk_periph_pds[] = {
+ 	CLK_PDS(NULL),
+ };
+ 
+-#define RK_CLKS(_clk_name, _ppds, _dvfs_table, _dvfs_nb) \
++#define RK_CLKS(_clk_name, _ppds, _dvfs_table, _dvfs_nb, _disable) \
+ { \
+ 	.name	= _clk_name, \
+ 	.pds = _ppds,\
+ 	.dvfs_table = _dvfs_table,	\
+ 	.dvfs_nb	= _dvfs_nb,	\
++	.disable_ctr = _disable,	\
+ }
+ 
++static struct clk_disable_ctr gpu_disable= {
++	.disable_work_fn=dvfs_clk_disable_delay_work,
++	.clk_disable_target=clk_disable_target,
++	.delay=40,//ms
++};
+ static struct clk_node rk30_clks[] = {
+-	RK_CLKS("cpu", cpu_pds, cpu_dvfs_table, &rk_dvfs_clk_notifier),
+-	RK_CLKS("ddr", ddr_pds, ddr_dvfs_table, &rk_dvfs_clk_notifier),
+-	RK_CLKS("gpu", gpu_pds, gpu_dvfs_table, &rk_dvfs_clk_notifier),
+-	RK_CLKS("aclk_periph", aclk_periph_pds, peri_aclk_dvfs_table, &rk_dvfs_clk_notifier),
++	RK_CLKS("cpu", cpu_pds, cpu_dvfs_table, &rk_dvfs_clk_notifier, NULL),
++	RK_CLKS("ddr", ddr_pds, ddr_dvfs_table, &rk_dvfs_clk_notifier, NULL),
++	RK_CLKS("gpu", gpu_pds, gpu_dvfs_table, &rk_dvfs_clk_notifier,&gpu_disable),
++	RK_CLKS("aclk_periph", aclk_periph_pds, peri_aclk_dvfs_table, &rk_dvfs_clk_notifier, NULL),
+ };
+ 
+ #if 0
+diff --git a/arch/arm/plat-rk/clock.c b/arch/arm/plat-rk/clock.c
+old mode 100755
+new mode 100644
+index 7902e8742e0b..2fdd5bb5a0a4
+--- a/arch/arm/plat-rk/clock.c
++++ b/arch/arm/plat-rk/clock.c
+@@ -322,12 +322,6 @@ int clk_set_parent_nolock(struct clk *clk, struct clk *parent)
+ 	return ret;
+ }
+ /**********************************dvfs****************************************************/
+-
+-struct clk_node *clk_get_dvfs_info(struct clk *clk)
+-{
+-    return clk->dvfs_info;
+-}
+-
+ int clk_set_rate_locked(struct clk * clk,unsigned long rate)
+ {
+ 	int ret;
+@@ -342,8 +336,18 @@ void clk_register_dvfs(struct clk_node *dvfs_clk, struct clk *clk)
+ {
+     clk->dvfs_info = dvfs_clk;
+ }
+-
+-
++int clk_set_enable_locked(struct clk * clk,int on)
++{
++	int ret=0;
++	LOCK();
++	if(on)
++		ret=clk_enable_nolock(clk);
++	else	
++		clk_disable_nolock(clk);
++	UNLOCK();
++	return ret;
++}
++EXPORT_SYMBOL(clk_set_enable_locked);
+ /*-------------------------------------------------------------------------
+  * Optional clock functions defined in include/linux/clk.h
+  *-------------------------------------------------------------------------*/
+@@ -402,8 +406,8 @@ int clk_set_rate(struct clk *clk, unsigned long rate)
+ 	}
+ 	if (rate == clk->rate)
+ 		return 0;
+-	if (clk->dvfs_info!=NULL&&is_support_dvfs(clk->dvfs_info))
+-		return dvfs_set_rate(clk, rate);
++	if (dvfs_support_clk_set_rate(clk->dvfs_info)==true)
++		return dvfs_vd_clk_set_rate(clk, rate);
+ 
+ 	LOCK();
+ 	ret = clk_set_rate_nolock(clk, rate);
+@@ -488,6 +492,8 @@ void clk_disable(struct clk *clk)
+ {
+ 	if (clk == NULL || IS_ERR(clk))
+ 		return;
++	if (dvfs_support_clk_disable(clk->dvfs_info)==true)
++		return dvfs_vd_clk_disable(clk, 0);
+ 
+ 	LOCK();
+ 	clk_disable_nolock(clk);
+@@ -509,6 +515,8 @@ int  clk_enable(struct clk *clk)
+ 
+ 	if (clk == NULL || IS_ERR(clk))
+ 		return -EINVAL;
++	if (dvfs_support_clk_disable(clk->dvfs_info)==true)
++		return dvfs_vd_clk_disable(clk, 1);
+ 
+ 	LOCK();
+ 	ret = clk_enable_nolock(clk);
+diff --git a/arch/arm/plat-rk/dvfs.c b/arch/arm/plat-rk/dvfs.c
+old mode 100755
+new mode 100644
+index 4f82c153d4c3..f22d7e587451
+--- a/arch/arm/plat-rk/dvfs.c
++++ b/arch/arm/plat-rk/dvfs.c
+@@ -34,8 +34,10 @@ static DEFINE_MUTEX(rk_dvfs_mutex);
+ 
+ static int dump_dbg_map(char *buf);
+ 
++static struct workqueue_struct *dvfs_wq;
+ #define PD_ON	1
+ #define PD_OFF	0
++#define DVFS_STR_DISABLE(on) ((on)?"enable":"disable")
+ 
+ #define get_volt_up_delay(new_volt, old_volt)	\
+ 	((new_volt) > (old_volt) ? (((new_volt) - (old_volt)) >> 9) : 0)
+@@ -280,31 +282,159 @@ int dvfs_clk_disable_limit(struct clk *clk)
+ 	return 0;
+ }
+ 
+-int is_support_dvfs(struct clk_node *dvfs_info)
++int dvfs_vd_clk_set_rate(struct clk *clk, unsigned long rate)
+ {
+-	return (dvfs_info->vd && dvfs_info->vd->vd_dvfs_target && dvfs_info->enable_dvfs);
++	int ret = -1;
++	struct clk_node *dvfs_info=clk_get_dvfs_info(clk);
++	
++	DVFS_DBG("%s(%s(%lu))\n", __func__, dvfs_info->name, rate);
++
++	#if 0 // judge by reference func in rk
++	if (dvfs_support_clk_set_rate(dvfs_info)==false) {
++		DVFS_ERR("dvfs func:%s is not support!\n", __func__);
++		return ret;
++	}
++	#endif
++	
++	if(dvfs_info->vd&&dvfs_info->vd->vd_dvfs_target){
++		// mutex_lock(&vd->dvfs_mutex);
++		mutex_lock(&rk_dvfs_mutex);
++		ret = dvfs_info->vd->vd_dvfs_target(clk, rate);
++		mutex_unlock(&rk_dvfs_mutex);
++		// mutex_unlock(&vd->dvfs_mutex);
++	}
++	DVFS_DBG("%s(%s(%lu)),is end\n", __func__, clk->name, rate);
++	return ret;
+ }
++EXPORT_SYMBOL(dvfs_vd_clk_set_rate);
+ 
+-int dvfs_set_rate(struct clk *clk, unsigned long rate)
++int dvfs_vd_clk_disable(struct clk *clk, int on)
+ {
+-	int ret = 0;
+-	struct vd_node *vd;
+-	DVFS_DBG("%s(%s(%lu))\n", __func__, clk->name, rate);
+-	if (!clk->dvfs_info) {
+-		DVFS_ERR("%s :This clk do not support dvfs!\n", __func__);
+-		ret = -1;
+-	} else {
+-		vd = clk->dvfs_info->vd;
++	int ret = -1;
++	struct clk_node *dvfs_info=clk_get_dvfs_info(clk);	
++	DVFS_DBG("%s(%s(%s,%lu))\n", __func__, dvfs_info->name, DVFS_STR_DISABLE(on),clk_get_rate(clk));
++
++
++	#if 0 // judge by reference func in rk
++	if (dvfs_support_clk_disable(dvfs_info)==false) {
++		DVFS_ERR("dvfs func:%s is not support!\n", __func__);
++		return ret;
++	}
++	#endif
++	
++	if(dvfs_info->vd&&dvfs_info->vd->vd_clk_disable_target){
+ 		// mutex_lock(&vd->dvfs_mutex);
+ 		mutex_lock(&rk_dvfs_mutex);
+-		ret = vd->vd_dvfs_target(clk, rate);
++		ret = dvfs_info->vd->vd_clk_disable_target(clk, on);
+ 		mutex_unlock(&rk_dvfs_mutex);
+ 		// mutex_unlock(&vd->dvfs_mutex);
+ 	}
+-	DVFS_DBG("%s(%s(%lu)),is end\n", __func__, clk->name, rate);
++	DVFS_DBG("%s(%s(%lu)),is end\n", __func__, dvfs_info->name, DVFS_STR_ON(on));
++
++	return ret;
++}
++
++EXPORT_SYMBOL(dvfs_vd_clk_disable);
++
++
++int dvfs_vd_clk_disable_target(struct clk *clk, int on)
++{
++	struct clk_node *dvfs_clk;
++	struct clk_disable_ctr *disable_ctr;
++	int ret = 0;
++	int i;
++	if (!clk) {
++		DVFS_ERR("%s is not a clk\n", __func__);
++		return -1;
++	}
++	dvfs_clk = clk_get_dvfs_info(clk);
++	if(!dvfs_clk)
++	{
++		DVFS_ERR("%s is not a dvfs\n", __func__);
++		return -1;
++	}
++
++	DVFS_DBG("%s:clk=%s(%s),count=%d\n",__FUNCTION__,dvfs_clk->name,
++	DVFS_STR_DISABLE,clk_used_count(clk));
++	if(on)
++	{
++		// enable ,is usecount =0,this time will set volt
++		if(clk_used_count(clk)!= 0)
++			return clk_set_enable_locked(clk, on);
++	}
++	else
++	{
++		//disabe, is usecount =1,this time will set volt
++		if(clk_used_count(clk)!= 1)
++			return clk_set_enable_locked(clk, on);
++	}
++	if(!dvfs_clk->disable_ctr)
++		return clk_set_enable_locked(clk, on);
++	else
++		disable_ctr=dvfs_clk->disable_ctr;
++	if(on)
++	{	
++		if(disable_ctr->delay&&disable_ctr->disable_work_fn)
++			cancel_delayed_work(&disable_ctr->disable_work);
++		if(disable_ctr->clk_disable_target)
++		{
++			for(i=0;i<2;i++)
++			{
++				ret = disable_ctr->clk_disable_target(clk, on);
++				if(ret>=0)
++					break;
++				mdelay(1000);
++			}
++		}
++		else
++			ret=0;
++		
++		// volt resume fail, Muse set rate is mini
++		if(ret<0)
++		{
++			clk_set_rate_locked(clk,dvfs_clk->min_rate);
++			DVFS_WARNING("%s:clk=%s enable set volt fail,set min rate\n",__FUNCTION__,dvfs_clk->name);
++		}
++	}
++
++	ret = clk_set_enable_locked(clk, on);
++	if(ret < 0)
++	  return ret;
++	if(!on)
++	{
++		if(disable_ctr->delay&&disable_ctr->disable_work_fn)
++		{
++			DVFS_DBG("%s:clk=%s disable delay=%d\n",__FUNCTION__,dvfs_clk->name,disable_ctr->delay);
++			queue_delayed_work_on(0,dvfs_wq, &disable_ctr->disable_work, 
++											msecs_to_jiffies(disable_ctr->delay));
++		}
++		else
++		{
++			DVFS_DBG("%s:clk=%s disable now\n",__FUNCTION__,dvfs_clk->name);
++			if(disable_ctr->clk_disable_target)
++				ret=disable_ctr->clk_disable_target(clk, on);
++		}
++	}
+ 	return ret;
+ }
+ 
++EXPORT_SYMBOL(dvfs_vd_clk_disable_target);
++
++void dvfs_clk_disable_delay_work(struct work_struct *work)
++{
++	struct clk_disable_ctr *disable_ctr=container_of(work, struct clk_disable_ctr, disable_work.work);
++	struct clk_node *dvfs_clk;
++	if(!disable_ctr->dvfs_clk)
++		return;
++	dvfs_clk=disable_ctr->dvfs_clk;
++	mutex_lock(&rk_dvfs_mutex);
++	DVFS_DBG("%s:clk=%s disable delay work\n",__FUNCTION__,dvfs_clk->name);
++	if(disable_ctr->clk_disable_target&&(!clk_used_count(dvfs_clk->clk)))
++		disable_ctr->clk_disable_target(dvfs_clk->clk,0);
++	mutex_unlock(&rk_dvfs_mutex);
++}
++EXPORT_SYMBOL(dvfs_clk_disable_delay_work);
++
+ static void dvfs_table_round_clk_rate(struct clk_node  *dvfs_clk)
+ {
+ 	int i;
+@@ -728,6 +858,7 @@ int rk_regist_clk(struct clk_node *dvfs_clk)
+ 	struct pd_node	*pd;
+ 	struct clk_list	*child;
+ 	struct clk	*clk;
++	struct clk_disable_ctr *disable_ctr;
+ 	int i = 0;
+ 
+ 	if (!dvfs_clk)
+@@ -746,6 +877,20 @@ int rk_regist_clk(struct clk_node *dvfs_clk)
+ 	}
+ 	clk = dvfs_clk_get(NULL, dvfs_clk->name);
+ 	dvfs_clk->clk = clk;
++	disable_ctr=dvfs_clk->disable_ctr;
++	if(disable_ctr)
++	{
++		if(disable_ctr->clk_disable_target)
++		{
++			disable_ctr->dvfs_clk=dvfs_clk;
++
++			if(disable_ctr->delay&&disable_ctr->disable_work_fn)
++			{
++				INIT_DELAYED_WORK(&disable_ctr->disable_work,disable_ctr->disable_work_fn);	
++			}
++		}else
++			dvfs_clk->disable_ctr=NULL;
++	}
+ 	clk_register_dvfs(dvfs_clk, clk);
+ 	INIT_LIST_HEAD(&dvfs_clk->depend_list);
+ 	mutex_unlock(&mutex);
+@@ -1485,6 +1630,7 @@ static int __init dvfs_init(void)
+ 			return ret;
+ 		}
+ 	}
++	dvfs_wq = create_singlethread_workqueue("rk dvfs wq");
+ 
+ 	return ret;
+ }
+diff --git a/arch/arm/plat-rk/include/plat/clock.h b/arch/arm/plat-rk/include/plat/clock.h
+index ece9e1f18faf..65b23a2879af 100644
+--- a/arch/arm/plat-rk/include/plat/clock.h
++++ b/arch/arm/plat-rk/include/plat/clock.h
+@@ -70,8 +70,17 @@ int clk_set_rate_nolock(struct clk *clk, unsigned long rate);
+ int clk_set_parent_nolock(struct clk *clk, struct clk *parent);
+ int clk_set_rate_locked(struct clk * clk,unsigned long rate);
+ void clk_register_dvfs(struct clk_node *dvfs_clk, struct clk *clk);
+-struct clk_node *clk_get_dvfs_info(struct clk *clk);
+ int is_suport_round_rate(struct clk *clk);
++int clk_set_enable_locked(struct clk * clk,int on);
++/************************inline fun*****************************/
++static inline struct clk_node *clk_get_dvfs_info(struct clk *clk)
++{
++    return clk->dvfs_info;
++}
++static inline s16 clk_used_count(struct clk * clk)
++{
++	return (clk->usecount);
++}
+ 
+ #ifdef RK30_CLK_OFFBOARD_TEST
+ #include <linux/device.h>
+diff --git a/arch/arm/plat-rk/include/plat/dvfs.h b/arch/arm/plat-rk/include/plat/dvfs.h
+old mode 100755
+new mode 100644
+index 5278f9104218..36b0a2d5b5bd
+--- a/arch/arm/plat-rk/include/plat/dvfs.h
++++ b/arch/arm/plat-rk/include/plat/dvfs.h
+@@ -24,6 +24,9 @@ typedef int (*dvfs_set_rate_callback)(struct clk *clk, unsigned long rate);
+ typedef int (*clk_dvfs_target_callback)(struct clk *clk, unsigned long rate,
+                                         dvfs_set_rate_callback set_rate);
+ 
++typedef int (*dvfs_vd_clk_disable_callback)(struct clk *clk,int on);
++
++typedef void (*dvfs_clk_disable_work_callback)(struct work_struct *work);
+ /**
+  * struct vd_node:	To Store All Voltage Domains' info
+  * @name:		Voltage Domain's Name
+@@ -52,6 +55,7 @@ struct vd_node {
+ 	struct list_head	pd_list;
+ 	struct list_head	req_volt_list;
+ 	//struct mutex		dvfs_mutex;
++	dvfs_vd_clk_disable_callback		vd_clk_disable_target;
+ 	vd_dvfs_target_callback	vd_dvfs_target;
+ 	unsigned n_voltages;
+ 	int volt_list[VD_VOL_LIST_CNT];
+@@ -108,6 +112,13 @@ struct depend_lookup {
+ 	struct cpufreq_frequency_table	*dep_table;
+ };
+ 
++struct clk_disable_ctr {
++	struct delayed_work disable_work;
++	dvfs_clk_disable_work_callback disable_work_fn;
++	dvfs_vd_clk_disable_callback clk_disable_target;
++	unsigned int delay;//ms
++	struct clk_node *dvfs_clk;
++};
+ /**
+  * struct clk_node:	To Store All dvfs clocks' info
+  * @name:		Dvfs clock's Name
+@@ -137,6 +148,7 @@ struct clk_node {
+ 	struct notifier_block	*dvfs_nb;
+ 	struct cpufreq_frequency_table	*dvfs_table;
+ 	clk_dvfs_target_callback	clk_dvfs_target;
++	struct clk_disable_ctr *disable_ctr;
+ };
+ 
+ struct dvfs_arm_table {
+@@ -182,8 +194,6 @@ struct dvfs_arm_table {
+ #define dvfs_clk_get(a,b) clk_get((a),(b))
+ #define dvfs_clk_get_rate_kz(a) (clk_get_rate((a))/1000)
+ #define dvfs_clk_set_rate(a,b) clk_set_rate((a),(b))
+-#define dvfs_clk_enable(a) clk_enable((a))
+-#define dvfs_clk_disable(a) clk_disable((a))
+ 
+ 
+ 
+@@ -215,11 +225,12 @@ int rk_regist_clk(struct clk_node *dvfs_clk);
+ int rk_regist_depends(struct depend_lookup *dep_node);
+ struct clk_node *dvfs_get_dvfs_clk_byname(char *name);
+ int vd_regulator_round_volt(struct vd_node *vd, int volt,int flags);
++int dvfs_vd_clk_disable_target(struct clk *clk, int on);
++void dvfs_clk_disable_delay_work(struct work_struct *work);
+ 
+-/******************************************************************************/
+-
+-int is_support_dvfs(struct clk_node *dvfs_info);
+-int dvfs_set_rate(struct clk *clk, unsigned long rate);
++/*********************************if not define dvfs ,the following function is need defined func{}******************************/
++int dvfs_vd_clk_set_rate(struct clk *clk, unsigned long rate);
++int dvfs_vd_clk_disable(struct clk *clk, int on);
+ int clk_enable_dvfs(struct clk *clk);
+ int clk_disable_dvfs(struct clk *clk);
+ void dvfs_clk_register_set_rate_callback(struct clk *clk, clk_dvfs_target_callback clk_dvfs_target);
+@@ -231,15 +242,27 @@ struct regulator* dvfs_get_regulator(char *regulator_name);
+ int dvfs_clk_enable_limit(struct clk *clk, unsigned int min_rate, unsigned max_rate);
+ int dvfs_clk_disable_limit(struct clk *clk);
+ int dvfs_scale_volt_direct(struct vd_node *vd_clk, int volt_new);
+-
++/******************************** inline *******************************/
++static inline bool dvfs_support_clk_set_rate(struct clk_node *dvfs_info)
++{
++	return (dvfs_info&&dvfs_info->enable_dvfs);
++}
++static inline bool dvfs_support_clk_disable(struct clk_node *dvfs_info)
++{
++	return (dvfs_info&&dvfs_info->disable_ctr&&dvfs_info->enable_dvfs);
++}
++/********************************avs*******************************/
+ void avs_init(void);
+ void avs_init_val_get(int index,int vol,char *s);
+ int avs_set_scal_val(u8 avs_base);
+ void avs_board_init(struct avs_ctr_st *data);
+ 
+ #else
+-static inline int is_support_dvfs(struct clk_node *dvfs_info) { return 0; }
+-static inline int dvfs_set_rate(struct clk *clk, unsigned long rate) { return 0; }
++static inline bool dvfs_support_clk_set_rate(struct clk_node *dvfs_info) { return 0; }
++static inline bool dvfs_support_clk_disable(struct clk_node *dvfs_info) { return 0; }
++
++static inline int dvfs_vd_clk_set_rate(struct clk *clk, unsigned long rate) { return 0; }
++static inline int dvfs_vd_clk_disable(struct clk *clk, int on) { return 0; }
+ static inline int clk_enable_dvfs(struct clk *clk) { return 0; }
+ static inline int clk_disable_dvfs(struct clk *clk) { return 0; }
+ static inline void dvfs_clk_register_set_rate_callback(struct clk *clk, clk_dvfs_target_callback clk_dvfs_target) {}
+-- 
+2.35.3
+

@@ -1,0 +1,166 @@
+From df4424d9746d6e54b74858ac925878d327913427 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Thu, 18 Jun 2020 20:15:26 +0800
+Subject: [PATCH] media: rockchip: isp: fix dmarx iommu error
+
+dmarx isr is unreliable, using MI frame end to replace it
+
+Change-Id: Iabb4f405aedf3e81995d009ce2f4bddce2d12ed3
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/bridge.c  | 28 +++++++++++++++++--
+ drivers/media/platform/rockchip/isp/capture.c |  3 --
+ drivers/media/platform/rockchip/isp/csi.c     |  3 ++
+ drivers/media/platform/rockchip/isp/dmarx.c   | 16 ++++-------
+ drivers/media/platform/rockchip/isp/rkisp.c   |  3 --
+ 5 files changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 95fe9e4429f6..52dbb2464f03 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -49,13 +49,15 @@ static int frame_end(struct rkisp_bridge_device *dev)
+ {
+ 	struct v4l2_subdev *sd = v4l2_get_subdev_hostdata(&dev->sd);
+ 	unsigned long lock_flags = 0;
++	u64 ns = 0;
+ 
+ 	if (dev->cur_buf && dev->nxt_buf) {
+ 		rkisp_dmarx_get_frame(dev->ispdev,
+-				      &dev->cur_buf->frame_id,
+-				      &dev->cur_buf->frame_timestamp,
+-				      false);
++				      &dev->cur_buf->frame_id, &ns, false);
+ 		dev->cur_buf->frame_id++;
++		if (!ns)
++			ns = ktime_get_ns();
++		dev->cur_buf->frame_timestamp = ns;
+ 		v4l2_subdev_call(sd, video, s_rx_buffer, dev->cur_buf, NULL);
+ 		dev->cur_buf = NULL;
+ 	}
+@@ -687,6 +689,26 @@ void rkisp_bridge_isr(u32 *mis_val, struct rkisp_device *dev)
+ {
+ 	struct rkisp_bridge_device *bridge = &dev->br_dev;
+ 	void __iomem *base = dev->base_addr;
++	u32 val = 0;
++
++	/* dmarx isr is unreliable, MI frame end to replace it */
++	if (*mis_val & (MI_MP_FRAME | MI_MPFBC_FRAME) &&
++	    IS_HDR_RDBK(dev->hdr.op_mode) &&
++	    dev->dmarx_dev.trigger == T_MANUAL) {
++		switch (dev->hdr.op_mode) {
++		case HDR_RDBK_FRAME3://for rd1 rd0 rd2
++			val |= RAW1_RD_FRAME;
++			/* FALLTHROUGH */
++		case HDR_RDBK_FRAME2://for rd0 rd2
++			val |= RAW0_RD_FRAME;
++			/* FALLTHROUGH */
++		default:// for rd2
++			val |= RAW2_RD_FRAME;
++			/* FALLTHROUGH */
++		}
++		rkisp2_rawrd_isr(val, dev);
++		rkisp_csi_trigger_event(&dev->csi_dev, NULL);
++	}
+ 
+ 	if (!bridge->en || !bridge->cfg ||
+ 	    (bridge->cfg &&
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index f8737f7ecfb7..18c1b2909ddb 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -3295,9 +3295,6 @@ void rkisp_mipi_v20_isr(unsigned int phy, unsigned int packet,
+ 		}
+ 	}
+ 
+-	if (state & (RAW0_RD_FRAME | RAW1_RD_FRAME | RAW2_RD_FRAME))
+-		rkisp2_rawrd_isr(state, dev);
+-
+ 	if (state & (RAW0_Y_STATE | RAW1_Y_STATE | RAW2_Y_STATE |
+ 	    RAW0_WR_FRAME | RAW1_WR_FRAME | RAW2_WR_FRAME))
+ 		rkisp_luma_isr(&dev->luma_vdev, state);
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index 3ab8c7a7f8f6..c43c526c24be 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -452,6 +452,9 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 
+ 	/* not using isp V_START irq to generate sof event */
+ 	csi->filt_state[CSI_F_VS] = dma2frm + 1;
++	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
++		 "isp readback frame:%d time:%d\n",
++		 cur_frame_id, dma2frm + 1);
+ 	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/isp/dmarx.c b/drivers/media/platform/rockchip/isp/dmarx.c
+index 001d99ffb8ae..8bfa482aa3a5 100644
+--- a/drivers/media/platform/rockchip/isp/dmarx.c
++++ b/drivers/media/platform/rockchip/isp/dmarx.c
+@@ -356,11 +356,6 @@ static void update_rawrd(struct rkisp_stream *stream)
+ 				readl(base + rawwr_addr));
+ 		}
+ 	}
+-	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
+-		 "%s stream:%d Y:0x%x SHD:0x%x\n",
+-		 __func__, stream->id,
+-		 readl(base + stream->config->mi.y_base_ad_init),
+-		 readl(base + stream->config->mi.y_base_ad_shd));
+ }
+ 
+ static void rawrd_stop_mi(struct rkisp_stream *stream)
+@@ -381,13 +376,13 @@ static int dmarx_frame_end(struct rkisp_stream *stream)
+ {
+ 	unsigned long lock_flags = 0;
+ 
++	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+ 	if (stream->curr_buf) {
+ 		vb2_buffer_done(&stream->curr_buf->vb.vb2_buf,
+ 			VB2_BUF_STATE_DONE);
+ 		stream->curr_buf = NULL;
+ 	}
+ 
+-	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+ 	if (!list_empty(&stream->buf_queue)) {
+ 		stream->curr_buf =
+ 			list_first_entry(&stream->buf_queue,
+@@ -505,6 +500,10 @@ static void rkisp_buf_queue(struct vb2_buffer *vb)
+ 		}
+ 	}
+ 
++	v4l2_dbg(2, rkisp_debug, &stream->ispdev->v4l2_dev,
++		 "rx:%d queue buf:0x%x\n",
++		 stream->id, ispbuf->buff_addr[0]);
++
+ 	spin_lock_irqsave(&stream->vbq_lock, lock_flags);
+ 	if (stream->streaming &&
+ 	    list_empty(&stream->buf_queue) &&
+@@ -861,11 +860,6 @@ void rkisp2_rawrd_isr(u32 mis_val, struct rkisp_device *dev)
+ 		stream = &dev->dmarx_dev.stream[i];
+ 		if (!(mis_val & CIF_MI_FRAME(stream)))
+ 			continue;
+-		/* filt rawrd frame end when frame read back mode */
+-		if (dev->csi_dev.filt_state[stream->id]) {
+-			dev->csi_dev.filt_state[stream->id]--;
+-			continue;
+-		}
+ 		stream->frame_end = true;
+ 		if (stream->stopping) {
+ 			stream->stopping = false;
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index e7f2c6d0cbf2..3ace47784fa7 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -2218,9 +2218,6 @@ void rkisp_isp_isr(unsigned int isp_mis,
+ 	 * Do the updates in the order of the processing flow.
+ 	 */
+ 	rkisp_params_isr(&dev->params_vdev, isp_mis);
+-
+-	if (isp_mis & CIF_ISP_FRAME)
+-		rkisp_csi_trigger_event(&dev->csi_dev, NULL);
+ }
+ 
+ irqreturn_t rkisp_vs_isr_handler(int irq, void *ctx)
+-- 
+2.35.3
+

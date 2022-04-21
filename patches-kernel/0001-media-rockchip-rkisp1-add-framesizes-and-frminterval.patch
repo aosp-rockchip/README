@@ -1,0 +1,157 @@
+From 95335207829faecdfe91e54af669f0b3fb7f9681 Mon Sep 17 00:00:00 2001
+From: Shunqian Zheng <zhengsq@rock-chips.com>
+Date: Thu, 22 Aug 2019 09:01:06 +0000
+Subject: [PATCH] media: rockchip: rkisp1: add framesizes and frmintervals
+ ioctl
+
+Callbacks .vidioc_enum_frameintervals() and .vidioc_enum_framesizes()
+are required for applications to obtain the frame intervals and
+resolutions the driver/sensor supported.
+
+For the frame intervals, it reads the minimum one from
+current linked sensor, and set maximum to 1s.
+For the frame size, it's stepwise with step equals 8,
+and maximum is the isp sub-device output size.
+
+Change-Id: I840b12a165855e7275c2fbd6f28db364ca7105d8
+Signed-off-by: Shunqian Zheng <zhengsq@rock-chips.com>
+---
+ .../media/platform/rockchip/isp1/capture.c    | 77 +++++++++++++++++++
+ drivers/phy/rockchip/phy-rockchip-mipi-rx.c   | 12 +++
+ 2 files changed, 89 insertions(+)
+
+diff --git a/drivers/media/platform/rockchip/isp1/capture.c b/drivers/media/platform/rockchip/isp1/capture.c
+index 8deb45612427..27c0c594cfec 100644
+--- a/drivers/media/platform/rockchip/isp1/capture.c
++++ b/drivers/media/platform/rockchip/isp1/capture.c
+@@ -74,6 +74,7 @@
+ #define STREAM_MAX_SP_RSZ_OUTPUT_HEIGHT		1920
+ #define STREAM_MIN_RSZ_OUTPUT_WIDTH		32
+ #define STREAM_MIN_RSZ_OUTPUT_HEIGHT		16
++#define STREAM_OUTPUT_STEP_WISE			8
+ 
+ #define STREAM_MAX_MP_SP_INPUT_WIDTH STREAM_MAX_MP_RSZ_OUTPUT_WIDTH
+ #define STREAM_MAX_MP_SP_INPUT_HEIGHT STREAM_MAX_MP_RSZ_OUTPUT_HEIGHT
+@@ -1834,6 +1835,80 @@ static int rkisp1_try_fmt_vid_cap_mplane(struct file *file, void *fh,
+ 	return rkisp1_set_fmt(stream, &f->fmt.pix_mp, true);
+ }
+ 
++static int rkisp_enum_framesizes(struct file *file, void *prov,
++				 struct v4l2_frmsizeenum *fsize)
++{
++	struct rkisp1_stream *stream = video_drvdata(file);
++	const struct stream_config *config = stream->config;
++	struct v4l2_frmsize_stepwise *s = &fsize->stepwise;
++	struct v4l2_frmsize_discrete *d = &fsize->discrete;
++	const struct ispsd_out_fmt *input_isp_fmt;
++	struct v4l2_rect max_rsz;
++
++	if (fsize->index != 0)
++		return -EINVAL;
++
++	if (!find_fmt(stream, fsize->pixel_format))
++		return -EINVAL;
++
++	restrict_rsz_resolution(stream->ispdev, config, &max_rsz);
++
++	input_isp_fmt = rkisp1_get_ispsd_out_fmt(&stream->ispdev->isp_sdev);
++	if (input_isp_fmt->fmt_type == FMT_BAYER) {
++		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
++		d->width = max_rsz.width;
++		d->height = max_rsz.height;
++	} else {
++		fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++		s->min_width = STREAM_MIN_RSZ_OUTPUT_WIDTH;
++		s->min_height = STREAM_MIN_RSZ_OUTPUT_HEIGHT;
++		s->max_width = max_rsz.width;
++		s->max_height = max_rsz.height;
++		s->step_width = STREAM_OUTPUT_STEP_WISE;
++		s->step_height = STREAM_OUTPUT_STEP_WISE;
++	}
++
++	return 0;
++}
++
++static int rkisp_enum_frameintervals(struct file *file, void *fh,
++				     struct v4l2_frmivalenum *fival)
++{
++	const struct rkisp1_stream *stream = video_drvdata(file);
++	struct rkisp1_device *dev = stream->ispdev;
++	struct rkisp1_sensor_info *sensor = dev->active_sensor;
++	struct v4l2_subdev_frame_interval fi;
++	int ret;
++
++	if (fival->index != 0)
++		return -EINVAL;
++
++	if (!sensor) {
++		/* TODO: active_sensor is NULL if using DMARX path */
++		v4l2_err(&dev->v4l2_dev, "%s Not active sensor\n", __func__);
++		return -ENODEV;
++	}
++
++	ret = v4l2_subdev_call(sensor->sd, video, g_frame_interval, &fi);
++	if (ret && ret != -ENOIOCTLCMD) {
++		return ret;
++	} else if (ret == -ENOIOCTLCMD) {
++		/* Set a default value for sensors not implements ioctl */
++		fi.interval.numerator = 1;
++		fi.interval.denominator = 30;
++	}
++
++	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
++	fival->stepwise.step.numerator = 1;
++	fival->stepwise.step.denominator = 1;
++	fival->stepwise.max.numerator = 1;
++	fival->stepwise.max.denominator = 1;
++	fival->stepwise.min.numerator = fi.interval.numerator;
++	fival->stepwise.min.denominator = fi.interval.denominator;
++
++	return 0;
++}
++
+ static int rkisp1_enum_fmt_vid_cap_mplane(struct file *file, void *priv,
+ 					  struct v4l2_fmtdesc *f)
+ {
+@@ -1996,6 +2071,8 @@ static const struct v4l2_ioctl_ops rkisp1_v4l2_ioctl_ops = {
+ 	.vidioc_s_selection = rkisp1_s_selection,
+ 	.vidioc_g_selection = rkisp1_g_selection,
+ 	.vidioc_querycap = rkisp1_querycap,
++	.vidioc_enum_frameintervals = rkisp_enum_frameintervals,
++	.vidioc_enum_framesizes = rkisp_enum_framesizes,
+ };
+ 
+ static void rkisp1_unregister_stream_vdev(struct rkisp1_stream *stream)
+diff --git a/drivers/phy/rockchip/phy-rockchip-mipi-rx.c b/drivers/phy/rockchip/phy-rockchip-mipi-rx.c
+index 0670de2ce66a..dbf5675821f0 100644
+--- a/drivers/phy/rockchip/phy-rockchip-mipi-rx.c
++++ b/drivers/phy/rockchip/phy-rockchip-mipi-rx.c
+@@ -721,6 +721,17 @@ static int mipidphy_s_stream(struct v4l2_subdev *sd, int on)
+ 		return mipidphy_s_stream_stop(sd);
+ }
+ 
++static int mipidphy_g_frame_interval(struct v4l2_subdev *sd,
++				     struct v4l2_subdev_frame_interval *fi)
++{
++	struct v4l2_subdev *sensor = get_remote_sensor(sd);
++
++	if (sensor)
++		return v4l2_subdev_call(sensor, video, g_frame_interval, fi);
++
++	return -EINVAL;
++}
++
+ static int mipidphy_g_mbus_config(struct v4l2_subdev *sd,
+ 				  struct v4l2_mbus_config *config)
+ {
+@@ -808,6 +819,7 @@ static const struct v4l2_subdev_core_ops mipidphy_core_ops = {
+ };
+ 
+ static const struct v4l2_subdev_video_ops mipidphy_video_ops = {
++	.g_frame_interval = mipidphy_g_frame_interval,
+ 	.g_mbus_config = mipidphy_g_mbus_config,
+ 	.s_stream = mipidphy_s_stream,
+ };
+-- 
+2.35.3
+

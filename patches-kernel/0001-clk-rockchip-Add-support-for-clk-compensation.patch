@@ -1,0 +1,144 @@
+From 8d9702cd43506f9eee9fe18d555b7defb987beee Mon Sep 17 00:00:00 2001
+From: Sugar Zhang <sugar.zhang@rock-chips.com>
+Date: Thu, 24 Dec 2020 17:07:30 +0800
+Subject: [PATCH] clk: rockchip: Add support for clk compensation
+
+Change-Id: I099261a5906dd72dca15cbbf6acea16179c471ad
+Signed-off-by: Elaine Zhang <zhangqing@rock-chips.com>
+Signed-off-by: Sugar Zhang <sugar.zhang@rock-chips.com>
+---
+ drivers/clk/rockchip/Kconfig   |  5 +++
+ drivers/clk/rockchip/clk-pll.c | 71 ++++++++++++++++++++++++++++++++++
+ include/linux/clk/rockchip.h   | 18 +++++++++
+ 3 files changed, 94 insertions(+)
+ create mode 100644 include/linux/clk/rockchip.h
+
+diff --git a/drivers/clk/rockchip/Kconfig b/drivers/clk/rockchip/Kconfig
+index f5b7a6e7aebe..4f6663c05066 100644
+--- a/drivers/clk/rockchip/Kconfig
++++ b/drivers/clk/rockchip/Kconfig
+@@ -1,3 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
++config ROCKCHIP_CLK_COMPENSATION
++	bool "Rockchip Clk Compensation"
++	help
++	  Say y here to enable clk compensation(+/- 1000 ppm).
++
+ source "drivers/clk/rockchip/regmap/Kconfig"
+diff --git a/drivers/clk/rockchip/clk-pll.c b/drivers/clk/rockchip/clk-pll.c
+index b6db520fb768..bbfddfbc09a9 100644
+--- a/drivers/clk/rockchip/clk-pll.c
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -25,6 +25,7 @@
+ #include <linux/regmap.h>
+ #include <linux/clk.h>
+ #include <linux/gcd.h>
++#include <linux/clk/rockchip.h>
+ #include <linux/mfd/syscon.h>
+ #include "clk.h"
+ 
+@@ -1183,6 +1184,76 @@ static const struct clk_ops rockchip_rk3399_pll_clk_ops = {
+ 	.init = rockchip_rk3399_pll_init,
+ };
+ 
++#ifdef CONFIG_ROCKCHIP_CLK_COMPENSATION
++int rockchip_pll_clk_compensation(struct clk *clk, int ppm)
++{
++	struct clk *parent = clk_get_parent(clk);
++	struct rockchip_clk_pll *pll;
++	static u32 frac, fbdiv;
++	unsigned long m, n;
++	bool negative;
++	u32 pllcon, pllcon0, pllcon2, fbdiv_mask, frac_mask, frac_shift;
++	u64 fracdiv;
++
++	if ((ppm > 1000) || (ppm < -1000))
++		return -EINVAL;
++
++	if (IS_ERR_OR_NULL(parent))
++		return -EINVAL;
++
++	pll = to_rockchip_clk_pll(__clk_get_hw(parent));
++	if (!pll)
++		return -EINVAL;
++
++	switch (pll->type) {
++	case pll_rk3036:
++	case pll_rk3328:
++		pllcon0 = RK3036_PLLCON(0);
++		pllcon2 = RK3036_PLLCON(2);
++		fbdiv_mask = RK3036_PLLCON0_FBDIV_MASK;
++		frac_mask = RK3036_PLLCON2_FRAC_MASK;
++		frac_shift = RK3036_PLLCON2_FRAC_SHIFT;
++		break;
++	case pll_rk3066:
++		return -EINVAL;
++	case pll_rk3399:
++		pllcon0 = RK3399_PLLCON(0);
++		pllcon2 = RK3399_PLLCON(2);
++		fbdiv_mask = RK3399_PLLCON0_FBDIV_MASK;
++		frac_mask = RK3399_PLLCON2_FRAC_MASK;
++		frac_shift = RK3399_PLLCON2_FRAC_SHIFT;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	negative = !!(ppm & BIT(31));
++	ppm = negative ? ~ppm + 1 : ppm;
++
++	if (!frac) {
++		frac = readl_relaxed(pll->reg_base + pllcon2) & frac_mask;
++		fbdiv = readl_relaxed(pll->reg_base + pllcon0) & fbdiv_mask;
++	}
++
++	m = frac * ppm;
++	n = ppm << 24;
++
++	fracdiv = negative ? frac - ((m / MHZ) + ((n / MHZ) * fbdiv)) :
++			     frac + ((m / MHZ) + ((n / MHZ) * fbdiv));
++
++	if (fracdiv > frac_mask)
++		return -EINVAL;
++
++	pllcon = readl_relaxed(pll->reg_base + pllcon2);
++	pllcon &= ~(frac_mask << frac_shift);
++	pllcon |= fracdiv << frac_shift;
++	writel_relaxed(pllcon, pll->reg_base + pllcon2);
++
++	return  0;
++}
++EXPORT_SYMBOL(rockchip_pll_clk_compensation);
++#endif
++
+ /*
+  * Common registering of pll clocks
+  */
+diff --git a/include/linux/clk/rockchip.h b/include/linux/clk/rockchip.h
+new file mode 100644
+index 000000000000..07c563a42c60
+--- /dev/null
++++ b/include/linux/clk/rockchip.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (c) 2020 Rockchip Electronics Co. Ltd.
++ */
++
++#ifndef __LINUX_CLK_ROCKCHIP_H_
++#define __LINUX_CLK_ROCKCHIP_H_
++
++#ifdef CONFIG_ROCKCHIP_CLK_COMPENSATION
++int rockchip_pll_clk_compensation(struct clk *clk, int ppm);
++#else
++static inline int rockchip_pll_clk_compensation(struct clk *clk, int ppm)
++{
++	return -ENOSYS;
++}
++#endif
++
++#endif /* __LINUX_CLK_ROCKCHIP_H_ */
+-- 
+2.35.3
+

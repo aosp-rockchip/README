@@ -1,0 +1,129 @@
+From d8958cec3f2b6182f084da7b77daafd1c0738ffb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Sat, 30 Jul 2011 22:26:44 +0800
+Subject: [PATCH] Revert "Revert "Bluetooth: Fix rejected connection not
+ disconnecting ACL link""
+
+This reverts commit ce1c698ea8a242f386d03f236fac1af4f0e83495.
+---
+ include/net/bluetooth/rfcomm.h |  2 ++
+ net/bluetooth/rfcomm/core.c    | 41 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/include/net/bluetooth/rfcomm.h b/include/net/bluetooth/rfcomm.h
+index c274993234e3..921d7b3c7f8d 100644
+--- a/include/net/bluetooth/rfcomm.h
++++ b/include/net/bluetooth/rfcomm.h
+@@ -29,6 +29,7 @@
+ #define RFCOMM_CONN_TIMEOUT (HZ * 30)
+ #define RFCOMM_DISC_TIMEOUT (HZ * 20)
+ #define RFCOMM_AUTH_TIMEOUT (HZ * 25)
++#define RFCOMM_IDLE_TIMEOUT (HZ * 2)
+ 
+ #define RFCOMM_DEFAULT_MTU	127
+ #define RFCOMM_DEFAULT_CREDITS	7
+@@ -154,6 +155,7 @@ struct rfcomm_msc {
+ struct rfcomm_session {
+ 	struct list_head list;
+ 	struct socket   *sock;
++	struct timer_list timer;
+ 	unsigned long    state;
+ 	unsigned long    flags;
+ 	atomic_t         refcnt;
+diff --git a/net/bluetooth/rfcomm/core.c b/net/bluetooth/rfcomm/core.c
+index e105d36f01a7..d101f7b3505e 100755
+--- a/net/bluetooth/rfcomm/core.c
++++ b/net/bluetooth/rfcomm/core.c
+@@ -244,6 +244,33 @@ static inline int rfcomm_check_security(struct rfcomm_dlc *d)
+ 								auth_type);
+ }
+ 
++static void rfcomm_session_timeout(unsigned long arg)
++{
++	struct rfcomm_session *s = (void *) arg;
++
++	BT_DBG("session %p state %ld", s, s->state);
++
++	set_bit(RFCOMM_TIMED_OUT, &s->flags);
++	rfcomm_session_put(s);
++	rfcomm_schedule(RFCOMM_SCHED_TIMEO);
++}
++
++static void rfcomm_session_set_timer(struct rfcomm_session *s, long timeout)
++{
++	BT_DBG("session %p state %ld timeout %ld", s, s->state, timeout);
++
++	if (!mod_timer(&s->timer, jiffies + timeout))
++		rfcomm_session_hold(s);
++}
++
++static void rfcomm_session_clear_timer(struct rfcomm_session *s)
++{
++	BT_DBG("session %p state %ld", s, s->state);
++
++	if (timer_pending(&s->timer) && del_timer(&s->timer))
++		rfcomm_session_put(s);
++}
++
+ /* ---- RFCOMM DLCs ---- */
+ static void rfcomm_dlc_timeout(unsigned long arg)
+ {
+@@ -320,6 +347,7 @@ static void rfcomm_dlc_link(struct rfcomm_session *s, struct rfcomm_dlc *d)
+ 
+ 	rfcomm_session_hold(s);
+ 
++	rfcomm_session_clear_timer(s);
+ 	rfcomm_dlc_hold(d);
+ 	list_add(&d->list, &s->dlcs);
+ 	d->session = s;
+@@ -335,6 +363,9 @@ static void rfcomm_dlc_unlink(struct rfcomm_dlc *d)
+ 	d->session = NULL;
+ 	rfcomm_dlc_put(d);
+ 
++	if (list_empty(&s->dlcs))
++		rfcomm_session_set_timer(s, RFCOMM_IDLE_TIMEOUT);
++
+ 	rfcomm_session_put(s);
+ }
+ 
+@@ -566,6 +597,8 @@ static struct rfcomm_session *rfcomm_session_add(struct socket *sock, int state)
+ 
+ 	BT_DBG("session %p sock %p", s, sock);
+ 
++	setup_timer(&s->timer, rfcomm_session_timeout, (unsigned long) s);
++
+ 	INIT_LIST_HEAD(&s->dlcs);
+ 	s->state = state;
+ 	s->sock  = sock;
+@@ -597,6 +630,7 @@ static void rfcomm_session_del(struct rfcomm_session *s)
+ 	if (state == BT_CONNECTED)
+ 		rfcomm_send_disc(s, 0);
+ 
++	rfcomm_session_clear_timer(s);
+ 	sock_release(s->sock);
+ 	kfree(s);
+ 
+@@ -638,6 +672,7 @@ static void rfcomm_session_close(struct rfcomm_session *s, int err)
+ 		__rfcomm_dlc_close(d, err);
+ 	}
+ 
++	rfcomm_session_clear_timer(s);
+ 	rfcomm_session_put(s);
+ }
+ 
+@@ -1879,6 +1914,12 @@ static inline void rfcomm_process_sessions(void)
+ 		struct rfcomm_session *s;
+ 		s = list_entry(p, struct rfcomm_session, list);
+ 
++		if (test_and_clear_bit(RFCOMM_TIMED_OUT, &s->flags)) {
++			s->state = BT_DISCONN;
++			rfcomm_send_disc(s, 0);
++			continue;
++		}
++
+ 		if (s->state == BT_LISTEN) {
+ 			rfcomm_accept_connection(s);
+ 			continue;
+-- 
+2.35.3
+

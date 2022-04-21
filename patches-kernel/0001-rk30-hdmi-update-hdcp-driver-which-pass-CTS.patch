@@ -1,0 +1,1313 @@
+From 18ebf40367fbd982863d1e0f66896b30e3a80083 Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Fri, 26 Jul 2013 10:03:22 +0800
+Subject: [PATCH] rk30 hdmi: update hdcp driver which pass CTS.
+
+---
+ .../rockchip/hdmi/chips/rk30/hdcp/rk30_hdcp.c | 184 ++++--
+ .../hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.c     | 608 ++++++++++++++++--
+ .../hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.h     | 122 +++-
+ .../rockchip/hdmi/chips/rk30/rk30_hdmi.c      |   5 +-
+ .../rockchip/hdmi/chips/rk30/rk30_hdmi.h      |   3 +-
+ .../rockchip/hdmi/chips/rk30/rk30_hdmi_hw.c   |  20 +-
+ 6 files changed, 789 insertions(+), 153 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdcp.c b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdcp.c
+index 68d0ac841a67..c0411214854b 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdcp.c
++++ b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdcp.c
+@@ -9,7 +9,7 @@
+ #include "../rk30_hdmi_hw.h"
+ #include "rk30_hdmi_hdcp.h"
+ 
+-struct hdcp *hdcp = NULL;
++static struct hdcp *hdcp = NULL;
+ 
+ static void hdcp_work_queue(struct work_struct *work);
+ 
+@@ -17,11 +17,11 @@ static void hdcp_work_queue(struct work_struct *work);
+  * Function: hdcp_submit_work
+  *-----------------------------------------------------------------------------
+  */
+-static struct delayed_work *hdcp_submit_work(int event, int delay)
++struct delayed_work *hdcp_submit_work(int event, int delay)
+ {
+ 	struct hdcp_delayed_work *work;
+ 
+-	DBG("%s event %04x delay %d", __FUNCTION__, event, delay);
++	HDCP_DBG("%s event %04x delay %d", __FUNCTION__, event, delay);
+ 	
+ 	work = kmalloc(sizeof(struct hdcp_delayed_work), GFP_ATOMIC);
+ 
+@@ -48,6 +48,7 @@ static void hdcp_cancel_work(struct delayed_work **work)
+ {
+ 	int ret = 0;
+ 
++	return;
+ 	if (*work) {
+ 		ret = cancel_delayed_work(*work);
+ 		if (ret != 1) {
+@@ -66,11 +67,12 @@ static void hdcp_cancel_work(struct delayed_work **work)
+  */
+ static void hdcp_wq_authentication_failure(void)
+ {
++	HDCP_DBG("%s hdcp->retry_cnt %d \n", __FUNCTION__, hdcp->retry_cnt);
+ 	if (hdcp->hdmi_state == HDMI_STOPPED) {
+ 		return;
+ 	}
+ 
+-	rk30_hdcp_disable();
++	rk30_hdcp_disable(hdcp);
+ 	rk30_hdmi_control_output(false);
+ 	
+ 	hdcp_cancel_work(&hdcp->pending_wq_event);
+@@ -107,56 +109,119 @@ static void hdcp_wq_start_authentication(void)
+ 
+ 	hdcp->hdcp_state = HDCP_AUTHENTICATION_START;
+ 
+-	DBG("HDCP: authentication start");
++	HDCP_DBG("HDCP: authentication start");
+ 
+-	status = rk30_hdcp_start_authentication();
++	status = rk30_hdcp_start_authentication(hdcp);
+ 
+ 	if (status != HDCP_OK) {
+-		DBG("HDCP: authentication failed");
++		HDCP_DBG("HDCP: authentication failed");
+ 		hdcp_wq_authentication_failure();
+ 	} else {
+-		hdcp->hdcp_state = HDCP_WAIT_KSV_LIST;
++		hdcp->hdcp_state = HDCP_AUTHENTICATION_1ST;
+ 	}
+ }
+ 
++/*-----------------------------------------------------------------------------
++ * Function: hdcp_wq_authentication_1st
++ *-----------------------------------------------------------------------------
++ */
++static int hdcp_wq_authentication_1st(void)
++{
++	int status = HDCP_OK;
++
++	HDCP_DBG("1st authen start");
++	
++	status = rk30_hdcp_authentication_1st(hdcp);
++
++	if (status == -HDCP_DDC_ERROR)
++		hdcp->pending_wq_event = hdcp_submit_work(HDCP_AUTH_START_1ST, 1000);
++	else if (status != HDCP_OK) {
++		printk(KERN_INFO "HDCP: 1st authen failed %d", status);
++//		hdcp->retry_cnt = 0;
++		hdcp_wq_authentication_failure();
++	}
++	else {
++		HDCP_DBG("HDCP: 1st Authentication successful");
++		hdcp->hdcp_state = HDCP_WAIT_R0_DELAY;
++//		hdcp.auth_state = HDCP_STATE_AUTH_1ST_STEP;
++	}
++	return HDCP_OK;
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: hdcp_wq_check_r0
++ *-----------------------------------------------------------------------------
++ */
++static void hdcp_wq_check_r0(void)
++{
++	int status = rk30_hdcp_lib_step1_r0_check(hdcp);
++
++	if (status == -HDCP_CANCELLED_AUTH) {
++		HDCP_DBG("Authentication step 1/R0 cancelled.");
++		return;
++	} else if (status < 0)
++		hdcp_wq_authentication_failure();
++	else {
++		if (hdcp_lib_check_repeater_bit_in_tx(hdcp)) {
++			/* Repeater */
++			printk(KERN_INFO "HDCP: authentication step 1 "
++					 "successful - Repeater\n");
++
++			hdcp->hdcp_state = HDCP_WAIT_KSV_LIST;
++//			hdcp.auth_state = HDCP_STATE_AUTH_2ND_STEP;
++
++			hdcp->pending_wq_event =
++				hdcp_submit_work(HDCP_AUTH_START_2ND, 0);
++				
++		} else {
++			/* Receiver */
++			printk(KERN_INFO "HDCP: authentication step 1 "
++					 "successful - Receiver\n");
++
++			hdcp->hdcp_state = HDCP_LINK_INTEGRITY_CHECK;
++		}
++	}
++}
+ /*-----------------------------------------------------------------------------
+  * Function: hdcp_wq_check_bksv
+  *-----------------------------------------------------------------------------
+  */
+-static void hdcp_wq_check_bksv(void)
++static void hdcp_wq_step2_authentication(void)
+ {
+ 	int status = HDCP_OK;
+ 
+-	DBG("Check BKSV start");
++	HDCP_DBG("%s", __FUNCTION__);
+ 	
+-	status = rk30_hdcp_check_bksv();
++	status = rk30_hdcp_authentication_2nd(hdcp);
+ 
+-	if (status != HDCP_OK) {
+-		printk(KERN_INFO "HDCP: Check BKSV failed");
+-		hdcp->retry_cnt = 0;
++	if (status == -HDCP_CANCELLED_AUTH) {
++		HDCP_DBG("Authentication step 2nd cancelled.");
++		return;
++	}
++	else if (status < 0) {
++		printk(KERN_INFO "HDCP: step2 authentication failed");
+ 		hdcp_wq_authentication_failure();
+ 	}
+ 	else {
+-		DBG("HDCP: Check BKSV successful");
++		HDCP_DBG("HDCP: step2 authentication successful");
+ 
+ 		hdcp->hdcp_state = HDCP_LINK_INTEGRITY_CHECK;
+-
+-		/* Restore retry counter */
+-		if(hdcp->retry_times == 0)
+-			hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
+-		else
+-			hdcp->retry_cnt = hdcp->retry_times;
+ 	}
+ }
+ 
+ /*-----------------------------------------------------------------------------
+- * Function: hdcp_wq_authentication_sucess
++ * Function: hdcp_wq_authentication_3rd
+  *-----------------------------------------------------------------------------
+  */
+-static void hdcp_wq_authentication_sucess(void)
++static void hdcp_wq_authentication_3rd(void)
+ {
+-	printk(KERN_INFO "HDCP: authentication pass");
+-	rk30_hdmi_control_output(true);
++	int status = rk30_hdcp_lib_step3_r0_check(hdcp);
++
++	if (status == -HDCP_CANCELLED_AUTH) {
++		HDCP_DBG("Authentication step 3/Ri cancelled.");
++		return;
++	} else if (status < 0)
++		hdcp_wq_authentication_failure();
+ }
+ 
+ /*-----------------------------------------------------------------------------
+@@ -168,7 +233,7 @@ static void hdcp_wq_disable(int event)
+ 	printk(KERN_INFO "HDCP: disabled");
+ 
+ 	hdcp_cancel_work(&hdcp->pending_wq_event);
+-	rk30_hdcp_disable();
++	rk30_hdcp_disable(hdcp);
+ 	if(event == HDCP_DISABLE_CTL) {
+ 		hdcp->hdcp_state = HDCP_DISABLED;
+ 		if(hdcp->hdmi_state == HDMI_STARTED)
+@@ -190,7 +255,7 @@ static void hdcp_work_queue(struct work_struct *work)
+ 
+ 	mutex_lock(&hdcp->lock);
+ 	
+-	DBG("hdcp_work_queue() - START - %u hdmi=%d hdcp=%d evt= %x %d",
++	HDCP_DBG("hdcp_work_queue() - START - %u hdmi=%d hdcp=%d evt= %x %d",
+ 		jiffies_to_msecs(jiffies),
+ 		hdcp->hdmi_state,
+ 		hdcp->hdcp_state,
+@@ -212,6 +277,10 @@ static void hdcp_work_queue(struct work_struct *work)
+ 	if (event == HDCP_START_FRAME_EVENT) {
+ 		hdcp->pending_start = 0;
+ 		hdcp->hdmi_state = HDMI_STARTED;
++		if(hdcp->retry_times == 0)
++			hdcp->retry_cnt = HDCP_INFINITE_REAUTH;
++		else
++			hdcp->retry_cnt = hdcp->retry_times;
+ 	}
+ 	
+ 	/**********************/
+@@ -246,6 +315,16 @@ static void hdcp_work_queue(struct work_struct *work)
+ 	
+ 			break;
+ 		
++		case HDCP_AUTHENTICATION_1ST:
++			if(event == HDCP_AUTH_START_1ST)
++				hdcp_wq_authentication_1st();
++			break;
++		
++		case HDCP_WAIT_R0_DELAY:
++			if(event == HDCP_R0_EXP_EVENT)
++				hdcp_wq_check_r0();
++			break;
++			
+ 		case HDCP_WAIT_KSV_LIST:
+ 			/* KSV failure */
+ 			if (event == HDCP_FAIL_EVENT) {
+@@ -254,8 +333,8 @@ static void hdcp_work_queue(struct work_struct *work)
+ 				hdcp_wq_authentication_failure();
+ 			}
+ 			/* KSV list ready event */
+-			else if (event == HDCP_KSV_LIST_RDY_EVENT)
+-				hdcp_wq_check_bksv();
++			else if (event == HDCP_AUTH_START_2ND)
++				hdcp_wq_step2_authentication();
+ 			break;
+ 		
+ 		case HDCP_LINK_INTEGRITY_CHECK:
+@@ -264,8 +343,8 @@ static void hdcp_work_queue(struct work_struct *work)
+ 				printk(KERN_INFO "HDCP: Ri check failure\n");
+ 				hdcp_wq_authentication_failure();
+ 			}
+-			else if(event == HDCP_AUTH_PASS_EVENT)
+-				hdcp_wq_authentication_sucess();
++			else if(event == HDCP_RI_EXP_EVENT)
++				hdcp_wq_authentication_3rd();
+ 			break;
+ 	
+ 		default:
+@@ -286,14 +365,14 @@ static void hdcp_work_queue(struct work_struct *work)
+  */
+ static void hdcp_start_frame_cb(void)
+ {
+-	DBG("hdcp_start_frame_cb()");
++	HDCP_DBG("hdcp_start_frame_cb()");
+ 
+ 	/* Cancel any pending work */
+ 	if (hdcp->pending_start)
+ 		hdcp_cancel_work(&hdcp->pending_start);
+ 	if (hdcp->pending_wq_event)
+ 		hdcp_cancel_work(&hdcp->pending_wq_event);
+-
++	hdcp->pending_disable = 0;
+ 	hdcp->pending_start = hdcp_submit_work(HDCP_START_FRAME_EVENT,
+ 							HDCP_ENABLE_DELAY);
+ }
+@@ -304,24 +383,7 @@ static void hdcp_start_frame_cb(void)
+  */
+ static void hdcp_irq_cb(int interrupt)
+ {
+-	int value;
+-	DBG("%s 0x%x", __FUNCTION__, interrupt);
+-	if(interrupt & m_INT_HDCP_ERR)
+-	{
+-		value = HDMIRdReg(HDCP_ERROR);
+-		HDMIWrReg(HDCP_ERROR, value);
+-		printk(KERN_INFO "HDCP: Error 0x%02x\n", value);
+-		
+-		if( (hdcp->hdcp_state != HDCP_DISABLED) &&
+-			(hdcp->hdcp_state != HDCP_ENABLE_PENDING) )
+-		{	
+-			hdcp_submit_work(HDCP_FAIL_EVENT, 0);
+-		}
+-	}
+-	else if(interrupt & (m_INT_BKSV_RPRDY | m_INT_BKSV_RCRDY))
+-		hdcp_submit_work(HDCP_KSV_LIST_RDY_EVENT, 0);
+-	else if(interrupt & m_INT_AUTH_DONE)
+-		hdcp_submit_work(HDCP_AUTH_PASS_EVENT, 0);
++	rk30_hdcp_irq(hdcp);
+ }
+ 
+ /*-----------------------------------------------------------------------------
+@@ -330,8 +392,8 @@ static void hdcp_irq_cb(int interrupt)
+  */
+ static int hdcp_power_on_cb(void)
+ {
+-	DBG("%s", __FUNCTION__);
+-	return rk30_hdcp_load_key2mem(hdcp->keys);
++	HDCP_DBG("%s", __FUNCTION__);
++	return rk30_hdcp_load_key2mem(hdcp, hdcp->keys);
+ }
+ 
+ /*-----------------------------------------------------------------------------
+@@ -340,12 +402,13 @@ static int hdcp_power_on_cb(void)
+  */
+ static void hdcp_power_off_cb(void)
+ {
+-	DBG("%s", __FUNCTION__);
++	HDCP_DBG("%s", __FUNCTION__);
+ 	if(!hdcp->enable)
+ 		return;
+ 	
+ 	hdcp_cancel_work(&hdcp->pending_start);
+ 	hdcp_cancel_work(&hdcp->pending_wq_event);
++	hdcp->pending_disable = 1;
+ 	init_completion(&hdcp->complete);
+ 	/* Post event to workqueue */
+ 	if (hdcp_submit_work(HDCP_STOP_FRAME_EVENT, 0))	
+@@ -374,11 +437,11 @@ static void hdcp_load_keys_cb(const struct firmware *fw, void *context)
+ 	
+ 	memcpy(hdcp->keys, fw->data, HDCP_KEY_SIZE);
+ 	
+-	rk30_hdcp_load_key2mem(hdcp->keys);
++	rk30_hdcp_load_key2mem(hdcp, hdcp->keys);
+ 	printk(KERN_INFO "HDCP: loaded hdcp key success\n");
+ 
+ 	if(fw->size > HDCP_KEY_SIZE) {
+-		DBG("%s invalid key size %d", __FUNCTION__, fw->size - HDCP_KEY_SIZE);
++		HDCP_DBG("%s invalid key size %d", __FUNCTION__, fw->size - HDCP_KEY_SIZE);
+ 		if((fw->size - HDCP_KEY_SIZE) % 5) {
+ 			pr_err("HDCP: failed to load invalid keys\n");
+ 			return;
+@@ -472,7 +535,7 @@ static int __init rk30_hdcp_init(void)
+ {
+ 	int ret;
+ 	
+-	DBG("[%s] %u", __FUNCTION__, jiffies_to_msecs(jiffies));
++	HDCP_DBG("[%s] %u", __FUNCTION__, jiffies_to_msecs(jiffies));
+ 	
+ 	hdcp = kmalloc(sizeof(struct hdcp), GFP_KERNEL);
+ 	if(!hdcp)
+@@ -523,12 +586,12 @@ static int __init rk30_hdcp_init(void)
+ 		goto error5;
+ 	}
+ 	
+-	rk30_hdmi_register_hdcp_callbacks(	hdcp_start_frame_cb,
++	hdcp->hdmi = rk30_hdmi_register_hdcp_callbacks(	hdcp_start_frame_cb,
+ 										hdcp_irq_cb,
+ 										hdcp_power_on_cb,
+ 										hdcp_power_off_cb);
+ 										
+-	DBG("%s success %u", __FUNCTION__, jiffies_to_msecs(jiffies));
++	HDCP_DBG("%s success %u", __FUNCTION__, jiffies_to_msecs(jiffies));
+ 	return 0;
+ 	
+ error5:
+@@ -566,5 +629,6 @@ static void __exit rk30_hdcp_exit(void)
+ 	}
+ }
+ 
+-module_init(rk30_hdcp_init);
++//module_init(rk30_hdcp_init);
++device_initcall_sync(rk30_hdcp_init);
+ module_exit(rk30_hdcp_exit);
+\ No newline at end of file
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.c b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.c
+index 1184989a57b2..294d9cfc3e48 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.c
++++ b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.c
+@@ -1,10 +1,38 @@
+ #include <linux/delay.h>
++#include <linux/interrupt.h>
+ #include <asm/io.h>
+ #include <mach/io.h>
+ #include "../rk30_hdmi.h"
+ #include "../rk30_hdmi_hw.h"
+ #include "rk30_hdmi_hdcp.h"
+ 
++static int an_ready = 0, sha_ready = 0, i2c_ack = 9;
++
++/*-----------------------------------------------------------------------------
++ * Function: hdcp_lib_check_ksv
++ *-----------------------------------------------------------------------------
++ */
++static int hdcp_lib_check_ksv(uint8_t ksv[5])
++{
++	int i, j;
++	int zero = 0, one = 0;
++
++	for (i = 0; i < 5; i++) {
++		/* Count number of zero / one */
++		for (j = 0; j < 8; j++) {
++			if (ksv[i] & (0x01 << j))
++				one++;
++			else
++				zero++;
++		}
++	}
++
++	if (one == zero)
++		return 0;
++	else
++		return -1;
++}
++
+ static void rk30_hdcp_write_mem(int addr_8, char value)
+ {
+ 	int temp;
+@@ -18,7 +46,7 @@ static void rk30_hdcp_write_mem(int addr_8, char value)
+ 	HDMIWrReg(addr_32, temp);
+ }
+ 
+-int rk30_hdcp_load_key2mem(struct hdcp_keys *key)
++int rk30_hdcp_load_key2mem(struct hdcp *hdcp, struct hdcp_keys *key)
+ {
+ 	int i;
+ 	
+@@ -39,20 +67,25 @@ int rk30_hdcp_load_key2mem(struct hdcp_keys *key)
+ 	return HDCP_OK;
+ }
+ 
+-void rk30_hdcp_disable(void)
++void rk30_hdcp_disable(struct hdcp *hdcp)
+ {
+ 	int temp;
++	
++	// Diable Encrypt
++	HDMIMskReg(temp, HDCP_CTRL, m_HDCP_FRAMED_ENCRYPED, v_HDCP_FRAMED_ENCRYPED(0));
++	
+ 	// Diable HDCP Interrupt
+-	HDMIWrReg(INTR_MASK2, 0x00);
++	HDMIWrReg(SOFT_HDCP_INT_MASK1, 0x00);
++	HDMIWrReg(SOFT_HDCP_INT_MASK2, 0x00);
++	
+ 	// Stop and Reset HDCP
+-	HDMIMskReg(temp, HDCP_CTRL, m_HDCP_FRAMED_ENCRYPED | m_HDCP_AUTH_STOP | m_HDCP_RESET, 
+-		v_HDCP_FRAMED_ENCRYPED(0) | v_HDCP_AUTH_STOP(1) | v_HDCP_RESET(1) );
++	HDMIWrReg(SOFT_HDCP_CTRL1, 0x00);
+ }
+ 
+-static int rk30_hdcp_load_key(void)
++static int rk30_hdcp_load_key(struct hdcp *hdcp)
+ {
+ 	int value, temp = 0;
+-	
++
+ 	if(hdcp->keys == NULL) {
+ 		pr_err("[%s] HDCP key not loaded.\n", __FUNCTION__);
+ 		return HDCP_KEY_ERR;
+@@ -75,83 +108,526 @@ static int rk30_hdcp_load_key(void)
+ 	return HDCP_OK;
+ }
+ 
+-
+-int rk30_hdcp_start_authentication(void)
++static int rk30_hdcp_ddc_read(struct hdcp *hdcp, u16 no_bytes, u8 addr, u8 *pdata)
+ {
+-	int rc, temp;
++	int i, temp;
+ 	
+-	rc = rk30_hdcp_load_key();
+-	if(rc != HDCP_OK)
+-		return rc;
++	i2c_ack = 0;
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0xC0);
++	HDMIWrReg(HDCP_DDC_ACCESS_LENGTH, no_bytes);
++	HDMIWrReg(HDCP_DDC_OFFSET_ADDR, addr);
++	HDMIWrReg(HDCP_DDC_CTRL, m_DDC_READ);
+ 	
+-	// Set 100ms & 5 sec timer
+-	switch(hdmi->vic)
+-	{
+-		case HDMI_720x576p_50Hz_4_3:
+-		case HDMI_720x576p_50Hz_16_9:
+-		case HDMI_1280x720p_50Hz:
+-		case HDMI_1920x1080i_50Hz:
+-		case HDMI_720x576i_50Hz_4_3:
+-		case HDMI_720x576i_50Hz_16_9:
+-		case HDMI_1920x1080p_50Hz:
+-			HDMIWrReg(HDCP_TIMER_100MS, 5);
+-			HDMIWrReg(HDCP_TIMER_5S, 250);
++	while(1) {
++		if(i2c_ack & 0xc0) {
+ 			break;
++		}
++		msleep(100);
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++	}
++	
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0x00);
++	if(i2c_ack & m_I2C_NO_ACK)
++		return -HDCP_DDC_ERROR;
+ 		
+-		default:
+-			HDMIWrReg(HDCP_TIMER_100MS, 0x26);
+-			HDMIWrReg(HDCP_TIMER_5S, 0x2c);
++	if(i2c_ack & m_I2C_ACK) {
++		for(i = 0; i < no_bytes; i++)
++			pdata[i] = HDMIRdReg(HDCP_DDC_READ_BUFF + i * 4);
++	}
++	
++	return HDCP_OK;
++}
++
++static int rk30_hdcp_ddc_write(struct hdcp *hdcp, u16 no_bytes, u8 addr, u8 *pdata)
++{
++	int i, temp;
++	
++	for(i = 0; i < no_bytes; i++)
++		 HDMIWrReg(HDCP_DDC_WRITE_BUFF + i * 4, pdata[i]);
++
++	i2c_ack = 0;
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0xC0);
++	HDMIWrReg(HDCP_DDC_ACCESS_LENGTH, no_bytes);
++	HDMIWrReg(HDCP_DDC_OFFSET_ADDR, addr);
++	HDMIWrReg(HDCP_DDC_CTRL, m_DDC_WRITE);
++	
++	while(1) {
++		if(i2c_ack & 0xc0) {
+ 			break;
++		}
++		msleep(100);
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
+ 	}
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0x00);
++	if(i2c_ack & m_I2C_NO_ACK)
++		return -HDCP_DDC_ERROR;
++		
++	return HDCP_OK;
++}
++
++int rk30_hdcp_start_authentication(struct hdcp *hdcp)
++{
++	int rc, temp;
++	struct hdmi* hdmi = hdcp->hdmi;
++
++	rc = rk30_hdcp_load_key(hdcp);
++	if(rc != HDCP_OK)
++		return rc;
++	
+ 	// Config DDC Clock
+ 	temp = (hdmi->tmdsclk/HDCP_DDC_CLK)/4;
+ 	HDMIWrReg(DDC_BUS_FREQ_L, temp & 0xFF);
+ 	HDMIWrReg(DDC_BUS_FREQ_H, (temp >> 8) & 0xFF);
+-	// Enable HDCP Interrupt
+-	HDMIWrReg(INTR_MASK2, m_INT_HDCP_ERR | m_INT_BKSV_RPRDY | m_INT_BKSV_RCRDY | m_INT_AUTH_DONE | m_INT_AUTH_READY);
+-	// Start HDCP
+-	HDMIMskReg(temp, HDCP_CTRL, m_HDCP_AUTH_START | m_HDCP_FRAMED_ENCRYPED, v_HDCP_AUTH_START(1) | v_HDCP_FRAMED_ENCRYPED(0));
++	
++	// Enable Software HDCP INT
++	HDMIWrReg(INTR_MASK2, 0x00);
++	HDMIWrReg(SOFT_HDCP_INT_MASK1, m_SF_MODE_READY);
++	HDMIWrReg(SOFT_HDCP_INT_MASK2, 0x00);
++	
++	// Diable Encrypt
++	HDMIMskReg(temp, HDCP_CTRL, m_HDCP_FRAMED_ENCRYPED, v_HDCP_FRAMED_ENCRYPED(0));
++	
++	// Enable Software HDCP
++	HDMIWrReg(SOFT_HDCP_CTRL1, v_SOFT_HDCP_AUTH_EN(1));
++	
++	return HDCP_OK;
++}
++
++static int rk30_hdcp_generate_an(struct hdcp *hdcp, uint8_t ksv[8])
++{
++	int temp;
++	
++	HDCP_DBG("%s", __FUNCTION__);
++	
++	an_ready = 0;
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK1, (1 << 4), (1 << 4));
++	HDMIWrReg(SOFT_HDCP_CTRL1, v_SOFT_HDCP_AUTH_EN(1) | v_SOFT_HDCP_PREP_AN(1));
++
++	while(1) {
++		if(an_ready)
++			break;
++		msleep(100);
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++	}
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK1, (1 << 4), 0);
++	for(temp = 0; temp < 8; temp++)
++		ksv[temp] = HDMIRdReg(HDCP_AN_BUFF + temp * 4);	
++	return HDCP_OK;
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: hdcp_lib_read_aksv
++ *-----------------------------------------------------------------------------
++ */
++static void rk30_hdcp_read_aksv(struct hdcp *hdcp, u8 *ksv_data)
++{
++	u8 i;
++	int temp;
++	
++	// Load AKSV to Reg
++	HDMIMskReg(temp, HDCP_KEY_MEM_CTRL, (1 << 4), (1 << 4));
++
++	for (i = 0; i < 5; i++) {
++		ksv_data[i] = HDMIRdReg(HDCP_AKSV_BUFF + i * 4);
++	}
++}
++
++int rk30_hdcp_authentication_1st(struct hdcp *hdcp)
++{
++	/* HDCP authentication steps:
++	 *   1) Read Bksv - check validity (is HDMI Rx supporting HDCP ?)
++	 *   2) Initializes HDCP (CP reset release)
++	 *   3) Read Bcaps - is HDMI Rx a repeater ?
++	 *   *** First part authentication ***
++	 *   4) Read Bksv - check validity (is HDMI Rx supporting HDCP ?)
++	 *   5) Generates An
++	 *   6) DDC: Writes An, Aksv
++	 *   7) DDC: Write Bksv
++	 */
++	uint8_t an_ksv_data[8];
++	uint8_t rx_type;
++	uint8_t trytimes = 5;
++	int temp, status;
++	/* Generate An */
++	status = rk30_hdcp_generate_an(hdcp, an_ksv_data);
++	if(status < 0)
++		return status;
++	HDCP_DBG("AN: %02x %02x %02x %02x %02x %02x %02x %02x", an_ksv_data[0], an_ksv_data[1],
++					      an_ksv_data[2], an_ksv_data[3],
++					      an_ksv_data[4], an_ksv_data[5],
++					      an_ksv_data[6], an_ksv_data[7]);
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	/* DDC: Write An */
++	status = rk30_hdcp_ddc_write(hdcp, DDC_AN_LEN, DDC_AN_ADDR , an_ksv_data);
++	if (status < 0)
++		return status;
++		
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	/* Read AKSV from IP: (HDCP AKSV register) */
++	rk30_hdcp_read_aksv(hdcp, an_ksv_data);
++
++	HDCP_DBG("AKSV: %02x %02x %02x %02x %02x", an_ksv_data[0], an_ksv_data[1],
++					      an_ksv_data[2], an_ksv_data[3],
++					      an_ksv_data[4]);
++
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	if (hdcp_lib_check_ksv(an_ksv_data)) {
++		printk(KERN_INFO "HDCP: AKSV error (number of 0 and 1)\n");
++		return -HDCP_AKSV_ERROR;
++	}
++
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++	
++	/* DDC: Write AKSV */
++	status = rk30_hdcp_ddc_write(hdcp, DDC_AKSV_LEN, DDC_AKSV_ADDR, an_ksv_data);
++	if (status < 0)
++		return status;
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++			
++	/* Read BCAPS to determine if HDCP RX is a repeater */
++	status = rk30_hdcp_ddc_read(hdcp, DDC_BCAPS_LEN, DDC_BCAPS_ADDR, &rx_type);
++	if (status < 0)
++		return status;
++
++	HDCP_DBG("bcaps is %02x", rx_type);
++
++	HDMIWrReg(SOFT_HDCP_BCAPS, rx_type);
++	
++	if(rx_type & m_REPEATER) {
++		HDCP_DBG("Downstream device is a repeater");
++		HDMIMskReg(temp, SOFT_HDCP_CTRL1, m_SOFT_HDCP_REPEATER, v_SOFT_HDCP_REPEATER(1));
++	}
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	/* DDC: Read BKSV from RX */
++	while(trytimes--) {
++		status = rk30_hdcp_ddc_read(hdcp, DDC_BKSV_LEN, DDC_BKSV_ADDR, an_ksv_data);
++		if (status < 0)
++			return status;
++		
++		HDCP_DBG("BKSV: %02x %02x %02x %02x %02x", an_ksv_data[0], an_ksv_data[1],
++						      an_ksv_data[2], an_ksv_data[3],
++						      an_ksv_data[4]);
++						      
++		if (hdcp_lib_check_ksv(an_ksv_data) == 0)
++			break;
++		else {
++			HDCP_DBG("BKSV error (number of 0 and 1)");
++		}
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++	}
++	if(trytimes == 0)
++		return -HDCP_BKSV_ERROR;
++	
++	for(trytimes = 0; trytimes < 5; trytimes++)
++		HDMIWrReg(HDCP_BKSV_BUFF + trytimes * 4, an_ksv_data[trytimes]);
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK1, (1 << 6), (1 << 6));
++	HDMIMskReg(temp, SOFT_HDCP_CTRL1, m_SOFT_HDCP_GEN_RI, v_SOFT_HDCP_GEN_RI(1));
++	return HDCP_OK;
++}
++
++static int rk30_hdcp_r0_check(struct hdcp *hdcp)
++{
++	u8 ro_rx[2], ro_tx[2];
++	int status;
++
++	HDCP_DBG("%s()", __FUNCTION__);
++	
++	HDMIMskReg(status, SOFT_HDCP_INT_MASK1, (1 << 6), 0);
++	
++	/* DDC: Read Ri' from RX */
++	status = rk30_hdcp_ddc_read(hdcp, DDC_Ri_LEN, DDC_Ri_ADDR , (u8 *)&ro_rx);
++	if (status < 0)
++		return status;
++
++	/* Read Ri in HDCP IP */
++	ro_tx[0] = HDMIRdReg(HDCP_RI_BUFF);
++
++	ro_tx[1] = HDMIRdReg(HDCP_RI_BUFF + 4);
++
++	/* Compare values */
++	HDCP_DBG("ROTX: %x%x RORX:%x%x", ro_tx[0], ro_tx[1], ro_rx[0], ro_rx[1]);
++
++	if ((ro_rx[0] == ro_tx[0]) && (ro_rx[1] == ro_tx[1]))
++		return HDCP_OK;
++	else
++		return -HDCP_AUTH_FAILURE;
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: hdcp_lib_check_repeater_bit_in_tx
++ *-----------------------------------------------------------------------------
++ */
++u8 hdcp_lib_check_repeater_bit_in_tx(struct hdcp *hdcp)
++{
++	return (HDMIRdReg(HDCP_BCAPS) & m_REPEATER);
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: rk30_hdcp_lib_step1_r0_check
++ *-----------------------------------------------------------------------------
++ */
++int rk30_hdcp_lib_step1_r0_check(struct hdcp *hdcp)
++{
++	int status = HDCP_OK, temp;
++	
++	/* HDCP authentication steps:
++	 *   1) DDC: Read M0'
++	 *   2) Compare M0 and M0'
++	 *   if Rx is a receiver: switch to authentication step 3
++	 *   3) Enable encryption / auto Ri check / disable AV mute
++	 *   if Rx is a repeater: switch to authentication step 2
++	 *   3) Get M0 from HDMI IP and store it for further processing (V)
++	 *   4) Enable encryption / auto Ri check / auto BCAPS RDY polling
++	 *      Disable AV mute
++	 */
++
++	HDCP_DBG("hdcp_lib_step1_r0_check() %u", jiffies_to_msecs(jiffies));
++	
++	status = rk30_hdcp_r0_check(hdcp);
++	if(status < 0)
++		return status;
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++
++	if (hdcp_lib_check_repeater_bit_in_tx(hdcp)) {
++
++	} else {
++		HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, (1 << 4) | (1 << 5), (1 << 4) | (1 << 5));
++		/* Receiver: enable encryption */
++		HDMIMskReg(temp, HDCP_CTRL, m_HDCP_FRAMED_ENCRYPED, v_HDCP_FRAMED_ENCRYPED(1));
++		HDMIMskReg(temp, SOFT_HDCP_CTRL1, m_SOFT_HDCP_AUTH_START, m_SOFT_HDCP_AUTH_START);
++	}
+ 	
+ 	return HDCP_OK;
+ }
+ 
+-int rk30_hdcp_check_bksv(void)
++static int rk30_hdcp_read_ksvlist(struct hdcp *hdcp, int num)
+ {
+ 	int i, temp;
+-	char bksv[5];
+-	char *invalidkey;
+-	
+-	temp = HDMIRdReg(HDCP_BCAPS);
+-	DBG("Receiver capacity is 0x%02x", temp);
+-	
+-#ifdef DEBUG	
+-	if(temp & m_HDMI_RECEIVED)
+-		DBG("Receiver support HDMI");
+-	if(temp & m_REPEATER)
+-		DBG("Receiver is a repeater");
+-	if(temp & m_DDC_FAST)
+-		DBG("Receiver support 400K DDC");
+-	if(temp & m_1_1_FEATURE)
+-		DBG("Receiver support 1.1 features, such as advanced cipher, EESS.");
+-	if(temp & m_FAST_REAUTHENTICATION)
+-		DBG("Receiver support fast reauthentication.");
+-#endif
+-		
+-	for(i = 0; i < 5; i++) {
+-		bksv[i] = HDMIRdReg(HDCP_KSV_BYTE0 + (4 - i)*4) & 0xFF;
+-	}
+-	
+-	DBG("bksv is 0x%02x%02x%02x%02x%02x", bksv[0], bksv[1], bksv[2], bksv[3], bksv[4]);
+-	
+-	for(i = 0; i < hdcp->invalidkey; i++)
+-	{
+-		invalidkey = hdcp->invalidkeys + i *5;
+-		if(memcmp(bksv, invalidkey, 5) == 0) {
+-			printk(KERN_ERR "HDCP: BKSV was revocated!!!\n");
+-			HDMIMskReg(temp, HDCP_CTRL, m_HDCP_BKSV_FAILED | m_HDCP_FRAMED_ENCRYPED, v_HDCP_BKSV_FAILED(1) | v_HDCP_FRAMED_ENCRYPED(0));
+-			return HDCP_KSV_ERR;
++	uint8_t an_ksv_data[5];
++	
++	i2c_ack = 0;
++
++	HDCP_DBG("%s", __FUNCTION__);
++	
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0xC0);
++	HDMIWrReg(HDCP_DDC_ACCESS_LENGTH, num * 5);
++	HDMIWrReg(HDCP_DDC_OFFSET_ADDR, DDC_KSV_FIFO_ADDR);
++	HDMIWrReg(HDCP_DDC_CTRL, m_DDC_READ | (1 << 2));
++	
++	while(1) {
++		if(i2c_ack & 0xc0) {
++			break;
++		}
++		msleep(100);
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++	}
++	
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK2, m_I2C_ACK|m_I2C_NO_ACK, 0x00);
++	if(i2c_ack & m_I2C_NO_ACK)
++		return -HDCP_DDC_ERROR;
++		
++	if(i2c_ack & m_I2C_ACK) {
++		for(i = 0; i < num * 5; i++) {
++			temp = HDMIRdReg(0x80 * 4);
++			an_ksv_data[i%5] = temp;
++			if((i+1) % 5 == 0) {
++				HDCP_DBG("BKSV: %02x %02x %02x %02x %02x", an_ksv_data[0], an_ksv_data[1],
++						      an_ksv_data[2], an_ksv_data[3],
++						      an_ksv_data[4]);
++				if (hdcp_lib_check_ksv(an_ksv_data))
++					return -HDCP_AUTH_FAILURE;
++//				for(temp = 0; temp < 5; temp++)
++//					HDMIWrReg(HDCP_BKSV_BUFF + temp * 4, an_ksv_data[temp]);
++			}
+ 		}
+ 	}
+-	HDMIMskReg(temp, HDCP_CTRL, m_HDCP_BKSV_PASS | m_HDCP_FRAMED_ENCRYPED, v_HDCP_BKSV_PASS(1) | v_HDCP_FRAMED_ENCRYPED(1));
+ 	return HDCP_OK;
+ }
++
++static int rk30_hdcp_check_sha(struct hdcp *hdcp)
++{
++	int temp, status;
++	uint8_t asha[4], bsha[4], i;
++	
++	HDCP_DBG("%s", __FUNCTION__);
++	
++	// Calculate SHA1
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK1, (1 << 3), (1 << 3));
++	HDMIMskReg(temp, SOFT_HDCP_CTRL1, m_SOFT_HDCP_CAL_SHA, v_SOFT_HDCP_CAL_SHA(1));
++	
++	while(1) {
++		if(sha_ready)
++			break;
++		msleep(100);
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++	}
++	
++	HDMIMskReg(temp, SOFT_HDCP_INT_MASK1, (1 << 3), 0);
++	
++	for(temp = 0; temp < 5; temp++) {
++		for(i = 0; i < 4; i++) {
++			HDMIWrReg(HDCP_SHA_INDEX, i);
++			asha[i] = HDMIRdReg(HDCP_SHA_BUF + 4 * temp);
++		}
++		HDCP_DBG("ASHA%d %02x %02x %02x %02x\n", temp, asha[0], asha[1], asha[2], asha[3]);
++		
++		status = rk30_hdcp_ddc_read(hdcp, DDC_V_LEN, DDC_V_ADDR + temp * 4, bsha);
++		if(status < 0)
++			return status;
++		
++		HDCP_DBG("BSHA%d %02x %02x %02x %02x\n", temp, bsha[0], bsha[1], bsha[2], bsha[3]);
++		
++		if( (asha[0] != bsha[0]) || (asha[1] != bsha[1]) || (asha[2] != bsha[2]) || (asha[3] != bsha[3]) )
++			return -HDCP_AUTH_FAILURE;
++		
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++		
++		
++	}
++	return HDCP_OK;
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: rk30_hdcp_authentication_2nd
++ *-----------------------------------------------------------------------------
++ */
++int rk30_hdcp_authentication_2nd(struct hdcp *hdcp)
++{
++	int status = HDCP_OK;
++	struct timeval  ts_start, ts;
++	uint32_t delta = 0, num_dev;
++	uint8_t bstatus[2];
++	
++	HDCP_DBG("\n%s", __FUNCTION__);
++	
++	do_gettimeofday(&ts_start);
++	while(delta <= 5000000) {
++		/* Poll BCAPS */
++		status = rk30_hdcp_ddc_read(hdcp, DDC_BCAPS_LEN, DDC_BCAPS_ADDR, bstatus);
++		if( (status == HDCP_OK) && (bstatus[0] & (1 << 5)) )
++			break;
++		if (hdcp->pending_disable)
++			return -HDCP_CANCELLED_AUTH;
++		
++		do_gettimeofday(&ts);		
++		delta = (ts.tv_sec - ts_start.tv_sec) * 1000000 + (ts.tv_usec - ts_start.tv_usec);
++		msleep(100);
++	}
++	if(delta > 5000000) {
++		HDCP_DBG("Poll BKSV list out of time");
++		return -HDCP_BKSVLIST_TIMEOUT;
++	}	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++	
++	status = rk30_hdcp_ddc_read(hdcp, DDC_BSTATUS_LEN, DDC_BSTATUS_ADDR, bstatus);
++	if(status < 0)
++		return status;
++		
++	HDCP_DBG("bstatus %02x %02x\n", bstatus[1], bstatus[0]);
++	
++	if( bstatus[0] & (1 << 7) ) {
++		HDCP_DBG("MAX_DEVS_EXCEEDED");
++		return -HDCP_AUTH_FAILURE;
++	}
++	
++	if( bstatus[1] & (1 << 3) ) {
++		HDCP_DBG("MAX_CASCADE_EXCEEDED");
++		return -HDCP_AUTH_FAILURE;
++	}		
++	
++	num_dev = bstatus[0] & 0x7F;
++	if( num_dev > (MAX_DOWNSTREAM_DEVICE_NUM)) {
++		HDCP_DBG("Out of MAX_DOWNSTREAM_DEVICE_NUM");
++		return -HDCP_AUTH_FAILURE;
++	}
++	
++	HDMIWrReg(HDCP_BSTATUS_BUFF, bstatus[0]);
++	HDMIWrReg(HDCP_BSTATUS_BUFF + 4, bstatus[1]);
++	
++	HDMIWrReg(HDCP_NUM_DEV, num_dev);
++	
++	// Read KSV List
++	if(num_dev) {
++		status = rk30_hdcp_read_ksvlist(hdcp, num_dev);
++		if(status < 0)
++			return status;
++	}
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++	
++	status = rk30_hdcp_check_sha(hdcp);
++	if(status < 0)
++		return status;
++	
++	if (hdcp->pending_disable)
++		return -HDCP_CANCELLED_AUTH;
++		
++	HDMIMskReg(status, SOFT_HDCP_INT_MASK2, (1 << 4) | (1 << 5), (1 << 4) | (1 << 5));
++	/* Receiver: enable encryption */
++	HDMIMskReg(status, HDCP_CTRL, m_HDCP_FRAMED_ENCRYPED, v_HDCP_FRAMED_ENCRYPED(1));
++	HDMIMskReg(status, SOFT_HDCP_CTRL1, m_SOFT_HDCP_AUTH_START, m_SOFT_HDCP_AUTH_START);
++	return HDCP_OK;
++}
++
++/*-----------------------------------------------------------------------------
++ * Function: rk30_hdcp_lib_step3_r0_check
++ *-----------------------------------------------------------------------------
++ */
++int rk30_hdcp_lib_step3_r0_check(struct hdcp *hdcp)
++{
++	return rk30_hdcp_r0_check(hdcp);
++}
++
++void rk30_hdcp_irq(struct hdcp *hdcp)
++{
++	int soft_int1, soft_int2;
++	
++	soft_int1 = HDMIRdReg(INTR_STATUS3);
++	soft_int2 = HDMIRdReg(INTR_STATUS4);
++	HDMIWrReg(INTR_STATUS3, soft_int1);
++	HDMIWrReg(INTR_STATUS4, soft_int2);
++	HDCP_DBG("soft_int1 %x soft_int2 %x\n", soft_int1, soft_int2);
++	if(soft_int1 & m_SF_MODE_READY)
++		hdcp_submit_work(HDCP_AUTH_START_1ST, 0);
++	if(soft_int1 & m_SOFT_HDCP_AN_READY)
++		an_ready = 1;
++	if(soft_int1 & m_SOFT_HDCP_SHA_READY)
++		sha_ready = 1;
++	if(soft_int1 & m_SOFT_HDCP_RI_READY)
++			hdcp->pending_wq_event = 
++				hdcp_submit_work(HDCP_R0_EXP_EVENT,
++							 HDCP_R0_DELAY);
++	if(soft_int2 & 0xc0)
++		i2c_ack = soft_int2 & 0xc0;
++	if(soft_int2 & m_SOFT_HDCP_RI_SAVED)
++			hdcp->pending_wq_event = 
++				hdcp_submit_work(HDCP_RI_EXP_EVENT,
++							 0);
++}
+\ No newline at end of file
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.h b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.h
+index 0224d88ab134..d3183e993c8a 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.h
++++ b/drivers/video/rockchip/hdmi/chips/rk30/hdcp/rk30_hdmi_hdcp.h
+@@ -6,13 +6,42 @@
+ /***************************/
+ 
+ /* Status / error codes */
+-#define HDCP_OK			0
+-#define HDCP_KEY_ERR	1
+-#define HDCP_KSV_ERR	2
++enum {
++	HDCP_OK,
++	HDCP_KEY_ERR,
++	HDCP_DDC_ERROR,
++	HDCP_AUTH_FAILURE,
++	HDCP_AKSV_ERROR,
++	HDCP_BKSV_ERROR,
++	HDCP_CANCELLED_AUTH,
++	HDCP_BKSVLIST_TIMEOUT,
++};
+ 
+ /* Delays */
+ #define HDCP_ENABLE_DELAY	300
+ #define HDCP_REAUTH_DELAY	100
++#define HDCP_R0_DELAY		120
++#define HDCP_KSV_TIMEOUT_DELAY  5000
++/***********************/
++/* HDCP DDC addresses  */
++/***********************/
++
++#define DDC_BKSV_ADDR		0x00
++#define DDC_Ri_ADDR		0x08
++#define DDC_AKSV_ADDR		0x10
++#define DDC_AN_ADDR		0x18
++#define DDC_V_ADDR		0x20
++#define DDC_BCAPS_ADDR		0x40
++#define DDC_BSTATUS_ADDR	0x41
++#define DDC_KSV_FIFO_ADDR	0x43
++
++#define DDC_BKSV_LEN		5
++#define DDC_Ri_LEN		2
++#define DDC_AKSV_LEN		5
++#define DDC_AN_LEN		8
++#define DDC_V_LEN		4//20
++#define DDC_BCAPS_LEN		1
++#define DDC_BSTATUS_LEN		2
+ 
+ /* Event source */
+ #define HDCP_SRC_SHIFT		8
+@@ -26,10 +55,13 @@
+ #define HDCP_DISABLE_CTL		(HDCP_IOCTL_SRC		| 1)
+ #define HDCP_START_FRAME_EVENT	(HDCP_HDMI_SRC		| 2)
+ #define HDCP_STOP_FRAME_EVENT	(HDCP_HDMI_SRC		| 3)
+-#define HDCP_KSV_LIST_RDY_EVENT	(HDCP_IRQ_SRC		| 4)
+-#define HDCP_FAIL_EVENT			(HDCP_IRQ_SRC		| 5)
+-#define HDCP_AUTH_PASS_EVENT	(HDCP_IRQ_SRC		| 6)
+-#define HDCP_AUTH_REATT_EVENT	(HDCP_WORKQUEUE_SRC	| 7)
++#define HDCP_FAIL_EVENT			(HDCP_IRQ_SRC		| 4)
++#define HDCP_AUTH_PASS_EVENT	(HDCP_IRQ_SRC		| 5)
++#define HDCP_AUTH_START_1ST		(HDCP_IRQ_SRC		| 6)
++#define HDCP_RI_EXP_EVENT		(HDCP_IRQ_SRC		| 7)
++#define HDCP_AUTH_REATT_EVENT	(HDCP_WORKQUEUE_SRC	| 8)
++#define HDCP_R0_EXP_EVENT		(HDCP_WORKQUEUE_SRC	| 9)
++#define HDCP_AUTH_START_2ND		(HDCP_WORKQUEUE_SRC	| 10)
+ 
+ /* Key size */
+ #define HDCP_KEY_SIZE			308	
+@@ -37,10 +69,15 @@
+ /* Authentication retry times */
+ #define HDCP_INFINITE_REAUTH	0x100
+ 
++/* Max downstream device number */
++#define MAX_DOWNSTREAM_DEVICE_NUM	1
++
+ enum hdcp_states {
+ 	HDCP_DISABLED,
+ 	HDCP_ENABLE_PENDING,
+ 	HDCP_AUTHENTICATION_START,
++	HDCP_AUTHENTICATION_1ST,
++	HDCP_WAIT_R0_DELAY,
+ 	HDCP_WAIT_KSV_LIST,
+ 	HDCP_LINK_INTEGRITY_CHECK,
+ };
+@@ -81,19 +118,76 @@ struct hdcp {
+ 	struct delayed_work *pending_start;
+ 	struct delayed_work *pending_wq_event;
+ 	int retry_cnt;
++	int pending_disable;
++	struct hdmi* hdmi;
+ };
+ 
+-extern struct hdcp *hdcp;
++#define SOFT_HDCP_INT_MASK1	0x96 * 4
++	#define m_SF_MODE_READY		(1 << 7)
++	
++#define SOFT_HDCP_INT_MASK2	0x97 * 4
++	#define m_I2C_ACK			(1 << 7)
++	#define m_I2C_NO_ACK		(1 << 6)
++	
++#define SOFT_HDCP_INT1		0x98 * 4
++	#define m_SOFT_HDCP_READY			(1 << 7)
++	#define m_SOFT_HDCP_RI_READY		(1 << 6)
++	#define m_SOFT_HDCP_AN_READY		(1 << 4)
++	#define m_SOFT_HDCP_SHA_READY		(1 << 3)
++	
++#define SOFT_HDCP_INT2		0x99 * 4
++	#define m_SOFT_HDCP_RI_SAVED		(1 << 5)
++	#define m_SOFT_HDCP_PJ_SAVED		(1 << 4)
++	
++#define SOFT_HDCP_CTRL1		0x9A * 4
++	#define m_SOFT_HDCP_AUTH_EN			(1 << 7)	// enable software hdcp
++	#define m_SOFT_HDCP_AUTH_START		(1 << 5)
++	#define m_SOFT_HDCP_PREP_AN			(1 << 4)
++	#define m_SOFT_HDCP_REPEATER		(1 << 2)
++	#define m_SOFT_HDCP_GEN_RI			(1 << 1)
++	#define m_SOFT_HDCP_CAL_SHA			(1 << 0)
++	#define v_SOFT_HDCP_AUTH_EN(n)		(n << 7)
++	#define v_SOFT_HDCP_PREP_AN(n)		(n << 4)
++	#define v_SOFT_HDCP_REPEATER(n)		(n << 2)
++	#define v_SOFT_HDCP_GEN_RI(n)		(n << 1)
++	#define v_SOFT_HDCP_CAL_SHA(n)		(n << 0)
++	
++#define HDCP_DDC_ACCESS_LENGTH	0x9E * 4
++#define	HDCP_DDC_OFFSET_ADDR	0xA0 * 4
++#define HDCP_DDC_CTRL			0xA1 * 4
++	#define m_DDC_READ			(1 << 0)
++	#define m_DDC_WRITE			(1 << 1)
++
++#define SOFT_HDCP_BCAPS			0xE0 * 4
++
++#define HDCP_DDC_READ_BUFF		0xA2 * 4
++#define HDCP_DDC_WRITE_BUFF		0xA7 * 4
++#define HDCP_AN_BUFF			0xE8 * 4
++#define HDCP_AKSV_BUFF			0xBF * 4
++#define HDCP_BKSV_BUFF			0xE3 * 4
++#define HDCP_RI_BUFF			0xD9 * 4
++#define HDCP_BSTATUS_BUFF		0xE1 * 4
++
++#define HDCP_NUM_DEV			0xDC * 4
++#define HDCP_SHA_BUF			0xB9 * 4
++#define HDCP_SHA_INDEX			0xD8 * 4
+ 
+ #ifdef HDCP_DEBUG
+-#define DBG(format, ...) \
++#define HDCP_DBG(format, ...) \
+ 		printk(KERN_INFO "HDCP: " format "\n", ## __VA_ARGS__)
+ #else
+-#define DBG(format, ...)
++#define HDCP_DBG(format, ...)
+ #endif
+ 
+-extern void rk30_hdcp_disable(void);
+-extern int	rk30_hdcp_start_authentication(void);
+-extern int	rk30_hdcp_check_bksv(void);
+-extern int	rk30_hdcp_load_key2mem(struct hdcp_keys *key);
++extern struct delayed_work *hdcp_submit_work(int event, int delay);
++extern void rk30_hdcp_disable(struct hdcp *hdcp);
++extern int	rk30_hdcp_start_authentication(struct hdcp *hdcp);
++extern int	rk30_hdcp_check_bksv(struct hdcp *hdcp);
++extern int	rk30_hdcp_load_key2mem(struct hdcp *hdcp, struct hdcp_keys *key);
++extern int	rk30_hdcp_authentication_1st(struct hdcp *hdcp);
++extern int	rk30_hdcp_authentication_2nd(struct hdcp *hdcp);
++extern void rk30_hdcp_irq(struct hdcp *hdcp);
++extern int	rk30_hdcp_lib_step1_r0_check(struct hdcp *hdcp);
++extern int	rk30_hdcp_lib_step3_r0_check(struct hdcp *hdcp);
++extern u8	hdcp_lib_check_repeater_bit_in_tx(struct hdcp *hdcp);
+ #endif /* __RK30_HDMI_HDCP_H__ */
+\ No newline at end of file
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.c b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.c
+index 63ddcc622d99..a33f7e65468e 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.c
+@@ -27,7 +27,8 @@ extern struct rk_lcdc_device_driver * rk_get_lcdc_drv(char *name);
+ extern void hdmi_register_display_sysfs(struct hdmi *hdmi, struct device *parent);
+ extern void hdmi_unregister_display_sysfs(struct hdmi *hdmi);
+ 
+-int rk30_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
++struct hdmi* rk30_hdmi_register_hdcp_callbacks( 
++					 void (*hdcp_cb)(void),
+ 					 void (*hdcp_irq_cb)(int status),
+ 					 int (*hdcp_power_on_cb)(void),
+ 					 void (*hdcp_power_off_cb)(void))
+@@ -40,7 +41,7 @@ int rk30_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
+ 	hdmi->hdcp_power_on_cb = hdcp_power_on_cb;
+ 	hdmi->hdcp_power_off_cb = hdcp_power_off_cb;
+ 	
+-	return HDMI_ERROR_SUCESS;
++	return hdmi;
+ }
+ 
+ #ifdef CONFIG_HAS_EARLYSUSPEND
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.h b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.h
+index c7c937387835..ae72f2b47bcf 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.h
++++ b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi.h
+@@ -9,7 +9,8 @@
+ #define HDMI_SOURCE_DEFAULT HDMI_SOURCE_LCDC0
+ #endif
+ 
+-extern int rk30_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
++extern struct hdmi* rk30_hdmi_register_hdcp_callbacks(
++					 void (*hdcp_cb)(void),
+ 					 void (*hdcp_irq_cb)(int status),
+ 					 int  (*hdcp_power_on_cb)(void),
+ 					 void (*hdcp_power_off_cb)(void));
+diff --git a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi_hw.c
+index 3e7ed568e684..dcd730e3a793 100755
+--- a/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/rk30/rk30_hdmi_hw.c
+@@ -8,7 +8,7 @@ static char edid_result = 0;
+ 
+ static inline void delay100us(void)
+ {
+-	msleep(1);
++	udelay(100);
+ }
+ 
+ int rk30_hdmi_initial(void)
+@@ -635,9 +635,9 @@ irqreturn_t hdmi_irq(int irq, void *priv)
+ 		interrupt3 = HDMIRdReg(INTR_STATUS3);
+ 		interrupt4 = HDMIRdReg(INTR_STATUS4);
+ 		HDMIWrReg(INTR_STATUS1, interrupt1);
+-		HDMIWrReg(INTR_STATUS2, interrupt2);
+-		HDMIWrReg(INTR_STATUS3, interrupt3);
+-		HDMIWrReg(INTR_STATUS4, interrupt4);
++//		HDMIWrReg(INTR_STATUS2, interrupt2);
++//		HDMIWrReg(INTR_STATUS3, interrupt3);
++//		HDMIWrReg(INTR_STATUS4, interrupt4);
+ #if 0
+ 		hdmi_dbg(hdmi->dev, "[%s] interrupt1 %02x interrupt2 %02x interrupt3 %02x interrupt4 %02x\n",\
+ 			 __FUNCTION__, interrupt1, interrupt2, interrupt3, interrupt4);
+@@ -654,12 +654,12 @@ irqreturn_t hdmi_irq(int irq, void *priv)
+ 			edid_result = interrupt1;
+ 			spin_unlock(&hdmi->irq_lock);
+ 		}
+-		else if(hdmi->state == HDMI_SLEEP) {
+-			hdmi_dbg(hdmi->dev, "hdmi return to sleep mode\n");
+-			HDMIWrReg(SYS_CTRL, 0x10);
+-			hdmi->pwr_mode = PWR_SAVE_MODE_A;
+-		}
+-		if(interrupt2 && hdmi->hdcp_irq_cb)
++//		else if(hdmi->state == HDMI_SLEEP) {
++//			RK30DBG( "hdmi return to sleep mode\n");
++//			HDMIWrReg(SYS_CTRL, 0x10);
++//			rk30_hdmi->pwr_mode = PWR_SAVE_MODE_A;
++//		}
++		if(hdmi->hdcp_irq_cb)
+ 			hdmi->hdcp_irq_cb(interrupt2);
+ 	}
+ 	return IRQ_HANDLED;
+-- 
+2.35.3
+

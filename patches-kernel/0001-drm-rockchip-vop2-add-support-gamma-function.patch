@@ -1,0 +1,213 @@
+From 8877840a6f3f013fc1979b1bc355c3d556731f32 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Sat, 12 Dec 2020 11:28:24 +0800
+Subject: [PATCH] drm/rockchip: vop2: add support gamma function
+
+Change-Id: I8e86cfa4e7229d26cfcf729890445d6180a1c0c5
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h  |  2 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop2.c | 96 ++++++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_vop2_reg.c |  4 +
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.h  |  1 +
+ 4 files changed, 103 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index 3f9f40b596e3..f6632c45667d 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -543,6 +543,7 @@ struct vop2_video_port_regs {
+ 	struct vop_reg p2i_en;
+ 	struct vop_reg mipi_dual_en;
+ 	struct vop_reg mipi_dual_channel_swap;
++	struct vop_reg dsp_lut_en;
+ 
+ 	struct vop_reg hdr_lut_update_en;
+ 	struct vop_reg hdr_lut_mode;
+@@ -762,6 +763,7 @@ struct vop2_ctrl {
+ 
+ 	struct vop_reg bt1120_yc_swap;
+ 	struct vop_reg bt656_yc_swap;
++	struct vop_reg gamma_port_sel;
+ 
+ 	struct vop_reg reg_done_frm;
+ 	struct vop_reg cfg_done;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+index 098de778dcca..81674bbf3ebd 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+@@ -1412,6 +1412,36 @@ static void vop2_core_clks_disable(struct vop2 *vop2)
+ 
+ static void vop2_crtc_load_lut(struct drm_crtc *crtc)
+ {
++	struct vop2_video_port *vp = to_vop2_video_port(crtc);
++	struct vop2 *vop2 = vp->vop2;
++	int dle = 0, i = 0;
++
++	if (!vop2->is_enabled || !vop2->lut || !vop2->lut_regs)
++		return;
++
++	if (WARN_ON(!drm_modeset_is_locked(&crtc->mutex)))
++		return;
++
++	spin_lock(&vop2->reg_lock);
++	VOP_MODULE_SET(vop2, vp, dsp_lut_en, 0);
++	vop2_cfg_done(crtc);
++	spin_unlock(&vop2->reg_lock);
++
++#define CTRL_GET(name) VOP_MODULE_GET(vop2, vp, name)
++	readx_poll_timeout(CTRL_GET, dsp_lut_en, dle, !dle, 5, 33333);
++
++	for (i = 0; i < vop2->lut_len; i++)
++		vop2_write_lut(vop2, i << 2, vop2->lut[i]);
++
++	spin_lock(&vop2->reg_lock);
++
++	VOP_MODULE_SET(vop2, vp, dsp_lut_en, 1);
++	VOP_CTRL_SET(vop2, gamma_port_sel, vp->id);
++	vop2_cfg_done(crtc);
++	vop2->lut_active = true;
++
++	spin_unlock(&vop2->reg_lock);
++#undef CTRL_GET
+ }
+ 
+ static void rockchip_vop2_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red,
+@@ -1432,6 +1462,25 @@ static void rockchip_vop2_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red,
+ 	vop2->lut[regno] = r * lut_len * lut_len + g * lut_len + b;
+ }
+ 
++static void rockchip_vop2_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red,
++				       u16 *green, u16 *blue, int regno)
++{
++	struct vop2_video_port *vp = to_vop2_video_port(crtc);
++	struct vop2 *vop2 = vp->vop2;
++	u32 lut_len = vop2->lut_len;
++	u32 r, g, b;
++
++	if (regno >= lut_len || !vop2->lut)
++		return;
++
++	r = (vop2->lut[regno] / lut_len / lut_len) & (lut_len - 1);
++	g = (vop2->lut[regno] / lut_len) & (lut_len - 1);
++	b = vop2->lut[regno] & (lut_len - 1);
++	*red = r * 0xffff / (lut_len - 1);
++	*green = g * 0xffff / (lut_len - 1);
++	*blue = b * 0xffff / (lut_len - 1);
++}
++
+ static int vop2_core_clks_prepare_enable(struct vop2 *vop2)
+ {
+ 	int ret;
+@@ -4274,6 +4323,50 @@ static int vop2_plane_init(struct vop2 *vop2, struct vop2_win *win, unsigned lon
+ 	return 0;
+ }
+ 
++static int vop2_gamma_init(struct vop2 *vop2)
++{
++	const struct vop2_data *vop2_data = vop2->data;
++	struct vop2_video_port *vp;
++	struct device *dev = vop2->dev;
++	u16 *r_base, *g_base, *b_base;
++	u32 lut_len = vop2->lut_len;
++	struct drm_crtc *crtc;
++	int i = 0, j = 0;
++
++	if (!vop2->lut_regs)
++		return 0;
++
++	vop2->lut = devm_kmalloc_array(dev, lut_len, sizeof(*vop2->lut),
++				       GFP_KERNEL);
++	if (!vop2->lut)
++		return -ENOMEM;
++
++	for (i = 0; i < lut_len; i++) {
++		u32 r = i * lut_len * lut_len;
++		u32 g = i * lut_len;
++		u32 b = i;
++
++		vop2->lut[i] = r | g | b;
++	}
++
++	for (i = 0; i < vop2_data->nr_vps; i++) {
++		vp = &vop2->vps[i];
++		crtc = &vp->crtc;
++
++		drm_mode_crtc_set_gamma_size(crtc, lut_len);
++		r_base = crtc->gamma_store;
++		g_base = r_base + crtc->gamma_size;
++		b_base = g_base + crtc->gamma_size;
++		for (j = 0; j < lut_len; j++) {
++			rockchip_vop2_crtc_fb_gamma_get(crtc, &r_base[j],
++							&g_base[j],
++							&b_base[j], j);
++		}
++	}
++
++	return 0;
++}
++
+ static int vop2_create_crtc(struct vop2 *vop2)
+ {
+ 	const struct vop2_data *vop2_data = vop2->data;
+@@ -4623,6 +4716,9 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
+ 		return ret;
+ 
+ 	ret = vop2_create_crtc(vop2);
++	if (ret)
++		return ret;
++	ret = vop2_gamma_init(vop2);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+index 047bdb5d2303..51ca06ba581d 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+@@ -379,6 +379,7 @@ static const struct vop2_video_port_regs rk3568_vop_vp0_regs = {
+ 	.dither_down_mode = VOP_REG(RK3568_VP0_DSP_CTRL, 0x1, 20),
+ 	.mipi_dual_en = VOP_REG(RK3568_VP0_MIPI_CTRL, 0x1, 20),
+ 	.mipi_dual_channel_swap = VOP_REG(RK3568_VP0_MIPI_CTRL, 0x1, 21),
++	.dsp_lut_en = VOP_REG(RK3568_VP0_DSP_CTRL, 0x1, 28),
+ 	.hdr_lut_update_en = VOP_REG(RK3568_HDR_LUT_CTRL, 0x1, 0),
+ 	.hdr_lut_mode = VOP_REG(RK3568_HDR_LUT_CTRL, 0x1, 1),
+ 	.hdr_lut_mst = VOP_REG(RK3568_HDR_LUT_MST, 0xffffffff, 0),
+@@ -462,6 +463,7 @@ static const struct vop2_video_port_regs rk3568_vop_vp1_regs = {
+ 	.bcsh_y2r_csc_mode = VOP_REG(RK3568_VP1_BCSH_CTRL, 0x3, 2),
+ 	.bcsh_y2r_en = VOP_REG(RK3568_VP1_BCSH_CTRL, 0x1, 0),
+ 	.bcsh_en = VOP_REG(RK3568_VP1_BCSH_COLOR_BAR, 0x1, 31),
++	.dsp_lut_en = VOP_REG(RK3568_VP1_DSP_CTRL, 0x1, 28),
+ };
+ 
+ static const struct vop2_video_port_regs rk3568_vop_vp2_regs = {
+@@ -508,6 +510,7 @@ static const struct vop2_video_port_regs rk3568_vop_vp2_regs = {
+ 	.bcsh_y2r_csc_mode = VOP_REG(RK3568_VP2_BCSH_CTRL, 0x3, 2),
+ 	.bcsh_y2r_en = VOP_REG(RK3568_VP2_BCSH_CTRL, 0x1, 0),
+ 	.bcsh_en = VOP_REG(RK3568_VP2_BCSH_COLOR_BAR, 0x1, 31),
++	.dsp_lut_en = VOP_REG(RK3568_VP2_DSP_CTRL, 0x1, 28),
+ };
+ 
+ static const struct vop2_video_port_data rk3568_vop_video_ports[] = {
+@@ -1075,6 +1078,7 @@ static const struct vop2_ctrl rk3568_vop_ctrl = {
+ 	.lvds_dual_channel_swap = VOP_REG(RK3568_DSP_IF_CTRL, 0x1, 2),
+ 	.bt656_yc_swap = VOP_REG(RK3568_DSP_IF_CTRL, 0x1, 5),
+ 	.bt1120_yc_swap = VOP_REG(RK3568_DSP_IF_CTRL, 0x1, 9),
++	.gamma_port_sel = VOP_REG(RK3568_LUT_PORT_SEL, 0x3, 0),
+ 	.lvds_pin_pol = VOP_REG(RK3568_DSP_IF_POL, 0x7, 0),
+ 	.lvds_dclk_pol = VOP_REG(RK3568_DSP_IF_POL, 0x1, 3),
+ 	.hdmi_pin_pol = VOP_REG(RK3568_DSP_IF_POL, 0x7, 4),
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+index 69365ef83fd3..a3875b77cde5 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+@@ -1055,6 +1055,7 @@
+ #define RK3568_DSP_IF_EN			0x028
+ #define RK3568_DSP_IF_CTRL			0x02c
+ #define RK3568_DSP_IF_POL			0x030
++#define RK3568_LUT_PORT_SEL			0x058
+ #define RK3568_VP0_LINE_FLAG			0x70
+ #define RK3568_VP1_LINE_FLAG			0x74
+ #define RK3568_VP2_LINE_FLAG			0x78
+-- 
+2.35.3
+

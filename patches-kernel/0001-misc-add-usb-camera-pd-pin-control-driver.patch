@@ -1,0 +1,265 @@
+From 3344984bec2e94392987af0ae6498a92ccea169e Mon Sep 17 00:00:00 2001
+From: Bin Yang <yangbin@rock-chips.com>
+Date: Thu, 15 Dec 2016 18:29:07 +0800
+Subject: [PATCH] misc: add usb camera pd pin control driver
+
+Change-Id: Id6ad835c2fff43167a52f90c19e7e6dfe93a4655
+Signed-off-by: Bin Yang <yangbin@rock-chips.com>
+---
+ .../devicetree/bindings/misc/usb_cam_gpio.txt |  16 ++
+ drivers/misc/Kconfig                          |   6 +
+ drivers/misc/Makefile                         |   1 +
+ drivers/misc/usb_cam_gpio.c                   | 192 ++++++++++++++++++
+ 4 files changed, 215 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/misc/usb_cam_gpio.txt
+ create mode 100644 drivers/misc/usb_cam_gpio.c
+
+diff --git a/Documentation/devicetree/bindings/misc/usb_cam_gpio.txt b/Documentation/devicetree/bindings/misc/usb_cam_gpio.txt
+new file mode 100644
+index 000000000000..2e7a44ed65de
+--- /dev/null
++++ b/Documentation/devicetree/bindings/misc/usb_cam_gpio.txt
+@@ -0,0 +1,16 @@
++* Rockchip USB camera GPIO control driver
++
++Required properties:
++- compatible: should be "usb-cam-gpio"
++- hd-cam-pin: HD camera on gpio pin
++- ir-cam-pin: IR camera on gpio pin
++
++Example:
++	usb_cam_gpio: usb-cam-gpio {
++		compatible = "usb-cam-gpio";
++		pinctrl-names = "default";
++		pinctrl-0 = <&usb_cam_on_gpio>;
++		hd-cam-pin = <&gpio3 GPIO_A1 GPIO_ACTIVE_LOW>;
++		ir-cam-pin = <&gpio3 GPIO_A2 GPIO_ACTIVE_HIGH>;
++		status = "okay";
++	};
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 84c2e7f663b1..4727abb80ed9 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -544,6 +544,12 @@ config MEMORY_STATE_TIME
+ 	help
+ 	  Memory time statistics exported to /sys/kernel/memory_state_time
+ 
++config USB_CAM_GPIO
++	bool "usb camera gpio driver"
++	default n
++	help
++	  Enable this driver will support usb camera gpio control
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 589997197504..06750b942827 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -59,3 +59,4 @@ obj-$(CONFIG_VEXPRESS_SYSCFG)	+= vexpress-syscfg.o
+ obj-$(CONFIG_CXL_BASE)		+= cxl/
+ obj-$(CONFIG_UID_CPUTIME) += uid_cputime.o
+ obj-$(CONFIG_MEMORY_STATE_TIME) += memory_state_time.o
++obj-$(CONFIG_USB_CAM_GPIO)	+= usb_cam_gpio.o
+diff --git a/drivers/misc/usb_cam_gpio.c b/drivers/misc/usb_cam_gpio.c
+new file mode 100644
+index 000000000000..15930c366e69
+--- /dev/null
++++ b/drivers/misc/usb_cam_gpio.c
+@@ -0,0 +1,192 @@
++/*
++ * drivers/misc/usb_cam_gpio.c
++ *
++ * Copyright (C) 2012-2016 Rockchip Co.,Ltd.
++ * Author: Bin Yang <yangbin@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/freezer.h>
++#include <linux/of_gpio.h>
++
++static struct class *usb_cam_gpio_class;
++
++struct usb_cam_gpio {
++	struct device *dev;
++	struct device sys_dev;
++
++	struct gpio_desc *gpio_cam_hd;
++	struct gpio_desc *gpio_cam_ir;
++};
++
++static ssize_t hd_camera_on_show(struct device *sys_dev,
++				 struct device_attribute *attr,
++				 char *buf)
++{
++	struct usb_cam_gpio *gpiod = container_of(sys_dev, struct usb_cam_gpio,
++						  sys_dev);
++
++	return sprintf(buf, "%d\n", gpiod_get_value(gpiod->gpio_cam_hd));
++}
++
++static ssize_t hd_camera_on_store(struct device *sys_dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct usb_cam_gpio *gpiod = container_of(sys_dev, struct usb_cam_gpio,
++						  sys_dev);
++	int val = 0;
++	int ret = 0;
++
++	ret = kstrtoint(buf, 0, &val);
++	if (ret < 0)
++		return ret;
++	if (val)
++		val = 1;
++	gpiod_set_value(gpiod->gpio_cam_hd, val);
++
++	return count;
++}
++static DEVICE_ATTR_RW(hd_camera_on);
++
++static ssize_t ir_camera_on_show(struct device *sys_dev,
++				 struct device_attribute *attr,
++				 char *buf)
++{
++	struct usb_cam_gpio *gpiod = container_of(sys_dev,
++						  struct usb_cam_gpio, sys_dev);
++
++	return sprintf(buf, "%d\n", gpiod_get_value(gpiod->gpio_cam_ir));
++}
++
++static ssize_t ir_camera_on_store(struct device *sys_dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct usb_cam_gpio *gpiod = container_of(sys_dev,
++						  struct usb_cam_gpio, sys_dev);
++	int val;
++	int ret;
++
++	ret = kstrtoint(buf, 0, &val);
++	if (ret < 0)
++		return ret;
++	if (val)
++		val = 1;
++	gpiod_set_value(gpiod->gpio_cam_ir, val);
++
++	return count;
++}
++static DEVICE_ATTR_RW(ir_camera_on);
++
++static struct attribute *usb_cam_gpio_attrs[] = {
++	&dev_attr_hd_camera_on.attr,
++	&dev_attr_ir_camera_on.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(usb_cam_gpio);
++
++static int usb_cam_gpio_device_register(struct usb_cam_gpio *gpiod)
++{
++	int ret;
++	struct device *dev = &gpiod->sys_dev;
++	const char *name = {"usb_camera_on"};
++
++	dev->class = usb_cam_gpio_class;
++	dev_set_name(dev, "%s", name);
++	dev_set_drvdata(dev, gpiod);
++	ret = device_register(dev);
++
++	return ret;
++}
++
++static int usb_cam_gpio_probe(struct platform_device *pdev)
++{
++	struct usb_cam_gpio *gpiod;
++	int ret = 0;
++
++	usb_cam_gpio_class = class_create(THIS_MODULE, "usb_cam_gpio");
++	if (IS_ERR(usb_cam_gpio_class)) {
++		pr_err("create uvc_detection class failed (%ld)\n",
++		       PTR_ERR(usb_cam_gpio_class));
++		return PTR_ERR(usb_cam_gpio_class);
++	}
++	usb_cam_gpio_class->dev_groups = usb_cam_gpio_groups;
++
++	gpiod = devm_kzalloc(&pdev->dev, sizeof(*gpiod), GFP_KERNEL);
++	if (!gpiod)
++		return -ENOMEM;
++
++	gpiod->dev = &pdev->dev;
++
++	gpiod->gpio_cam_hd = devm_gpiod_get_optional(gpiod->dev,
++						     "hd-cam", GPIOD_OUT_LOW);
++	if (IS_ERR(gpiod->gpio_cam_hd)) {
++		dev_warn(gpiod->dev, "Could not get hd-cam-gpios!\n");
++		gpiod->gpio_cam_hd = NULL;
++	}
++
++	gpiod->gpio_cam_ir = devm_gpiod_get_optional(gpiod->dev,
++						     "ir-cam", GPIOD_OUT_HIGH);
++	if (IS_ERR(gpiod->gpio_cam_ir)) {
++		dev_warn(gpiod->dev, "Could not get ir-cam-gpios!\n");
++		gpiod->gpio_cam_ir = NULL;
++	}
++
++	ret = usb_cam_gpio_device_register(gpiod);
++	if (ret < 0) {
++		dev_err(gpiod->dev, "usb_cam_gpio device register fail\n");
++		return ret;
++	}
++
++	dev_info(gpiod->dev, "usb_cam_gpio_probe success\n");
++
++	return 0;
++}
++
++static const struct of_device_id usb_cam_gpio_match[] = {
++	{ .compatible = "usb-cam-gpio" },
++	{ /* Sentinel */ }
++};
++
++static int usb_cam_gpio_remove(struct platform_device *pdev)
++{
++	if (!IS_ERR(usb_cam_gpio_class))
++		class_destroy(usb_cam_gpio_class);
++
++	return 0;
++}
++
++static struct platform_driver usb_cam_gpio_driver = {
++	.probe = usb_cam_gpio_probe,
++	.remove = usb_cam_gpio_remove,
++	.driver = {
++		.name = "usb_cam_gpio",
++		.owner = THIS_MODULE,
++		.of_match_table	= usb_cam_gpio_match,
++	},
++};
++
++module_platform_driver(usb_cam_gpio_driver);
++
++MODULE_ALIAS("platform:usb_cam_gpio");
++MODULE_AUTHOR("Bin Yang <yangbin@rock-chips.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("usb camera gpio driver");
+-- 
+2.35.3
+

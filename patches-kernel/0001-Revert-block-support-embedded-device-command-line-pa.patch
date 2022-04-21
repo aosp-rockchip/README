@@ -1,0 +1,567 @@
+From 701d7e2b9778114f0f96a81cd2835d24eb42cbe3 Mon Sep 17 00:00:00 2001
+From: "Huang, Tao" <huangtao@rock-chips.com>
+Date: Wed, 11 Nov 2015 14:25:17 +0800
+Subject: [PATCH] Revert "block: support embedded device command line
+ partition"
+
+This reverts commit d4900b6d2b262b449ecbf70cc340af2c173faa16.
+---
+ Documentation/block/cmdline-partition.txt |  39 ----
+ block/Kconfig                             |   6 -
+ block/Makefile                            |   1 -
+ block/cmdline-parser.c                    | 250 ----------------------
+ block/partitions/Kconfig                  |   7 -
+ block/partitions/Makefile                 |   2 -
+ block/partitions/check.c                  |   4 -
+ block/partitions/cmdline.c                |  99 ---------
+ block/partitions/cmdline.h                |   2 -
+ include/linux/cmdline-parser.h            |  43 ----
+ 10 files changed, 453 deletions(-)
+ delete mode 100644 Documentation/block/cmdline-partition.txt
+ delete mode 100644 block/cmdline-parser.c
+ delete mode 100644 block/partitions/cmdline.c
+ delete mode 100644 block/partitions/cmdline.h
+ delete mode 100644 include/linux/cmdline-parser.h
+
+diff --git a/Documentation/block/cmdline-partition.txt b/Documentation/block/cmdline-partition.txt
+deleted file mode 100644
+index 2bbf4cc40c3f..000000000000
+--- a/Documentation/block/cmdline-partition.txt
++++ /dev/null
+@@ -1,39 +0,0 @@
+-Embedded device command line partition
+-=====================================================================
+-
+-Read block device partition table from command line.
+-The partition used for fixed block device (eMMC) embedded device.
+-It is no MBR, save storage space. Bootloader can be easily accessed
+-by absolute address of data on the block device.
+-Users can easily change the partition.
+-
+-The format for the command line is just like mtdparts:
+-
+-blkdevparts=<blkdev-def>[;<blkdev-def>]
+-  <blkdev-def> := <blkdev-id>:<partdef>[,<partdef>]
+-    <partdef> := <size>[@<offset>](part-name)
+-
+-<blkdev-id>
+-    block device disk name, embedded device used fixed block device,
+-    it's disk name also fixed. such as: mmcblk0, mmcblk1, mmcblk0boot0.
+-
+-<size>
+-    partition size, in bytes, such as: 512, 1m, 1G.
+-
+-<offset>
+-    partition start address, in bytes.
+-
+-(part-name)
+-    partition name, kernel send uevent with "PARTNAME". application can create
+-    a link to block device partition with the name "PARTNAME".
+-    user space application can access partition by partition name.
+-
+-Example:
+-    eMMC disk name is "mmcblk0" and "mmcblk0boot0"
+-
+-  bootargs:
+-    'blkdevparts=mmcblk0:1G(data0),1G(data1),-;mmcblk0boot0:1m(boot),-(kernel)'
+-
+-  dmesg:
+-    mmcblk0: p1(data0) p2(data1) p3()
+-    mmcblk0boot0: p1(boot) p2(kernel)
+diff --git a/block/Kconfig b/block/Kconfig
+index 7f38e40fee08..a7e40a7c8214 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -99,12 +99,6 @@ config BLK_DEV_THROTTLING
+ 
+ 	See Documentation/cgroups/blkio-controller.txt for more information.
+ 
+-config CMDLINE_PARSER
+-	bool "Block device command line partition parser"
+-	default n
+-	---help---
+-	Parsing command line, get the partitions information.
+-
+ menu "Partition Types"
+ 
+ source "block/partitions/Kconfig"
+diff --git a/block/Makefile b/block/Makefile
+index 4fa4be544ece..39b76ba66ffd 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -18,4 +18,3 @@ obj-$(CONFIG_IOSCHED_CFQ)	+= cfq-iosched.o
+ 
+ obj-$(CONFIG_BLOCK_COMPAT)	+= compat_ioctl.o
+ obj-$(CONFIG_BLK_DEV_INTEGRITY)	+= blk-integrity.o
+-obj-$(CONFIG_CMDLINE_PARSER)	+= cmdline-parser.o
+diff --git a/block/cmdline-parser.c b/block/cmdline-parser.c
+deleted file mode 100644
+index cc2637f8674e..000000000000
+--- a/block/cmdline-parser.c
++++ /dev/null
+@@ -1,250 +0,0 @@
+-/*
+- * Parse command line, get partition information
+- *
+- * Written by Cai Zhiyong <caizhiyong@huawei.com>
+- *
+- */
+-#include <linux/buffer_head.h>
+-#include <linux/module.h>
+-#include <linux/cmdline-parser.h>
+-
+-static int parse_subpart(struct cmdline_subpart **subpart, char *partdef)
+-{
+-	int ret = 0;
+-	struct cmdline_subpart *new_subpart;
+-
+-	*subpart = NULL;
+-
+-	new_subpart = kzalloc(sizeof(struct cmdline_subpart), GFP_KERNEL);
+-	if (!new_subpart)
+-		return -ENOMEM;
+-
+-	if (*partdef == '-') {
+-		new_subpart->size = (sector_t)(~0ULL);
+-		partdef++;
+-	} else {
+-		new_subpart->size = (sector_t)memparse(partdef, &partdef);
+-		if (new_subpart->size < (sector_t)PAGE_SIZE) {
+-			pr_warn("cmdline partition size is invalid.");
+-			ret = -EINVAL;
+-			goto fail;
+-		}
+-	}
+-
+-	if (*partdef == '@') {
+-		partdef++;
+-		new_subpart->from = (sector_t)memparse(partdef, &partdef);
+-	} else {
+-		new_subpart->from = (sector_t)(~0ULL);
+-	}
+-
+-	if (*partdef == '(') {
+-		int length;
+-		char *next = strchr(++partdef, ')');
+-
+-		if (!next) {
+-			pr_warn("cmdline partition format is invalid.");
+-			ret = -EINVAL;
+-			goto fail;
+-		}
+-
+-		length = min_t(int, next - partdef,
+-			       sizeof(new_subpart->name) - 1);
+-		strncpy(new_subpart->name, partdef, length);
+-		new_subpart->name[length] = '\0';
+-
+-		partdef = ++next;
+-	} else
+-		new_subpart->name[0] = '\0';
+-
+-	new_subpart->flags = 0;
+-
+-	if (!strncmp(partdef, "ro", 2)) {
+-		new_subpart->flags |= PF_RDONLY;
+-		partdef += 2;
+-	}
+-
+-	if (!strncmp(partdef, "lk", 2)) {
+-		new_subpart->flags |= PF_POWERUP_LOCK;
+-		partdef += 2;
+-	}
+-
+-	*subpart = new_subpart;
+-	return 0;
+-fail:
+-	kfree(new_subpart);
+-	return ret;
+-}
+-
+-static void free_subpart(struct cmdline_parts *parts)
+-{
+-	struct cmdline_subpart *subpart;
+-
+-	while (parts->subpart) {
+-		subpart = parts->subpart;
+-		parts->subpart = subpart->next_subpart;
+-		kfree(subpart);
+-	}
+-}
+-
+-static int parse_parts(struct cmdline_parts **parts, const char *bdevdef)
+-{
+-	int ret = -EINVAL;
+-	char *next;
+-	int length;
+-	struct cmdline_subpart **next_subpart;
+-	struct cmdline_parts *newparts;
+-	char buf[BDEVNAME_SIZE + 32 + 4];
+-
+-	*parts = NULL;
+-
+-	newparts = kzalloc(sizeof(struct cmdline_parts), GFP_KERNEL);
+-	if (!newparts)
+-		return -ENOMEM;
+-
+-	next = strchr(bdevdef, ':');
+-	if (!next) {
+-		pr_warn("cmdline partition has no block device.");
+-		goto fail;
+-	}
+-
+-	length = min_t(int, next - bdevdef, sizeof(newparts->name) - 1);
+-	strncpy(newparts->name, bdevdef, length);
+-	newparts->name[length] = '\0';
+-	newparts->nr_subparts = 0;
+-
+-	next_subpart = &newparts->subpart;
+-
+-	while (next && *(++next)) {
+-		bdevdef = next;
+-		next = strchr(bdevdef, ',');
+-
+-		length = (!next) ? (sizeof(buf) - 1) :
+-			min_t(int, next - bdevdef, sizeof(buf) - 1);
+-
+-		strncpy(buf, bdevdef, length);
+-		buf[length] = '\0';
+-
+-		ret = parse_subpart(next_subpart, buf);
+-		if (ret)
+-			goto fail;
+-
+-		newparts->nr_subparts++;
+-		next_subpart = &(*next_subpart)->next_subpart;
+-	}
+-
+-	if (!newparts->subpart) {
+-		pr_warn("cmdline partition has no valid partition.");
+-		ret = -EINVAL;
+-		goto fail;
+-	}
+-
+-	*parts = newparts;
+-
+-	return 0;
+-fail:
+-	free_subpart(newparts);
+-	kfree(newparts);
+-	return ret;
+-}
+-
+-void cmdline_parts_free(struct cmdline_parts **parts)
+-{
+-	struct cmdline_parts *next_parts;
+-
+-	while (*parts) {
+-		next_parts = (*parts)->next_parts;
+-		free_subpart(*parts);
+-		kfree(*parts);
+-		*parts = next_parts;
+-	}
+-}
+-
+-int cmdline_parts_parse(struct cmdline_parts **parts, const char *cmdline)
+-{
+-	int ret;
+-	char *buf;
+-	char *pbuf;
+-	char *next;
+-	struct cmdline_parts **next_parts;
+-
+-	*parts = NULL;
+-
+-	next = pbuf = buf = kstrdup(cmdline, GFP_KERNEL);
+-	if (!buf)
+-		return -ENOMEM;
+-
+-	next_parts = parts;
+-
+-	while (next && *pbuf) {
+-		next = strchr(pbuf, ';');
+-		if (next)
+-			*next = '\0';
+-
+-		ret = parse_parts(next_parts, pbuf);
+-		if (ret)
+-			goto fail;
+-
+-		if (next)
+-			pbuf = ++next;
+-
+-		next_parts = &(*next_parts)->next_parts;
+-	}
+-
+-	if (!*parts) {
+-		pr_warn("cmdline partition has no valid partition.");
+-		ret = -EINVAL;
+-		goto fail;
+-	}
+-
+-	ret = 0;
+-done:
+-	kfree(buf);
+-	return ret;
+-
+-fail:
+-	cmdline_parts_free(parts);
+-	goto done;
+-}
+-
+-struct cmdline_parts *cmdline_parts_find(struct cmdline_parts *parts,
+-					 const char *bdev)
+-{
+-	while (parts && strncmp(bdev, parts->name, sizeof(parts->name)))
+-		parts = parts->next_parts;
+-	return parts;
+-}
+-
+-/*
+- *  add_part()
+- *    0 success.
+- *    1 can not add so many partitions.
+- */
+-void cmdline_parts_set(struct cmdline_parts *parts, sector_t disk_size,
+-		       int slot,
+-		       int (*add_part)(int, struct cmdline_subpart *, void *),
+-		       void *param)
+-
+-{
+-	sector_t from = 0;
+-	struct cmdline_subpart *subpart;
+-
+-	for (subpart = parts->subpart; subpart;
+-	     subpart = subpart->next_subpart, slot++) {
+-		if (subpart->from == (sector_t)(~0ULL))
+-			subpart->from = from;
+-		else
+-			from = subpart->from;
+-
+-		if (from >= disk_size)
+-			break;
+-
+-		if (subpart->size > (disk_size - from))
+-			subpart->size = disk_size - from;
+-
+-		from += subpart->size;
+-
+-		if (add_part(slot, subpart, param))
+-			break;
+-	}
+-}
+diff --git a/block/partitions/Kconfig b/block/partitions/Kconfig
+index 73e1e950d6fa..1a9c61ee4d80 100644
+--- a/block/partitions/Kconfig
++++ b/block/partitions/Kconfig
+@@ -260,10 +260,3 @@ config RK_PARTITION
+ 	  to be able to read the hard diskpartition table format used by Rockchip
+ 	  Soc inside machines with eMMC as main storage disk. Otherwise, as well
+ 	  as you don't know what all this about, say N.
+-
+-config CMDLINE_PARTITION
+-	bool "Command line partition support" if PARTITION_ADVANCED
+-	select CMDLINE_PARSER
+-	help
+-	  Say Y here if you would read the partitions table from bootargs.
+-	  The format for the command line is just like mtdparts.
+diff --git a/block/partitions/Makefile b/block/partitions/Makefile
+index efe4439c5623..d6842b632b61 100644
+--- a/block/partitions/Makefile
++++ b/block/partitions/Makefile
+@@ -7,8 +7,6 @@ obj-$(CONFIG_BLOCK) := check.o
+ obj-$(CONFIG_ACORN_PARTITION) += acorn.o
+ obj-$(CONFIG_AMIGA_PARTITION) += amiga.o
+ obj-$(CONFIG_ATARI_PARTITION) += atari.o
+-obj-$(CONFIG_AIX_PARTITION) += aix.o
+-obj-$(CONFIG_CMDLINE_PARTITION) += cmdline.o
+ obj-$(CONFIG_MAC_PARTITION) += mac.o
+ obj-$(CONFIG_LDM_PARTITION) += ldm.o
+ obj-$(CONFIG_MSDOS_PARTITION) += msdos.o
+diff --git a/block/partitions/check.c b/block/partitions/check.c
+index b7c76e4da75f..a7c678fff0b7 100644
+--- a/block/partitions/check.c
++++ b/block/partitions/check.c
+@@ -34,7 +34,6 @@
+ #include "karma.h"
+ #include "sysv68.h"
+ #include "rk.h"
+-#include "cmdline.h"
+ 
+ int warn_no_part = 1; /*This is ugly: should make genhd removable media aware*/
+ 
+@@ -66,9 +65,6 @@ static int (*check_part[])(struct parsed_partitions *) = {
+ 	adfspart_check_ADFS,
+ #endif
+ 
+-#ifdef CONFIG_CMDLINE_PARTITION
+-	cmdline_partition,
+-#endif
+ #ifdef CONFIG_EFI_PARTITION
+ 	efi_partition,		/* this must come before msdos */
+ #endif
+diff --git a/block/partitions/cmdline.c b/block/partitions/cmdline.c
+deleted file mode 100644
+index 56cf4ffad51e..000000000000
+--- a/block/partitions/cmdline.c
++++ /dev/null
+@@ -1,99 +0,0 @@
+-/*
+- * Copyright (C) 2013 HUAWEI
+- * Author: Cai Zhiyong <caizhiyong@huawei.com>
+- *
+- * Read block device partition table from command line.
+- * The partition used for fixed block device (eMMC) embedded device.
+- * It is no MBR, save storage space. Bootloader can be easily accessed
+- * by absolute address of data on the block device.
+- * Users can easily change the partition.
+- *
+- * The format for the command line is just like mtdparts.
+- *
+- * Verbose config please reference "Documentation/block/cmdline-partition.txt"
+- *
+- */
+-
+-#include <linux/cmdline-parser.h>
+-
+-#include "check.h"
+-#include "cmdline.h"
+-
+-static char *cmdline;
+-static struct cmdline_parts *bdev_parts;
+-
+-static int add_part(int slot, struct cmdline_subpart *subpart, void *param)
+-{
+-	int label_min;
+-	struct partition_meta_info *info;
+-	char tmp[sizeof(info->volname) + 4];
+-	struct parsed_partitions *state = (struct parsed_partitions *)param;
+-
+-	if (slot >= state->limit)
+-		return 1;
+-
+-	put_partition(state, slot, subpart->from >> 9,
+-		      subpart->size >> 9);
+-
+-	info = &state->parts[slot].info;
+-
+-	label_min = min_t(int, sizeof(info->volname) - 1,
+-			  sizeof(subpart->name));
+-	strncpy(info->volname, subpart->name, label_min);
+-	info->volname[label_min] = '\0';
+-
+-	snprintf(tmp, sizeof(tmp), "(%s)", info->volname);
+-	strlcat(state->pp_buf, tmp, PAGE_SIZE);
+-
+-	state->parts[slot].has_info = true;
+-
+-	return 0;
+-}
+-
+-static int __init cmdline_parts_setup(char *s)
+-{
+-	cmdline = s;
+-	return 1;
+-}
+-__setup("blkdevparts=", cmdline_parts_setup);
+-
+-/*
+- * Purpose: allocate cmdline partitions.
+- * Returns:
+- * -1 if unable to read the partition table
+- *  0 if this isn't our partition table
+- *  1 if successful
+- */
+-int cmdline_partition(struct parsed_partitions *state)
+-{
+-	sector_t disk_size;
+-	char bdev[BDEVNAME_SIZE];
+-	struct cmdline_parts *parts;
+-
+-	if (cmdline) {
+-		if (bdev_parts)
+-			cmdline_parts_free(&bdev_parts);
+-
+-		if (cmdline_parts_parse(&bdev_parts, cmdline)) {
+-			cmdline = NULL;
+-			return -1;
+-		}
+-		cmdline = NULL;
+-	}
+-
+-	if (!bdev_parts)
+-		return 0;
+-
+-	bdevname(state->bdev, bdev);
+-	parts = cmdline_parts_find(bdev_parts, bdev);
+-	if (!parts)
+-		return 0;
+-
+-	disk_size = get_capacity(state->bdev->bd_disk) << 9;
+-
+-	cmdline_parts_set(parts, disk_size, 1, add_part, (void *)state);
+-
+-	strlcat(state->pp_buf, "\n", PAGE_SIZE);
+-
+-	return 1;
+-}
+diff --git a/block/partitions/cmdline.h b/block/partitions/cmdline.h
+deleted file mode 100644
+index 26e0f8da1414..000000000000
+--- a/block/partitions/cmdline.h
++++ /dev/null
+@@ -1,2 +0,0 @@
+-
+-int cmdline_partition(struct parsed_partitions *state);
+diff --git a/include/linux/cmdline-parser.h b/include/linux/cmdline-parser.h
+deleted file mode 100644
+index 98e892ef6d5a..000000000000
+--- a/include/linux/cmdline-parser.h
++++ /dev/null
+@@ -1,43 +0,0 @@
+-/*
+- * Parsing command line, get the partitions information.
+- *
+- * Written by Cai Zhiyong <caizhiyong@huawei.com>
+- *
+- */
+-#ifndef CMDLINEPARSEH
+-#define CMDLINEPARSEH
+-
+-#include <linux/blkdev.h>
+-
+-/* partition flags */
+-#define PF_RDONLY                   0x01 /* Device is read only */
+-#define PF_POWERUP_LOCK             0x02 /* Always locked after reset */
+-
+-struct cmdline_subpart {
+-	char name[BDEVNAME_SIZE]; /* partition name, such as 'rootfs' */
+-	sector_t from;
+-	sector_t size;
+-	int flags;
+-	struct cmdline_subpart *next_subpart;
+-};
+-
+-struct cmdline_parts {
+-	char name[BDEVNAME_SIZE]; /* block device, such as 'mmcblk0' */
+-	unsigned int nr_subparts;
+-	struct cmdline_subpart *subpart;
+-	struct cmdline_parts *next_parts;
+-};
+-
+-void cmdline_parts_free(struct cmdline_parts **parts);
+-
+-int cmdline_parts_parse(struct cmdline_parts **parts, const char *cmdline);
+-
+-struct cmdline_parts *cmdline_parts_find(struct cmdline_parts *parts,
+-					 const char *bdev);
+-
+-void cmdline_parts_set(struct cmdline_parts *parts, sector_t disk_size,
+-		       int slot,
+-		       int (*add_part)(int, struct cmdline_subpart *, void *),
+-		       void *param);
+-
+-#endif /* CMDLINEPARSEH */
+-- 
+2.35.3
+

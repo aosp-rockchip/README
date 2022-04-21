@@ -1,0 +1,179 @@
+From b523f5838630b8b21df2f6ce68c7bba3b56c6fdf Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 15 Jan 2020 15:42:29 +0800
+Subject: [PATCH] media: rockchip: isp: add csi sof event
+
+Change-Id: I28f430424110c504b999f2b9a87314cfbab26eac
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/capture.c | 30 ++++++++------
+ drivers/media/platform/rockchip/isp/csi.c     | 39 ++++++++++++++++++-
+ drivers/media/platform/rockchip/isp/csi.h     |  3 ++
+ drivers/media/platform/rockchip/isp/rkisp.c   |  2 +-
+ drivers/media/platform/rockchip/isp/rkisp.h   |  2 +
+ 5 files changed, 62 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index fcb913e5fad8..5d0e10326a13 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -3106,6 +3106,7 @@ void rkisp_mipi_v20_isr(unsigned int phy, unsigned int packet,
+ {
+ 	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
+ 	struct rkisp_stream *stream;
++	int i;
+ 
+ 	v4l2_dbg(3, rkisp_debug, &dev->v4l2_dev,
+ 		 "csi state:0x%x\n", state);
+@@ -3120,19 +3121,24 @@ void rkisp_mipi_v20_isr(unsigned int phy, unsigned int packet,
+ 	if (state & MIPI_DROP_FRM)
+ 		v4l2_warn(v4l2_dev, "MIPI drop frame\n");
+ 
+-	if (state & RAW0_WR_FRAME) {
+-		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX0];
+-		atomic_inc_return(&stream->sequence);
+-	}
+-
+-	if (state & RAW1_WR_FRAME) {
+-		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX1];
+-		atomic_inc_return(&stream->sequence);
++	/* first Y_STATE irq as csi sof event */
++	if (state & (RAW0_Y_STATE | RAW1_Y_STATE | RAW2_Y_STATE)) {
++		for (i = 0; i < HDR_DMA_MAX; i++) {
++			if (!((RAW0_Y_STATE << i) & state) ||
++			    dev->csi_dev.tx_first[i])
++				continue;
++			dev->csi_dev.tx_first[i] = true;
++			rkisp_csi_sof(dev, i);
++			stream = &dev->cap_dev.stream[i + RKISP_STREAM_DMATX0];
++			atomic_inc(&stream->sequence);
++		}
+ 	}
+-
+-	if (state & RAW2_WR_FRAME) {
+-		stream = &dev->cap_dev.stream[RKISP_STREAM_DMATX2];
+-		atomic_inc_return(&stream->sequence);
++	if (state & (RAW0_WR_FRAME | RAW1_WR_FRAME | RAW2_WR_FRAME)) {
++		for (i = 0; i < HDR_DMA_MAX; i++) {
++			if (!((RAW0_WR_FRAME << i) & state))
++				continue;
++			dev->csi_dev.tx_first[i] = false;
++		}
+ 	}
+ 
+ 	if (state & (RAW0_RD_FRAME | RAW1_RD_FRAME | RAW2_RD_FRAME))
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index caaa26c9a65c..a3e9b4f3fdef 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -124,6 +124,15 @@ static int rkisp_csi_get_set_fmt(struct v4l2_subdev *sd,
+ 
+ static int rkisp_csi_s_stream(struct v4l2_subdev *sd, int on)
+ {
++	struct rkisp_csi_device *csi = v4l2_get_subdevdata(sd);
++	struct rkisp_device *dev = csi->ispdev;
++	void __iomem *base = dev->base_addr;
++
++	memset(csi->tx_first, 0, sizeof(csi->tx_first));
++	if (on)
++		writel(SW_Y_STAT_EN, base + CSI2RX_Y_STAT_CTRL);
++	else
++		writel(0, base + CSI2RX_Y_STAT_CTRL);
+ 	return 0;
+ }
+ 
+@@ -436,10 +445,38 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm)
+ 	default://other no support readback
+ 		return;
+ 	}
+-	csi->filt_state[CSI_F_VS] = dma2frm;
++	/* not using isp V_START irq to generate sof event */
++	csi->filt_state[CSI_F_VS] = dma2frm + 1;
+ 	writel(SW_CSI2RX_EN | SW_DMA_2FRM_MODE(dma2frm) | readl(addr), addr);
+ }
+ 
++void rkisp_csi_sof(struct rkisp_device *dev, u8 id)
++{
++	/* to get long frame vc_start */
++	switch (dev->hdr.op_mode) {
++	case HDR_DBG_FRAME1:
++		if (id != HDR_DMA2)
++			return;
++		break;
++	case HDR_DBG_FRAME2:
++	case HDR_FRAMEX2_DDR:
++	case HDR_LINEX2_DDR:
++		if (id != HDR_DMA0)
++			return;
++		break;
++	case HDR_DBG_FRAME3:
++	case HDR_FRAMEX3_DDR:
++	case HDR_LINEX3_DDR:
++		if (id != HDR_DMA1)
++			return;
++		break;
++	default:
++		return;
++	}
++	dev->csi_dev.filt_state[CSI_F_VS] = 1;
++	rkisp_isp_queue_event_sof(&dev->isp_sdev);
++}
++
+ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+ 			       struct v4l2_device *v4l2_dev)
+ {
+diff --git a/drivers/media/platform/rockchip/isp/csi.h b/drivers/media/platform/rockchip/isp/csi.h
+index 5a4aa70088ab..1a00bb6b8c61 100644
+--- a/drivers/media/platform/rockchip/isp/csi.h
++++ b/drivers/media/platform/rockchip/isp/csi.h
+@@ -63,6 +63,7 @@ struct sink_info {
+  * sink: csi link enable flags
+  * mipi_di: Data Identifier (vc[7:6],dt[5:0])
+  * filt_state: multiframe read back mode to filt irq event
++ * tx_first: flags for dmatx first Y_STATE irq
+  */
+ struct rkisp_csi_device {
+ 	struct rkisp_device *ispdev;
+@@ -72,6 +73,7 @@ struct rkisp_csi_device {
+ 	struct sink_info sink[CSI_PAD_MAX - 1];
+ 	u8 mipi_di[CSI_PAD_MAX - 1];
+ 	u8 filt_state[CSI_F_MAX];
++	u8 tx_first[HDR_DMA_MAX];
+ };
+ 
+ int rkisp_register_csi_subdev(struct rkisp_device *dev,
+@@ -80,4 +82,5 @@ void rkisp_unregister_csi_subdev(struct rkisp_device *dev);
+ 
+ int rkisp_csi_config_patch(struct rkisp_device *dev);
+ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm);
++void rkisp_csi_sof(struct rkisp_device *dev, u8 id);
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 344519f566d9..974605cbf2bc 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -1552,7 +1552,7 @@ static int rkisp_subdev_fmt_link_validate(struct v4l2_subdev *sd,
+ }
+ #endif
+ 
+-static void
++void
+ rkisp_isp_queue_event_sof(struct rkisp_isp_subdev *isp)
+ {
+ 	struct v4l2_event event = {
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.h b/drivers/media/platform/rockchip/isp/rkisp.h
+index 449ee71bcac6..228a388b4809 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.h
++++ b/drivers/media/platform/rockchip/isp/rkisp.h
+@@ -149,6 +149,8 @@ int rkisp_update_sensor_info(struct rkisp_device *dev);
+ 
+ u32 rkisp_mbus_pixelcode_to_v4l2(u32 pixelcode);
+ 
++void rkisp_isp_queue_event_sof(struct rkisp_isp_subdev *isp);
++
+ static inline
+ struct ispsd_out_fmt *rkisp_get_ispsd_out_fmt(struct rkisp_isp_subdev *isp_sdev)
+ {
+-- 
+2.35.3
+

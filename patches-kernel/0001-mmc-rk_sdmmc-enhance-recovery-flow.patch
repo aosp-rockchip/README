@@ -1,0 +1,239 @@
+From 013d60efceaf0c51781e7c4be38f0710a34d25ea Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Fri, 10 Jul 2015 14:03:25 +0800
+Subject: [PATCH] mmc: rk_sdmmc: enhance recovery flow
+
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+---
+ drivers/mmc/core/core.c            | 11 ++---
+ drivers/mmc/host/dw_mmc-rockchip.c | 16 ++++++-
+ drivers/mmc/host/rk_sdmmc.c        | 73 ++++++++++++++++++++++++------
+ include/linux/mmc/rk_mmc.h         |  3 ++
+ 4 files changed, 80 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 285949f7d062..b4bd9d33b888 100755
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -407,6 +407,8 @@ static void mmc_get_req_timeout(struct mmc_request *mrq, u32 *timeout)
+ 			 ((mrq->cmd->arg == MMC_DISCARD_ARG) ||
+ 			 (mrq->cmd->arg == MMC_TRIM_ARG))) ?
+ 			 (*timeout = 10000) : (*timeout = 25000);
++		else if (mrq->cmd->opcode == MMC_SWITCH)
++			*timeout = mrq->cmd->cmd_timeout_ms;
+ 		else
+ 			*timeout = 500;
+ 
+@@ -457,11 +459,11 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
+ 					 msecs_to_jiffies(timeout))) {
+ 			cmd = mrq->cmd;
+ 			cmd->error = -ETIMEDOUT;
+-			host->ops->post_tmo(host);
+-			context_info->is_done_rcv = true;
+ 			dev_err(mmc_dev(host),
+ 				"req failed (CMD%u): error = %d, timeout = %dms\n",
+ 				cmd->opcode, cmd->error, timeout);
++			host->ops->post_tmo(host);
++			context_info->is_done_rcv = true;
+ 		}
+ 
+ 		spin_lock_irqsave(&context_info->lock, flags);
+@@ -510,13 +512,10 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
+ 						 msecs_to_jiffies(timeout))) {
+ 			cmd = mrq->cmd;
+ 			cmd->error = -ETIMEDOUT;
+-			host->ops->post_tmo(host);
+-
+ 			dev_err(mmc_dev(host),
+ 				"req failed (CMD%u): error = %d, timeout = %dms\n",
+ 				cmd->opcode, cmd->error, timeout);
+-			if (!cmd->data)
+-				break;
++			host->ops->post_tmo(host);
+ 		}
+ 
+ 		cmd = mrq->cmd;
+diff --git a/drivers/mmc/host/dw_mmc-rockchip.c b/drivers/mmc/host/dw_mmc-rockchip.c
+index ad998fbab545..f0ed5643b2f5 100755
+--- a/drivers/mmc/host/dw_mmc-rockchip.c
++++ b/drivers/mmc/host/dw_mmc-rockchip.c
+@@ -83,8 +83,20 @@ static int dw_mci_rockchip_priv_init(struct dw_mci *host)
+ 					    rockchip_compat[idx].compatible)) {
+ 			priv->ctrl_type = rockchip_compat[idx].ctrl_type;
+ 			host->cid = priv->ctrl_type;
+-			host->grf = syscon_find(host->dev->of_node,
+-						"rockchip,grf");
++			if (priv->ctrl_type == DW_MCI_TYPE_RK3368) {
++				host->grf = syscon_regmap_lookup_by_phandle(
++						host->dev->of_node, "rockchip,grf");
++				if (IS_ERR(host->grf)) {
++					pr_err("No rockchip,grf phandle specified");
++					return PTR_ERR(host->grf);
++				}
++				host->cru = syscon_regmap_lookup_by_phandle(
++					host->dev->of_node, "rockchip,cru");
++				if (IS_ERR(host->cru)) {
++					pr_err("No rockchip,cru phandle specified");
++					return PTR_ERR(host->cru);
++				}
++			}
+ 		}
+ 	}
+ 
+diff --git a/drivers/mmc/host/rk_sdmmc.c b/drivers/mmc/host/rk_sdmmc.c
+index d9138b6a32eb..870c94cc1ec1 100755
+--- a/drivers/mmc/host/rk_sdmmc.c
++++ b/drivers/mmc/host/rk_sdmmc.c
+@@ -1970,12 +1970,13 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ 	struct dw_mci_slot *slot = mmc_priv(mmc);
+ 	struct dw_mci *host = slot->host;
+ 	struct mmc_data	*data;
+-	u32 ret, i, regs, cmd_flags;
++	u32 i, regs, cmd_flags;
+ 	u32 sdio_int;
+ 	unsigned long timeout = 0;
+-	bool ret_timeout = true;
+-	u32 opcode;
++	bool ret_timeout = true, is_retry = false;
++	u32 opcode, offset;
+ 
++	offset = host->cru_reset_offset;
+ 	opcode = host->mrq->cmd->opcode;
+ 	host->cur_slot->mrq = NULL;
+ 	host->mrq = NULL;
+@@ -1985,11 +1986,16 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ 
+ 	if ((opcode == MMC_SEND_TUNING_BLOCK_HS200) ||
+ 	    (opcode == MMC_SEND_TUNING_BLOCK))
+-	    return;
++		return;
+ 
+ 	printk("[%s] -- Timeout recovery procedure start --\n",
+ 		mmc_hostname(host->mmc));
+ 
++	/* unmask irq */
++	mci_writel(host, INTMASK, 0x0);
++
++retry_stop:
++	/* send stop cmd */
+ 	mci_writel(host, CMDARG, 0);
+ 	wmb();
+ 	cmd_flags = SDMMC_CMD_STOP | SDMMC_CMD_RESP_CRC |
+@@ -2000,7 +2006,7 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ 
+ 	mci_writel(host, CMD, cmd_flags | SDMMC_CMD_START);
+ 	wmb();
+-	timeout = jiffies + msecs_to_jiffies(500);
++	timeout = jiffies + msecs_to_jiffies(10);
+ 
+ 	while(ret_timeout) {
+ 		ret_timeout = time_before(jiffies, timeout);
+@@ -2008,13 +2014,29 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ 			break;
+ 	}
+ 
+-	if (false == ret_timeout)
++	if (false == ret_timeout) {
+ 		MMC_DBG_ERR_FUNC(host->mmc, "stop recovery failed![%s]",
+ 				 mmc_hostname(host->mmc));
+-
+-	if (!dw_mci_ctrl_all_reset(host)) {
+-		ret = -ENODEV;
+-		return ;
++		if (host->cid == DW_MCI_TYPE_RK3368) {
++			/* pd_peri mmc AHB bus software reset request */
++			regmap_write(host->cru, host->cru_regsbase,
++					(0x1<<offset)<<16 | (0x1 << offset));
++			mdelay(1);
++			regmap_write(host->cru, host->cru_regsbase,
++					(0x1<<offset)<<16 | (0x0 << offset));
++		} else {
++			/* pd_peri mmc AHB bus software reset request */
++			cru_writel(((0x1<<offset)<<16) | (0x1 << offset),
++					host->cru_regsbase);
++			mdelay(1);
++			cru_writel(((0x1<<offset)<<16) | (0x0 << offset),
++					host->cru_regsbase);
++		}
++	} else {
++		if (!dw_mci_ctrl_all_reset(host))
++			return;
++		if (is_retry == true)
++			goto recovery_end;
+ 	}
+ 
+ #ifdef CONFIG_MMC_DW_IDMAC
+@@ -2024,15 +2046,16 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ #endif
+ 
+ 	/*
+-	* Restore the initial value at FIFOTH register
+-	* And Invalidate the prev_blksz with zero
+-	*/
++	 * Restore the initial value at FIFOTH register
++	 * And Invalidate the prev_blksz with zero
++	 */
+ 	mci_writel(host, FIFOTH, host->fifoth_val);
+ 	host->prev_blksz = 0;
+ 	mci_writel(host, TMOUT, 0xFFFFFFFF);
+ 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
+-	regs = SDMMC_INT_CMD_DONE | SDMMC_INT_DATA_OVER | SDMMC_INT_TXDR
+-			| SDMMC_INT_RXDR | SDMMC_INT_VSI | DW_MCI_ERROR_FLAGS;
++	regs = SDMMC_INT_CMD_DONE | SDMMC_INT_DATA_OVER |
++		SDMMC_INT_TXDR | SDMMC_INT_RXDR | SDMMC_INT_VSI |
++		DW_MCI_ERROR_FLAGS;
+ 	if (!(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO))
+ 		regs |= SDMMC_INT_CD;
+ 
+@@ -2058,7 +2081,13 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
+ 		}
+ 	}
+ 	mci_writel(host, RINTSTS, 0xFFFFFFFF);
++	if (ret_timeout == false) {
++		ret_timeout = true;
++		is_retry = true;
++		goto retry_stop;
++	}
+ 
++recovery_end:
+ 	printk("[%s] -- Timeout recovery procedure finished --\n",
+ 		mmc_hostname(host->mmc));
+ }
+@@ -3949,6 +3978,20 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
+ 	if (of_get_property(np, "assume_removable", NULL))
+ 		mmc_assume_removable = 0;
+ 
++	if (!of_property_read_u32(np, "cru_regsbase", &host->cru_regsbase)) {
++		printk("dw cru_regsbase addr 0x%03x.\n", host->cru_regsbase);
++	} else {
++		pr_err("dw cru_regsbase addr is missing!\n");
++		return ERR_PTR(-1);
++	}
++
++	if (!of_property_read_u32(np, "cru_reset_offset", &host->cru_reset_offset)) {
++		printk("dw cru_reset_offset val %d.\n", host->cru_reset_offset);
++	} else {
++		pr_err("dw cru_reset_offset val is missing!\n");
++		return ERR_PTR(-1);
++	}
++
+ 	return pdata;
+ }
+ 
+diff --git a/include/linux/mmc/rk_mmc.h b/include/linux/mmc/rk_mmc.h
+index a736e4afb859..25cb1473d931 100755
+--- a/include/linux/mmc/rk_mmc.h
++++ b/include/linux/mmc/rk_mmc.h
+@@ -221,6 +221,9 @@ struct dw_mci {
+ 	u32 *regs_buffer;
+ 	const struct dw_mci_rst_ops *rst_ops;
+ 	u32	tune_regsbase;
++	u32	cru_regsbase;
++	u32	cru_reset_offset;
++	struct regmap *cru;
+ };
+ 
+ /* DMA ops for Internal/External DMAC interface */
+-- 
+2.35.3
+

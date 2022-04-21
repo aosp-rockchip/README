@@ -1,0 +1,231 @@
+From 77dbbdc036791c8cf48eaa80201a8cbb92d58bf2 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Thu, 8 Mar 2018 14:44:26 +0800
+Subject: [PATCH] drm/rockchp: rk3328 vop: fix post empty when plug out hdmi
+
+case 1:
+plug in hdmi and power on, after kernel complete and before android
+start(maybe can update simplification boot.img) we plug out hdmi will
+appear error log.
+
+case 2:
+plug in hdmi and power on, at the beginning of drm driver bind, plug out
+hdmi, the hdmi irq maybe at disable state, so the vop is in running
+state which is set at uboot. in this case vop will not to enable clk
+refrerence, after driver probe complete, the unused clk maybe close by
+clk driver framework. this will lead to vop appear error log:
+
+[    4.898107] rockchip-vop ff370000.vop: [drm:vop_crtc_enable] Update mode to 720*288
+[    4.900174] rockchip-vop ff370000.vop: [drm:vop_isr] *ERROR*BUS_ERROR irq err
+
+solution:
+1. disable vop all planes before disable crtc and enable crtc;
+2. disable vop all planes when can't detect connect at power on.
+3. enable dma stop before detach iommu and disable dma stop after attach
+iommu.
+
+Change-Id: Ia981d52c96a274fa177493d10362fd4e395a6707
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c | 34 +++++++++++++++++++--
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 26 +++++++++++++---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h |  1 +
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.c |  2 ++
+ 5 files changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 88b149375f10..f50add350628 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -679,8 +679,9 @@ static void show_loader_logo(struct drm_device *drm_dev)
+ 	struct device_node *np = drm_dev->dev->of_node;
+ 	struct drm_mode_config *mode_config = &drm_dev->mode_config;
+ 	struct device_node *root, *route;
+-	struct rockchip_drm_mode_set *set, *tmp;
++	struct rockchip_drm_mode_set *set, *tmp, *unset;
+ 	struct list_head mode_set_list;
++	struct list_head mode_unset_list;
+ 	unsigned plane_mask = 0;
+ 	int ret;
+ 
+@@ -696,6 +697,7 @@ static void show_loader_logo(struct drm_device *drm_dev)
+ 	}
+ 
+ 	INIT_LIST_HEAD(&mode_set_list);
++	INIT_LIST_HEAD(&mode_unset_list);
+ 	drm_modeset_lock_all(drm_dev);
+ 	state = drm_atomic_state_alloc(drm_dev);
+ 	if (!state) {
+@@ -716,13 +718,41 @@ static void show_loader_logo(struct drm_device *drm_dev)
+ 
+ 		if (setup_initial_state(drm_dev, state, set)) {
+ 			drm_framebuffer_unreference(set->fb);
+-			kfree(set);
++			INIT_LIST_HEAD(&set->head);
++			list_add_tail(&set->head, &mode_unset_list);
+ 			continue;
+ 		}
+ 		INIT_LIST_HEAD(&set->head);
+ 		list_add_tail(&set->head, &mode_set_list);
+ 	}
+ 
++	/*
++	 * the mode_unset_list store the unconnected route, if route's crtc
++	 * isn't used, we should close it.
++	 */
++	list_for_each_entry_safe(unset, tmp, &mode_unset_list, head) {
++		struct rockchip_drm_mode_set *tmp_set;
++		int found_used_crtc = 0;
++
++		list_for_each_entry_safe(set, tmp_set, &mode_set_list, head) {
++			if (set->crtc == unset->crtc) {
++				found_used_crtc = 1;
++				continue;
++			}
++		}
++		if (!found_used_crtc) {
++			struct drm_crtc *crtc = unset->crtc;
++			int pipe = drm_crtc_index(crtc);
++			struct rockchip_drm_private *priv =
++							drm_dev->dev_private;
++
++			if (unset->hdisplay && unset->vdisplay)
++				priv->crtc_funcs[pipe]->crtc_close(crtc);
++		}
++		list_del(&unset->head);
++		kfree(unset);
++	}
++
+ 	if (list_empty(&mode_set_list)) {
+ 		dev_warn(drm_dev->dev, "can't not find any loader display\n");
+ 		ret = -ENXIO;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 7c090c97bf83..cd1500604f36 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -52,6 +52,7 @@ struct rockchip_crtc_funcs {
+ 	enum drm_mode_status (*mode_valid)(struct drm_crtc *crtc,
+ 					   const struct drm_display_mode *mode,
+ 					   int output_type);
++	void (*crtc_close)(struct drm_crtc *crtc);
+ };
+ 
+ struct drm_rockchip_subdrv {
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 898e85f8552f..f7edd04728c3 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -1344,6 +1344,7 @@ static void vop_crtc_disable(struct drm_crtc *crtc)
+ 
+ 	mutex_lock(&vop->vop_lock);
+ 	drm_crtc_vblank_off(crtc);
++	vop_disable_all_planes(vop);
+ 
+ 	/*
+ 	 * Vop standby will take effect at end of current frame,
+@@ -1373,6 +1374,7 @@ static void vop_crtc_disable(struct drm_crtc *crtc)
+ 		/*
+ 		 * vop standby complete, so iommu detach is safe.
+ 		 */
++		VOP_CTRL_SET(vop, dma_stop, 1);
+ 		rockchip_drm_dma_detach_device(vop->drm_dev, vop->dev);
+ 		vop->is_iommu_enabled = false;
+ 	}
+@@ -2290,6 +2292,16 @@ static size_t vop_crtc_bandwidth(struct drm_crtc *crtc,
+ 	return bandwidth;
+ }
+ 
++static void vop_crtc_close(struct drm_crtc *crtc)
++{
++	struct vop *vop = NULL;
++
++	if (!crtc)
++		return;
++	vop = to_vop(crtc);
++	vop_disable_all_planes(vop);
++}
++
+ static const struct rockchip_crtc_funcs private_crtc_funcs = {
+ 	.loader_protect = vop_crtc_loader_protect,
+ 	.enable_vblank = vop_crtc_enable_vblank,
+@@ -2300,6 +2312,7 @@ static const struct rockchip_crtc_funcs private_crtc_funcs = {
+ 	.regs_dump = vop_crtc_regs_dump,
+ 	.mode_valid = vop_crtc_mode_valid,
+ 	.bandwidth = vop_crtc_bandwidth,
++	.crtc_close = vop_crtc_close,
+ };
+ 
+ static bool vop_crtc_mode_fixup(struct drm_crtc *crtc,
+@@ -2450,20 +2463,24 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 				SYS_STATUS_LCDC1 : SYS_STATUS_LCDC0;
+ 	uint32_t val;
+ 	int act_end;
++	bool interlaced = !!(adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE);
+ 
+ 	rockchip_set_system_status(sys_status);
+ 	mutex_lock(&vop->vop_lock);
++	DRM_DEV_INFO(vop->dev, "Update mode to %dx%d%s%d, type: %d\n",
++		     hdisplay, vdisplay, interlaced ? "i" : "p",
++		     adjusted_mode->vrefresh, s->output_type);
+ 	vop_initial(crtc);
+-
++	vop_disable_allwin(vop);
+ 	VOP_CTRL_SET(vop, standby, 0);
+-	vop_disable_all_planes(vop);
++	vop->mode_update = vop_crtc_mode_update(crtc);
++	if (vop->mode_update)
++		vop_disable_all_planes(vop);
+ 	/*
+ 	 * restore the lut table.
+ 	 */
+ 	if (vop->lut_active)
+ 		vop_crtc_load_lut(crtc);
+-	vop->mode_update = vop_crtc_mode_update(crtc);
+-	DRM_DEV_INFO(vop->dev, "Update mode to %d*%d\n", hdisplay, vdisplay);
+ 	VOP_CTRL_SET(vop, dclk_pol, 1);
+ 	val = (adjusted_mode->flags & DRM_MODE_FLAG_NHSYNC) ?
+ 		   0 : BIT(HSYNC_POSITIVE);
+@@ -3219,6 +3236,7 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 				ret);
+ 		} else {
+ 			vop->is_iommu_enabled = true;
++			VOP_CTRL_SET(vop, dma_stop, 0);
+ 		}
+ 
+ 		if (need_wait_vblank) {
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index 61760b233e7d..e8b14e4036d1 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -102,6 +102,7 @@ struct vop_csc {
+ struct vop_ctrl {
+ 	struct vop_reg version;
+ 	struct vop_reg standby;
++	struct vop_reg dma_stop;
+ 	struct vop_reg axi_outstanding_max_num;
+ 	struct vop_reg axi_max_outstanding_en;
+ 	struct vop_reg htotal_pw;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+index 21cc1cadddc5..ecfacd2022ac 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+@@ -174,6 +174,7 @@ static const struct vop_win_phy *rk3288_area_data[] = {
+ static const struct vop_ctrl rk3288_ctrl_data = {
+ 	.version = VOP_REG(RK3288_VERSION_INFO, 0xffff, 16),
+ 	.standby = VOP_REG(RK3288_SYS_CTRL, 0x1, 22),
++	.dma_stop = VOP_REG(RK3288_SYS_CTRL, 0x1, 21),
+ 	.axi_outstanding_max_num = VOP_REG(RK3288_SYS_CTRL1, 0x1f, 13),
+ 	.axi_max_outstanding_en = VOP_REG(RK3288_SYS_CTRL1, 0x1, 12),
+ 	.reg_done_frm = VOP_REG_VER(RK3288_SYS_CTRL1, 0x1, 24, 3, 7, -1),
+@@ -880,6 +881,7 @@ static const struct vop_hdr_table rk3328_hdr_table = {
+ 
+ static const struct vop_ctrl rk3328_ctrl_data = {
+ 	.standby = VOP_REG(RK3328_SYS_CTRL, 0x1, 22),
++	.dma_stop = VOP_REG(RK3328_SYS_CTRL, 0x1, 21),
+ 	.axi_outstanding_max_num = VOP_REG(RK3328_SYS_CTRL1, 0x1f, 13),
+ 	.axi_max_outstanding_en = VOP_REG(RK3328_SYS_CTRL1, 0x1, 12),
+ 	.reg_done_frm = VOP_REG(RK3328_SYS_CTRL1, 0x1, 24),
+-- 
+2.35.3
+

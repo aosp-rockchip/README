@@ -1,0 +1,288 @@
+From 8f79d1610bfcb192c84008e1216aa1839bc782a7 Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Wed, 25 Apr 2012 14:15:19 +0800
+Subject: [PATCH] rk30 fb: add IOCTL and sys interface for overlay control
+
+---
+ drivers/video/rockchip/chips/rk30_lcdc.c | 59 ++++++++++++++++++++----
+ drivers/video/rockchip/rk_fb.c           | 28 +++++++++--
+ drivers/video/rockchip/rkfb_sysfs.c      | 40 ++++++++++++++++
+ include/linux/rk_fb.h                    | 17 ++++---
+ 4 files changed, 123 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index 8e1cd6ba6c97..b18a10f0df13 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -511,6 +511,7 @@ static int rk30_lcdc_open(struct rk_lcdc_device_driver *dev_drv,int layer_id,boo
+ 
+ 	return 0;
+ }
++
+ static int rk30_lcdc_set_par(struct rk_lcdc_device_driver *dev_drv,int layer_id)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+@@ -588,9 +589,10 @@ int rk30_lcdc_ioctl(struct rk_lcdc_device_driver * dev_drv,unsigned int cmd, uns
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	u32 panel_size[2];
+ 	void __user *argp = (void __user *)arg;
++	int ret = 0;
+ 	switch(cmd)
+ 	{
+-		case FB1_IOCTL_GET_PANEL_SIZE:    //get panel size
++		case FBIOGET_PANEL_SIZE:    //get panel size
+                 	panel_size[0] = lcdc_dev->screen->x_res;
+                 	panel_size[1] = lcdc_dev->screen->y_res;
+             		if(copy_to_user(argp, panel_size, 8)) 
+@@ -600,26 +602,64 @@ int rk30_lcdc_ioctl(struct rk_lcdc_device_driver * dev_drv,unsigned int cmd, uns
+ 			break;
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ static int rk30_lcdc_get_layer_state(struct rk_lcdc_device_driver *dev_drv,int layer_id)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+ 	struct layer_par *par = dev_drv->layer_par[layer_id];
+ 
+-	if(layer_id == 0)
+-	{
+-		par->state = LcdReadBit(lcdc_dev,SYS_CTRL1,m_W0_EN);
+-	}
+-	else if( layer_id == 1)
++	spin_lock(&lcdc_dev->reg_lock);
++	if(lcdc_dev->clk_on)
+ 	{
+-		par->state = LcdReadBit(lcdc_dev,SYS_CTRL1,m_W1_EN);
++		if(layer_id == 0)
++		{
++			par->state = LcdReadBit(lcdc_dev,SYS_CTRL1,m_W0_EN);
++		}
++		else if( layer_id == 1)
++		{
++			par->state = LcdReadBit(lcdc_dev,SYS_CTRL1,m_W1_EN);
++		}
+ 	}
+-
++	spin_unlock(&lcdc_dev->reg_lock);
++	
+ 	return par->state;
+ 	
+ }
+ 
++/***********************************
++overlay manager
++swap:1 win0 on the top of win1
++        0 win1 on the top of win0
++set  : 1 set overlay 
++        0 get overlay state
++************************************/
++static int rk30_ovl_mgr(struct rk_lcdc_device_driver *dev_drv,int swap,bool set)
++{
++	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
++	int ovl;
++	spin_lock(&lcdc_dev->reg_lock);
++	if(lcdc_dev->clk_on)
++	{
++		if(set)  //set overlay
++		{
++			LcdMskReg(lcdc_dev,DSP_CTRL0,m_W0W1_POSITION_SWAP,v_W0W1_POSITION_SWAP(swap));
++			LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);
++			ovl = swap;
++		}
++		else  //get overlay
++		{
++			ovl = LcdReadBit(lcdc_dev,DSP_CTRL0,m_W0W1_POSITION_SWAP);
++		}
++	}
++	else
++	{
++		ovl = -EPERM;
++	}
++	spin_unlock(&lcdc_dev->reg_lock);
++
++	return ovl;
++}
+ static int rk30_get_disp_info(struct rk_lcdc_device_driver *dev_drv,int layer_id)
+ {
+ 	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
+@@ -690,6 +730,7 @@ static struct rk_lcdc_device_driver lcdc_driver = {
+ 	.pan_display            = rk30_lcdc_pan_display,
+ 	.load_screen		= rk30_load_screen,
+ 	.get_layer_state	= rk30_lcdc_get_layer_state,
++	.ovl_mgr		= rk30_ovl_mgr,
+ 	.get_disp_info		= rk30_get_disp_info,
+ };
+ #ifdef CONFIG_PM
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index 0a3473d01168..9fd427d51c6a 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -232,17 +232,19 @@ static int rk_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+ }
+ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ {
+- 	struct rk_fb_inf *inf = dev_get_drvdata(info->device);
+ 	struct fb_fix_screeninfo *fix = &info->fix;
+ 	struct rk_lcdc_device_driver *dev_drv = (struct rk_lcdc_device_driver * )info->par;
+ 	u32 yuv_phy[2];
++	int layer_id = get_fb_layer_id(&info->fix);
++	int enable; // enable fb:1 enable;0 disable 
++	int ovl;	//overlay:0 win1 on the top of win0;1,win0 on the top of win1
+ 	void __user *argp = (void __user *)arg;
+ 	
+ 	switch(cmd)
+ 	{
+  		case FBIOPUT_FBPHYADD:
+ 			return info->fix.smem_start;
+-		case FB1_IOCTL_SET_YUV_ADDR:   //when in video mode, buff alloc by android
++		case FBIOSET_YUV_ADDR:   //when in video mode, buff alloc by android
+ 			if((!strcmp(fix->id,"fb1"))||(!strcmp(fix->id,"fb3")))
+ 			{
+ 				if (copy_from_user(yuv_phy, argp, 8))
+@@ -251,8 +253,24 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ 				info->fix.mmio_start = yuv_phy[1];  //four uv
+ 			}
+ 			break;
++		case FBIOSET_ENABLE:
++			if (copy_from_user(&enable, argp, 1))
++				return -EFAULT;
++			dev_drv->open(dev_drv,layer_id,enable);
++			break;
++		case FBIOGET_ENABLE:
++			enable = dev_drv->get_layer_state(dev_drv,layer_id);
++			if(copy_to_user(argp,&enable,1))
++				return -EFAULT;
++			break;
++		case FBIOSET_OVERLAY_STATE:
++			if (copy_from_user(&ovl, argp, 1))
++				return -EFAULT;
++			dev_drv->ovl_mgr(dev_drv,ovl,1);
+ 		case FBIOGET_OVERLAY_STATE:
+-			return inf->video_mode;
++			ovl = dev_drv->ovl_mgr(dev_drv,0,0);
++			if (copy_to_user(argp, &ovl, 1))
++				return -EFAULT;
+ 		case FBIOGET_SCREEN_STATE:
+ 		case FBIOPUT_SET_CURSOR_EN:
+ 		case FBIOPUT_SET_CURSOR_POS:
+@@ -265,9 +283,8 @@ static int rk_fb_ioctl(struct fb_info *info, unsigned int cmd,unsigned long arg)
+ 		case FBIOGET_16OR32:
+ 		case FBIOGET_IDLEFBUff_16OR32:
+ 		case FBIOSET_COMPOSE_LAYER_COUNTS:
+-		case FBIOGET_COMPOSE_LAYER_COUNTS:
+         	default:
+-			dev_drv->ioctl(dev_drv,cmd,arg,0);
++			dev_drv->ioctl(dev_drv,cmd,arg,layer_id);
+             break;
+     }
+     return 0;
+@@ -812,6 +829,7 @@ static int init_lcdc_device_driver(struct rk_lcdc_device_driver *dev_drv,
+ 	dev_drv->num_layer	= def_drv->num_layer;
+ 	dev_drv->get_layer_state= def_drv->get_layer_state;
+ 	dev_drv->get_disp_info  = def_drv->get_disp_info;
++	dev_drv->ovl_mgr	= def_drv->ovl_mgr;
+ 	init_layer_par(dev_drv);
+ 	init_completion(&dev_drv->frame_done);
+ 	spin_lock_init(&dev_drv->cpl_lock);
+diff --git a/drivers/video/rockchip/rkfb_sysfs.c b/drivers/video/rockchip/rkfb_sysfs.c
+index ed73d4366da6..17f8fafa746a 100644
+--- a/drivers/video/rockchip/rkfb_sysfs.c
++++ b/drivers/video/rockchip/rkfb_sysfs.c
+@@ -113,12 +113,52 @@ static ssize_t set_fb_state(struct device *dev,struct device_attribute *attr,
+ 	return count;
+ }
+ 
++static ssize_t show_overlay(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_lcdc_device_driver * dev_drv = 
++		(struct rk_lcdc_device_driver * )fbi->par;
++	int ovl;
++	ovl =  dev_drv->ovl_mgr(dev_drv,0,0);
++	if(ovl < 0)
++	{
++		return ovl;
++	}
++
++	return snprintf(buf, PAGE_SIZE, "%s\n",
++		ovl?"win0 on the top of win1":"win1 on the top of win0");
++	
++}
++static ssize_t set_overlay(struct device *dev,struct device_attribute *attr,
++	const char *buf, size_t count)
++{
++	struct fb_info *fbi = dev_get_drvdata(dev);
++	struct rk_lcdc_device_driver * dev_drv = 
++		(struct rk_lcdc_device_driver * )fbi->par;
++	int ovl;
++	int ret;
++	ret = kstrtoint(buf, 0, &ovl);
++	if(ret)
++	{
++		return ret;
++	}
++	ret = dev_drv->ovl_mgr(dev_drv,ovl,1);
++	if(ret < 0)
++	{
++		return ret;
++	}
++
++	return count;
++}
++
+ static struct device_attribute rkfb_attrs[] = {
+ 	__ATTR(phys_addr, S_IRUGO, show_phys, NULL),
+ 	__ATTR(virt_addr, S_IRUGO, show_virt, NULL),
+ 	__ATTR(disp_info, S_IRUGO, show_disp_info, NULL),
+ 	__ATTR(screen_info, S_IRUGO, show_screen_info, NULL),
+ 	__ATTR(enable, S_IRUGO | S_IWUSR, show_fb_state, set_fb_state),
++	__ATTR(overlay, S_IRUGO | S_IWUSR, show_overlay, set_overlay),
+ };
+ 
+ int rkfb_create_sysfs(struct fb_info *fbi)
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 673365dbfce6..bc909f9ee470 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -36,18 +36,20 @@
+ #define FB_WIMO_FLAG
+ #endif
+ #ifdef FB_WIMO_FLAG
+-#define FB0_IOCTL_SET_BUF					0x6017
++#define FB0_IOCTL_SET_BUF				0x6017
+ #define FB0_IOCTL_COPY_CURBUF				0x6018
+ #define FB0_IOCTL_CLOSE_BUF				0x6019
+ #endif
+ 
+-#define FB1_IOCTL_GET_PANEL_SIZE		0x5001
+-#define FB1_IOCTL_SET_YUV_ADDR			0x5002
++#define FBIOGET_PANEL_SIZE		0x5001
++#define FBIOSET_YUV_ADDR		0x5002
+ //#define FB1_TOCTL_SET_MCU_DIR			0x5003
+-#define FB1_IOCTL_SET_ROTATE            0x5003
+-#define FB1_IOCTL_SET_I2P_ODD_ADDR      0x5005
+-#define FB1_IOCTL_SET_I2P_EVEN_ADDR     0x5006
+-#define FB1_IOCTL_SET_WIN0_TOP          0x5018
++#define FBIOSET_ROTATE            	0x5003
++#define FB_IOCTL_SET_I2P_ODD_ADDR       0x5005
++#define FB_IOCTL_SET_I2P_EVEN_ADDR      0x5006
++#define FBIOSET_OVERLAY_STATE     	0x5018
++#define FBIOSET_ENABLE			0x5019	
++#define FBIOGET_ENABLE			0x5020
+ 
+ /********************************************************************
+ **              display output interface supported by rk lcdc                       *
+@@ -209,6 +211,7 @@ struct rk_lcdc_device_driver{
+ 	int (*get_disp_info)(struct rk_lcdc_device_driver *dev_drv,int layer_id);
+ 	int (*load_screen)(struct rk_lcdc_device_driver *dev_drv, bool initscreen);
+ 	int (*get_layer_state)(struct rk_lcdc_device_driver *dev_drv,int layer_id);
++	int (*ovl_mgr)(struct rk_lcdc_device_driver *dev_drv,int swap,bool set);  //overlay manager
+ 	
+ };
+ 
+-- 
+2.35.3
+

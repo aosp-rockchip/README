@@ -1,0 +1,912 @@
+From 467dd9f46635951ec2e65bd6c254961e46d12a03 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Tue, 19 Sep 2017 14:16:03 +0800
+Subject: [PATCH] drm/rockchip: vop: add HDR for rk3328
+
+Change-Id: Id5f7e627c3a7ec00d5b7a413b0d1d4e8f64e53e0
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c |   5 +
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  24 ++
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 235 +++++++++++++++-
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h |  69 +++++
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.c | 294 +++++++++++++++++++-
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.h |  15 +
+ include/uapi/drm/rockchip_drm.h             |   2 +
+ 7 files changed, 632 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index 8459eccc3033..ab11b5cebdcf 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -1095,6 +1095,11 @@ static int rockchip_drm_create_properties(struct drm_device *dev)
+ 	if (!prop)
+ 		return -ENOMEM;
+ 	private->cabc_calc_pixel_num_property = prop;
++	prop = drm_property_create_range(dev, DRM_MODE_PROP_ATOMIC,
++					 "EOTF", 0, 5);
++	if (!prop)
++		return -ENOMEM;
++	private->eotf_prop = prop;
+ 
+ 	return drm_mode_create_tv_properties(dev, 0, NULL);
+ }
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 7f01c908b441..a300821594a9 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -76,6 +76,26 @@ struct rockchip_dclk_pll {
+ 	unsigned int use_count;
+ };
+ 
++struct rockchip_sdr2hdr_state {
++	int sdr2hdr_func;
++
++	bool bt1886eotf_pre_conv_en;
++	bool rgb2rgb_pre_conv_en;
++	bool rgb2rgb_pre_conv_mode;
++	bool st2084oetf_pre_conv_en;
++
++	bool bt1886eotf_post_conv_en;
++	bool rgb2rgb_post_conv_en;
++	bool rgb2rgb_post_conv_mode;
++	bool st2084oetf_post_conv_en;
++};
++
++struct rockchip_hdr_state {
++	bool pre_overlay;
++	bool hdr2sdr_en;
++	struct rockchip_sdr2hdr_state sdr2hdr_state;
++};
++
+ struct rockchip_crtc_state {
+ 	struct drm_crtc_state base;
+ 	struct drm_property_blob *cabc_lut;
+@@ -100,6 +120,9 @@ struct rockchip_crtc_state {
+ 	int output_mode;
+ 	int output_flags;
+ 	int bus_format;
++	bool yuv_overlay;
++	int eotf;
++	struct rockchip_hdr_state hdr;
+ };
+ 
+ #define to_rockchip_crtc_state(s) \
+@@ -142,6 +165,7 @@ struct rockchip_drm_private {
+ 	struct drm_property *cabc_stage_down_property;
+ 	struct drm_property *cabc_global_dn_property;
+ 	struct drm_property *cabc_calc_pixel_num_property;
++	struct drm_property *eotf_prop;
+ 	void *backlight;
+ 	struct drm_fb_helper *fbdev_helper;
+ 	struct drm_gem_object *fbdev_bo;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 6c389eb8d7cd..8f662fd82fce 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -158,6 +158,7 @@ struct vop_plane_state {
+ 	const uint32_t *y2r_table;
+ 	const uint32_t *r2r_table;
+ 	const uint32_t *r2y_table;
++	int eotf;
+ 	bool enable;
+ };
+ 
+@@ -173,6 +174,7 @@ struct vop_win {
+ 	const struct vop_csc *csc;
+ 	const uint32_t *data_formats;
+ 	uint32_t nformats;
++	u64 feature;
+ 	struct vop *vop;
+ 
+ 	struct drm_property *rotation_prop;
+@@ -320,6 +322,76 @@ static inline uint32_t vop_get_intr_type(struct vop *vop,
+ 	return ret;
+ }
+ 
++static void vop_load_hdr2sdr_table(struct vop *vop)
++{
++	int i;
++	const struct vop_hdr_table *table = vop->data->hdr_table;
++	uint32_t hdr2sdr_eetf_oetf_yn[33];
++
++	for (i = 0; i < 33; i++)
++		hdr2sdr_eetf_oetf_yn[i] = table->hdr2sdr_eetf_yn[i] +
++				(table->hdr2sdr_bt1886oetf_yn[i] << 16);
++
++	vop_writel(vop, table->hdr2sdr_eetf_oetf_y0_offset,
++		   hdr2sdr_eetf_oetf_yn[0]);
++	for (i = 1; i < 33; i++)
++		vop_writel(vop,
++			   table->hdr2sdr_eetf_oetf_y1_offset + (i - 1) * 4,
++			   hdr2sdr_eetf_oetf_yn[i]);
++
++	vop_writel(vop, table->hdr2sdr_sat_y0_offset,
++		   table->hdr2sdr_sat_yn[0]);
++	for (i = 1; i < 9; i++)
++		vop_writel(vop, table->hdr2sdr_sat_y1_offset + (i - 1) * 4,
++			   table->hdr2sdr_sat_yn[i]);
++
++	VOP_CTRL_SET(vop, hdr2sdr_src_min, table->hdr2sdr_src_range_min);
++	VOP_CTRL_SET(vop, hdr2sdr_src_max, table->hdr2sdr_src_range_max);
++	VOP_CTRL_SET(vop, hdr2sdr_normfaceetf, table->hdr2sdr_normfaceetf);
++	VOP_CTRL_SET(vop, hdr2sdr_dst_min, table->hdr2sdr_dst_range_min);
++	VOP_CTRL_SET(vop, hdr2sdr_dst_max, table->hdr2sdr_dst_range_max);
++	VOP_CTRL_SET(vop, hdr2sdr_normfacgamma, table->hdr2sdr_normfacgamma);
++}
++
++static void vop_load_sdr2hdr_table(struct vop *vop, uint32_t cmd)
++{
++	int i;
++	const struct vop_hdr_table *table = vop->data->hdr_table;
++	uint32_t sdr2hdr_eotf_oetf_yn[65];
++	uint32_t sdr2hdr_oetf_dx_dxpow[64];
++
++	for (i = 0; i < 65; i++) {
++		if (cmd == SDR2HDR_FOR_BT2020)
++			sdr2hdr_eotf_oetf_yn[i] =
++				table->sdr2hdr_bt1886eotf_yn_for_bt2020[i] +
++				(table->sdr2hdr_st2084oetf_yn_for_bt2020[i] << 18);
++		else if (cmd == SDR2HDR_FOR_HDR)
++			sdr2hdr_eotf_oetf_yn[i] =
++				table->sdr2hdr_bt1886eotf_yn_for_hdr[i] +
++				(table->sdr2hdr_st2084oetf_yn_for_hdr[i] << 18);
++		else if (cmd == SDR2HDR_FOR_HLG_HDR)
++			sdr2hdr_eotf_oetf_yn[i] =
++				table->sdr2hdr_bt1886eotf_yn_for_hlg_hdr[i] +
++				(table->sdr2hdr_st2084oetf_yn_for_hlg_hdr[i] << 18);
++	}
++	vop_writel(vop, table->sdr2hdr_eotf_oetf_y0_offset,
++		   sdr2hdr_eotf_oetf_yn[0]);
++	for (i = 1; i < 65; i++)
++		vop_writel(vop, table->sdr2hdr_eotf_oetf_y1_offset +
++			   (i - 1) * 4, sdr2hdr_eotf_oetf_yn[i]);
++
++	for (i = 0; i < 64; i++) {
++		sdr2hdr_oetf_dx_dxpow[i] = table->sdr2hdr_st2084oetf_dxn[i] +
++				(table->sdr2hdr_st2084oetf_dxn_pow2[i] << 16);
++		vop_writel(vop, table->sdr2hdr_oetf_dx_dxpow1_offset + i * 4,
++			   sdr2hdr_oetf_dx_dxpow[i]);
++	}
++
++	for (i = 0; i < 63; i++)
++		vop_writel(vop, table->sdr2hdr_oetf_xn1_offset + i * 4,
++			   table->sdr2hdr_st2084oetf_xn[i]);
++}
++
+ static void vop_load_csc_table(struct vop *vop, u32 offset, const u32 *table)
+ {
+ 	int i;
+@@ -622,6 +694,83 @@ static void scl_vop_cal_scl_fac(struct vop *vop, struct vop_win *win,
+ 	}
+ }
+ 
++/*
++ * rk3328 HDR/CSC path
++ *
++ * HDR/SDR --> win0  --> HDR2SDR ----\
++ *		  \		      MUX --\
++ *                 \ --> SDR2HDR/CSC--/      \
++ *                                            \
++ * SDR --> win1 -->pre_overlay ->SDR2HDR/CSC --> post_ovrlay-->post CSC-->output
++ * SDR --> win2 -/
++ *
++ */
++
++static int vop_hdr_atomic_check(struct drm_crtc *crtc,
++				struct drm_crtc_state *crtc_state)
++{
++	struct drm_atomic_state *state = crtc_state->state;
++	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
++	struct drm_plane_state *pstate;
++	struct drm_plane *plane;
++	struct vop *vop = to_vop(crtc);
++	int pre_sdr2hdr_state = 0, post_sdr2hdr_state = 0;
++	int pre_sdr2hdr_mode = 0, post_sdr2hdr_mode = 0, sdr2hdr_func = 0;
++	bool pre_overlay = 0;
++	int hdr2sdr_en = 0, plane_id = 0;
++
++	if (!vop->data->hdr_table)
++		return 0;
++	/* hdr cover */
++	s->yuv_overlay = is_yuv_output(s->bus_format);
++	drm_atomic_crtc_state_for_each_plane(plane, crtc_state) {
++		struct vop_plane_state *vop_plane_state;
++		struct vop_win *win = to_vop_win(plane);
++
++		pstate = drm_atomic_get_plane_state(state, plane);
++		if (IS_ERR(pstate))
++			return PTR_ERR(pstate);
++		vop_plane_state = to_vop_plane_state(pstate);
++		if (!pstate->fb)
++			continue;
++
++		if (vop_plane_state->eotf > s->eotf)
++			if (win->feature & WIN_FEATURE_HDR2SDR)
++				hdr2sdr_en = 1;
++		if (vop_plane_state->eotf < s->eotf) {
++			if (win->feature & WIN_FEATURE_PRE_OVERLAY)
++				pre_sdr2hdr_state |= BIT(plane_id);
++			else
++				post_sdr2hdr_state |= BIT(plane_id);
++		}
++		plane_id++;
++	}
++
++	if (pre_sdr2hdr_state || post_sdr2hdr_state || hdr2sdr_en) {
++		pre_overlay = 1;
++		pre_sdr2hdr_mode = BT709_TO_BT2020;
++		post_sdr2hdr_mode = BT709_TO_BT2020;
++		sdr2hdr_func = SDR2HDR_FOR_HDR;
++	}
++	s->hdr.pre_overlay = pre_overlay;
++	s->hdr.hdr2sdr_en = hdr2sdr_en;
++	if (s->hdr.pre_overlay)
++		s->yuv_overlay = 0;
++
++	s->hdr.sdr2hdr_state.bt1886eotf_pre_conv_en = !!pre_sdr2hdr_state;
++	s->hdr.sdr2hdr_state.rgb2rgb_pre_conv_en = !!pre_sdr2hdr_state;
++	s->hdr.sdr2hdr_state.rgb2rgb_pre_conv_mode = pre_sdr2hdr_mode;
++	s->hdr.sdr2hdr_state.st2084oetf_pre_conv_en = !!pre_sdr2hdr_state;
++
++	s->hdr.sdr2hdr_state.bt1886eotf_post_conv_en = !!post_sdr2hdr_state;
++	s->hdr.sdr2hdr_state.rgb2rgb_post_conv_en = !!post_sdr2hdr_state;
++	s->hdr.sdr2hdr_state.rgb2rgb_post_conv_mode = post_sdr2hdr_mode;
++	s->hdr.sdr2hdr_state.st2084oetf_post_conv_en = !!post_sdr2hdr_state;
++	s->hdr.sdr2hdr_state.sdr2hdr_func = sdr2hdr_func;
++
++	return 0;
++}
++
+ /*
+  * rk3399 colorspace path:
+  *      Input        Win csc                     Output
+@@ -1443,6 +1592,10 @@ static int vop_atomic_plane_set_property(struct drm_plane *plane,
+ 		return 0;
+ 	}
+ 
++	if (property == private->eotf_prop) {
++		plane_state->eotf = val;
++		return 0;
++	}
+ 	DRM_ERROR("failed to set vop plane property\n");
+ 	return -EINVAL;
+ }
+@@ -1454,6 +1607,7 @@ static int vop_atomic_plane_get_property(struct drm_plane *plane,
+ {
+ 	struct vop_win *win = to_vop_win(plane);
+ 	struct vop_plane_state *plane_state = to_vop_plane_state(state);
++	struct rockchip_drm_private *private = plane->dev->dev_private;
+ 
+ 	if (property == win->vop->plane_zpos_prop) {
+ 		*val = plane_state->zpos;
+@@ -1465,6 +1619,11 @@ static int vop_atomic_plane_get_property(struct drm_plane *plane,
+ 		return 0;
+ 	}
+ 
++	if (property == private->eotf_prop) {
++		*val = plane_state->eotf;
++		return 0;
++	}
++
+ 	DRM_ERROR("failed to get vop plane property\n");
+ 	return -EINVAL;
+ }
+@@ -2055,14 +2214,15 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
+ 		     s->output_mode == ROCKCHIP_OUT_MODE_YUV420 ? 1 : 0);
+ 	VOP_CTRL_SET(vop, hdmi_dclk_out_en,
+ 		     s->output_mode == ROCKCHIP_OUT_MODE_YUV420 ? 1 : 0);
++	s->yuv_overlay = is_yuv_output(s->bus_format);
+ 	if (VOP_CTRL_SUPPORT(vop, overlay_mode)) {
+-		VOP_CTRL_SET(vop, overlay_mode, is_yuv_output(s->bus_format));
+-		VOP_CTRL_SET(vop, bcsh_r2y_en, !is_yuv_output(s->bus_format));
+-		VOP_CTRL_SET(vop, bcsh_y2r_en, !is_yuv_output(s->bus_format));
++		VOP_CTRL_SET(vop, overlay_mode, s->yuv_overlay);
++		VOP_CTRL_SET(vop, bcsh_r2y_en, !s->yuv_overlay);
++		VOP_CTRL_SET(vop, bcsh_y2r_en, !s->yuv_overlay);
+ 	} else {
+-		VOP_CTRL_SET(vop, bcsh_r2y_en, is_yuv_output(s->bus_format));
++		VOP_CTRL_SET(vop, bcsh_r2y_en, s->yuv_overlay);
+ 	}
+-	VOP_CTRL_SET(vop, dsp_out_yuv, is_yuv_output(s->bus_format));
++	VOP_CTRL_SET(vop, dsp_out_yuv, s->yuv_overlay);
+ 
+ 	/*
+ 	 * Background color is 10bit depth if vop version >= 3.5
+@@ -2270,6 +2430,9 @@ static int vop_crtc_atomic_check(struct drm_crtc *crtc,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = vop_hdr_atomic_check(crtc, crtc_state);
++	if (ret)
++		return ret;
+ 	ret = vop_csc_atomic_check(crtc, crtc_state);
+ 	if (ret)
+ 		return ret;
+@@ -2423,6 +2586,55 @@ static void vop_update_cabc_lut(struct drm_crtc *crtc,
+ 	VOP_CTRL_SET(vop, cabc_lut_en, 1);
+ }
+ 
++static void vop_update_hdr(struct drm_crtc *crtc,
++			   struct drm_crtc_state *old_crtc_state)
++{
++	struct rockchip_crtc_state *s =
++			to_rockchip_crtc_state(crtc->state);
++	struct vop *vop = to_vop(crtc);
++	struct rockchip_sdr2hdr_state *sdr2hdr_state = &s->hdr.sdr2hdr_state;
++
++	if (!vop->data->hdr_table)
++		return;
++
++	if (s->hdr.hdr2sdr_en)
++		vop_load_hdr2sdr_table(vop);
++	VOP_CTRL_SET(vop, hdr2sdr_en, s->hdr.hdr2sdr_en);
++
++	VOP_CTRL_SET(vop, bt1886eotf_pre_conv_en,
++		     sdr2hdr_state->bt1886eotf_pre_conv_en);
++	VOP_CTRL_SET(vop, bt1886eotf_post_conv_en,
++		     sdr2hdr_state->bt1886eotf_post_conv_en);
++
++	if (sdr2hdr_state->bt1886eotf_pre_conv_en) {
++		VOP_CTRL_SET(vop, rgb2rgb_pre_conv_en,
++			     sdr2hdr_state->rgb2rgb_pre_conv_en);
++		VOP_CTRL_SET(vop, rgb2rgb_pre_conv_mode,
++			     sdr2hdr_state->rgb2rgb_pre_conv_mode);
++		VOP_CTRL_SET(vop, st2084oetf_pre_conv_en,
++			     sdr2hdr_state->st2084oetf_pre_conv_en);
++	}
++
++	if (sdr2hdr_state->bt1886eotf_post_conv_en) {
++		VOP_CTRL_SET(vop, rgb2rgb_post_conv_en,
++			     sdr2hdr_state->rgb2rgb_post_conv_en);
++		VOP_CTRL_SET(vop, rgb2rgb_post_conv_mode,
++			     sdr2hdr_state->rgb2rgb_post_conv_mode);
++		VOP_CTRL_SET(vop, st2084oetf_post_conv_en,
++			     sdr2hdr_state->st2084oetf_post_conv_en);
++	}
++
++	if (sdr2hdr_state->bt1886eotf_pre_conv_en ||
++	    sdr2hdr_state->bt1886eotf_post_conv_en)
++		vop_load_sdr2hdr_table(vop, sdr2hdr_state->sdr2hdr_func);
++
++	/* TODO: maybe need move to irq func */
++	VOP_CTRL_SET(vop, level2_overlay_en, s->hdr.pre_overlay);
++	VOP_CTRL_SET(vop, alpha_hard_calc, s->hdr.pre_overlay);
++
++	VOP_CTRL_SET(vop, overlay_mode, s->yuv_overlay);
++}
++
+ static void vop_update_cabc(struct drm_crtc *crtc,
+ 			    struct drm_crtc_state *old_crtc_state)
+ {
+@@ -2622,6 +2834,7 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	}
+ 
+ 	vop_update_cabc(crtc, old_crtc_state);
++	vop_update_hdr(crtc, old_crtc_state);
+ 
+ 	vop_cfg_done(vop);
+ 
+@@ -3049,9 +3262,14 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
+ 	if (VOP_WIN_SUPPORT(vop, win, src_alpha_ctl) ||
+ 	    VOP_WIN_SUPPORT(vop, win, alpha_en))
+ 		feature |= BIT(ROCKCHIP_DRM_PLANE_FEATURE_ALPHA);
++	if (win->feature & WIN_FEATURE_HDR2SDR)
++		feature |= BIT(ROCKCHIP_DRM_PLANE_FEATURE_HDR2SDR);
++	if (win->feature & WIN_FEATURE_SDR2HDR)
++		feature |= BIT(ROCKCHIP_DRM_PLANE_FEATURE_SDR2HDR);
+ 
+ 	drm_object_attach_property(&win->base.base, vop->plane_feature_prop,
+ 				   feature);
++	drm_object_attach_property(&win->base.base, private->eotf_prop, 0);
+ 
+ 	return 0;
+ }
+@@ -3295,6 +3513,8 @@ static int vop_win_init(struct vop *vop)
+ 	static const struct drm_prop_enum_list props[] = {
+ 		{ ROCKCHIP_DRM_PLANE_FEATURE_SCALE, "scale" },
+ 		{ ROCKCHIP_DRM_PLANE_FEATURE_ALPHA, "alpha" },
++		{ ROCKCHIP_DRM_PLANE_FEATURE_HDR2SDR, "hdr2sdr" },
++		{ ROCKCHIP_DRM_PLANE_FEATURE_SDR2HDR, "sdr2hdr" },
+ 	};
+ 	static const struct drm_prop_enum_list crtc_props[] = {
+ 		{ ROCKCHIP_DRM_CRTC_FEATURE_AFBDC, "afbdc" },
+@@ -3313,6 +3533,7 @@ static int vop_win_init(struct vop *vop)
+ 		vop_win->type = win_data->type;
+ 		vop_win->data_formats = win_data->phy->data_formats;
+ 		vop_win->nformats = win_data->phy->nformats;
++		vop_win->feature = win_data->feature;
+ 		vop_win->vop = vop;
+ 		vop_win->win_id = i;
+ 		vop_win->area_id = 0;
+@@ -3349,7 +3570,9 @@ static int vop_win_init(struct vop *vop)
+ 				DRM_MODE_PROP_IMMUTABLE, "FEATURE",
+ 				props, ARRAY_SIZE(props),
+ 				BIT(ROCKCHIP_DRM_PLANE_FEATURE_SCALE) |
+-				BIT(ROCKCHIP_DRM_PLANE_FEATURE_ALPHA));
++				BIT(ROCKCHIP_DRM_PLANE_FEATURE_ALPHA) |
++				BIT(ROCKCHIP_DRM_PLANE_FEATURE_HDR2SDR) |
++				BIT(ROCKCHIP_DRM_PLANE_FEATURE_SDR2HDR));
+ 	if (!vop->plane_feature_prop) {
+ 		DRM_ERROR("failed to create feature property\n");
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index e483186e01c4..dfaae0a714fe 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -202,6 +202,27 @@ struct vop_ctrl {
+ 	struct vop_reg bcsh_out_mode;
+ 	struct vop_reg bcsh_en;
+ 
++	/* HDR */
++	struct vop_reg level2_overlay_en;
++	struct vop_reg alpha_hard_calc;
++	struct vop_reg hdr2sdr_en;
++	struct vop_reg hdr2sdr_src_min;
++	struct vop_reg hdr2sdr_src_max;
++	struct vop_reg hdr2sdr_normfaceetf;
++	struct vop_reg hdr2sdr_dst_min;
++	struct vop_reg hdr2sdr_dst_max;
++	struct vop_reg hdr2sdr_normfacgamma;
++
++	struct vop_reg bt1886eotf_pre_conv_en;
++	struct vop_reg rgb2rgb_pre_conv_en;
++	struct vop_reg rgb2rgb_pre_conv_mode;
++	struct vop_reg st2084oetf_pre_conv_en;
++	struct vop_reg bt1886eotf_post_conv_en;
++	struct vop_reg rgb2rgb_post_conv_en;
++	struct vop_reg rgb2rgb_post_conv_mode;
++	struct vop_reg st2084oetf_post_conv_en;
++	struct vop_reg win_csc_mode_sel;
++
+ 	struct vop_reg cfg_done;
+ };
+ 
+@@ -269,6 +290,37 @@ struct vop_csc_table {
+ 	const uint32_t *r2r_bt2020_to_bt709;
+ };
+ 
++struct vop_hdr_table {
++	const uint32_t hdr2sdr_eetf_oetf_y0_offset;
++	const uint32_t hdr2sdr_eetf_oetf_y1_offset;
++	const uint32_t *hdr2sdr_eetf_yn;
++	const uint32_t *hdr2sdr_bt1886oetf_yn;
++	const uint32_t hdr2sdr_sat_y0_offset;
++	const uint32_t hdr2sdr_sat_y1_offset;
++	const uint32_t *hdr2sdr_sat_yn;
++
++	const uint32_t hdr2sdr_src_range_min;
++	const uint32_t hdr2sdr_src_range_max;
++	const uint32_t hdr2sdr_normfaceetf;
++	const uint32_t hdr2sdr_dst_range_min;
++	const uint32_t hdr2sdr_dst_range_max;
++	const uint32_t hdr2sdr_normfacgamma;
++
++	const uint32_t sdr2hdr_eotf_oetf_y0_offset;
++	const uint32_t sdr2hdr_eotf_oetf_y1_offset;
++	const uint32_t *sdr2hdr_bt1886eotf_yn_for_hlg_hdr;
++	const uint32_t *sdr2hdr_bt1886eotf_yn_for_bt2020;
++	const uint32_t *sdr2hdr_bt1886eotf_yn_for_hdr;
++	const uint32_t *sdr2hdr_st2084oetf_yn_for_hlg_hdr;
++	const uint32_t *sdr2hdr_st2084oetf_yn_for_bt2020;
++	const uint32_t *sdr2hdr_st2084oetf_yn_for_hdr;
++	const uint32_t sdr2hdr_oetf_dx_dxpow1_offset;
++	const uint32_t *sdr2hdr_st2084oetf_dxn_pow2;
++	const uint32_t *sdr2hdr_st2084oetf_dxn;
++	const uint32_t sdr2hdr_oetf_xn1_offset;
++	const uint32_t *sdr2hdr_st2084oetf_xn;
++};
++
+ enum {
+ 	VOP_CSC_Y2R_BT601,
+ 	VOP_CSC_Y2R_BT709,
+@@ -285,6 +337,17 @@ enum _vop_overlay_mode {
+ 	VOP_YUV_DOMAIN
+ };
+ 
++enum _vop_sdr2hdr_func {
++	SDR2HDR_FOR_BT2020,
++	SDR2HDR_FOR_HDR,
++	SDR2HDR_FOR_HLG_HDR,
++};
++
++enum _vop_rgb2rgb_conv_mode {
++	BT709_TO_BT2020,
++	BT2020_TO_BT709,
++};
++
+ struct vop_win_phy {
+ 	const struct vop_scl_regs *scl;
+ 	const uint32_t *data_formats;
+@@ -321,11 +384,16 @@ struct vop_win_data {
+ 	const struct vop_win_phy **area;
+ 	const struct vop_csc *csc;
+ 	unsigned int area_size;
++	u64 feature;
+ };
+ 
+ #define VOP_FEATURE_OUTPUT_10BIT	BIT(0)
+ #define VOP_FEATURE_AFBDC		BIT(1)
+ 
++#define WIN_FEATURE_HDR2SDR		BIT(0)
++#define WIN_FEATURE_SDR2HDR		BIT(1)
++#define WIN_FEATURE_PRE_OVERLAY		BIT(2)
++
+ struct vop_rect {
+ 	int width;
+ 	int height;
+@@ -338,6 +406,7 @@ struct vop_data {
+ 	const struct vop_intr *intr;
+ 	const struct vop_win_data *win;
+ 	const struct vop_csc_table *csc_table;
++	const struct vop_hdr_table *hdr_table;
+ 	unsigned int win_size;
+ 	uint32_t version;
+ 	struct vop_rect max_input;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+index ca7b2c046414..1ed5b2b470fc 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.c
+@@ -601,6 +601,245 @@ static const struct vop_data rk322x_vop = {
+ 	.win_size = ARRAY_SIZE(rk322x_vop_win_data),
+ };
+ 
++static const u32 sdr2hdr_bt1886eotf_yn_for_hlg_hdr[65] = {
++	0,
++	1,	7,	17,	35,
++	60,	92,	134,	184,
++	244,	315,	396,	487,
++	591,	706,	833,	915,
++	1129,	1392,	1717,	2118,
++	2352,	2612,	2900,	3221,
++	3577,	3972,	4411,	4899,
++	5441,	6042,	6710,	7452,
++	7853,	8276,	8721,	9191,
++	9685,	10207,	10756,	11335,
++	11945,	12588,	13266,	13980,
++	14732,	15525,	16361,	17241,
++	17699,	18169,	18652,	19147,
++	19656,	20178,	20714,	21264,
++	21829,	22408,	23004,	23615,
++	24242,	24886,	25547,	26214,
++};
++
++static const u32 sdr2hdr_bt1886eotf_yn_for_bt2020[65] = {
++	0,
++	1820,   3640,   5498,   7674,
++	10256,  13253,  16678,  20539,
++	24847,  29609,  34833,  40527,
++	46699,  53354,  60499,  68141,
++	76285,  84937,  94103,  103787,
++	108825, 113995, 119296, 124731,
++	130299, 136001, 141837, 147808,
++	153915, 160158, 166538, 173055,
++	176365, 179709, 183089, 186502,
++	189951, 193434, 196952, 200505,
++	204093, 207715, 211373, 215066,
++	218795, 222558, 226357, 230191,
++	232121, 234060, 236008, 237965,
++	239931, 241906, 243889, 245882,
++	247883, 249894, 251913, 253941,
++	255978, 258024, 260079, 262143,
++};
++
++static u32 sdr2hdr_bt1886eotf_yn_for_hdr[65] = {
++	/* dst_range 425int */
++	0,
++	5,     21,    49,     91,
++	150,   225,   320,   434,
++	569,   726,   905,   1108,
++	1336,  1588,  1866,  2171,
++	2502,  2862,  3250,  3667,
++	3887,  4114,  4349,  4591,
++	4841,  5099,  5364,  5638,
++	5920,  6209,  6507,  6812,
++	6968,  7126,  7287,  7449,
++	7613,  7779,  7948,  8118,
++	8291,  8466,  8643,  8822,
++	9003,  9187,  9372,  9560,
++	9655,  9750,  9846,  9942,
++	10039, 10136, 10234, 10333,
++	10432, 10531, 10631, 10732,
++	10833, 10935, 11038, 11141,
++};
++
++static const u32 sdr2hdr_st2084oetf_yn_for_hlg_hdr[65] = {
++	0,
++	668,	910,	1217,	1600,
++	2068,	2384,	2627,	3282,
++	3710,	4033,	4879,	5416,
++	5815,	6135,	6401,	6631,
++	6833,	7176,	7462,	7707,
++	7921,	8113,	8285,	8442,
++	8586,	8843,	9068,	9268,
++	9447,	9760,	10027,	10259,
++	10465,	10650,	10817,	10971,
++	11243,	11480,	11689,	11877,
++	12047,	12202,	12345,	12477,
++	12601,	12716,	12926,	13115,
++	13285,	13441,	13583,	13716,
++	13839,	13953,	14163,	14350,
++	14519,	14673,	14945,	15180,
++	15570,	15887,	16153,	16383,
++};
++
++static const u32 sdr2hdr_st2084oetf_yn_for_bt2020[65] = {
++	0,
++	0,     0,     1,     2,
++	4,     6,     9,     18,
++	27,    36,    72,    108,
++	144,   180,   216,   252,
++	288,   360,   432,   504,
++	576,   648,   720,   792,
++	864,   1008,  1152,  1296,
++	1444,  1706,  1945,  2166,
++	2372,  2566,  2750,  2924,
++	3251,  3553,  3834,  4099,
++	4350,  4588,  4816,  5035,
++	5245,  5447,  5832,  6194,
++	6536,  6862,  7173,  7471,
++	7758,  8035,  8560,  9055,
++	9523,  9968,  10800, 11569,
++	12963, 14210, 15347, 16383,
++};
++
++static u32 sdr2hdr_st2084oetf_yn_for_hdr[65] = {
++	0,
++	281,   418,   610,   871,
++	1217,  1464,  1662,  2218,
++	2599,  2896,  3699,  4228,
++	4628,  4953,  5227,  5466,
++	5676,  6038,  6341,  6602,
++	6833,  7039,  7226,  7396,
++	7554,  7835,  8082,  8302,
++	8501,  8848,  9145,  9405,
++	9635,  9842,  10031, 10204,
++	10512, 10779, 11017, 11230,
++	11423, 11599, 11762, 11913,
++	12054, 12185, 12426, 12641,
++	12835, 13013, 13177, 13328,
++	13469, 13600, 13840, 14055,
++	14248, 14425, 14737, 15006,
++	15453, 15816, 16121, 16383,
++};
++
++static const u32 sdr2hdr_st2084oetf_dxn_pow2[64] = {
++	0,  0,  1,  2,
++	3,  3,  3,  5,
++	5,  5,  7,  7,
++	7,  7,  7,  7,
++	7,  8,  8,  8,
++	8,  8,  8,  8,
++	8,  9,  9,  9,
++	9,  10, 10, 10,
++	10, 10, 10, 10,
++	11, 11, 11, 11,
++	11, 11, 11, 11,
++	11, 11, 12, 12,
++	12, 12, 12, 12,
++	12, 12, 13, 13,
++	13, 13, 14, 14,
++	15, 15, 15, 15,
++};
++
++static const u32 sdr2hdr_st2084oetf_dxn[64] = {
++	1,     1,     2,     4,
++	8,     8,     8,     32,
++	32,    32,    128,   128,
++	128,   128,   128,   128,
++	128,   256,   256,   256,
++	256,   256,   256,   256,
++	256,   512,   512,   512,
++	512,   1024,  1024,  1024,
++	1024,  1024,  1024,  1024,
++	2048,  2048,  2048,  2048,
++	2048,  2048,  2048,  2048,
++	2048,  2048,  4096,  4096,
++	4096,  4096,  4096,  4096,
++	4096,  4096,  8192,  8192,
++	8192,  8192,  16384, 16384,
++	32768, 32768, 32768, 32768,
++};
++
++static const u32 sdr2hdr_st2084oetf_xn[63] = {
++	1,      2,      4,      8,
++	16,     24,     32,     64,
++	96,     128,    256,    384,
++	512,    640,    768,    896,
++	1024,   1280,   1536,   1792,
++	2048,   2304,   2560,   2816,
++	3072,   3584,   4096,   4608,
++	5120,   6144,   7168,   8192,
++	9216,   10240,  11264,  12288,
++	14336,  16384,  18432,  20480,
++	22528,  24576,  26624,  28672,
++	30720,  32768,  36864,  40960,
++	45056,  49152,  53248,  57344,
++	61440,  65536,  73728,  81920,
++	90112,  98304,  114688, 131072,
++	163840, 196608, 229376,
++};
++
++static u32 hdr2sdr_eetf_yn[33] = {
++	1716,
++	1880,	2067,	2277,	2508,
++	2758,	3026,	3310,	3609,
++	3921,	4246,	4581,	4925,
++	5279,	5640,	6007,	6380,
++	6758,	7140,	7526,	7914,
++	8304,	8694,	9074,	9438,
++	9779,	10093,	10373,	10615,
++	10812,	10960,	11053,	11084,
++};
++
++static u32 hdr2sdr_bt1886oetf_yn[33] = {
++	0,
++	0,	0,	0,	0,
++	0,	0,	0,	314,
++	746,	1323,	2093,	2657,
++	3120,	3519,	3874,	4196,
++	4492,	5024,	5498,	5928,
++	6323,	7034,	7666,	8239,
++	8766,	9716,	10560,	11325,
++	12029,	13296,	14422,	16383,
++};
++
++static const u32 hdr2sdr_sat_yn[9] = {
++	0,
++	1792, 3584, 3472, 2778,
++	2083, 1389, 694,  0,
++};
++
++static const struct vop_hdr_table rk3328_hdr_table = {
++	.hdr2sdr_eetf_oetf_y0_offset = RK3328_HDR2SDR_EETF_OETF_Y0,
++	.hdr2sdr_eetf_oetf_y1_offset = RK3328_HDR2SDR_EETF_OETF_Y1,
++	.hdr2sdr_eetf_yn	= hdr2sdr_eetf_yn,
++	.hdr2sdr_bt1886oetf_yn	= hdr2sdr_bt1886oetf_yn,
++	.hdr2sdr_sat_y0_offset = RK3328_HDR2DR_SAT_Y0,
++	.hdr2sdr_sat_y1_offset = RK3328_HDR2DR_SAT_Y1,
++	.hdr2sdr_sat_yn = hdr2sdr_sat_yn,
++
++	.hdr2sdr_src_range_min = 494,
++	.hdr2sdr_src_range_max = 12642,
++	.hdr2sdr_normfaceetf = 1327,
++	.hdr2sdr_dst_range_min = 4,
++	.hdr2sdr_dst_range_max = 3276,
++	.hdr2sdr_normfacgamma = 5120,
++
++	.sdr2hdr_eotf_oetf_y0_offset = RK3328_SDR2HDR_EOTF_OETF_Y0,
++	.sdr2hdr_eotf_oetf_y1_offset = RK3328_SDR2HDR_EOTF_OETF_Y1,
++	.sdr2hdr_bt1886eotf_yn_for_hlg_hdr = sdr2hdr_bt1886eotf_yn_for_hlg_hdr,
++	.sdr2hdr_bt1886eotf_yn_for_bt2020 = sdr2hdr_bt1886eotf_yn_for_bt2020,
++	.sdr2hdr_bt1886eotf_yn_for_hdr = sdr2hdr_bt1886eotf_yn_for_hdr,
++	.sdr2hdr_st2084oetf_yn_for_hlg_hdr = sdr2hdr_st2084oetf_yn_for_hlg_hdr,
++	.sdr2hdr_st2084oetf_yn_for_bt2020 = sdr2hdr_st2084oetf_yn_for_bt2020,
++	.sdr2hdr_st2084oetf_yn_for_hdr = sdr2hdr_st2084oetf_yn_for_hdr,
++	.sdr2hdr_oetf_dx_dxpow1_offset = RK3328_SDR2HDR_OETF_DX_DXPOW1,
++	.sdr2hdr_oetf_xn1_offset = RK3328_SDR2HDR_OETF_XN1,
++	.sdr2hdr_st2084oetf_dxn_pow2 = sdr2hdr_st2084oetf_dxn_pow2,
++	.sdr2hdr_st2084oetf_dxn = sdr2hdr_st2084oetf_dxn,
++	.sdr2hdr_st2084oetf_xn = sdr2hdr_st2084oetf_xn,
++};
++
+ static const struct vop_ctrl rk3328_ctrl_data = {
+ 	.standby = VOP_REG(RK3328_SYS_CTRL, 0x1, 22),
+ 	.axi_outstanding_max_num = VOP_REG(RK3328_SYS_CTRL1, 0x1f, 13),
+@@ -655,6 +894,27 @@ static const struct vop_ctrl rk3328_ctrl_data = {
+ 
+ 	.dsp_background = VOP_REG(RK3328_DSP_BG, 0xffffffff, 0),
+ 
++	.alpha_hard_calc = VOP_REG(RK3328_SYS_CTRL1, 0x1, 27),
++	.level2_overlay_en = VOP_REG(RK3328_SYS_CTRL1, 0x1, 28),
++
++	.hdr2sdr_en = VOP_REG(RK3328_HDR2DR_CTRL, 0x1, 0),
++	.hdr2sdr_src_min = VOP_REG(RK3328_HDR2DR_SRC_RANGE, 0x3fff, 0),
++	.hdr2sdr_src_max = VOP_REG(RK3328_HDR2DR_SRC_RANGE, 0x3fff, 16),
++	.hdr2sdr_normfaceetf = VOP_REG(RK3328_HDR2DR_NORMFACEETF, 0x7ff, 0),
++	.hdr2sdr_dst_min = VOP_REG(RK3328_HDR2DR_DST_RANGE, 0x3fff, 0),
++	.hdr2sdr_dst_max = VOP_REG(RK3328_HDR2DR_DST_RANGE, 0x3fff, 16),
++	.hdr2sdr_normfacgamma = VOP_REG(RK3328_HDR2DR_NORMFACGAMMA, 0xffff, 0),
++
++	.bt1886eotf_pre_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 0),
++	.rgb2rgb_pre_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 1),
++	.rgb2rgb_pre_conv_mode = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 2),
++	.st2084oetf_pre_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 3),
++	.bt1886eotf_post_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 4),
++	.rgb2rgb_post_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 5),
++	.rgb2rgb_post_conv_mode = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 6),
++	.st2084oetf_post_conv_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 7),
++	.win_csc_mode_sel = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 31),
++
+ 	.bcsh_brightness = VOP_REG(RK3328_BCSH_BCS, 0xff, 0),
+ 	.bcsh_contrast = VOP_REG(RK3328_BCSH_BCS, 0x1ff, 8),
+ 	.bcsh_sat_con = VOP_REG(RK3328_BCSH_BCS, 0x3ff, 20),
+@@ -681,18 +941,40 @@ static const struct vop_intr rk3328_vop_intr = {
+ 	.clear = VOP_REG_MASK(RK3328_INTR_CLEAR0, 0xffff, 0),
+ };
+ 
++static const struct vop_csc rk3328_win0_csc = {
++	.r2y_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 8),
++	.r2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 5),
++	.y2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 9),
++};
++
++static const struct vop_csc rk3328_win1_csc = {
++	.r2y_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 10),
++	.r2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 1),
++	.y2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 11),
++};
++
++static const struct vop_csc rk3328_win2_csc = {
++	.r2y_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 12),
++	.r2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 1),
++	.y2r_en = VOP_REG(RK3328_SDR2HDR_CTRL, 0x1, 13),
++};
++
+ static const struct vop_win_data rk3328_vop_win_data[] = {
+-	{ .base = 0xd0, .phy = &rk3288_win01_data,
+-	  .type = DRM_PLANE_TYPE_PRIMARY },
+-	{ .base = 0x1d0, .phy = &rk3288_win01_data,
+-	  .type = DRM_PLANE_TYPE_OVERLAY },
+-	{ .base = 0x2d0, .phy = &rk3288_win01_data,
+-	  .type = DRM_PLANE_TYPE_CURSOR },
++	{ .base = 0xd0, .phy = &rk3288_win01_data,  .csc = &rk3328_win0_csc,
++	  .type = DRM_PLANE_TYPE_PRIMARY,
++	  .feature = WIN_FEATURE_HDR2SDR | WIN_FEATURE_SDR2HDR },
++	{ .base = 0x1d0, .phy = &rk3288_win01_data, .csc = &rk3328_win1_csc,
++	  .type = DRM_PLANE_TYPE_OVERLAY,
++	  .feature = WIN_FEATURE_SDR2HDR | WIN_FEATURE_PRE_OVERLAY },
++	{ .base = 0x2d0, .phy = &rk3288_win01_data, .csc = &rk3328_win2_csc,
++	  .type = DRM_PLANE_TYPE_CURSOR,
++	  .feature = WIN_FEATURE_SDR2HDR | WIN_FEATURE_PRE_OVERLAY },
+ };
+ 
+ static const struct vop_data rk3328_vop = {
+ 	.version = VOP_VERSION(3, 8),
+ 	.feature = VOP_FEATURE_OUTPUT_10BIT,
++	.hdr_table = &rk3328_hdr_table,
+ 	.max_input = {4096, 8192},
+ 	.max_output = {4096, 2160},
+ 	.intr = &rk3328_vop_intr,
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+index 4b5cd0e470b7..a93cb62d55c6 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+@@ -811,6 +811,21 @@
+ #define RK3328_DBG_POST_RESERVED		0x000006ec
+ #define RK3328_DBG_DATAO			0x000006f0
+ #define RK3328_DBG_DATAO_2			0x000006f4
++#define RK3328_SDR2HDR_CTRL			0x00000700
++#define RK3328_SDR2HDR_EOTF_OETF_Y0		0x00000704
++#define RK3328_SDR2HDR_EOTF_OETF_Y1		0x00000710
++#define RK3328_SDR2HDR_OETF_DX_DXPOW1		0x00000810
++#define RK3328_SDR2HDR_OETF_XN1			0x00000910
++
++#define RK3328_HDR2DR_CTRL			0x00000a10
++#define RK3328_HDR2DR_SRC_RANGE			0x00000a14
++#define RK3328_HDR2DR_NORMFACEETF		0x00000a18
++#define RK3328_HDR2DR_DST_RANGE			0x00000a20
++#define RK3328_HDR2DR_NORMFACGAMMA		0x00000a24
++#define RK3328_HDR2SDR_EETF_OETF_Y0		0x00000a28
++#define RK3328_HDR2DR_SAT_Y0			0x00000a2C
++#define RK3328_HDR2SDR_EETF_OETF_Y1		0x00000a30
++#define RK3328_HDR2DR_SAT_Y1			0x00000ab0
+ 
+ /* sdr to hdr */
+ #define RK3328_SDR2HDR_CTRL			0x00000700
+diff --git a/include/uapi/drm/rockchip_drm.h b/include/uapi/drm/rockchip_drm.h
+index 6d8f11c93ba4..8e7c6350e20c 100644
+--- a/include/uapi/drm/rockchip_drm.h
++++ b/include/uapi/drm/rockchip_drm.h
+@@ -120,6 +120,8 @@ struct drm_rockchip_rga_exec {
+ enum rockchip_plane_feture {
+ 	ROCKCHIP_DRM_PLANE_FEATURE_SCALE,
+ 	ROCKCHIP_DRM_PLANE_FEATURE_ALPHA,
++	ROCKCHIP_DRM_PLANE_FEATURE_HDR2SDR,
++	ROCKCHIP_DRM_PLANE_FEATURE_SDR2HDR,
+ 	ROCKCHIP_DRM_PLANE_FEATURE_MAX,
+ };
+ 
+-- 
+2.35.3
+

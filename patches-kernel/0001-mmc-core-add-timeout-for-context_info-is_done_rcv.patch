@@ -1,0 +1,106 @@
+From 8f7ac8a82fcb69ef48708218a7ea7b2f57e492d6 Mon Sep 17 00:00:00 2001
+From: Shawn Lin <shawn.lin@rock-chips.com>
+Date: Tue, 16 Jun 2015 18:01:40 +0800
+Subject: [PATCH] mmc: core: add timeout for context_info->is_done_rcv
+
+  After dequeue a rq from blk and a accidental rq missing makes
+bq->queue fails to fetch blk_rq again since !rq w/o been done.
+Whatsoever was that, MUST ensure a schedule mechanisam to break
+the dead loop, and issue the missing one again. We observe this
+problem, all processes calling aio page writeback or commiting
+journal were confined in io_schedule waiting for previous blk rq
+to be completed, and cause os stucked.
+
+page:c1337420 count:3 mapcount:0 mapping:dc8fdc34 index:0x502
+page flags: 0x4000286c(referenced|uptodate|lru|active|private|writeback)
+sleep_on_page: inode: dc8fdb58, 119091
+CPU: 3 PID: 199 Comm: abc Not tainted 3.10.0 #298
+[<c0013e44>] (unwind_backtrace+0x0/0xe0) from [<c001175c>] (show_stack+0x10/0x14)
+[<c001175c>] (show_stack+0x10/0x14) from [<c00cadb8>] (sleep_on_page+0x6c/0x8c)
+[<c00cadb8>] (sleep_on_page+0x6c/0x8c) from [<c0769a80>] (__wait_on_bit+0x54/0xa0)
+[<c0769a80>] (__wait_on_bit+0x54/0xa0) from [<c00ca88c>] (wait_on_page_bit+0x8c/0x9c)
+[<c00ca88c>] (wait_on_page_bit+0x8c/0x9c) from [<c00ca954>] (filemap_fdatawait_range+0x6c/0x110)
+[<c00ca954>] (filemap_fdatawait_range+0x6c/0x110) from [<c00cbd8c>] (filemap_write_and_wait_range+0x54/0x78)
+[<c00cbd8c>] (filemap_write_and_wait_range+0x54/0x78) from [<c0182e14>] (ext4_sync_file+0xdc/0x308)
+[<c0182e14>] (ext4_sync_file+0xdc/0x308) from [<c01305f8>] (vfs_fsync_range+0x34/0x44)
+[<c01305f8>] (vfs_fsync_range+0x34/0x44) from [<c01306b0>] (generic_write_sync+0x80/0x88)
+[<c01306b0>] (generic_write_sync+0x80/0x88) from [<c00cc3fc>] (generic_file_aio_write+0xa0/0xb0)
+[<c00cc3fc>] (generic_file_aio_write+0xa0/0xb0) from [<c0109198>] (do_sync_write+0x74/0x98)
+[<c0109198>] (do_sync_write+0x74/0x98) from [<c0109ab8>] (vfs_write+0xd4/0x16c)
+[<c0109ab8>] (vfs_write+0xd4/0x16c) from [<c0109df8>] (SyS_write+0x3c/0x60)
+[<c0109df8>] (SyS_write+0x3c/0x60) from [<c000da00>] (ret_fast_syscall+0x0/0x30)
+
+Signed-off-by: Shawn Lin <shawn.lin@rock-chips.com>
+Tested-by: Meiyou Chen <cmy@rock-chips.com>
+---
+ drivers/mmc/core/core.c | 44 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 33bdf60c8096..05b8eaf06d72 100755
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -396,6 +396,33 @@ static int __mmc_start_req(struct mmc_host *host, struct mmc_request *mrq)
+ 	return 0;
+ }
+ 
++static void mmc_get_req_timeout(struct mmc_request *mrq, u32 *timeout)
++{
++	if (!mrq->cmd->data) {
++		if (mrq->cmd->opcode == MMC_ERASE ||
++		    (mrq->cmd->opcode == MMC_ERASE_GROUP_START) ||
++		    (mrq->cmd->opcode == MMC_ERASE_GROUP_END) ||
++		    (mrq->cmd->opcode == MMC_SEND_STATUS))
++			*timeout = 2500000;
++		else
++			*timeout = 500;
++	} else {
++		*timeout = mrq->cmd->data->blocks *
++			mrq->cmd->data->blksz * 500;
++		*timeout = (*timeout) ? (*timeout) : 1000;
++		if (*timeout > 8000)
++			*timeout = 8000;
++	}
++
++	if ((mrq->cmd->opcode == SD_IO_RW_DIRECT) ||
++	    (mrq->cmd->opcode == SD_IO_RW_EXTENDED))
++		*timeout = 8000;
++	else if ((mrq->cmd->opcode == MMC_SEND_TUNING_BLOCK_HS200) ||
++		 (mrq->cmd->opcode == MMC_SEND_TUNING_BLOCK))
++		*timeout = 30;
++}
++
++
+ /*
+  * mmc_wait_for_data_req_done() - wait for request completed
+  * @host: MMC host to prepare the command.
+@@ -415,11 +442,24 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
+ 	struct mmc_context_info *context_info = &host->context_info;
+ 	int err;
+ 	unsigned long flags;
++	u32 timeout = 0;
++
++	mmc_get_req_timeout(mrq, &timeout);
+ 
+ 	while (1) {
+-		wait_event_interruptible(context_info->wait,
++		if (!wait_event_interruptible_timeout(context_info->wait,
+ 					 (context_info->is_done_rcv ||
+-					 context_info->is_new_req));
++					 context_info->is_new_req),
++					 msecs_to_jiffies(timeout))) {
++			cmd = mrq->cmd;
++			cmd->error = -ETIMEDOUT;
++			host->ops->post_tmo(host);
++			context_info->is_done_rcv = true;
++			dev_err(mmc_dev(host),
++				"req failed (CMD%u): error = %d, timeout = %dms\n",
++				cmd->opcode, cmd->error, timeout);
++		}
++
+ 		spin_lock_irqsave(&context_info->lock, flags);
+ 		context_info->is_waiting_last_req = false;
+ 		spin_unlock_irqrestore(&context_info->lock, flags);
+-- 
+2.35.3
+

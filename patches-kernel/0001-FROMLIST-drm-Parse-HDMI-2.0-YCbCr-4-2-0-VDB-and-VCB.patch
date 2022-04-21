@@ -1,0 +1,291 @@
+From 0088faa3f81e3638ec655678a7f476cf5653b6df Mon Sep 17 00:00:00 2001
+From: Zheng Yang <zhengyang@rock-chips.com>
+Date: Tue, 28 Feb 2017 17:29:09 +0800
+Subject: [PATCH] FROMLIST: drm: Parse HDMI 2.0 YCbCr 4:2:0 VDB and VCB
+
+HDMI 2.0 introduces a new sampling mode called YCbCr 4:2:0.
+According to the spec the EDID may contain two blocks that
+signal this sampling mode:
+	- YCbCr 4:2:0 Video Data Block
+	- YCbCr 4:2:0 Video Capability Map Data Block
+
+The video data block contains the list of vic's were
+only YCbCr 4:2:0 sampling mode shall be used while the
+video capability map data block contains a mask were
+YCbCr 4:2:0 sampling mode may be used.
+
+This RFC patch adds support for parsing these two new blocks
+and introduces new flags to signal the drivers if the
+mode is 4:2:0'only or 4:2:0'able.
+
+The reason this is still a RFC is because there is no
+reference in kernel for this new sampling mode (specially in
+AVI infoframe part), so, I was hoping to hear some feedback
+first.
+
+Tested in a HDMI 2.0 compliance scenario.
+
+Signed-off-by: Jose Abreu <joabreu@synopsys.com>
+Cc: Carlos Palminha <palminha@synopsys.com>
+Cc: Daniel Vetter <daniel.vetter@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: David Airlie <airlied@linux.ie>
+Cc: dri-devel@lists.freedesktop.org
+Cc: linux-kernel@vger.kernel.org
+
+(am from https://patchwork.kernel.org/patch/9495175)
+Change-Id: I7c9e331b5bf5f1fbcefd4368bc4b82ff180eb91e
+Signed-off-by: Zheng Yang <zhengyang@rock-chips.com>
+---
+ drivers/gpu/drm/drm_edid.c  | 138 +++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/drm_modes.c |  10 ++-
+ include/uapi/drm/drm_mode.h |   6 ++
+ 3 files changed, 150 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index 4dc3542d4f37..d7f95724c630 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -2712,6 +2712,8 @@ add_detailed_modes(struct drm_connector *connector, struct edid *edid,
+ #define VENDOR_BLOCK    0x03
+ #define SPEAKER_BLOCK	0x04
+ #define VIDEO_CAPABILITY_BLOCK	0x07
++#define VIDEO_DATA_BLOCK_420	0x0E
++#define VIDEO_CAP_BLOCK_420	0x0F
+ #define EDID_BASIC_AUDIO	(1 << 6)
+ #define EDID_CEA_YCRCB444	(1 << 5)
+ #define EDID_CEA_YCRCB422	(1 << 4)
+@@ -3171,6 +3173,99 @@ static int add_3d_struct_modes(struct drm_connector *connector, u16 structure,
+ 	return modes;
+ }
+ 
++static int add_420_mode(struct drm_connector *connector, u8 vic)
++{
++	struct drm_device *dev = connector->dev;
++	struct drm_display_mode *newmode;
++
++	if (!drm_valid_cea_vic(vic))
++		return 0;
++
++	newmode = drm_mode_duplicate(dev, &edid_cea_modes[vic]);
++	if (!newmode)
++		return 0;
++
++	newmode->flags |= DRM_MODE_FLAG_420_ONLY;
++	drm_mode_probed_add(connector, newmode);
++
++	return 1;
++}
++
++static int add_420_vdb_modes(struct drm_connector *connector, const u8 *svds,
++		u8 svds_len)
++{
++	int modes = 0, i;
++
++	for (i = 0; i < svds_len; i++)
++		modes += add_420_mode(connector, svds[i]);
++
++	return modes;
++}
++
++static int add_420_vcb_modes(struct drm_connector *connector, const u8 *svds,
++		u8 svds_len, const u8 *video_db, u8 video_len)
++{
++	struct drm_display_mode *newmode = NULL;
++	int modes = 0, i, j;
++
++	for (i = 0; i < svds_len; i++) {
++		u8 mask = svds[i];
++
++		for (j = 0; j < 8; j++) {
++			if (mask & (1 << j)) {
++				newmode = drm_display_mode_from_vic_index(
++						connector, video_db, video_len,
++						i * 8 + j);
++				if (newmode) {
++					newmode->flags |= DRM_MODE_FLAG_420;
++					drm_mode_probed_add(connector, newmode);
++					modes++;
++				}
++			}
++		}
++	}
++
++	return modes;
++}
++
++static int add_420_vcb_modes_all(struct drm_connector *connector,
++		const u8 *video_db, u8 video_len)
++{
++	struct drm_display_mode *newmode = NULL;
++	int modes = 0, i;
++
++	for (i = 0; i < video_len; i++) {
++		newmode = drm_display_mode_from_vic_index(connector, video_db,
++				video_len, i);
++		if (newmode) {
++			newmode->flags |= DRM_MODE_FLAG_420;
++			drm_mode_probed_add(connector, newmode);
++			modes++;
++		}
++	}
++
++	return modes;
++}
++
++static int do_hdmi_420_modes(struct drm_connector *connector, const u8 *vdb,
++		u8 vdb_len, const u8 *vcb, u8 vcb_len, const u8 *video_db,
++		u8 video_len)
++{
++	int modes = 0;
++
++	if (vdb && (vdb_len > 1)) /* Add 4:2:0 modes present in EDID */
++		modes += add_420_vdb_modes(connector, &vdb[2], vdb_len - 1);
++
++	if (vcb && (vcb_len > 1)) /* Parse bit mask of supported modes */
++		modes += add_420_vcb_modes(connector, &vcb[2], vcb_len - 1,
++				video_db, video_len);
++	else if (vcb) /* All modes support 4:2:0 mode */
++		modes += add_420_vcb_modes_all(connector, video_db, video_len);
++
++	DRM_DEBUG("added %d 4:2:0 modes\n", modes);
++	return modes;
++}
++
+ /*
+  * do_hdmi_vsdb_modes - Parse the HDMI Vendor Specific data block
+  * @connector: connector corresponding to the HDMI sink
+@@ -3326,6 +3421,12 @@ cea_db_tag(const u8 *db)
+ 	return db[0] >> 5;
+ }
+ 
++static int
++cea_db_extended_tag(const u8 *db)
++{
++	return db[1];
++}
++
+ static int
+ cea_revision(const u8 *cea)
+ {
+@@ -3375,6 +3476,28 @@ static bool cea_db_is_hdmi_hf_vsdb(const u8 *db)
+ 	return hdmi_id == HDMI_IEEE_OUI_HF;
+ }
+ 
++static bool cea_db_is_hdmi_vdb420(const u8 *db)
++{
++	if (cea_db_tag(db) != VIDEO_CAPABILITY_BLOCK)
++		return false;
++
++	if (cea_db_extended_tag(db) != VIDEO_DATA_BLOCK_420)
++		return false;
++
++	return true;
++}
++
++static bool cea_db_is_hdmi_vcb420(const u8 *db)
++{
++	if (cea_db_tag(db) != VIDEO_CAPABILITY_BLOCK)
++		return false;
++
++	if (cea_db_extended_tag(db) != VIDEO_CAP_BLOCK_420)
++		return false;
++
++	return true;
++}
++
+ #define for_each_cea_db(cea, i, start, end) \
+ 	for ((i) = (start); (i) < (end) && (i) + cea_db_payload_len(&(cea)[(i)]) < (end); (i) += cea_db_payload_len(&(cea)[(i)]) + 1)
+ 
+@@ -3382,8 +3505,9 @@ static int
+ add_cea_modes(struct drm_connector *connector, struct edid *edid)
+ {
+ 	const u8 *cea = drm_find_cea_extension(edid);
+-	const u8 *db, *hdmi = NULL, *video = NULL;
+-	u8 dbl, hdmi_len, video_len = 0;
++	const u8 *db, *hdmi = NULL, *video = NULL, *vdb420 = NULL,
++	      *vcb420 = NULL;
++	u8 dbl, hdmi_len, video_len = 0, vdb420_len = 0, vcb420_len = 0;
+ 	int modes = 0;
+ 
+ 	if (cea && cea_revision(cea) >= 3) {
+@@ -3404,6 +3528,12 @@ add_cea_modes(struct drm_connector *connector, struct edid *edid)
+ 			else if (cea_db_is_hdmi_vsdb(db)) {
+ 				hdmi = db;
+ 				hdmi_len = dbl;
++			} else if (cea_db_is_hdmi_vdb420(db)) {
++				vdb420 = db;
++				vdb420_len = dbl;
++			} else if (cea_db_is_hdmi_vcb420(db)) {
++				vcb420 = db;
++				vcb420_len = dbl;
+ 			}
+ 		}
+ 	}
+@@ -3416,6 +3546,10 @@ add_cea_modes(struct drm_connector *connector, struct edid *edid)
+ 		modes += do_hdmi_vsdb_modes(connector, hdmi, hdmi_len, video,
+ 					    video_len);
+ 
++	if (vdb420 || vcb420)
++		modes += do_hdmi_420_modes(connector, vdb420, vdb420_len,
++				vcb420, vcb420_len, video, video_len);
++
+ 	return modes;
+ }
+ 
+diff --git a/drivers/gpu/drm/drm_modes.c b/drivers/gpu/drm/drm_modes.c
+index a773a7cdcb07..bb0733063e63 100644
+--- a/drivers/gpu/drm/drm_modes.c
++++ b/drivers/gpu/drm/drm_modes.c
+@@ -938,6 +938,10 @@ bool drm_mode_equal_no_clocks(const struct drm_display_mode *mode1, const struct
+ 	    (mode2->flags & DRM_MODE_FLAG_3D_MASK))
+ 		return false;
+ 
++	if ((mode1->flags & DRM_MODE_FLAG_420_MASK) !=
++	    (mode2->flags & DRM_MODE_FLAG_420_MASK))
++		return false;
++
+ 	return drm_mode_equal_no_clocks_no_stereo(mode1, mode2);
+ }
+ EXPORT_SYMBOL(drm_mode_equal_no_clocks);
+@@ -956,6 +960,9 @@ EXPORT_SYMBOL(drm_mode_equal_no_clocks);
+ bool drm_mode_equal_no_clocks_no_stereo(const struct drm_display_mode *mode1,
+ 					const struct drm_display_mode *mode2)
+ {
++	unsigned int flags_mask =
++		~(DRM_MODE_FLAG_3D_MASK | DRM_MODE_FLAG_420_MASK);
++
+ 	if (mode1->hdisplay == mode2->hdisplay &&
+ 	    mode1->hsync_start == mode2->hsync_start &&
+ 	    mode1->hsync_end == mode2->hsync_end &&
+@@ -966,8 +973,7 @@ bool drm_mode_equal_no_clocks_no_stereo(const struct drm_display_mode *mode1,
+ 	    mode1->vsync_end == mode2->vsync_end &&
+ 	    mode1->vtotal == mode2->vtotal &&
+ 	    mode1->vscan == mode2->vscan &&
+-	    (mode1->flags & ~DRM_MODE_FLAG_3D_MASK) ==
+-	     (mode2->flags & ~DRM_MODE_FLAG_3D_MASK))
++	    (mode1->flags & flags_mask) == (mode2->flags & flags_mask))
+ 		return true;
+ 
+ 	return false;
+diff --git a/include/uapi/drm/drm_mode.h b/include/uapi/drm/drm_mode.h
+index 6c11ca401de8..efe881206406 100644
+--- a/include/uapi/drm/drm_mode.h
++++ b/include/uapi/drm/drm_mode.h
+@@ -72,6 +72,12 @@
+ #define  DRM_MODE_FLAG_3D_L_DEPTH_GFX_GFX_DEPTH	(6<<14)
+ #define  DRM_MODE_FLAG_3D_TOP_AND_BOTTOM	(7<<14)
+ #define  DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF	(8<<14)
++/*
++ * HDMI 2.0
++ */
++#define DRM_MODE_FLAG_420_MASK			(0x03<<19)
++#define  DRM_MODE_FLAG_420			(1<<19)
++#define  DRM_MODE_FLAG_420_ONLY			(1<<20)
+ 
+ 
+ /* DPMS flags */
+-- 
+2.35.3
+

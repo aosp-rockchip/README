@@ -1,0 +1,163 @@
+From e10d2cae4086dc216512052499bc3c6d50631999 Mon Sep 17 00:00:00 2001
+From: Jon Lin <jon.lin@rock-chips.com>
+Date: Fri, 10 Apr 2020 21:36:41 +0800
+Subject: [PATCH] drivers: rkflash: support transfer large size data
+
+Change-Id: I07cb3cc2699cfdb43dcad9db58078796ed2f59c4
+Signed-off-by: Jon Lin <jon.lin@rock-chips.com>
+---
+ drivers/rkflash/sfc.c     | 22 +++++++++++++++++++---
+ drivers/rkflash/sfc.h     |  5 +++--
+ drivers/rkflash/sfc_nor.c |  7 ++++---
+ drivers/rkflash/sfc_nor.h |  3 ++-
+ 4 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/rkflash/sfc.c b/drivers/rkflash/sfc.c
+index cb3e1453f6e2..43069bbf3774 100644
+--- a/drivers/rkflash/sfc.c
++++ b/drivers/rkflash/sfc.c
+@@ -8,6 +8,9 @@
+ 
+ #include "sfc.h"
+ 
++#define SFC_MAX_IOSIZE_VER3		(1024 * 8)
++#define SFC_MAX_IOSIZE_VER4		(0xFFFFFFFF)
++
+ static void __iomem *g_sfc_reg;
+ 
+ static void sfc_reset(void)
+@@ -27,11 +30,21 @@ u16 sfc_get_version(void)
+ 	return  (u32)(readl(g_sfc_reg + SFC_VER) & 0xffff);
+ }
+ 
++u32 sfc_get_max_iosize(void)
++{
++	if (sfc_get_version() >= SFC_VER_4)
++		return SFC_MAX_IOSIZE_VER4;
++	else
++		return SFC_MAX_IOSIZE_VER3;
++}
++
+ int sfc_init(void __iomem *reg_addr)
+ {
+ 	g_sfc_reg = reg_addr;
+ 	sfc_reset();
+ 	writel(0, g_sfc_reg + SFC_CTRL);
++	if (sfc_get_version() >= SFC_VER_4)
++		writel(1, g_sfc_reg + SFC_LEN_CTRL);
+ 
+ 	return SFC_OK;
+ }
+@@ -67,6 +80,10 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 	/* shift in the data at negedge sclk_out */
+ 	op->sfctrl.d32 |= 0x2;
+ 	cmd.b.datasize = size;
++	if (sfc_get_version() >= SFC_VER_4)
++		writel(size, g_sfc_reg + SFC_LEN_EXT);
++	else
++		cmd.b.datasize = size;
+ 
+ 	writel(op->sfctrl.d32, g_sfc_reg + SFC_CTRL);
+ 	writel(cmd.d32, g_sfc_reg + SFC_CMD);
+@@ -87,12 +104,11 @@ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size)
+ 		writel((u32)dma_addr, g_sfc_reg + SFC_DMA_ADDR);
+ 		writel(SFC_DMA_START, g_sfc_reg + SFC_DMA_TRIGGER);
+ 
+-		timeout = size * 10;
+ 		rksfc_wait_for_irq_completed();
+-		while (!((readl(g_sfc_reg + SFC_RAWISR) & DMA_INT)) &&
++		timeout = size * 10;
++		while ((readl(g_sfc_reg + SFC_SR) & SFC_BUSY) &&
+ 		       (timeout-- > 0))
+ 			sfc_delay(1);
+-		writel(0xFFFFFFFF, g_sfc_reg + SFC_ICLR);
+ 		if (timeout <= 0)
+ 			ret = SFC_WAIT_TIMEOUT;
+ 		direction = (cmd.b.rw == SFC_WRITE) ? 1 : 0;
+diff --git a/drivers/rkflash/sfc.h b/drivers/rkflash/sfc.h
+index 6cb1f4865343..319e010cccc6 100644
+--- a/drivers/rkflash/sfc.h
++++ b/drivers/rkflash/sfc.h
+@@ -5,9 +5,9 @@
+ #ifndef _SFC_H
+ #define _SFC_H
+ 
+-#define SFC_VER_3		0x3 /* ver 3, else ver 1 */
++#define SFC_VER_3		0x3
++#define SFC_VER_4		0x4
+ 
+-#define SFC_MAX_IOSIZE		(1024 * 8)    /* 8K byte */
+ #define SFC_EN_INT		(0)         /* enable interrupt */
+ #define SFC_EN_DMA		(1)         /* enable dma */
+ #define SFC_FIFO_DEPTH		(0x10)      /* 16 words */
+@@ -191,6 +191,7 @@ int sfc_init(void __iomem *reg_addr);
+ int sfc_request(struct rk_sfc_op *op, u32 addr, void *data, u32 size);
+ u16 sfc_get_version(void);
+ void sfc_clean_irq(void);
++u32 sfc_get_max_iosize(void);
+ void sfc_handle_irq(void);
+ unsigned long rksfc_dma_map_single(unsigned long ptr, int size, int dir);
+ void rksfc_dma_unmap_single(unsigned long ptr, int size, int dir);
+diff --git a/drivers/rkflash/sfc_nor.c b/drivers/rkflash/sfc_nor.c
+index 9b7b9a0985a2..f001455fe55d 100644
+--- a/drivers/rkflash/sfc_nor.c
++++ b/drivers/rkflash/sfc_nor.c
+@@ -300,7 +300,7 @@ int snor_prog_page(struct SFNOR_DEV *p_dev,
+ 
+ 	op.sfctrl.d32 = 0;
+ 	op.sfctrl.b.datalines = p_dev->prog_lines;
+-	op.sfctrl.b.enbledma = 0;
++	op.sfctrl.b.enbledma = 1;
+ 	if (p_dev->prog_cmd == CMD_PAGE_PROG_A4)
+ 		op.sfctrl.b.addrlines = SFC_4BITS_LINE;
+ 
+@@ -396,7 +396,7 @@ int snor_read_data(struct SFNOR_DEV *p_dev,
+ 	op.sfctrl.d32 = 0;
+ 	op.sfctrl.b.datalines = p_dev->read_lines;
+ 	if (!(size & 0x3) && size >= 4)
+-		op.sfctrl.b.enbledma = 0;
++		op.sfctrl.b.enbledma = 1;
+ 
+ 	if (p_dev->read_cmd == CMD_FAST_READ_X1 ||
+ 	    p_dev->read_cmd == CMD_FAST_READ_X4 ||
+@@ -433,7 +433,7 @@ int snor_read(struct SFNOR_DEV *p_dev, u32 sec, u32 n_sec, void *p_data)
+ 	addr = sec << 9;
+ 	size = n_sec << 9;
+ 	while (size) {
+-		len = size < SFC_MAX_IOSIZE ? size : SFC_MAX_IOSIZE;
++		len = size < p_dev->max_iosize ? size : p_dev->max_iosize;
+ 		ret = snor_read_data(p_dev, addr, p_buf, len);
+ 		if (ret != SFC_OK) {
+ 			rkflash_print_error("snor_read_data %x ret= %x\n",
+@@ -574,6 +574,7 @@ int snor_init(struct SFNOR_DEV *p_dev)
+ 		return SFC_PARAM_ERR;
+ 
+ 	memset((void *)p_dev, 0, sizeof(struct SFNOR_DEV));
++	p_dev->max_iosize = sfc_get_max_iosize();
+ 	snor_read_id(id_byte);
+ 	rkflash_print_error("sfc nor id: %x %x %x\n",
+ 			    id_byte[0], id_byte[1], id_byte[2]);
+diff --git a/drivers/rkflash/sfc_nor.h b/drivers/rkflash/sfc_nor.h
+index e3552e13e559..a779398c5a3f 100644
+--- a/drivers/rkflash/sfc_nor.h
++++ b/drivers/rkflash/sfc_nor.h
+@@ -10,7 +10,7 @@
+ #define NOR_PAGE_SIZE		256
+ #define NOR_BLOCK_SIZE		(64 * 1024)
+ #define NOR_SECS_BLK		(NOR_BLOCK_SIZE / 512)
+-#define NOR_SECS_PAGE		4
++#define NOR_SECS_PAGE		8
+ 
+ #define FEA_READ_STATUE_MASK	(0x3 << 0)
+ #define FEA_STATUE_MODE1	0
+@@ -110,6 +110,7 @@ struct SFNOR_DEV {
+ 	enum SFC_DATA_LINES prog_lines;
+ 
+ 	SNOR_WRITE_STATUS write_status;
++	u32 max_iosize;
+ };
+ 
+ struct flash_info {
+-- 
+2.35.3
+

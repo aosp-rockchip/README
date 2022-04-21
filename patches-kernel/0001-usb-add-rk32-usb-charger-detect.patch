@@ -1,0 +1,607 @@
+From 571039326c14b1b1504f0518cc153b4fb58a50cd Mon Sep 17 00:00:00 2001
+From: lyz <lyz@rock-chips.com>
+Date: Fri, 14 Mar 2014 18:13:48 +0800
+Subject: [PATCH] usb: add rk32 usb charger detect
+
+---
+ arch/arm/boot/dts/rk3188.dtsi               |   6 +
+ drivers/usb/dwc_otg_310/Makefile            |   2 +-
+ drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c  |   3 +-
+ drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c |  33 ++-
+ drivers/usb/dwc_otg_310/usbdev_bc.c         | 232 ++++++++++++++++++++
+ drivers/usb/dwc_otg_310/usbdev_bc.h         |  43 ++++
+ drivers/usb/dwc_otg_310/usbdev_rk.h         |  21 ++
+ drivers/usb/dwc_otg_310/usbdev_rk30.c       |  22 +-
+ drivers/usb/dwc_otg_310/usbdev_rk32.c       |  21 +-
+ drivers/usb/dwc_otg_310/usbdev_rkuoc.h      |  35 +++
+ 10 files changed, 367 insertions(+), 51 deletions(-)
+ create mode 100644 drivers/usb/dwc_otg_310/usbdev_bc.c
+ create mode 100644 drivers/usb/dwc_otg_310/usbdev_bc.h
+ create mode 100644 drivers/usb/dwc_otg_310/usbdev_rkuoc.h
+
+diff --git a/arch/arm/boot/dts/rk3188.dtsi b/arch/arm/boot/dts/rk3188.dtsi
+index 8792b1eea5f3..653e028effd2 100755
+--- a/arch/arm/boot/dts/rk3188.dtsi
++++ b/arch/arm/boot/dts/rk3188.dtsi
+@@ -667,7 +667,13 @@
+ 		gpios = <&gpio0 GPIO_C0 GPIO_ACTIVE_LOW>, <&gpio3 GPIO_D5 GPIO_ACTIVE_LOW>;
+ 		clocks = <&clk_gates4 5>;
+ 		clock-names = "hclk_usb_peri";
++
++		usb_bc{
++			compatible = "rockchip,ctrl";
++			rk_usb,bvalid     = <0xac  10 1>;
++		};
+ 	};
++	
+ 
+ 	usb@10180000 {
+ 		compatible = "rockchip,rk3188_usb20_otg";
+diff --git a/drivers/usb/dwc_otg_310/Makefile b/drivers/usb/dwc_otg_310/Makefile
+index 2850418f5854..fcec9ed1d4a4 100755
+--- a/drivers/usb/dwc_otg_310/Makefile
++++ b/drivers/usb/dwc_otg_310/Makefile
+@@ -25,7 +25,7 @@ endif
+ dwc_otg-objs	+= common_port/dwc_common_linux.o
+ 
+ #objs relative to RK platform 
+-dwc_otg-objs 	+= usbdev_rk30.o usbdev_rk32.o
++dwc_otg-objs 	+= usbdev_rk30.o usbdev_rk32.o usbdev_bc.o
+ #dwc_otg-objs 	+= usbdev_rk3190.o
+ #dwc_otg-objs	+= dwc_otg_rk_common.o
+ obj-$(CONFIG_DWC_OTG_310) := dwc_otg.o
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+index a1f69df06a73..762e4434c1c8 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_cil_intr.c
+@@ -45,6 +45,7 @@
+ #include "dwc_otg_driver.h"
+ #include "dwc_otg_pcd.h"
+ #include "dwc_otg_hcd.h"
++#include "usbdev_rk.h"
+ 
+ #ifdef DEBUG
+ inline const char *op_state_str(dwc_otg_core_if_t * core_if)
+@@ -105,7 +106,7 @@ int32_t dwc_otg_handle_otg_intr(dwc_otg_core_if_t * core_if)
+ 		dctl.b.sftdiscon = 1;
+ 		DWC_WRITE_REG32( &core_if->dev_if->dev_global_regs->dctl, dctl.d32 );
+ 		dwc_otg_disable_global_interrupts(core_if);
+-		core_if->otg_dev->pcd->vbus_status = 0;
++		core_if->otg_dev->pcd->vbus_status = USB_BC_TYPE_DISCNT;
+ 		DWC_PRINTF("********session end ,soft disconnect************************\n");
+ 
+ 		gotgctl.d32 = DWC_READ_REG32(&global_regs->gotgctl);
+diff --git a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+index 60e15a47a495..3fac0abb6c11 100755
+--- a/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
++++ b/drivers/usb/dwc_otg_310/dwc_otg_pcd_linux.c
+@@ -61,7 +61,6 @@
+ #include "dwc_otg_attr.h"
+ 
+ #include "usbdev_rk.h"
+-
+ static struct gadget_wrapper {
+ 	dwc_otg_pcd_t *pcd;
+ 
+@@ -1509,13 +1508,20 @@ static void dwc_otg_pcd_check_vbus_work( struct work_struct *work )
+ 			pldata->clock_enable( pldata, 1);
+ 			pldata->phy_suspend(pldata, USB_PHY_ENABLED);
+ 		}
+-	       dwc_otg_enable_global_interrupts(otg_dev->core_if);
++		if( pldata->bc_detect_cb != NULL )
++            pldata->bc_detect_cb( _pcd->vbus_status = USB_BC_TYPE_DISCNT );
++        else
++            _pcd->vbus_status = USB_BC_TYPE_DISCNT;
++	    dwc_otg_enable_global_interrupts(otg_dev->core_if);
+ 
+ 	}else if(pldata->get_status(USB_STATUS_BVABLID)){
+ 		/* if usb not connect before ,then start connect */
+-		if( _pcd->vbus_status == 0 ) {
++		if( _pcd->vbus_status == USB_BC_TYPE_DISCNT ) {
+ 			printk("*******************vbus detect*********************\n");
+-			_pcd->vbus_status = 1;
++            if( pldata->bc_detect_cb != NULL )
++                pldata->bc_detect_cb( _pcd->vbus_status = usb_battery_charger_detect(1) );
++            else
++                _pcd->vbus_status = USB_BC_TYPE_SDP;
+ 			if(_pcd->conn_en){
+ 				goto connect;
+ 			}
+@@ -1534,10 +1540,10 @@ static void dwc_otg_pcd_check_vbus_work( struct work_struct *work )
+ 			 */
+ 			dwc_otg_msc_unlock(_pcd);
+ 			_pcd->conn_status++;
+-			if((DWC_READ_REG32((uint32_t*)((uint8_t *)_pcd->otg_dev->os_dep.base
+-			    + DWC_OTG_HOST_PORT_REGS_OFFSET))&0xc00) == 0xc00)
+-			_pcd->vbus_status = 2;
+-                
++            if( pldata->bc_detect_cb != NULL )
++               pldata->bc_detect_cb( _pcd->vbus_status = USB_BC_TYPE_DCP ); 
++            else
++                _pcd->vbus_status = USB_BC_TYPE_DCP;
+ 			/* fail to connect, suspend usb phy and disable clk */
+ 			if( pldata->phy_status == USB_PHY_ENABLED ){
+ 				pldata->phy_suspend(pldata, USB_PHY_SUSPEND);
+@@ -1546,7 +1552,10 @@ static void dwc_otg_pcd_check_vbus_work( struct work_struct *work )
+ 			}
+ 		}
+ 	}else {
+-		_pcd->vbus_status = 0;
++        if( pldata->bc_detect_cb != NULL )
++            pldata->bc_detect_cb( _pcd->vbus_status = USB_BC_TYPE_DISCNT );
++        else
++		    _pcd->vbus_status = USB_BC_TYPE_DISCNT;
+ 
+ 		if(_pcd->conn_status){
+ 			_pcd->conn_status = 0;
+@@ -1617,13 +1626,13 @@ static void dwc_otg_pcd_work_init(dwc_otg_pcd_t *pcd, struct platform_device *de
+ 
+ 	struct dwc_otg_device* otg_dev = pcd->otg_dev;
+ 	struct dwc_otg_platform_data *pldata = otg_dev->pldata;
+-	pcd->vbus_status  = 0;
+-	pcd->phy_suspend  = 0;
++	pcd->vbus_status  = USB_BC_TYPE_DISCNT;
++	pcd->phy_suspend  = USB_PHY_ENABLED;
+ 
+ 	INIT_DELAYED_WORK(&pcd->reconnect , dwc_phy_reconnect);
+ 	INIT_DELAYED_WORK(&pcd->check_vbus_work , dwc_otg_pcd_check_vbus_work);
+ 
+-	wake_lock_init(&pcd->wake_lock, WAKE_LOCK_SUSPEND,"usb_pcd");
++	wake_lock_init(&pcd->wake_lock, WAKE_LOCK_SUSPEND, "usb_pcd");
+     
+ 	if(dwc_otg_is_device_mode(pcd->core_if)){
+ #ifdef CONFIG_RK_USB_UART        
+diff --git a/drivers/usb/dwc_otg_310/usbdev_bc.c b/drivers/usb/dwc_otg_310/usbdev_bc.c
+new file mode 100644
+index 000000000000..6227386f582c
+--- /dev/null
++++ b/drivers/usb/dwc_otg_310/usbdev_bc.c
+@@ -0,0 +1,232 @@
++/*
++ * Copyright (C) 2013-2014 ROCKCHIP, Inc.
++ * Author: LIYUNZHI  <lyz@rock-chips.com>
++ * Data: 2014-3-14
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "usbdev_rk.h"
++
++/****** GET and SET REGISTER FIELDS IN GRF UOC ******/
++
++#define BC_GET(x) grf_uoc_get_field(&pBC_UOC_FIELDS[x])
++#define BC_SET(x,v) grf_uoc_set_field(&pBC_UOC_FIELDS[x], v)
++
++uoc_field_t *pBC_UOC_FIELDS = NULL;
++static void *pGRF_BASE = NULL;
++
++/****** GET REGISTER FIELD INFO FROM Device Tree ******/
++
++inline static void *get_grf_base(struct device_node *np)
++{
++    void *grf_base = of_iomap(of_get_parent(np), 0);
++
++    if(of_machine_is_compatible("rockchip,rk3188"))
++        return (grf_base - 0xac);
++    else if(of_machine_is_compatible("rockchip,rk3288"))
++        return (grf_base - 0x284);
++}
++
++
++void grf_uoc_set_field(uoc_field_t *field, u32 value)
++{
++    if(!uoc_field_valid(field))
++        return ;
++    grf_uoc_set(pGRF_BASE, field->b.offset, field->b.bitmap, field->b.mask, value);
++}
++
++u32 grf_uoc_get_field(uoc_field_t *field)
++{
++    return grf_uoc_get(pGRF_BASE, field->b.offset, field->b.bitmap, field->b.mask);
++}
++
++inline static int uoc_init_field(struct device_node *np, const char* name, uoc_field_t *f)
++{
++    of_property_read_u32_array(np, name, f->array, 3);
++    printk("usb battery charger detect: uoc_init_field: 0x%08x %d %d \n",f->b.offset,f->b.bitmap,f->b.mask);
++    return 0;
++}
++inline static void uoc_init_synop(struct device_node *np)
++{
++    pBC_UOC_FIELDS = (uoc_field_t *)kzalloc(SYNOP_BC_MAX * sizeof(uoc_field_t), GFP_ATOMIC);
++
++    uoc_init_field(np, "rk_usb,bvalid", &pBC_UOC_FIELDS[SYNOP_BC_BVALID]);
++    uoc_init_field(np, "rk_usb,dcdenb", &pBC_UOC_FIELDS[SYNOP_BC_DCDENB]);
++    uoc_init_field(np, "rk_usb,vdatsrcenb", &pBC_UOC_FIELDS[SYNOP_BC_VDATSRCENB]);
++    uoc_init_field(np, "rk_usb,vdatdetenb", &pBC_UOC_FIELDS[SYNOP_BC_VDATDETENB]);
++    uoc_init_field(np, "rk_usb,chrgsel",  &pBC_UOC_FIELDS[SYNOP_BC_CHRGSEL]);
++    uoc_init_field(np, "rk_usb,chgdet",   &pBC_UOC_FIELDS[SYNOP_BC_CHGDET]);
++}
++
++inline static void uoc_init_rk(struct device_node *np)
++{
++    pBC_UOC_FIELDS = (uoc_field_t *)kzalloc(RK_BC_MAX * sizeof(uoc_field_t), GFP_ATOMIC);
++
++    uoc_init_field(np, "rk_usb,bvalid", &pBC_UOC_FIELDS[RK_BC_BVALID]);
++}
++
++inline static void uoc_init_inno(struct device_node *np)
++{
++    ;
++}
++
++/****** BATTERY CHARGER DETECT FUNCTIONS ******/
++
++int usb_battery_charger_detect_rk(bool wait)
++{
++
++    int port_type = USB_BC_TYPE_DISCNT;
++
++    if(BC_GET(RK_BC_BVALID))
++        port_type = USB_BC_TYPE_SDP;
++
++    printk("%s rk3188 kernel-3.10 not suppert this function\n",__func__);
++    return port_type;
++}
++
++int usb_battery_charger_detect_inno(bool wait)
++{
++
++    return -1;
++}
++
++/* When do BC detect PCD pull-up register should be disabled  */
++//wait wait for dcd timeout 900ms
++int usb_battery_charger_detect_synop(bool wait)
++{
++    int port_type = USB_BC_TYPE_DISCNT;
++    int timeout;
++    //VBUS Valid detect
++
++    if(BC_GET(SYNOP_BC_BVALID)) {
++        //todo : add DCD !
++        mdelay(wait ? T_DCD_TIMEOUT : 1);
++
++        /* Turn on VDPSRC */
++        //Primary Detection
++        BC_SET(SYNOP_BC_VDATSRCENB, 1);
++        BC_SET(SYNOP_BC_VDATDETENB, 1);
++        BC_SET(SYNOP_BC_CHRGSEL, 0);
++
++        timeout = T_BC_WAIT_CHGDET;
++        while(timeout--) {
++            if(BC_GET(SYNOP_BC_CHGDET))
++                break;
++            mdelay(1);
++        }
++
++        /* SDP and CDP/DCP distinguish */
++        if(BC_GET(SYNOP_BC_CHGDET)) {
++            /* Turn off VDPSRC */
++            BC_SET(SYNOP_BC_VDATSRCENB, 0);
++            BC_SET(SYNOP_BC_VDATDETENB, 0);
++
++            timeout = T_BC_SRC_OFF;
++            while(timeout--) {
++                if(!BC_GET(SYNOP_BC_CHGDET))
++                    break;
++                mdelay(1);
++            };
++
++            /* Turn on VDMSRC */
++            BC_SET(SYNOP_BC_VDATSRCENB, 1);
++            BC_SET(SYNOP_BC_VDATDETENB, 1);
++            BC_SET(SYNOP_BC_CHRGSEL, 1);
++
++            if(BC_GET(SYNOP_BC_CHGDET))
++                port_type = USB_BC_TYPE_DCP;
++            else
++                port_type = USB_BC_TYPE_CDP;
++        } else {
++            port_type = USB_BC_TYPE_SDP;
++        }
++        BC_SET(SYNOP_BC_VDATSRCENB, 0);
++        BC_SET(SYNOP_BC_VDATDETENB, 0);
++        BC_SET(SYNOP_BC_CHRGSEL, 0);
++
++    }
++
++    printk("%s , battery_charger_detect %d\n", __func__, port_type);
++    return port_type;
++}
++
++int usb_battery_charger_detect(bool wait)
++{
++    static struct device_node *np = NULL;
++    if(!np)
++        np = of_find_node_by_name(NULL, "usb_bc");
++    if(!np)
++        goto fail;
++    if(!pGRF_BASE) {
++        pGRF_BASE = get_grf_base(np);
++    }
++
++    if(of_device_is_compatible(np,"rockchip,ctrl")) {
++        if(!pBC_UOC_FIELDS)
++            uoc_init_rk(np);
++        return usb_battery_charger_detect_rk(wait);
++    }
++
++    else if(of_device_is_compatible(np,"synopsys,phy")) {
++        if(!pBC_UOC_FIELDS)
++            uoc_init_synop(np);
++        return usb_battery_charger_detect_synop(wait);
++    }
++
++    else if(of_device_is_compatible(np,"inno,phy")) {
++        if(!pBC_UOC_FIELDS)
++            uoc_init_inno(np);
++        return usb_battery_charger_detect_inno(wait);
++    }
++fail:
++    return -1;
++}
++EXPORT_SYMBOL(usb_battery_charger_detect);
++
++
++int dwc_otg_check_dpdm(bool wait)
++{
++    return usb_battery_charger_detect(wait);
++}
++EXPORT_SYMBOL(dwc_otg_check_dpdm);
++
++/* CALL BACK FUNCTION for USB CHARGER TYPE CHANGED */
++
++void usb20otg_battery_charger_detect_cb(int charger_type_new)
++{
++    static int charger_type = USB_BC_TYPE_DISCNT;
++    if(charger_type != charger_type_new) {
++        switch(charger_type_new) {
++            case USB_BC_TYPE_DISCNT:
++                break;
++
++            case USB_BC_TYPE_SDP:
++                break;
++
++            case USB_BC_TYPE_DCP:
++                break;
++
++            case USB_BC_TYPE_CDP:
++                break;
++
++            case USB_BC_TYPE_UNKNOW:
++                break;
++
++            default :
++                break;
++        }
++
++        printk("%s , battery_charger_detect %d\n", __func__, charger_type_new);
++    }
++    charger_type = charger_type_new;
++}
++
+diff --git a/drivers/usb/dwc_otg_310/usbdev_bc.h b/drivers/usb/dwc_otg_310/usbdev_bc.h
+new file mode 100644
+index 000000000000..43b84c5909d3
+--- /dev/null
++++ b/drivers/usb/dwc_otg_310/usbdev_bc.h
+@@ -0,0 +1,43 @@
++#ifndef _USBDEV_BC_H
++#define _USBDEV_BC_H
++
++/* USB Charger Types */
++#define USB_BC_TYPE_DISCNT  (0)
++#define USB_BC_TYPE_SDP     (1)
++#define USB_BC_TYPE_DCP     (2)
++#define USB_BC_TYPE_CDP     (3)
++#define USB_BC_TYPE_UNKNOW  (4)
++
++enum {
++    SYNOP_BC_BVALID = 0,
++    SYNOP_BC_DCDENB,
++    SYNOP_BC_VDATSRCENB,
++    SYNOP_BC_VDATDETENB,
++    SYNOP_BC_CHRGSEL,
++    SYNOP_BC_CHGDET,
++    SYNOP_BC_MAX,	
++};
++
++enum {
++    RK_BC_BVALID = 0,
++    RK_BC_MAX,
++};
++
++#define T_DCD_TIMEOUT	 (200)
++#define T_BC_WAIT_CHGDET (40)
++#define T_BC_SRC_OFF     (10)
++
++
++/***********************************
++USB Port Type
++0 : Disconnect
++1 : SDP - pc
++2 : DCP - charger
++3 : CDP - pc with big currect charge
++***********************************/
++
++extern int dwc_otg_check_dpdm(bool wait);
++extern int usb_battery_charger_detect(bool wait);
++extern void usb20otg_battery_charger_detect_cb(int charger_type_new);
++
++#endif
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk.h b/drivers/usb/dwc_otg_310/usbdev_rk.h
+index 70728e814aa3..80fd925cb7e9 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk.h
++++ b/drivers/usb/dwc_otg_310/usbdev_rk.h
+@@ -1,8 +1,28 @@
+ #ifndef __USBDEV_RK_H
+ #define __USBDEV_RK_H
++
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/clk.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/of_gpio.h>
++#include <linux/of_device.h>
++#include <linux/of_address.h>
++#include <linux/gpio.h>
+ #include <linux/wakelock.h>
+ #include <linux/workqueue.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++
++
+ #include "usbdev_grf_regs.h"
++#include "usbdev_bc.h"
++#include "usbdev_rkuoc.h"
+ 
+ #define USB_PHY_ENABLED (0)
+ #define USB_PHY_SUSPEND (1)
+@@ -40,6 +60,7 @@ struct dwc_otg_platform_data {
+     void (*clock_enable)(void* pdata, int enable);
+     void (*power_enable)(int enable);
+     void (*dwc_otg_uart_mode)(void* pdata, int enter_usb_uart_mode);
++    void (*bc_detect_cb)(int bc_type);
+     int (*get_status)(int id);
+     int (*get_chip_id)(void);
+ };
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk30.c b/drivers/usb/dwc_otg_310/usbdev_rk30.c
+index 33a2e6da03f6..1faf3a293541 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk30.c
++++ b/drivers/usb/dwc_otg_310/usbdev_rk30.c
+@@ -1,22 +1,6 @@
+-#include <linux/kernel.h>
+-#include <linux/platform_device.h>
+-#include <linux/delay.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/clk.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/of.h>
+-#include <linux/err.h>
+-#include <linux/io.h>
+-#include <linux/of_gpio.h>
+-#include <linux/of_device.h>
+-#include <linux/gpio.h>
+-#include <linux/wakelock.h>
+-#include <linux/workqueue.h>
+-#include <linux/interrupt.h>
+-#include <linux/irq.h>
+-#include "usbdev_grf_regs.h"
++
+ #include "usbdev_rk.h"
++#include "usbdev_grf_regs.h"
+ #include "dwc_otg_regs.h"
+ 
+ static struct dwc_otg_control_usb *control_usb;
+@@ -167,6 +151,7 @@ struct dwc_otg_platform_data usb20otg_pdata_rk3188 = {
+ #ifdef CONFIG_RK_USB_UART
+ 	.dwc_otg_uart_mode = dwc_otg_uart_mode,
+ #endif
++    .bc_detect_cb=usb20otg_battery_charger_detect_cb,
+ };
+ 
+ #endif
+@@ -577,7 +562,6 @@ static int dwc_otg_control_usb_probe(struct platform_device *pdev)
+ 		ret = err;
+ 		goto err2;
+ 	}
+-
+ 	ret = otg_irq_detect_init(pdev);
+ 	if (ret < 0)
+ 		goto err2;
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rk32.c b/drivers/usb/dwc_otg_310/usbdev_rk32.c
+index 2635b456c352..b373bd200629 100755
+--- a/drivers/usb/dwc_otg_310/usbdev_rk32.c
++++ b/drivers/usb/dwc_otg_310/usbdev_rk32.c
+@@ -1,22 +1,6 @@
+-#include <linux/kernel.h>
+-#include <linux/platform_device.h>
+-#include <linux/delay.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/clk.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/of.h>
+-#include <linux/err.h>
+-#include <linux/io.h>
+-#include <linux/of_gpio.h>
+-#include <linux/of_device.h>
+-#include <linux/gpio.h>
+-#include <linux/wakelock.h>
+-#include <linux/workqueue.h>
+-#include <linux/interrupt.h>
+-#include <linux/irq.h>
+-#include "usbdev_grf_regs.h"
++
+ #include "usbdev_rk.h"
++#include "usbdev_grf_regs.h"
+ #include "dwc_otg_regs.h"
+ static struct dwc_otg_control_usb *control_usb;
+ 
+@@ -167,6 +151,7 @@ struct dwc_otg_platform_data usb20otg_pdata_rk3288 = {
+ #ifdef CONFIG_RK_USB_UART
+ 	.dwc_otg_uart_mode = dwc_otg_uart_mode,
+ #endif
++    .bc_detect_cb=usb20otg_battery_charger_detect_cb,
+ };
+ 
+ #endif
+diff --git a/drivers/usb/dwc_otg_310/usbdev_rkuoc.h b/drivers/usb/dwc_otg_310/usbdev_rkuoc.h
+new file mode 100644
+index 000000000000..419ae0b8ecb2
+--- /dev/null
++++ b/drivers/usb/dwc_otg_310/usbdev_rkuoc.h
+@@ -0,0 +1,35 @@
++#ifndef __USBDEV_RKUOC_H
++#define _USBDEV_RKUOC_H
++
++typedef union uoc_field
++{
++    u32 array[3];
++    struct {
++            u32 offset;
++            u32 bitmap;
++            u32 mask;
++    }b;
++} uoc_field_t;
++
++inline static void grf_uoc_set(void *base, u32 offset, u8 bitmap, u8 mask, u32 value)
++{
++    //printk("bc_debug:set addr %p val = 0x%08x\n",((u32*)(base + offset)),(((((1 << mask) - 1) & value) | (((1 << mask) - 1) << 16))<< bitmap));
++    *((u32*)(base + offset)) = (((((1 << mask) - 1) & value) | (((1 << mask) - 1) << 16))<< bitmap);
++}
++inline static u32 grf_uoc_get(void *base, u32 offset, u32 bitmap, u32 mask)
++{
++    //printk("bc_debug:get addr %p bit %d val = 0x%08x\n",(u32*)(base + offset), bitmap, *((u32*)(base + offset)));
++    return ((*((u32*)(base + offset)) >> bitmap) & ((1 << mask) - 1));
++}
++
++static inline bool uoc_field_valid(uoc_field_t *f)
++{
++    if((f->b.bitmap < 32)&&(f->b.mask < 32))
++        return true;
++    else        {
++        printk("%s field invalid\n",__func__);
++        return false;
++    }
++}
++
++#endif
+-- 
+2.35.3
+

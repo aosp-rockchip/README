@@ -1,0 +1,132 @@
+From 34564b6204e19a1827b7d1131003c6638f677191 Mon Sep 17 00:00:00 2001
+From: Ding Wei <leo.ding@rock-chips.com>
+Date: Tue, 15 Sep 2020 11:25:36 +0800
+Subject: [PATCH] video: rockchip: mpp: fix irq issue for rkvenc
+
+1. before reset, it need set mask to avoid irq reentry.
+2. rearranged the write of L1 register.
+
+backtrace:
+[   33.276048 ] Exception stack(0xee8b9e20 to 0xee8b9e68)
+[   33.276059 ] 9e20: dd539040 ee0f6080 00000000 00000104 00000020
+00000080 42800200 000000d2
+[   33.276071 ] 9e40: 00000001 b0e2396c dd539040 ee0f6080 00000348
+ee8b9e70 b03e5044 b03e0ec0
+[   33.276080 ] 9e60: 80070013 ffffffff
+[   33.276093 ] [<b0101a78>] (__irq_svc) from [<b03e0ec0>]
+(mpp_write_req+0x4c/0x94)
+[   33.276108 ] [<b03e0ec0>] (mpp_write_req) from [<b03e5044>]
+(rkvenc_run+0x1e8/0x2a0)
+[   33.276122 ] [<b03e5044>] (rkvenc_run) from [<b03e0bcc>]
+(mpp_task_try_run+0x24c/0x3ac)
+[   33.276137 ] [<b03e0bcc>] (mpp_task_try_run) from [<b013ccdc>]
+(process_one_work+0x1f0/0x408)
+[   33.276151 ] [<b013ccdc>] (process_one_work) from [<b013d9b4>]
+(worker_thread+0x30/0x564)
+[   33.276165 ] [<b013d9b4>] (worker_thread) from [<b014290c>]
+(kthread+0x140/0x170)
+[   33.276178 ] [<b014290c>] (kthread) from [<b01010d8>]
+(ret_from_fork+0x14/0x3c)
+
+Change-Id: I82c56ed384507dbd0d01973dc9d88fa7fc255ed4
+Signed-off-by: Ding Wei <leo.ding@rock-chips.com>
+---
+ drivers/video/rockchip/mpp/mpp_common.c |  2 ++
+ drivers/video/rockchip/mpp/mpp_rkvenc.c | 38 ++++++++++++++++++-------
+ 2 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/video/rockchip/mpp/mpp_common.c b/drivers/video/rockchip/mpp/mpp_common.c
+index 09dda6be23ac..9c4cd68316fe 100644
+--- a/drivers/video/rockchip/mpp/mpp_common.c
++++ b/drivers/video/rockchip/mpp/mpp_common.c
+@@ -1675,6 +1675,8 @@ irqreturn_t mpp_dev_irq(int irq, void *param)
+ 		set_bit(TASK_STATE_IRQ, &task->state);
+ 		if (mpp->dev_ops->irq)
+ 			ret = mpp->dev_ops->irq(mpp);
++	} else {
++		mpp_err("error, task is null\n");
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/video/rockchip/mpp/mpp_rkvenc.c b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+index e3503d1e2842..989cbab3c759 100644
+--- a/drivers/video/rockchip/mpp/mpp_rkvenc.c
++++ b/drivers/video/rockchip/mpp/mpp_rkvenc.c
+@@ -381,6 +381,20 @@ static int rkvenc_read_req_l2(struct mpp_dev *mpp,
+ 	return 0;
+ }
+ 
++static int rkvenc_write_req_backward(struct mpp_dev *mpp, u32 *regs,
++				     s32 start_idx, s32 end_idx, s32 en_idx)
++{
++	int i;
++
++	for (i = end_idx - 1; i >= start_idx; i--) {
++		if (i == en_idx)
++			continue;
++		mpp_write_relaxed(mpp, i * sizeof(u32), regs[i]);
++	}
++
++	return 0;
++}
++
+ static int rkvenc_run(struct mpp_dev *mpp,
+ 		      struct mpp_task *mpp_task)
+ {
+@@ -418,7 +432,8 @@ static int rkvenc_run(struct mpp_dev *mpp,
+ 				/* set register L1 */
+ 				s = req->offset / sizeof(u32);
+ 				e = s + req->size / sizeof(u32);
+-				mpp_write_req(mpp, task->reg, s, e, reg_en);
++				/* NOTE: for rkvenc, register should set backward */
++				rkvenc_write_req_backward(mpp, task->reg, s, e, reg_en);
+ 			}
+ 		}
+ 		/* init current task */
+@@ -474,14 +489,10 @@ static int rkvenc_isr(struct mpp_dev *mpp)
+ 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n", task->irq_status);
+ 
+ 	if (task->irq_status & RKVENC_INT_ERROR_BITS) {
+-		/*
+-		 * according to war running, if the dummy encoding
+-		 * running with timeout, we enable a safe clear process,
+-		 * we reset the ip, and complete the war procedure.
+-		 */
+ 		atomic_inc(&mpp->reset_request);
+-		/* time out error */
+-		mpp_write(mpp, RKVENC_INT_ERROR_BITS, RKVENC_INT_MSK_BASE);
++		/* dump register */
++		if (mpp_debug_unlikely(DEBUG_DUMP_ERR_REG))
++			mpp_task_dump_reg(mpp, mpp_task);
+ 	}
+ 
+ 	mpp_task_finish(mpp_task->session, mpp_task);
+@@ -932,9 +943,14 @@ static int rkvenc_reset(struct mpp_dev *mpp)
+ #endif
+ 	mpp_clk_set_rate(&enc->aclk_info, CLK_MODE_REDUCE);
+ 	mpp_clk_set_rate(&enc->core_clk_info, CLK_MODE_REDUCE);
+-
+-	mpp_write(mpp, RKVENC_INT_EN_BASE, RKVENC_SAFE_CLR_BIT);
++	/* safe reset */
++	mpp_write(mpp, RKVENC_INT_MSK_BASE, 0x1FF);
+ 	mpp_write(mpp, RKVENC_CLR_BASE, RKVENC_SAFE_CLR_BIT);
++	udelay(5);
++	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n", mpp_read(mpp, RKVENC_INT_STATUS_BASE));
++	mpp_write(mpp, RKVENC_INT_CLR_BASE, 0xffffffff);
++	mpp_write(mpp, RKVENC_INT_STATUS_BASE, 0);
++	/* cru reset */
+ 	if (enc->rst_a && enc->rst_h && enc->rst_core) {
+ 		rockchip_pmu_idle_request(mpp->dev, true);
+ 		mpp_safe_reset(enc->rst_a);
+@@ -1160,6 +1176,8 @@ static void rkvenc_shutdown(struct platform_device *pdev)
+ 				 val, val == 0, 1000, 200000);
+ 	if (ret == -ETIMEDOUT)
+ 		dev_err(dev, "wait total running time out\n");
++
++	dev_info(dev, "shutdown success\n");
+ }
+ 
+ struct platform_driver rockchip_rkvenc_driver = {
+-- 
+2.35.3
+

@@ -1,0 +1,261 @@
+From 38e112d31c282acced7898cf49c5cc4b0dc6b9a4 Mon Sep 17 00:00:00 2001
+From: Algea Cao <algea.cao@rock-chips.com>
+Date: Mon, 17 Aug 2020 17:59:19 +0800
+Subject: [PATCH] drm/bridge: synopsys: dw-hdmi: Check whether color has
+ changed in connector atomic_check
+
+For compatibility with GKI, connector atomic_begin/atomic_flush should
+be removed. If hdmi color format has changed, set flag mode_changed
+true and start a modeset to config hdmi.
+
+We check whether color format has changed in
+dw_hdmi_connector_atomic_check(), but color format variable update in
+dw_hdmi_rockchip_encoder_atomic_check(), It runs after
+dw_hdmi_connector_atomic_check(). That will lead to misjudgments when
+determining whether color format has changed.
+
+To solve this problem, we introduce get_color_changed(). When color
+properties are set and color format is changed, get_color_changed()
+return true.
+
+Signed-off-by: Algea Cao <algea.cao@rock-chips.com>
+Change-Id: Id1fbe80171856f91efa5ae40a0e0608a92ebcbf7
+---
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.c   | 131 +++-----------------
+ drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c |  20 +++
+ include/drm/bridge/dw_hdmi.h                |   1 +
+ 3 files changed, 36 insertions(+), 116 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 619baa44ec76..d5953c58da12 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2711,119 +2711,6 @@ static int dw_hdmi_connector_get_modes(struct drm_connector *connector)
+ 	return ret;
+ }
+ 
+-static void
+-dw_hdmi_connector_atomic_begin(struct drm_connector *connector,
+-			       struct drm_connector_state *conn_state)
+-{
+-	struct dw_hdmi *hdmi = container_of(connector, struct dw_hdmi,
+-					    connector);
+-	void *data = hdmi->plat_data->phy_data;
+-	unsigned int enc_in_bus_format;
+-	unsigned int enc_out_bus_format;
+-	unsigned int enc_in_encoding;
+-	unsigned int enc_out_encoding;
+-
+-	if (!conn_state->crtc)
+-		return;
+-
+-	if (!hdmi->hdmi_data.video_mode.mpixelclock)
+-		return;
+-
+-	if (hdmi->plat_data->get_enc_in_encoding)
+-		enc_in_encoding = hdmi->plat_data->get_enc_in_encoding(data);
+-	else
+-		enc_in_encoding = hdmi->hdmi_data.enc_in_encoding;
+-	if (hdmi->plat_data->get_enc_out_encoding)
+-		enc_out_encoding = hdmi->plat_data->get_enc_out_encoding(data);
+-	else
+-		enc_out_encoding = hdmi->hdmi_data.enc_out_encoding;
+-	if (hdmi->plat_data->get_input_bus_format)
+-		enc_in_bus_format =
+-			hdmi->plat_data->get_input_bus_format(data);
+-	else
+-		enc_in_bus_format = hdmi->hdmi_data.enc_in_bus_format;
+-	if (hdmi->plat_data->get_output_bus_format)
+-		enc_out_bus_format =
+-			hdmi->plat_data->get_output_bus_format(data);
+-	else
+-		enc_out_bus_format = hdmi->hdmi_data.enc_out_bus_format;
+-
+-	if (enc_in_encoding != hdmi->hdmi_data.enc_in_encoding ||
+-	    enc_out_encoding != hdmi->hdmi_data.enc_out_encoding ||
+-	    enc_in_bus_format != hdmi->hdmi_data.enc_in_bus_format ||
+-	    enc_out_bus_format != hdmi->hdmi_data.enc_out_bus_format) {
+-		hdmi->hdmi_data.update = true;
+-		hdmi_writeb(hdmi, HDMI_FC_GCP_SET_AVMUTE, HDMI_FC_GCP);
+-		/* XXX: Add delay to make av mute work on sink*/
+-		msleep(50);
+-	} else {
+-		hdmi->hdmi_data.update = false;
+-	}
+-}
+-
+-static void
+-dw_hdmi_connector_atomic_flush(struct drm_connector *connector,
+-			       struct drm_connector_state *conn_state)
+-{
+-	struct dw_hdmi *hdmi = container_of(connector, struct dw_hdmi,
+-					     connector);
+-	struct drm_display_mode *mode = NULL;
+-	void *data = hdmi->plat_data->phy_data;
+-	struct hdmi_vmode *vmode = &hdmi->hdmi_data.video_mode;
+-	unsigned int in_bus_format = hdmi->hdmi_data.enc_in_bus_format;
+-	unsigned int out_bus_format = hdmi->hdmi_data.enc_out_bus_format;
+-
+-	if (!conn_state->crtc)
+-		return;
+-
+-	DRM_DEBUG("%s\n", __func__);
+-
+-	/*
+-	 * If HDMI is enabled in uboot, it's need to record
+-	 * drm_display_mode and set phy status to enabled.
+-	 */
+-	if (!vmode->mpixelclock) {
+-		if (hdmi->plat_data->get_enc_in_encoding)
+-			hdmi->hdmi_data.enc_in_encoding =
+-				hdmi->plat_data->get_enc_in_encoding(data);
+-		if (hdmi->plat_data->get_enc_out_encoding)
+-			hdmi->hdmi_data.enc_out_encoding =
+-				hdmi->plat_data->get_enc_out_encoding(data);
+-		if (hdmi->plat_data->get_input_bus_format)
+-			hdmi->hdmi_data.enc_in_bus_format =
+-				hdmi->plat_data->get_input_bus_format(data);
+-		if (hdmi->plat_data->get_output_bus_format)
+-			hdmi->hdmi_data.enc_out_bus_format =
+-				hdmi->plat_data->get_output_bus_format(data);
+-
+-		mode = &conn_state->crtc->mode;
+-		memcpy(&hdmi->previous_mode, mode, sizeof(hdmi->previous_mode));
+-		vmode->mpixelclock = mode->crtc_clock * 1000;
+-		vmode->previous_pixelclock = mode->clock;
+-		vmode->previous_tmdsclock = mode->clock;
+-		vmode->mtmdsclock = hdmi_get_tmdsclock(hdmi,
+-						       vmode->mpixelclock);
+-		if (hdmi_bus_fmt_is_yuv420(hdmi->hdmi_data.enc_out_bus_format))
+-			vmode->mtmdsclock /= 2;
+-		if (in_bus_format != hdmi->hdmi_data.enc_in_bus_format ||
+-		    out_bus_format != hdmi->hdmi_data.enc_out_bus_format)
+-			hdmi->hdmi_data.update = true;
+-		else
+-			return;
+-	}
+-
+-	if (hdmi->hdmi_data.update) {
+-		dw_hdmi_setup(hdmi, &hdmi->previous_mode);
+-		/*
+-		 * Before clear AVMUTE, delay is needed to
+-		 * prevent display flash.
+-		 */
+-		msleep(50);
+-		hdmi_writeb(hdmi, HDMI_FC_GCP_CLEAR_AVMUTE, HDMI_FC_GCP);
+-		hdmi->hdmi_data.update = false;
+-	}
+-}
+-
+ static int
+ dw_hdmi_atomic_connector_set_property(struct drm_connector *connector,
+ 				      struct drm_connector_state *state,
+@@ -2868,6 +2755,19 @@ dw_hdmi_connector_set_property(struct drm_connector *connector,
+ 						     property, val);
+ }
+ 
++static bool dw_hdmi_color_changed(struct drm_connector *connector)
++{
++	struct dw_hdmi *hdmi = container_of(connector, struct dw_hdmi,
++					    connector);
++	void *data = hdmi->plat_data->phy_data;
++	bool ret = false;
++
++	if (hdmi->plat_data->get_color_changed)
++		ret = hdmi->plat_data->get_color_changed(data);
++
++	return ret;
++}
++
+ static bool hdr_metadata_equal(const struct drm_connector_state *old_state,
+ 			       const struct drm_connector_state *new_state)
+ {
+@@ -2896,7 +2796,8 @@ static int dw_hdmi_connector_atomic_check(struct drm_connector *connector,
+ 	if (!crtc)
+ 		return 0;
+ 
+-	if (!hdr_metadata_equal(old_state, new_state)) {
++	if (!hdr_metadata_equal(old_state, new_state) ||
++	    dw_hdmi_color_changed(connector)) {
+ 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 		if (IS_ERR(crtc_state))
+ 			return PTR_ERR(crtc_state);
+@@ -2946,8 +2847,6 @@ static const struct drm_connector_helper_funcs dw_hdmi_connector_helper_funcs =
+ 	.get_modes = dw_hdmi_connector_get_modes,
+ 	.best_encoder = drm_atomic_helper_best_encoder,
+ 	.atomic_check = dw_hdmi_connector_atomic_check,
+-	.atomic_begin = dw_hdmi_connector_atomic_begin,
+-	.atomic_flush = dw_hdmi_connector_atomic_flush,
+ };
+ 
+ static void dw_hdmi_attach_properties(struct dw_hdmi *hdmi)
+diff --git a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+index ca9128e86e7f..0a492ec0901d 100644
+--- a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+@@ -112,6 +112,7 @@ struct rockchip_hdmi {
+ 	unsigned long bus_format;
+ 	unsigned long output_bus_format;
+ 	unsigned long enc_out_encoding;
++	int color_changed;
+ 
+ 	struct drm_property *color_depth_property;
+ 	struct drm_property *hdmi_output_property;
+@@ -824,6 +825,19 @@ dw_hdmi_rockchip_get_hdr_blob(void *data)
+ 	return hdmi->hdr_panel_blob_ptr;
+ }
+ 
++static bool
++dw_hdmi_rockchip_get_color_changed(void *data)
++{
++	struct rockchip_hdmi *hdmi = (struct rockchip_hdmi *)data;
++	bool ret = false;
++
++	if (hdmi->color_changed)
++		ret = true;
++	hdmi->color_changed = 0;
++
++	return ret;
++}
++
+ static const struct drm_prop_enum_list color_depth_enum_list[] = {
+ 	{ 0, "Automatic" }, /* Prefer highest color depth */
+ 	{ 8, "24bit" },
+@@ -1022,9 +1036,13 @@ dw_hdmi_rockchip_set_property(struct drm_connector *connector,
+ 	struct drm_mode_config *config = &connector->dev->mode_config;
+ 
+ 	if (property == hdmi->color_depth_property) {
++		if (val != hdmi->colordepth)
++			hdmi->color_changed++;
+ 		hdmi->colordepth = val;
+ 		return 0;
+ 	} else if (property == hdmi->hdmi_output_property) {
++		if (val != hdmi->hdmi_output)
++			hdmi->color_changed++;
+ 		hdmi->hdmi_output = val;
+ 		return 0;
+ 	} else if (property == hdmi->quant_range) {
+@@ -1344,6 +1362,8 @@ static int dw_hdmi_rockchip_bind(struct device *dev, struct device *master,
+ 		dw_hdmi_rockchip_get_hdr_property;
+ 	plat_data->get_hdr_blob =
+ 		dw_hdmi_rockchip_get_hdr_blob;
++	plat_data->get_color_changed =
++		dw_hdmi_rockchip_get_color_changed;
+ 	plat_data->property_ops = &dw_hdmi_rockchip_property_ops;
+ 
+ 	encoder = &hdmi->encoder;
+diff --git a/include/drm/bridge/dw_hdmi.h b/include/drm/bridge/dw_hdmi.h
+index d8f1082b7fab..12d129db70dc 100644
+--- a/include/drm/bridge/dw_hdmi.h
++++ b/include/drm/bridge/dw_hdmi.h
+@@ -178,6 +178,7 @@ struct dw_hdmi_plat_data {
+ 	unsigned long (*get_quant_range)(void *data);
+ 	struct drm_property *(*get_hdr_property)(void *data);
+ 	struct drm_property_blob *(*get_hdr_blob)(void *data);
++	bool (*get_color_changed)(void *data);
+ 
+ 	/* Vendor Property support */
+ 	const struct dw_hdmi_property_ops *property_ops;
+-- 
+2.35.3
+

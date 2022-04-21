@@ -1,0 +1,1042 @@
+From f18ee0f4d9b1ff82e598f241d4a2b03cd79db595 Mon Sep 17 00:00:00 2001
+From: Frank Wang <frank.wang@rock-chips.com>
+Date: Thu, 21 Jan 2016 16:30:20 +0800
+Subject: [PATCH] mailbox: rk3368: add mailbox and scpi function
+
+Add mailbox and scpi protocol function support for rk3368 SoC.
+
+Change-Id: I201c916865eb2729ed135c3f5a77a9dd97007952
+Signed-off-by: Frank Wang <frank.wang@rock-chips.com>
+---
+ drivers/mailbox/Kconfig                       |  22 ++
+ drivers/mailbox/Makefile                      |   4 +
+ .../{rockchip_mailbox.c => rk3368-mailbox.c}  | 125 +++++------
+ drivers/mailbox/scpi_cmd.h                    | 106 ----------
+ drivers/mailbox/scpi_protocol.c               | 196 ++++++++++++++----
+ .../rk3368-mailbox.h}                         |   2 +-
+ include/linux/rockchip/scpi.h                 | 102 ++++++++-
+ 7 files changed, 348 insertions(+), 209 deletions(-)
+ rename drivers/mailbox/{rockchip_mailbox.c => rk3368-mailbox.c} (68%)
+ delete mode 100644 drivers/mailbox/scpi_cmd.h
+ rename include/linux/{rockchip-mailbox.h => rockchip/rk3368-mailbox.h} (94%)
+
+diff --git a/drivers/mailbox/Kconfig b/drivers/mailbox/Kconfig
+index 546d05f4358a..d0dd30289bac 100644
+--- a/drivers/mailbox/Kconfig
++++ b/drivers/mailbox/Kconfig
+@@ -85,4 +85,26 @@ config MAILBOX_TEST
+ 	  Test client to help with testing new Controller driver
+ 	  implementations.
+ 
++config RK3368_MBOX
++	bool "RK3368 SoC Integrated Mailbox Support"
++	depends on ARCH_ROCKCHIP
++	help
++	  This driver provides support for inter-processor communication
++	  between CPU cores and MCU processor on RK3368 SoC.
++	  Please check it that the Soc you use have Mailbox hardware.
++	  Say Y here if you want to use the Rockchip Mailbox support.
++
++config RK3368_SCPI_PROTOCOL
++	bool "RK3368 SCPI Message Protocol Support"
++	depends on RK3368_MBOX
++	help
++	  System Control and Power Interface (SCPI) Message Protocol is
++	  defined for the purpose of communication between the Application
++	  Cores(AP) and the System Control Processor(SCP). The mailbox
++	  provides a mechanism for inter-processor communication between SCP
++	  and AP.
++
++	  This protocol library provides interface for all the client drivers
++	  making use of the features offered by the SCP.
++
+ endif
+diff --git a/drivers/mailbox/Makefile b/drivers/mailbox/Makefile
+index 92435ef11f26..61771d712c3a 100644
+--- a/drivers/mailbox/Makefile
++++ b/drivers/mailbox/Makefile
+@@ -17,3 +17,7 @@ obj-$(CONFIG_ALTERA_MBOX)	+= mailbox-altera.o
+ obj-$(CONFIG_BCM2835_MBOX)	+= bcm2835-mailbox.o
+ 
+ obj-$(CONFIG_STI_MBOX)		+= mailbox-sti.o
++
++obj-$(CONFIG_RK3368_MBOX)	+= rk3368-mailbox.o
++
++obj-$(CONFIG_RK3368_SCPI_PROTOCOL)	+= scpi_protocol.o
+diff --git a/drivers/mailbox/rockchip_mailbox.c b/drivers/mailbox/rk3368-mailbox.c
+similarity index 68%
+rename from drivers/mailbox/rockchip_mailbox.c
+rename to drivers/mailbox/rk3368-mailbox.c
+index db9943179476..34263d7453d2 100644
+--- a/drivers/mailbox/rockchip_mailbox.c
++++ b/drivers/mailbox/rk3368-mailbox.c
+@@ -22,8 +22,8 @@
+ #include <linux/slab.h>
+ #include <linux/clk.h>
+ 
+-#include <linux/rockchip-mailbox.h>
+-#include <linux/scpi_protocol.h>
++#include <linux/rockchip/rk3368-mailbox.h>
++#include <linux/rockchip/scpi.h>
+ 
+ #define MAILBOX_VERSION			"V1.00"
+ 
+@@ -44,17 +44,17 @@
+ /* B2A: 2k - 4k */
+ #define B2A_BUF(size, idx)		(((idx) + 4) * (size))
+ 
+-struct rockchip_mbox_drv_data {
++struct rk3368_mbox_drv_data {
+ 	int num_chans;
+ };
+ 
+-struct rockchip_mbox_chan {
++struct rk3368_mbox_chan {
+ 	int idx;
+-	struct rockchip_mbox_msg *msg;
+-	struct rockchip_mbox *mb;
++	struct rk3368_mbox_msg *msg;
++	struct rk3368_mbox *mb;
+ };
+ 
+-struct rockchip_mbox {
++struct rk3368_mbox {
+ 	struct mbox_controller mbox;
+ 	struct clk *pclk;
+ 	void __iomem *mbox_base;
+@@ -62,22 +62,22 @@ struct rockchip_mbox {
+ 	void __iomem *buf_base;
+ 	/* The maximum size of buf for each channel */
+ 	u32 buf_size;
+-	struct rockchip_mbox_chan *chans;
++	struct rk3368_mbox_chan *chans;
+ };
+ 
+ #define MBOX_CHAN_NUMS	4
+ int idx_map_irq[MBOX_CHAN_NUMS] = {0, 0, 0, 0};
+ 
+-static inline int chan_to_idx(struct rockchip_mbox *mb,
++static inline int chan_to_idx(struct rk3368_mbox *mb,
+ 			      struct mbox_chan *chan)
+ {
+ 	return (chan - mb->mbox.chans);
+ }
+ 
+-static int rockchip_mbox_send_data(struct mbox_chan *chan, void *data)
++static int rk3368_mbox_send_data(struct mbox_chan *chan, void *data)
+ {
+-	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
+-	struct rockchip_mbox_msg *msg = data;
++	struct rk3368_mbox *mb = dev_get_drvdata(chan->mbox->dev);
++	struct rk3368_mbox_msg *msg = data;
+ 	int idx = chan_to_idx(mb, chan);
+ 
+ 	if (!msg)
+@@ -105,29 +105,29 @@ static int rockchip_mbox_send_data(struct mbox_chan *chan, void *data)
+ 	return 0;
+ }
+ 
+-static int rockchip_mbox_startup(struct mbox_chan *chan)
++static int rk3368_mbox_startup(struct mbox_chan *chan)
+ {
+ 	return 0;
+ }
+ 
+-static void rockchip_mbox_shutdown(struct mbox_chan *chan)
++static void rk3368_mbox_shutdown(struct mbox_chan *chan)
+ {
+-	struct rockchip_mbox *mb = dev_get_drvdata(chan->mbox->dev);
++	struct rk3368_mbox *mb = dev_get_drvdata(chan->mbox->dev);
+ 	int idx = chan_to_idx(mb, chan);
+ 
+ 	mb->chans[idx].msg = NULL;
+ }
+ 
+-static struct mbox_chan_ops rockchip_mbox_chan_ops = {
+-	.send_data	= rockchip_mbox_send_data,
+-	.startup	= rockchip_mbox_startup,
+-	.shutdown	= rockchip_mbox_shutdown,
++static struct mbox_chan_ops rk3368_mbox_chan_ops = {
++	.send_data	= rk3368_mbox_send_data,
++	.startup	= rk3368_mbox_startup,
++	.shutdown	= rk3368_mbox_shutdown,
+ };
+ 
+-static irqreturn_t rockchip_mbox_irq(int irq, void *dev_id)
++static irqreturn_t rk3368_mbox_irq(int irq, void *dev_id)
+ {
+ 	int idx;
+-	struct rockchip_mbox *mb = (struct rockchip_mbox *)dev_id;
++	struct rk3368_mbox *mb = (struct rk3368_mbox *)dev_id;
+ 	u32 status = readl_relaxed(mb->mbox_base + MAILBOX_B2A_STATUS);
+ 
+ 	for (idx = 0; idx < mb->mbox.num_chans; idx++) {
+@@ -142,11 +142,11 @@ static irqreturn_t rockchip_mbox_irq(int irq, void *dev_id)
+ 	return IRQ_NONE;
+ }
+ 
+-static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
++static irqreturn_t rk3368_mbox_isr(int irq, void *dev_id)
+ {
+ 	int idx;
+-	struct rockchip_mbox_msg *msg = NULL;
+-	struct rockchip_mbox *mb = (struct rockchip_mbox *)dev_id;
++	struct rk3368_mbox_msg *msg = NULL;
++	struct rk3368_mbox *mb = (struct rk3368_mbox *)dev_id;
+ 
+ 	for (idx = 0; idx < mb->mbox.num_chans; idx++) {
+ 		if (irq != idx_map_irq[idx])
+@@ -176,30 +176,33 @@ static irqreturn_t rockchip_mbox_isr(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static const struct rockchip_mbox_drv_data rk3368_drv_data = {
++static const struct rk3368_mbox_drv_data rk3368_drv_data = {
+ 	.num_chans = 4,
+ };
+ 
+-static struct of_device_id rockchip_mbox_of_match[] = {
+-	{ .compatible = "rockchip,rk3368-mailbox", .data = &rk3368_drv_data },
++static const struct of_device_id rk3368_mbox_of_match[] = {
++	{
++		.compatible = "rockchip,rk3368-mbox-legacy",
++		.data = &rk3368_drv_data,
++	},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, rockchp_mbox_of_match);
+ 
+ #ifdef CONFIG_PM
+-static int rockchip_mbox_suspend(struct platform_device *pdev,
+-				 pm_message_t state)
++static int rk3368_mbox_suspend(struct platform_device *pdev,
++			       pm_message_t state)
+ {
+-	struct rockchip_mbox *mb = platform_get_drvdata(pdev);
++	struct rk3368_mbox *mb = platform_get_drvdata(pdev);
+ 
+ 	if (scpi_sys_set_mcu_state_suspend())
+ 		dev_err(mb->mbox.dev, "scpi_sys_set_mcu_state_suspend timeout.\n");
+ 	return 0;
+ }
+ 
+-static int rockchip_mbox_resume(struct platform_device *pdev)
++static int rk3368_mbox_resume(struct platform_device *pdev)
+ {
+-	struct rockchip_mbox *mb = platform_get_drvdata(pdev);
++	struct rk3368_mbox *mb = platform_get_drvdata(pdev);
+ 
+ 	writel_relaxed((1 << mb->mbox.num_chans) - 1,
+ 		       mb->mbox_base + MAILBOX_B2A_INTEN);
+@@ -210,22 +213,22 @@ static int rockchip_mbox_resume(struct platform_device *pdev)
+ }
+ #endif /* CONFIG_PM */
+ 
+-static int rockchip_mbox_probe(struct platform_device *pdev)
++static int rk3368_mbox_probe(struct platform_device *pdev)
+ {
+-	struct rockchip_mbox *mb;
++	struct rk3368_mbox *mb;
+ 	const struct of_device_id *match;
+-	const struct rockchip_mbox_drv_data *drv_data;
++	const struct rk3368_mbox_drv_data *drv_data;
+ 	struct resource *res;
+ 	int ret, irq, i;
+ 
+-	dev_info(&pdev->dev,
+-		 "Rockchip mailbox initialize, version: "MAILBOX_VERSION"\n");
++	dev_info(&pdev->dev, "rk3368-mailbox initialized, version: %s\n",
++		 MAILBOX_VERSION);
+ 
+ 	if (!pdev->dev.of_node)
+ 		return -ENODEV;
+ 
+-	match = of_match_node(rockchip_mbox_of_match, pdev->dev.of_node);
+-	drv_data = (const struct rockchip_mbox_drv_data *)match->data;
++	match = of_match_node(rk3368_mbox_of_match, pdev->dev.of_node);
++	drv_data = (const struct rk3368_mbox_drv_data *)match->data;
+ 
+ 	mb = devm_kzalloc(&pdev->dev, sizeof(*mb), GFP_KERNEL);
+ 	if (!mb)
+@@ -245,14 +248,14 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 
+ 	mb->mbox.dev = &pdev->dev;
+ 	mb->mbox.num_chans = drv_data->num_chans;
+-	mb->mbox.ops = &rockchip_mbox_chan_ops;
++	mb->mbox.ops = &rk3368_mbox_chan_ops;
+ 	mb->mbox.txdone_irq = true;
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res)
+ 		return -ENODEV;
+ 
+-	mb->mbox_base = devm_request_and_ioremap(&pdev->dev, res);
++	mb->mbox_base = devm_ioremap_resource(&pdev->dev, res);
+ 	if (!mb->mbox_base)
+ 		return -ENOMEM;
+ 
+@@ -260,6 +263,12 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 	if (!res)
+ 		return -ENODEV;
+ 
++	/* Each channel has two buffers for A2B and B2A */
++	mb->buf_size = resource_size(res) / (drv_data->num_chans * 2);
++	mb->buf_base = devm_ioremap_resource(&pdev->dev, res);
++	if (!mb->buf_base)
++		return -ENOMEM;
++
+ 	mb->pclk = devm_clk_get(&pdev->dev, "pclk_mailbox");
+ 	if (IS_ERR(mb->pclk)) {
+ 		ret = PTR_ERR(mb->pclk);
+@@ -274,20 +283,14 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	/* Each channel has two buffers for A2B and B2A */
+-	mb->buf_size = resource_size(res) / (drv_data->num_chans * 2);
+-	mb->buf_base = devm_request_and_ioremap(&pdev->dev, res);
+-	if (!mb->buf_base)
+-		return -ENOMEM;
+-
+ 	for (i = 0; i < mb->mbox.num_chans; i++) {
+ 		irq = platform_get_irq(pdev, i);
+ 		if (irq < 0)
+ 			return irq;
+ 
+ 		ret = devm_request_threaded_irq(&pdev->dev, irq,
+-						rockchip_mbox_irq,
+-						rockchip_mbox_isr, IRQF_ONESHOT,
++						rk3368_mbox_irq,
++						rk3368_mbox_isr, IRQF_ONESHOT,
+ 						dev_name(&pdev->dev), mb);
+ 		if (ret < 0)
+ 			return ret;
+@@ -309,30 +312,30 @@ static int rockchip_mbox_probe(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
+-static int rockchip_mbox_remove(struct platform_device *pdev)
++static int rk3368_mbox_remove(struct platform_device *pdev)
+ {
+-	struct rockchip_mbox *mb = platform_get_drvdata(pdev);
++	struct rk3368_mbox *mb = platform_get_drvdata(pdev);
+ 
+ 	mbox_controller_unregister(&mb->mbox);
+ 
+ 	return 0;
+ }
+ 
+-static struct platform_driver rockchip_mbox_driver = {
+-	.probe	= rockchip_mbox_probe,
+-	.remove	= rockchip_mbox_remove,
++static struct platform_driver rk3368_mbox_driver = {
++	.probe	= rk3368_mbox_probe,
++	.remove	= rk3368_mbox_remove,
+ #ifdef CONFIG_PM
+-	.suspend = rockchip_mbox_suspend,
+-	.resume	= rockchip_mbox_resume,
++	.suspend = rk3368_mbox_suspend,
++	.resume	= rk3368_mbox_resume,
+ #endif /* CONFIG_PM */
+ 	.driver = {
+-		.name = "rockchip-mailbox",
+-		.of_match_table = of_match_ptr(rockchip_mbox_of_match),
++		.name = "rk3368-mailbox",
++		.of_match_table = of_match_ptr(rk3368_mbox_of_match),
+ 	},
+ };
+ 
+-static int __init rockchip_mbox_init(void)
++static int __init rk3368_mbox_init(void)
+ {
+-	return platform_driver_register(&rockchip_mbox_driver);
++	return platform_driver_register(&rk3368_mbox_driver);
+ }
+-subsys_initcall(rockchip_mbox_init);
++subsys_initcall(rk3368_mbox_init);
+diff --git a/drivers/mailbox/scpi_cmd.h b/drivers/mailbox/scpi_cmd.h
+deleted file mode 100644
+index 9b89d371e512..000000000000
+--- a/drivers/mailbox/scpi_cmd.h
++++ /dev/null
+@@ -1,106 +0,0 @@
+-/*
+- * SCPI Command header
+- *
+- * Copyright (C) 2014 ARM Ltd.
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+- * more details.
+- *
+- * You should have received a copy of the GNU General Public License along with
+- * this program. If not, see <http://www.gnu.org/licenses/>.
+- */
+-
+-#define SCPI_VERSION		0x01000001	/* version: 1.0.0.0 */
+-
+-enum scpi_error_codes {
+-	SCPI_SUCCESS = 0, /* Success */
+-	SCPI_ERR_PARAM = 1, /* Invalid parameter(s) */
+-	SCPI_ERR_ALIGN = 2, /* Invalid alignment */
+-	SCPI_ERR_SIZE = 3, /* Invalid size */
+-	SCPI_ERR_HANDLER = 4, /* Invalid handler/callback */
+-	SCPI_ERR_ACCESS = 5, /* Invalid access/permission denied */
+-	SCPI_ERR_RANGE = 6, /* Value out of range */
+-	SCPI_ERR_TIMEOUT = 7, /* Timeout has occurred */
+-	SCPI_ERR_NOMEM = 8, /* Invalid memory area or pointer */
+-	SCPI_ERR_PWRSTATE = 9, /* Invalid power state */
+-	SCPI_ERR_SUPPORT = 10, /* Not supported or disabled */
+-	SCPI_ERR_DEVICE = 11, /* Device error */
+-	SCPI_ERR_MAX
+-};
+-
+-enum scpi_client_id {
+-	SCPI_CL_NONE,
+-	SCPI_CL_CLOCKS,
+-	SCPI_CL_DVFS,
+-	SCPI_CL_POWER,
+-	SCPI_CL_THERMAL,
+-	SCPI_CL_DDR,
+-	SCPI_CL_SYS,
+-	SCPI_MAX,
+-};
+-
+-enum scpi_ddr_cmd {
+-		SCPI_DDR_INIT,
+-		SCPI_DDR_SET_FREQ,
+-		SCPI_DDR_ROUND_RATE,
+-		SCPI_DDR_AUTO_SELF_REFRESH,
+-		SCPI_DDR_BANDWIDTH_GET,
+-		SCPI_DDR_GET_FREQ,
+-		SCPI_DDR_SEND_TIMING,
+-};
+-
+-enum scpi_sys_cmd {
+-	SCPI_SYS_GET_VERSION,
+-	SCPI_SYS_REFRESH_MCU_FREQ,
+-	SCPI_SYS_SET_MCU_STATE_SUSPEND,
+-	SCPI_SYS_SET_MCU_STATE_RESUME,
+-};
+-
+-enum scpi_std_cmd {
+-	SCPI_CMD_INVALID		= 0x00,
+-	SCPI_CMD_SCPI_READY		= 0x01,
+-	SCPI_CMD_SCPI_CAPABILITIES	= 0x02,
+-	SCPI_CMD_EVENT			= 0x03,
+-	SCPI_CMD_SET_CSS_PWR_STATE	= 0x04,
+-	SCPI_CMD_GET_CSS_PWR_STATE	= 0x05,
+-	SCPI_CMD_CFG_PWR_STATE_STAT	= 0x06,
+-	SCPI_CMD_GET_PWR_STATE_STAT	= 0x07,
+-	SCPI_CMD_SYS_PWR_STATE		= 0x08,
+-	SCPI_CMD_L2_READY		= 0x09,
+-	SCPI_CMD_SET_AP_TIMER		= 0x0a,
+-	SCPI_CMD_CANCEL_AP_TIME		= 0x0b,
+-	SCPI_CMD_DVFS_CAPABILITIES	= 0x0c,
+-	SCPI_CMD_GET_DVFS_INFO		= 0x0d,
+-	SCPI_CMD_SET_DVFS		= 0x0e,
+-	SCPI_CMD_GET_DVFS		= 0x0f,
+-	SCPI_CMD_GET_DVFS_STAT		= 0x10,
+-	SCPI_CMD_SET_RTC		= 0x11,
+-	SCPI_CMD_GET_RTC		= 0x12,
+-	SCPI_CMD_CLOCK_CAPABILITIES	= 0x13,
+-	SCPI_CMD_SET_CLOCK_INDEX	= 0x14,
+-	SCPI_CMD_SET_CLOCK_VALUE	= 0x15,
+-	SCPI_CMD_GET_CLOCK_VALUE	= 0x16,
+-	SCPI_CMD_PSU_CAPABILITIES	= 0x17,
+-	SCPI_CMD_SET_PSU		= 0x18,
+-	SCPI_CMD_GET_PSU		= 0x19,
+-	SCPI_CMD_SENSOR_CAPABILITIES	= 0x1a,
+-	SCPI_CMD_SENSOR_INFO		= 0x1b,
+-	SCPI_CMD_SENSOR_VALUE		= 0x1c,
+-	SCPI_CMD_SENSOR_CFG_PERIODIC	= 0x1d,
+-	SCPI_CMD_SENSOR_CFG_BOUNDS	= 0x1e,
+-	SCPI_CMD_SENSOR_ASYNC_VALUE	= 0x1f,
+-	SCPI_CMD_COUNT
+-};
+-
+-enum scpi_thermal_cmd {
+-	SCPI_THERMAL_GET_TSADC_DATA,
+-	SCPI_THERMAL_SET_TSADC_CYCLE,
+-	SCPI_THERMAL_COUNT
+-};
+-
+diff --git a/drivers/mailbox/scpi_protocol.c b/drivers/mailbox/scpi_protocol.c
+index c58a608596f7..9cc5384e070e 100644
+--- a/drivers/mailbox/scpi_protocol.c
++++ b/drivers/mailbox/scpi_protocol.c
+@@ -24,12 +24,11 @@
+ #include <linux/module.h>
+ #include <linux/printk.h>
+ #include <linux/mailbox_client.h>
+-#include <linux/scpi_protocol.h>
+ #include <linux/slab.h>
+-#include <linux/rockchip-mailbox.h>
+-#include <linux/rockchip/common.h>
++#include <linux/rockchip/scpi.h>
++#include <linux/rockchip/rk3368-mailbox.h>
+ 
+-#include "scpi_cmd.h"
++#define SCPI_VERSION		0x01000002	/* version: 1.0.0.2 */
+ 
+ #define CMD_ID_SHIFT		0
+ #define CMD_ID_MASK		0xff
+@@ -52,16 +51,91 @@ static int max_chan_num = 0;
+ static DECLARE_BITMAP(bm_mbox_chans, 4);
+ static DEFINE_MUTEX(scpi_mtx);
+ 
+-struct scpi_data_buf {
+-	int client_id;
+-	struct rockchip_mbox_msg *data;
+-	struct completion complete;
+-	int timeout_ms;
++enum scpi_error_codes {
++	SCPI_SUCCESS = 0, /* Success */
++	SCPI_ERR_PARAM = 1, /* Invalid parameter(s) */
++	SCPI_ERR_ALIGN = 2, /* Invalid alignment */
++	SCPI_ERR_SIZE = 3, /* Invalid size */
++	SCPI_ERR_HANDLER = 4, /* Invalid handler/callback */
++	SCPI_ERR_ACCESS = 5, /* Invalid access/permission denied */
++	SCPI_ERR_RANGE = 6, /* Value out of range */
++	SCPI_ERR_TIMEOUT = 7, /* Timeout has occurred */
++	SCPI_ERR_NOMEM = 8, /* Invalid memory area or pointer */
++	SCPI_ERR_PWRSTATE = 9, /* Invalid power state */
++	SCPI_ERR_SUPPORT = 10, /* Not supported or disabled */
++	SCPI_ERR_DEVICE = 11, /* Device error */
++	SCPI_ERR_MAX
+ };
+ 
+-struct scpi_mcu_ver {
+-	u32  scpi_ver;
+-	char mcu_ver[16];
++enum scpi_client_id {
++	SCPI_CL_NONE,
++	SCPI_CL_CLOCKS,
++	SCPI_CL_DVFS,
++	SCPI_CL_POWER,
++	SCPI_CL_THERMAL,
++	SCPI_CL_DDR,
++	SCPI_CL_SYS,
++	SCPI_MAX,
++};
++
++enum scpi_ddr_cmd {
++	SCPI_DDR_INIT,
++	SCPI_DDR_SET_FREQ,
++	SCPI_DDR_ROUND_RATE,
++	SCPI_DDR_AUTO_SELF_REFRESH,
++	SCPI_DDR_BANDWIDTH_GET,
++	SCPI_DDR_GET_FREQ,
++	SCPI_DDR_SEND_TIMING,
++};
++
++enum scpi_sys_cmd {
++	SCPI_SYS_GET_VERSION,
++	SCPI_SYS_REFRESH_MCU_FREQ,
++	SCPI_SYS_SET_MCU_STATE_SUSPEND,
++	SCPI_SYS_SET_MCU_STATE_RESUME,
++	SCPI_SYS_SET_JTAGMUX_ON_OFF,
++};
++
++enum scpi_std_cmd {
++	SCPI_CMD_INVALID		= 0x00,
++	SCPI_CMD_SCPI_READY		= 0x01,
++	SCPI_CMD_SCPI_CAPABILITIES	= 0x02,
++	SCPI_CMD_EVENT			= 0x03,
++	SCPI_CMD_SET_CSS_PWR_STATE	= 0x04,
++	SCPI_CMD_GET_CSS_PWR_STATE	= 0x05,
++	SCPI_CMD_CFG_PWR_STATE_STAT	= 0x06,
++	SCPI_CMD_GET_PWR_STATE_STAT	= 0x07,
++	SCPI_CMD_SYS_PWR_STATE		= 0x08,
++	SCPI_CMD_L2_READY		= 0x09,
++	SCPI_CMD_SET_AP_TIMER		= 0x0a,
++	SCPI_CMD_CANCEL_AP_TIME		= 0x0b,
++	SCPI_CMD_DVFS_CAPABILITIES	= 0x0c,
++	SCPI_CMD_GET_DVFS_INFO		= 0x0d,
++	SCPI_CMD_SET_DVFS		= 0x0e,
++	SCPI_CMD_GET_DVFS		= 0x0f,
++	SCPI_CMD_GET_DVFS_STAT		= 0x10,
++	SCPI_CMD_SET_RTC		= 0x11,
++	SCPI_CMD_GET_RTC		= 0x12,
++	SCPI_CMD_CLOCK_CAPABILITIES	= 0x13,
++	SCPI_CMD_SET_CLOCK_INDEX	= 0x14,
++	SCPI_CMD_SET_CLOCK_VALUE	= 0x15,
++	SCPI_CMD_GET_CLOCK_VALUE	= 0x16,
++	SCPI_CMD_PSU_CAPABILITIES	= 0x17,
++	SCPI_CMD_SET_PSU		= 0x18,
++	SCPI_CMD_GET_PSU		= 0x19,
++	SCPI_CMD_SENSOR_CAPABILITIES	= 0x1a,
++	SCPI_CMD_SENSOR_INFO		= 0x1b,
++	SCPI_CMD_SENSOR_VALUE		= 0x1c,
++	SCPI_CMD_SENSOR_CFG_PERIODIC	= 0x1d,
++	SCPI_CMD_SENSOR_CFG_BOUNDS	= 0x1e,
++	SCPI_CMD_SENSOR_ASYNC_VALUE	= 0x1f,
++	SCPI_CMD_COUNT
++};
++
++enum scpi_thermal_cmd {
++	SCPI_THERMAL_GET_TSADC_DATA,
++	SCPI_THERMAL_SET_TSADC_CYCLE,
++	SCPI_THERMAL_COUNT
+ };
+ 
+ static int high_priority_cmds[] = {
+@@ -81,6 +155,18 @@ static int high_priority_cmds[] = {
+ 	SCPI_CMD_SENSOR_CFG_BOUNDS,
+ };
+ 
++struct scpi_data_buf {
++	int client_id;
++	struct rk3368_mbox_msg *data;
++	struct completion complete;
++	int timeout_ms;
++};
++
++struct scpi_mcu_ver {
++	u32  scpi_ver;
++	char mcu_ver[16];
++};
++
+ static struct scpi_opp *scpi_opps[MAX_DVFS_DOMAINS];
+ 
+ static struct device *the_scpi_device;
+@@ -141,7 +227,7 @@ static void scpi_free_mbox_chan(int chan)
+ 
+ static void scpi_rx_callback(struct mbox_client *cl, void *msg)
+ {
+-	struct rockchip_mbox_msg *data = (struct rockchip_mbox_msg *)msg;
++	struct rk3368_mbox_msg *data = (struct rk3368_mbox_msg *)msg;
+ 	struct scpi_data_buf *scpi_buf = data->cl_data;
+ 
+ 	complete(&scpi_buf->complete);
+@@ -151,7 +237,7 @@ static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, int index)
+ {
+ 	struct mbox_chan *chan;
+ 	struct mbox_client cl;
+-	struct rockchip_mbox_msg *data = scpi_buf->data;
++	struct rk3368_mbox_msg *data = scpi_buf->data;
+ 	u32 status;
+ 	int ret;
+ 	int timeout = msecs_to_jiffies(scpi_buf->timeout_ms);
+@@ -164,6 +250,7 @@ static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, int index)
+ 	cl.dev = the_scpi_device;
+ 	cl.rx_callback = scpi_rx_callback;
+ 	cl.tx_done = NULL;
++	cl.tx_prepare = NULL;
+ 	cl.tx_block = false;
+ 	cl.knows_txdone = false;
+ 
+@@ -196,7 +283,7 @@ static int send_scpi_cmd(struct scpi_data_buf *scpi_buf, int index)
+ #define SCPI_SETUP_DBUF(scpi_buf, mbox_buf, _client_id,\
+ 			_cmd, _tx_buf, _rx_buf) \
+ do {						\
+-	struct rockchip_mbox_msg *pdata = &mbox_buf;	\
++	struct rk3368_mbox_msg *pdata = &mbox_buf;	\
+ 	pdata->cmd = _cmd;			\
+ 	pdata->tx_buf = &_tx_buf;		\
+ 	pdata->tx_size = sizeof(_tx_buf);	\
+@@ -210,7 +297,7 @@ do {						\
+ #define SCPI_SETUP_DBUF_BY_SIZE(scpi_buf, mbox_buf, _client_id,		\
+ 				_cmd, _tx_buf, _tx_size, _rx_buf)	\
+ do {									\
+-	struct rockchip_mbox_msg *pdata = &mbox_buf;			\
++	struct rk3368_mbox_msg *pdata = &mbox_buf;			\
+ 	pdata->cmd = _cmd;						\
+ 	pdata->tx_buf = _tx_buf;					\
+ 	pdata->tx_size = _tx_size;					\
+@@ -223,7 +310,7 @@ do {									\
+ 
+ static int scpi_execute_cmd(struct scpi_data_buf *scpi_buf)
+ {
+-	struct rockchip_mbox_msg *data;
++	struct rk3368_mbox_msg *data;
+ 	int index;
+ 
+ 	if (!scpi_buf || !scpi_buf->data)
+@@ -244,7 +331,7 @@ static int scpi_execute_cmd(struct scpi_data_buf *scpi_buf)
+ unsigned long scpi_clk_get_val(u16 clk_id)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		u32 clk_rate;
+@@ -262,7 +349,7 @@ EXPORT_SYMBOL_GPL(scpi_clk_get_val);
+ int scpi_clk_set_val(u16 clk_id, unsigned long rate)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	int stat;
+ 	struct __packed {
+ 		u32 clk_rate;
+@@ -281,7 +368,7 @@ EXPORT_SYMBOL_GPL(scpi_clk_set_val);
+ struct scpi_opp *scpi_dvfs_get_opps(u8 domain)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		u32 header;
+@@ -328,7 +415,7 @@ EXPORT_SYMBOL_GPL(scpi_dvfs_get_opps);
+ int scpi_dvfs_get_idx(u8 domain)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		u8 dvfs_idx;
+@@ -351,7 +438,7 @@ EXPORT_SYMBOL_GPL(scpi_dvfs_get_idx);
+ int scpi_dvfs_set_idx(u8 domain, u8 idx)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u8 dvfs_domain;
+ 		u8 dvfs_idx;
+@@ -373,7 +460,7 @@ EXPORT_SYMBOL_GPL(scpi_dvfs_set_idx);
+ int scpi_get_sensor(char *name)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		u16 sensors;
+@@ -390,7 +477,7 @@ int scpi_get_sensor(char *name)
+ 
+ 	/* This should be handled by a generic macro */
+ 	do {
+-		struct rockchip_mbox_msg *pdata = &mdata;
++		struct rk3368_mbox_msg *pdata = &mdata;
+ 
+ 		pdata->cmd = SCPI_CMD_SENSOR_CAPABILITIES;
+ 		pdata->tx_size = 0;
+@@ -425,7 +512,7 @@ EXPORT_SYMBOL_GPL(scpi_get_sensor);
+ int scpi_get_sensor_value(u16 sensor, u32 *val)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		u32 val;
+@@ -447,7 +534,7 @@ static int scpi_get_version(u32 old, struct scpi_mcu_ver *ver)
+ {
+ 	int ret;
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed {
+ 		u32 status;
+ 		struct scpi_mcu_ver version;
+@@ -472,7 +559,7 @@ static int scpi_get_version(u32 old, struct scpi_mcu_ver *ver)
+ int scpi_sys_set_mcu_state_suspend(void)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 status;
+ 	} tx_buf;
+@@ -490,7 +577,7 @@ EXPORT_SYMBOL_GPL(scpi_sys_set_mcu_state_suspend);
+ int scpi_sys_set_mcu_state_resume(void)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 status;
+ 	} tx_buf;
+@@ -506,10 +593,37 @@ int scpi_sys_set_mcu_state_resume(void)
+ }
+ EXPORT_SYMBOL_GPL(scpi_sys_set_mcu_state_resume);
+ 
++int scpi_sys_set_jtagmux_on_off(u32 en)
++{
++	int ret;
++	struct scpi_data_buf sdata;
++	struct rk3368_mbox_msg mdata;
++	struct __packed1 {
++		u32 enable;
++	} tx_buf;
++
++	struct __packed2 {
++		u32 status;
++	} rx_buf;
++
++	tx_buf.enable = en;
++	SCPI_SETUP_DBUF(sdata, mdata, SCPI_CL_SYS,
++			SCPI_SYS_SET_JTAGMUX_ON_OFF, tx_buf, rx_buf);
++
++	ret = scpi_execute_cmd(&sdata);
++	if (ret)
++		pr_err("set jtagmux on-off failed, ret=%d\n", ret);
++	else
++		ret = rx_buf.status;
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(scpi_sys_set_jtagmux_on_off);
++
+ int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type, u32 addr_mcu_el3)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 dram_speed_bin;
+ 		u32 freq;
+@@ -533,7 +647,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_init);
+ int scpi_ddr_set_clk_rate(u32 rate, u32 lcdc_type)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 clk_rate;
+ 		u32 lcdc_type;
+@@ -553,7 +667,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_set_clk_rate);
+ int scpi_ddr_send_timing(u32 *p, u32 size)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed2 {
+ 		u32 status;
+ 	} rx_buf;
+@@ -566,7 +680,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_send_timing);
+ int scpi_ddr_round_rate(u32 m_hz)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 clk_rate;
+ 	} tx_buf;
+@@ -589,7 +703,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_round_rate);
+ int scpi_ddr_set_auto_self_refresh(u32 en)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 enable;
+ 	} tx_buf;
+@@ -609,7 +723,7 @@ int scpi_ddr_bandwidth_get(struct ddr_bw_info *ddr_bw_ch0,
+ 			   struct ddr_bw_info *ddr_bw_ch1)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 status;
+ 	} tx_buf;
+@@ -636,7 +750,7 @@ EXPORT_SYMBOL_GPL(scpi_ddr_bandwidth_get);
+ int scpi_ddr_get_clk_rate(void)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 status;
+ 	} tx_buf;
+@@ -659,7 +773,7 @@ int scpi_thermal_get_temperature(void)
+ {
+ 	int ret;
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 status;
+ 	} tx_buf;
+@@ -686,7 +800,7 @@ EXPORT_SYMBOL_GPL(scpi_thermal_get_temperature);
+ int scpi_thermal_set_clk_cycle(u32 cycle)
+ {
+ 	struct scpi_data_buf sdata;
+-	struct rockchip_mbox_msg mdata;
++	struct rk3368_mbox_msg mdata;
+ 	struct __packed1 {
+ 		u32 clk_cycle;
+ 	} tx_buf;
+@@ -704,7 +818,7 @@ int scpi_thermal_set_clk_cycle(u32 cycle)
+ EXPORT_SYMBOL_GPL(scpi_thermal_set_clk_cycle);
+ 
+ static struct of_device_id mobx_scpi_of_match[] = {
+-	{ .compatible = "rockchip,mbox-scpi"},
++	{ .compatible = "rockchip,rk3368-scpi-legacy"},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, mobx_scpi_of_match);
+@@ -746,8 +860,10 @@ static int mobx_scpi_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	dev_info(&pdev->dev, "Scpi initialize, version: 0x%x, chan nums: %d\n",
+-		 mcu_ver.scpi_ver, val);
+-	dev_info(&pdev->dev, "MCU version: %s\n", mcu_ver.mcu_ver);
++		 SCPI_VERSION, val);
++
++	if (check_version)
++		dev_info(&pdev->dev, "MCU version: %s\n", mcu_ver.mcu_ver);
+ 
+ 	return 0;
+ exit:
+diff --git a/include/linux/rockchip-mailbox.h b/include/linux/rockchip/rk3368-mailbox.h
+similarity index 94%
+rename from include/linux/rockchip-mailbox.h
+rename to include/linux/rockchip/rk3368-mailbox.h
+index c06bfbd248f6..659375c7d874 100644
+--- a/include/linux/rockchip-mailbox.h
++++ b/include/linux/rockchip/rk3368-mailbox.h
+@@ -9,7 +9,7 @@
+ #ifndef __MAILBOX_ROCKCHIP_H__
+ #define __MAILBOX_ROCKCHIP_H__
+ 
+-struct rockchip_mbox_msg {
++struct rk3368_mbox_msg {
+ 	u32 cmd;
+ 	int tx_size;
+ 	void *tx_buf;
+diff --git a/include/linux/rockchip/scpi.h b/include/linux/rockchip/scpi.h
+index c57df9759ea5..468a35095c13 100644
+--- a/include/linux/rockchip/scpi.h
++++ b/include/linux/rockchip/scpi.h
+@@ -2,6 +2,7 @@
+  * SCPI Message Protocol driver header
+  *
+  * Copyright (C) 2014 ARM Ltd.
++ * Copyright (C) 2014, Fuzhou Rockchip Electronics Co., Ltd
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -18,6 +19,7 @@
+ #include <linux/types.h>
+ #include <linux/rockchip/common.h>
+ 
++#ifdef CONFIG_RK3368_SCPI_PROTOCOL
+ struct scpi_opp_entry {
+ 	u32 freq_hz;
+ 	u32 volt_mv;
+@@ -36,7 +38,7 @@ int scpi_dvfs_set_idx(u8 domain, u8 idx);
+ struct scpi_opp *scpi_dvfs_get_opps(u8 domain);
+ int scpi_get_sensor(char *name);
+ int scpi_get_sensor_value(u16 sensor, u32 *val);
+-
++int scpi_sys_set_jtagmux_on_off(u32 en);
+ int scpi_sys_set_mcu_state_suspend(void);
+ int scpi_sys_set_mcu_state_resume(void);
+ 
+@@ -51,3 +53,101 @@ int scpi_ddr_bandwidth_get(struct ddr_bw_info *ddr_bw_ch0,
+ int scpi_ddr_get_clk_rate(void);
+ int scpi_thermal_get_temperature(void);
+ int scpi_thermal_set_clk_cycle(u32 cycle);
++#else
++static inline unsigned long scpi_clk_get_val(u16 clk_id)
++{
++	return -EPERM;
++}
++
++static inline int scpi_clk_set_val(u16 clk_id, unsigned long rate)
++{
++	return -EPERM;
++}
++
++static inline int scpi_dvfs_get_idx(u8 domain)
++{
++	return -EPERM;
++}
++
++static inline int scpi_dvfs_set_idx(u8 domain, u8 idx)
++{
++	return -EPERM;
++}
++
++static inline struct scpi_opp *scpi_dvfs_get_opps(u8 domain)
++{
++	return ERR_PTR(-EPERM);
++}
++
++static inline int scpi_get_sensor(char *name)
++{
++	return -EPERM;
++}
++
++static inline int scpi_get_sensor_value(u16 sensor, u32 *val)
++{
++	return -EPERM;
++}
++
++static int scpi_sys_set_jtagmux_on_off(u32 en)
++{
++	return -EPERM;
++}
++
++static inline int scpi_sys_set_mcu_state_suspend(void)
++{
++	return -EPERM;
++}
++
++static inline int scpi_sys_set_mcu_state_resume(void)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_init(u32 dram_speed_bin, u32 freq, u32 lcdc_type,
++				u32 addr_mcu_el3)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_set_clk_rate(u32 rate, u32 lcdc_type)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_send_timing(u32 *p, u32 size)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_round_rate(u32 m_hz)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_set_auto_self_refresh(u32 en)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_bandwidth_get(struct ddr_bw_info *ddr_bw_ch0,
++					 struct ddr_bw_info *ddr_bw_ch1)
++{
++	return -EPERM;
++}
++
++static inline int scpi_ddr_get_clk_rate(void)
++{
++	return -EPERM;
++}
++
++static inline int scpi_thermal_get_temperature(void)
++{
++	return -EPERM;
++}
++
++static inline int scpi_thermal_set_clk_cycle(u32 cycle)
++{
++	return -EPERM;
++}
++#endif
+-- 
+2.35.3
+

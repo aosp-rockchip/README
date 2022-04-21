@@ -1,0 +1,1435 @@
+From 7afb6cdc75ca844df29afeab5661c44a34278011 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=80=AA=E6=8C=AF=E5=AE=87?= <nzy@rock-chips.com>
+Date: Wed, 28 Apr 2010 13:54:42 +0000
+Subject: [PATCH] add dwdma driver
+
+---
+ arch/arm/include/asm/dma.h              |  72 ++-
+ arch/arm/include/asm/mach/dma.h         |  17 +-
+ arch/arm/kernel/Makefile                |   4 +-
+ arch/arm/kernel/dma.c                   |  63 ++-
+ arch/arm/mach-rk2818/Makefile           |   1 +
+ arch/arm/mach-rk2818/dma.c              | 633 ++++++++++++++++++++++++
+ arch/arm/mach-rk2818/include/mach/dma.h | 398 ++++++++-------
+ 7 files changed, 939 insertions(+), 249 deletions(-)
+ create mode 100644 arch/arm/mach-rk2818/dma.c
+
+diff --git a/arch/arm/include/asm/dma.h b/arch/arm/include/asm/dma.h
+index 7edf3536df24..b0f667faf601 100644
+--- a/arch/arm/include/asm/dma.h
++++ b/arch/arm/include/asm/dma.h
+@@ -9,8 +9,6 @@
+ #ifndef MAX_DMA_ADDRESS
+ #define MAX_DMA_ADDRESS	0xffffffff
+ #endif
+-
+-#ifdef CONFIG_ISA_DMA_API
+ /*
+  * This is used to support drivers written for the x86 ISA DMA API.
+  * It should not be re-used except for that purpose.
+@@ -19,7 +17,28 @@
+ #include <asm/system.h>
+ #include <asm/scatterlist.h>
+ 
+-#include <mach/isa-dma.h>
++
++#define RK28_DMA_CH0      0
++#define RK28_DMA_CH1      1
++#define RK28_DMA_CH2      2
++#define RK28_DMA_CH3      3
++#define RK28_DMA_CH4      4
++#define RK28_DMA_CH5      5
++
++#define MAX_DMA_CHANNELS      6
++
++
++/*
++"sd_mmc",
++"uart_2",
++"uart_3",
++"sdio",
++"i2s",
++"spi_m",
++"spi_s",
++"uart_0",
++"uart_1",
++*/
+ 
+ /*
+  * The DMA modes reflect the settings for the ISA DMA controller
+@@ -31,31 +50,6 @@
+ #define DMA_MODE_CASCADE 0xc0
+ #define DMA_AUTOINIT	 0x10
+ 
+-extern spinlock_t  dma_spin_lock;
+-
+-static inline unsigned long claim_dma_lock(void)
+-{
+-	unsigned long flags;
+-	spin_lock_irqsave(&dma_spin_lock, flags);
+-	return flags;
+-}
+-
+-static inline void release_dma_lock(unsigned long flags)
+-{
+-	spin_unlock_irqrestore(&dma_spin_lock, flags);
+-}
+-
+-/* Clear the 'DMA Pointer Flip Flop'.
+- * Write 0 for LSB/MSB, 1 for MSB/LSB access.
+- */
+-#define clear_dma_ff(chan)
+-
+-/* Set only the page register bits of the transfer address.
+- *
+- * NOTE: This is an architecture specific function, and should
+- *       be hidden from the drivers
+- */
+-extern void set_dma_page(unsigned int chan, char pagenr);
+ 
+ /* Request a DMA channel
+  *
+@@ -67,21 +61,21 @@ extern int  request_dma(unsigned int chan, const char * device_id);
+  *
+  * Some architectures may need to do free an interrupt
+  */
+-extern void free_dma(unsigned int chan);
++extern int free_dma(unsigned int chan);
+ 
+ /* Enable DMA for this channel
+  *
+  * On some architectures, this may have other side effects like
+  * enabling an interrupt and setting the DMA registers.
+  */
+-extern void enable_dma(unsigned int chan);
++extern int enable_dma(unsigned int chan);
+ 
+ /* Disable DMA for this channel
+  *
+  * On some architectures, this may have other side effects like
+  * disabling an interrupt or whatever.
+  */
+-extern void disable_dma(unsigned int chan);
++extern int disable_dma(unsigned int chan);
+ 
+ /* Test whether the specified channel has an active DMA transfer
+  */
+@@ -121,7 +115,7 @@ extern void set_dma_count(unsigned int chan, unsigned long count);
+  * enable_dma().
+  */
+ extern void set_dma_mode(unsigned int chan, unsigned int mode);
+-
++#if 0
+ /* Set the transfer speed for this channel
+  */
+ extern void set_dma_speed(unsigned int chan, int cycle_ns);
+@@ -133,17 +127,9 @@ extern void set_dma_speed(unsigned int chan, int cycle_ns);
+  * Otherwise, it returns the number of _bytes_ left to transfer.
+  */
+ extern int  get_dma_residue(unsigned int chan);
+-
+-#ifndef NO_DMA
+-#define NO_DMA	255
+ #endif
+-
+-#ifdef CONFIG_PCI
+-extern int isa_dma_bridge_buggy;
+-#else
+-#define isa_dma_bridge_buggy    (0)
+-#endif
+-
+-#endif /* CONFIG_ISA_DMA_API */
++/* Set dam irq callback that perform when dma transfer has completed
++ */
++extern void set_dma_handler (unsigned int chan, void (*irq_handler) (int, void *), void *data);
+ 
+ #endif /* __ASM_ARM_DMA_H */
+diff --git a/arch/arm/include/asm/mach/dma.h b/arch/arm/include/asm/mach/dma.h
+index 9e614a18e680..c46ca4c5aa91 100644
+--- a/arch/arm/include/asm/mach/dma.h
++++ b/arch/arm/include/asm/mach/dma.h
+@@ -16,12 +16,14 @@ typedef struct dma_struct dma_t;
+ 
+ struct dma_ops {
+ 	int	(*request)(unsigned int, dma_t *);		/* optional */
+-	void	(*free)(unsigned int, dma_t *);			/* optional */
+-	void	(*enable)(unsigned int, dma_t *);		/* mandatory */
+-	void 	(*disable)(unsigned int, dma_t *);		/* mandatory */
++	int	(*free)(unsigned int, dma_t *);			/* optional */
++	int	(*enable)(unsigned int, dma_t *);		/* mandatory */
++	int	(*disable)(unsigned int, dma_t *);		/* mandatory */
++#if 0	
+ 	int	(*residue)(unsigned int, dma_t *);		/* optional */
+ 	int	(*setspeed)(unsigned int, dma_t *, int);	/* optional */
+ 	const char *type;
++#endif
+ };
+ 
+ struct dma_struct {
+@@ -40,15 +42,14 @@ struct dma_struct {
+ 	unsigned int	lock;		/* Device is allocated		*/
+ 	const char	*device_id;	/* Device name			*/
+ 
++    int (*irqHandle)(int irq, void *dev_id);    /*irq callback*/
++    void *data;
++    
+ 	const struct dma_ops *d_ops;
+ };
+ 
+ /*
+  * isa_dma_add - add an ISA-style DMA channel
+  */
+-extern int isa_dma_add(unsigned int, dma_t *dma);
++extern int dma_add(unsigned int, dma_t *dma);
+ 
+-/*
+- * Add the ISA DMA controller.  Always takes channels 0-7.
+- */
+-extern void isa_init_dma(void);
+diff --git a/arch/arm/kernel/Makefile b/arch/arm/kernel/Makefile
+index 79087dd6d869..64fe014b8645 100644
+--- a/arch/arm/kernel/Makefile
++++ b/arch/arm/kernel/Makefile
+@@ -15,9 +15,9 @@ CFLAGS_REMOVE_return_address.o = -pg
+ 
+ obj-y		:= compat.o elf.o entry-armv.o entry-common.o irq.o \
+ 		   process.o ptrace.o return_address.o setup.o signal.o \
+-		   sys_arm.o stacktrace.o time.o traps.o
++		   sys_arm.o stacktrace.o time.o traps.o dma.o
+ 
+-obj-$(CONFIG_ISA_DMA_API)	+= dma.o
++#obj-$(CONFIG_ISA_DMA_API)	+= dma.o
+ obj-$(CONFIG_ARCH_ACORN)	+= ecard.o 
+ obj-$(CONFIG_FIQ)		+= fiq.o
+ obj-$(CONFIG_MODULES)		+= armksyms.o module.o
+diff --git a/arch/arm/kernel/dma.c b/arch/arm/kernel/dma.c
+index 7d5b9fb01e71..478498105a8b 100644
+--- a/arch/arm/kernel/dma.c
++++ b/arch/arm/kernel/dma.c
+@@ -34,7 +34,7 @@ static inline dma_t *dma_channel(unsigned int chan)
+ 	return dma_chan[chan];
+ }
+ 
+-int __init isa_dma_add(unsigned int chan, dma_t *dma)
++int __init dma_add(unsigned int chan, dma_t *dma)
+ {
+ 	if (!dma->d_ops)
+ 		return -EINVAL;
+@@ -90,33 +90,55 @@ EXPORT_SYMBOL(request_dma);
+  *
+  * On certain platforms, we have to free interrupt as well...
+  */
+-void free_dma(unsigned int chan)
++int free_dma(unsigned int chan)
+ {
+ 	dma_t *dma = dma_channel(chan);
+-
++	int ret;
++	
+ 	if (!dma)
+ 		goto bad_dma;
+ 
+ 	if (dma->active) {
+ 		printk(KERN_ERR "dma%d: freeing active DMA\n", chan);
+-		dma->d_ops->disable(chan, dma);
++		ret = dma->d_ops->disable(chan, dma);
+ 		dma->active = 0;
++		if (ret) 
++            goto free_dma;
+ 	}
+ 
+ 	if (xchg(&dma->lock, 0) != 0) {
+ 		if (dma->d_ops->free)
+-			dma->d_ops->free(chan, dma);
+-		return;
++			ret = dma->d_ops->free(chan, dma);
++		return ret ;
+ 	}
+-
++	
++free_dma:
+ 	printk(KERN_ERR "dma%d: trying to free free DMA\n", chan);
+-	return;
++	return -ENODEV;
+ 
+ bad_dma:
+ 	printk(KERN_ERR "dma: trying to free DMA%d\n", chan);
++	return -EINVAL;
+ }
+ EXPORT_SYMBOL(free_dma);
+ 
++/* Set DMA irq handler
++ *
++ * Copy irq handler to the structure
++ */
++ void set_dma_handler (unsigned int chan, void (*irq_handler) (int, void *), void *data)
++{
++	dma_t *dma = dma_channel(chan);
++
++	if (dma->active)
++		printk(KERN_ERR "dma%d: altering DMA irq handler while "
++		       "DMA active\n", chan);
++
++	dma->irqHandle = irq_handler;
++	dma->data = data;
++}
++EXPORT_SYMBOL(set_dma_handler);
++
+ /* Set DMA Scatter-Gather list
+  */
+ void set_dma_sg (unsigned int chan, struct scatterlist *sg, int nr_sg)
+@@ -186,43 +208,51 @@ EXPORT_SYMBOL(set_dma_mode);
+ 
+ /* Enable DMA channel
+  */
+-void enable_dma (unsigned int chan)
++int enable_dma (unsigned int chan)
+ {
+ 	dma_t *dma = dma_channel(chan);
+-
++	int ret;
++	
+ 	if (!dma->lock)
+ 		goto free_dma;
+ 
+ 	if (dma->active == 0) {
+ 		dma->active = 1;
+-		dma->d_ops->enable(chan, dma);
++		ret = dma->d_ops->enable(chan, dma);
++		return ret;
+ 	}
+-	return;
++	
++	return -EBUSY;
+ 
+ free_dma:
+ 	printk(KERN_ERR "dma%d: trying to enable free DMA\n", chan);
+ 	BUG();
++	return -ENODEV;
+ }
+ EXPORT_SYMBOL(enable_dma);
+ 
+ /* Disable DMA channel
+  */
+-void disable_dma (unsigned int chan)
++int disable_dma (unsigned int chan)
+ {
+ 	dma_t *dma = dma_channel(chan);
++	int ret;
+ 
+ 	if (!dma->lock)
+ 		goto free_dma;
+ 
+ 	if (dma->active == 1) {
+ 		dma->active = 0;
+-		dma->d_ops->disable(chan, dma);
++		ret = dma->d_ops->disable(chan, dma);
++		return ret;
+ 	}
+-	return;
++	
++	return -EBUSY;
+ 
+ free_dma:
+ 	printk(KERN_ERR "dma%d: trying to disable free DMA\n", chan);
+ 	BUG();
++	return -ENODEV;
+ }
+ EXPORT_SYMBOL(disable_dma);
+ 
+@@ -235,7 +265,7 @@ int dma_channel_active(unsigned int chan)
+ 	return dma->active;
+ }
+ EXPORT_SYMBOL(dma_channel_active);
+-
++#if 0
+ void set_dma_page(unsigned int chan, char pagenr)
+ {
+ 	printk(KERN_ERR "dma%d: trying to set_dma_page\n", chan);
+@@ -264,3 +294,4 @@ int get_dma_residue(unsigned int chan)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(get_dma_residue);
++#endif
+diff --git a/arch/arm/mach-rk2818/Makefile b/arch/arm/mach-rk2818/Makefile
+index d131022af38a..37d0a03492ac 100644
+--- a/arch/arm/mach-rk2818/Makefile
++++ b/arch/arm/mach-rk2818/Makefile
+@@ -3,6 +3,7 @@ obj-y += devices.o
+ obj-y += proc_comm.o
+ obj-y += vreg.o
+ obj-y += clock.o
++obj-y += dma.o
+ 
+ obj-$(CONFIG_MACH_RK2818MID) += board-midsdk.o
+ 
+diff --git a/arch/arm/mach-rk2818/dma.c b/arch/arm/mach-rk2818/dma.c
+new file mode 100644
+index 000000000000..1412ebea36a8
+--- /dev/null
++++ b/arch/arm/mach-rk2818/dma.c
+@@ -0,0 +1,633 @@
++/* arch/arm/mach-rk2818/dma.c
++ *
++ * Copyright (C) 2010 ROCKCHIP, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/errno.h>
++#include <linux/dma-mapping.h>
++
++#include <asm/system.h>
++#include <asm/irq.h>
++#include <asm/io.h>
++#include <mach/dma.h>
++#include <mach/rk2818_iomap.h>
++
++
++static struct rk2818_dma rk2818_dma[MAX_DMA_CHANNELS];
++
++const static char *rk28_dma_dev_id[] = {
++    "sd_mmc",
++    "uart_2",
++    "uart_3",
++    "sdio",
++    "i2s",
++    "spi_m",
++    "spi_s",
++    "uart_0",
++    "uart_1",
++#ifdef test_dma    
++    "mobile_sdram"
++#endif    
++};  
++
++const static struct rk28_dma_dev rk28_dev_info[] = {
++	[RK28_DMA_SD_MMC] = {
++		.hd_if_r     = RK28_DMA_SD_MMC0,
++        .hd_if_w     = RK28_DMA_SD_MMC0,
++        .dev_addr_r  = RK2818_SDMMC0_PHYS + 0x100,
++		.dev_addr_w	 = RK2818_SDMMC0_PHYS + 0x100,
++		.fifo_width  = 32,
++	},
++	[RK28_DMA_URAT2] = {
++	    .hd_if_r     = RK28_DMA_URAT2_TXD,
++        .hd_if_w     = RK28_DMA_URAT2_RXD,
++		.dev_addr_r	 = RK2818_UART2_PHYS,
++        .dev_addr_w  = RK2818_UART2_PHYS,
++		.fifo_width  = 32,
++	},
++	[RK28_DMA_URAT3] = {
++        .hd_if_r     = RK28_DMA_URAT3_TXD,
++        .hd_if_w     = RK28_DMA_URAT3_RXD,
++        .dev_addr_r  = RK2818_UART3_PHYS,
++        .dev_addr_w  = RK2818_UART3_PHYS,
++		.fifo_width  = 32,
++	},
++	[RK28_DMA_SDIO] = {
++
++	    .hd_if_r     = RK28_DMA_SD_MMC1,
++        .hd_if_w     = RK28_DMA_SD_MMC1,
++		.dev_addr_r	 = RK2818_SDMMC1_PHYS + 0x100,
++        .dev_addr_w  = RK2818_SDMMC1_PHYS + 0x100,
++		.fifo_width  = 32,
++	},
++	[RK28_DMA_I2S] = {
++        .hd_if_r     = RK28_DMA_I2S_TXD,
++        .hd_if_w     = RK28_DMA_I2S_RXD,
++        .dev_addr_r  = RK2818_I2S_PHYS + 0x04,
++        .dev_addr_w  = RK2818_I2S_PHYS + 0x08,
++		.fifo_width  = 32,
++	},
++	[RK28_DMA_SPI_M] = {
++        .hd_if_r     = RK28_DMA_SPI_M_TXD,
++        .hd_if_w     = RK28_DMA_SPI_M_RXD,
++        .dev_addr_r  = RK2818_SPIMASTER_PHYS + 0x60,
++        .dev_addr_w  = RK2818_SPIMASTER_PHYS + 0x60,
++        .fifo_width  = 8,
++	},
++	[RK28_DMA_SPI_S] = {
++        .hd_if_r     = RK28_DMA_SPI_S_TXD,
++        .hd_if_w     = RK28_DMA_SPI_S_RXD,
++        .dev_addr_r  = RK2818_SPISLAVE_PHYS + 0x60,
++        .dev_addr_w  = RK2818_SPISLAVE_PHYS + 0x60,
++        .fifo_width  = 8,
++	},
++	[RK28_DMA_URAT0] = {
++        .hd_if_r     = RK28_DMA_URAT0_TXD,
++        .hd_if_w     = RK28_DMA_URAT0_RXD,
++        .dev_addr_r  = RK2818_UART0_PHYS,
++        .dev_addr_w  = RK2818_UART0_PHYS,
++		.fifo_width  = 8,
++	},
++	[RK28_DMA_URAT1] = {
++        .hd_if_r     = RK28_DMA_URAT1_TXD,
++        .hd_if_w     = RK28_DMA_URAT1_RXD,
++        .dev_addr_r  = RK2818_UART1_PHYS,
++        .dev_addr_w  = RK2818_UART1_PHYS,
++		.fifo_width  = 8,
++	},
++#ifdef test_dma	
++    [RK28_DMA_SDRAM] = {
++        .hd_if_r     = 0,
++        .hd_if_w     = 0,
++        .dev_addr_r  = BUF_READ_ARRR,
++        .dev_addr_w  = BUF_WRITE_ARRR,
++        .fifo_width  = 32,
++    },
++#endif    
++
++};
++
++
++
++
++/**
++ * rk28_dma_ctl_for_write - set dma control register for writing mode   
++ *
++ */
++static inline unsigned int rk28_dma_ctl_for_write(unsigned int dma_ch, struct rk28_dma_dev *dev_info, dma_t *dma_t)
++{    
++#ifdef test_dma
++    unsigned int dev_mode = B_CTLL_MEM2MEM_DMAC;
++    unsigned int inc_mode = B_CTLL_DINC_INC;
++#else
++    unsigned int dev_mode = B_CTLL_MEM2PER_DMAC;
++    unsigned int inc_mode = B_CTLL_DINC_UNC;
++#endif    
++    unsigned int llp_mode = (dma_t->sg)   ?  (B_CTLL_LLP_DST_EN | B_CTLL_LLP_SRC_EN) : 0;
++    unsigned int int_mode = (!dma_t->sg)   ?  B_CTLL_INT_EN : 0;
++    
++    unsigned int ctll = B_CTLL_SRC_TR_WIDTH_32 | B_CTLL_DST_TR_WIDTH(dev_info->fifo_width >> 4) |
++               B_CTLL_SINC_INC | inc_mode |
++               B_CTLL_DMS_ARMD | B_CTLL_SMS_EXP | dev_mode |
++               B_CTLL_SRC_MSIZE_4 | B_CTLL_DST_MSIZE_4 |
++               llp_mode | int_mode;
++               
++    return ctll;               
++}
++
++/**
++ * rk28_dma_ctl_for_read - set dma control register for reading mode   
++ *
++ */
++static inline unsigned int rk28_dma_ctl_for_read(unsigned int dma_ch, struct rk28_dma_dev *dev_info, dma_t *dma_t)
++{    
++#ifdef test_dma
++    unsigned int dev_mode = B_CTLL_MEM2MEM_DMAC;
++    unsigned int inc_mode = B_CTLL_SINC_INC;
++#else
++    unsigned int dev_mode = B_CTLL_PER2MEM_DMAC;
++    unsigned int inc_mode = B_CTLL_SINC_UNC;
++#endif
++    unsigned int llp_mode = (dma_t->sg)   ?  (B_CTLL_LLP_DST_EN | B_CTLL_LLP_SRC_EN) : 0;
++    unsigned int int_mode = (!dma_t->sg)   ?  B_CTLL_INT_EN : 0;
++    
++    unsigned int ctll = B_CTLL_SRC_TR_WIDTH(dev_info->fifo_width>> 4) | B_CTLL_DST_TR_WIDTH_32 |
++               inc_mode | B_CTLL_DINC_INC |
++               B_CTLL_DMS_EXP | B_CTLL_SMS_ARMD | dev_mode |
++               B_CTLL_SRC_MSIZE_4 | B_CTLL_DST_MSIZE_4 | 
++               llp_mode | int_mode;
++               
++    return ctll;               
++}
++
++/**
++ * rk28_dma_set_reg - set dma registers  
++ *
++ */
++static inline void rk28_dma_set_reg(unsigned int dma_ch, struct rk28_dma_llp *reg, unsigned int dma_if)
++{    
++    write_dma_reg(DWDMA_SAR(dma_ch), reg->sar); 
++    write_dma_reg(DWDMA_DAR(dma_ch), reg->dar);         
++    write_dma_reg(DWDMA_LLP(dma_ch), (unsigned int)(reg->llp));        
++    write_dma_reg(DWDMA_CTLL(dma_ch), reg->ctll);
++    write_dma_reg(DWDMA_CTLH(dma_ch), reg->size);
++    write_dma_reg(DWDMA_CFGL(dma_ch),  B_CFGL_CH_PRIOR(7) | 
++                                                B_CFGL_H_SEL_DST | B_CFGL_H_SEL_SRC |
++                                                B_CFGL_DST_HS_POL_H | B_CFGL_SRC_HS_POL_H);
++    write_dma_reg(DWDMA_CFGH(dma_ch), B_CFGH_SRC_PER(dma_if & 0xf) | 
++                                               B_CFGH_DST_PER(dma_if & 0xf) |
++                                               B_CFGH_PROTCTL);
++}
++
++/**
++ * rk28_dma_setup_reg - set linked list content  
++ *
++ */
++static inline void rk28_dma_set_llp(unsigned int sar, 
++                                         unsigned int dar, 
++                                         struct rk28_dma_llp *curllp, 
++                                         struct rk28_dma_llp *nexllp, 
++                                         unsigned int ctll,
++                                         unsigned int size)
++{            
++    curllp->sar  = sar; //pa
++    curllp->dar  = dar; //pa
++    curllp->ctll = ctll;	
++    curllp->llp  = nexllp; //physical next linked list pointer
++    curllp->size = size;
++}
++
++/**
++ * rk28_dma_end_of_llp - set linked list end  
++ *
++ */
++static inline void rk28_dma_end_of_llp(struct rk28_dma_llp *curllp)
++{
++    curllp->llp = 0; 
++    curllp->ctll &= (~B_CTLL_LLP_DST_EN) & (~B_CTLL_LLP_SRC_EN);
++    curllp->ctll |= B_CTLL_INT_EN;
++}
++
++/**
++ * rk28_dma_setup_sg - setup rk28 DMA channel SG list to/from device transfer
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ * @dma_t: pointer to the dma struct
++ *
++ * The function sets up DMA channel state and registers to be ready for transfer
++ * specified by provided parameters. The scatter-gather emulation is set up
++ * according to the parameters.
++ *
++ * enbale dma should be called after setup sg
++ *
++ * Return value: negative if incorrect parameters
++ * Zero indicates success.
++ */
++static void rk28_dma_write_to_sg(unsigned int dma_ch, dma_t *dma_t)
++{
++    unsigned int i, ctll_r, dev_addr_w;
++    struct rk2818_dma *rk28dma;
++    struct rk28_dma_llp * rk28llp_vir;
++    struct rk28_dma_llp * rk28llp_phy;
++    struct rk28_dma_llp rk28dma_reg;
++    struct scatterlist *sg;
++	
++    rk28dma = &rk2818_dma[dma_ch];
++    	
++    dev_addr_w = rk28dma->dev_info->dev_addr_w;
++    ctll_r = rk28_dma_ctl_for_read(dma_ch, rk28dma->dev_info, dma_t);
++
++    if (dma_t->sg) {
++        rk28llp_vir = rk28dma->dma_llp_vir;
++        rk28llp_phy = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        sg = dma_t->sg;
++        for (i = 0; i < dma_t->sgcount; i++, sg++) { 
++            rk28_dma_set_llp(dev_addr_w, sg->dma_address, rk28llp_vir++, ++rk28llp_phy, ctll_r, sg->length);
++        } 
++        rk28_dma_end_of_llp(rk28llp_vir - 1);
++
++        rk28dma_reg.sar = dev_addr_w;
++        rk28dma_reg.dar = dma_t->sg->dma_address;
++        rk28dma_reg.ctll = ctll_r;
++        rk28dma_reg.llp = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        rk28dma_reg.size = dma_t->sg->length;
++    } else { /*single transfer*/
++        if (dma_t->buf.length > RK28_DMA_CH2_MAX_LEN) {
++            rk28dma->length = RK28_DMA_CH2_MAX_LEN;
++            rk28dma->residue = dma_t->buf.length - RK28_DMA_CH2_MAX_LEN;
++        } else {
++            rk28dma->length = dma_t->buf.length;
++            rk28dma->residue = 0;
++        }
++        rk28dma_reg.sar = dev_addr_w;
++        rk28dma_reg.dar = dma_t->buf.dma_address;
++        rk28dma_reg.ctll = ctll_r;
++        rk28dma_reg.llp = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        rk28dma_reg.size = rk28dma->length;
++    }
++    rk28_dma_set_reg(dma_ch, &rk28dma_reg, rk28dma->dev_info->hd_if_r);
++
++    //printk(KERN_INFO "dma_write_to_sg: ch = %d, sar = 0x%x, dar = 0x%x, ctll = 0x%x, llp = 0x%x, size = %d, \n", 
++    //                 dma_ch, rk28dma_reg.sar, rk28dma_reg.dar, rk28dma_reg.ctll, rk28dma_reg.llp, rk28dma_reg.size);
++
++}
++
++/**
++ * rk28_dma_setup_sg - setup rk28 DMA channel SG list to/from device transfer
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ * @dma_t: pointer to the dma struct
++ *
++ * The function sets up DMA channel state and registers to be ready for transfer
++ * specified by provided parameters. The scatter-gather emulation is set up
++ * according to the parameters.
++ *
++ * enbale dma should be called after setup sg
++ *
++ * Return value: negative if incorrect parameters
++ * Zero indicates success.
++ */
++static void rk28_dma_read_from_sg(unsigned int dma_ch, dma_t *dma_t)
++{
++    unsigned int i, ctll_w, dev_addr_r;
++    struct rk2818_dma *rk28dma;
++    struct rk28_dma_llp * rk28llp_vir;
++    struct rk28_dma_llp * rk28llp_phy;
++    struct rk28_dma_llp rk28dma_reg;
++    struct scatterlist *sg;
++	
++    rk28dma = &rk2818_dma[dma_ch];
++    
++    /*setup linked list table end*/
++    dev_addr_r = rk28dma->dev_info->dev_addr_r;
++    ctll_w = rk28_dma_ctl_for_write(dma_ch, rk28dma->dev_info, dma_t);
++        
++    if (dma_t->sg) {
++        rk28llp_vir = rk28dma->dma_llp_vir;
++        rk28llp_phy = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        sg = dma_t->sg;
++        for (i = 0; i < dma_t->sgcount; i++, sg++) { 
++            rk28_dma_set_llp(sg->dma_address, dev_addr_r, rk28llp_vir++, ++rk28llp_phy, ctll_w, sg->length);
++        }
++        rk28_dma_end_of_llp(rk28llp_vir - 1);
++
++        rk28dma_reg.sar = dma_t->sg->dma_address;
++        rk28dma_reg.dar = dev_addr_r;
++        rk28dma_reg.ctll = ctll_w;
++        rk28dma_reg.llp = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        rk28dma_reg.size = dma_t->sg->length;
++    } else {
++        if (dma_t->buf.length > RK28_DMA_CH2_MAX_LEN) {
++            rk28dma->length = RK28_DMA_CH2_MAX_LEN;
++            rk28dma->residue = dma_t->buf.length - RK28_DMA_CH2_MAX_LEN;
++        } else { /*single transfer*/
++            rk28dma->length = dma_t->buf.length;
++            rk28dma->residue = 0;
++        } 
++        rk28dma_reg.sar = dma_t->buf.dma_address;
++        rk28dma_reg.dar = dev_addr_r;
++        rk28dma_reg.ctll = ctll_w;
++        rk28dma_reg.llp = (struct rk28_dma_llp *)rk28dma->dma_llp_phy;
++        rk28dma_reg.size = rk28dma->length;
++    }
++    rk28_dma_set_reg(dma_ch, &rk28dma_reg, rk28dma->dev_info->hd_if_w);
++
++    //printk(KERN_INFO "read_from_sg: ch = %d, sar = 0x%x, dar = 0x%x, ctll = 0x%x, llp = 0x%x, size = %d, \n", 
++    //                 dma_ch, rk28dma_reg.sar, rk28dma_reg.dar, rk28dma_reg.ctll, rk28dma_reg.llp, rk28dma_reg.size);
++}
++
++/**
++ * rk28_dma_enable - function to start rk28 DMA channel operation
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ *
++ * The channel has to be allocated by driver through rk28_dma_request()
++ * The transfer parameters has to be set to the channel registers through
++ * call of the rk28_dma_setup_sg() function.
++
++ */
++static int rk28_dma_enable(unsigned int dma_ch, dma_t *dma_t)
++{	
++    //printk(KERN_INFO "enter dwdma_enable\n");
++
++    if (dma_t->sg) {
++        if (dma_ch >= RK28_DMA_CH2) {
++            printk(KERN_ERR "dma_enable: channel %d does not support sg transfer mode\n", dma_ch);
++            goto bad_enable;
++        }
++        if (dma_t->sgcount > RK28_MAX_DMA_LLPS) {
++            printk(KERN_ERR "dma_enable: count %d are more than supported number %d\n", dma_t->sgcount, RK28_MAX_DMA_LLPS);
++            goto bad_enable;
++        }        
++    } else { /*single transfer*/
++        dma_t->buf.dma_address = (dma_addr_t)dma_t->addr;
++        dma_t->buf.length = dma_t->count;
++    }
++    //printk(KERN_INFO "dma_enable:  addr = 0x%x\n", (dma_addr_t)dma_t->addr);
++
++    if (dma_t->dma_mode == DMA_MODE_READ) {
++        rk28_dma_write_to_sg(dma_ch, dma_t);
++    } else {
++        rk28_dma_read_from_sg(dma_ch, dma_t);
++    }
++    
++    dma_t->invalid = 0;
++    
++	ENABLE_DWDMA(dma_ch);
++
++    //printk(KERN_INFO "exit dwdma_enable\n");
++	
++    return 0;	
++
++bad_enable:
++    dma_t->active = 0;
++    return -EINVAL;
++}
++
++/**
++ * rk28_dma_disable - stop, finish rk28 DMA channel operatin
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ *
++ * dma transfer will be force into suspend state whether dma have completed current transfer
++ */
++static int rk28_dma_disable(unsigned int dma_ch, dma_t *dma_t)
++{	
++	DISABLE_DWDMA(dma_ch);
++
++    return 0;	
++}
++
++/**
++ * rk28_dma_request - request/allocate specified channel number
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ * requesting dma channel if device need dma transfer 
++ * but just called one time in one event, and channle should be 
++ * free after this event  
++ */
++static int rk28_dma_request(unsigned int dma_ch, dma_t *dma_t)
++{  
++    int i;
++    
++    //printk(KERN_INFO "enter dwdma request\n");
++    
++    for (i = 0; i < RK28_DMA_DEV_NUM_MAX; i++) {
++        if (!strcmp(dma_t->device_id, rk28_dma_dev_id[i]))
++            break;
++    }
++
++    if (i >= RK28_DMA_DEV_NUM_MAX) {
++		printk(KERN_ERR "dma_request: called for  non-existed dev %s\n", dma_t->device_id);
++		return -ENODEV;
++    }
++
++	struct rk2818_dma *rk28dma = &rk2818_dma[dma_ch];
++
++	/*channel 0 and 1 support llp, but others does not*/    
++	if (dma_ch < RK28_DMA_CH2) { 
++        rk28dma->dma_llp_vir = (struct rk28_dma_llp *)dma_alloc_coherent(NULL, RK28_MAX_DMA_LLPS*sizeof(struct rk28_dma_llp), &rk28dma->dma_llp_phy, GFP_KERNEL);
++        if (!rk28dma->dma_llp_vir) {
++            printk(KERN_ERR "dma_request: no dma space can be allocated for llp by virtual channel %d\n", dma_ch); 
++            return -ENOMEM;
++        }
++    } else {
++        rk28dma->dma_llp_vir = NULL;
++        rk28dma->dma_llp_phy = NULL;
++    }
++    
++    rk2818_dma[dma_ch].dev_info = &rk28_dev_info[i];
++	
++	/* clear interrupt */
++    CLR_DWDMA_INTR(dma_ch);
++
++	/* Unmask interrupt */
++    UN_MASK_DWDMA_INTR(dma_ch);
++
++    //printk(KERN_INFO "exit dwdma request device %d\n", i);
++
++	return 0;
++}
++
++/**
++ * rk28_dma_free - release previously acquired channel
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ *
++ * request dam should be prior free dma
++ */
++static int rk28_dma_free(unsigned int dma_ch, dma_t *dma_t)
++{    
++	struct rk2818_dma *rk28dma = &rk2818_dma[dma_ch];
++	
++	/* clear interrupt */
++    CLR_DWDMA_INTR(dma_ch);
++
++	/* Mask interrupt */
++    MASK_DWDMA_INTR(dma_ch);
++
++	if (dma_ch < RK28_DMA_CH2) {
++        if (!rk28dma->dma_llp_vir) {
++            printk(KERN_ERR "dma_free: no dma space can be free by virtual channel %d\n", dma_ch);  
++            return -ENOMEM;       
++        }
++        dma_free_coherent(NULL, RK28_MAX_DMA_LLPS*sizeof(struct rk28_dma_llp), (void *)rk28dma->dma_llp_vir, rk28dma->dma_llp_phy);
++    }
++    
++    rk28dma->dma_t.irqHandle = NULL;
++    rk28dma->dma_t.data = NULL;
++    rk28dma->dma_t.sg = NULL;    
++    rk28dma->dma_llp_vir = NULL;
++    rk28dma->dma_llp_phy = NULL;
++    rk28dma->residue = 0;
++    rk28dma->length = 0;
++    
++	return 0;
++}
++
++/**
++ * rk28_dma_next - set dma regiters and start of next transfer if using channel 2   
++ * @dma_ch: rk28 device ID which using DMA, device id list is showed in dma.h
++ *
++ * just be applied to channel 2
++ */
++static int rk28_dma_next(unsigned int dma_ch)
++{
++	struct rk2818_dma *rk28dma = &rk2818_dma[dma_ch];	
++	unsigned int nextlength;
++	unsigned int nextaddr;
++    unsigned int width_off = rk28dma->dev_info->fifo_width >> 4;
++    unsigned int dma_if;
++    struct rk28_dma_llp rk28dma_reg;
++
++	/*go on transfering if there are buffer of other blocks leave*/
++	if (rk28dma->residue > 0) {
++        nextaddr = rk28dma->dma_t.buf.dma_address + (rk28dma->length << width_off);
++        if (rk28dma->residue > RK28_DMA_CH2_MAX_LEN) {
++            nextlength = RK28_DMA_CH2_MAX_LEN;
++            rk28dma->residue -= RK28_DMA_CH2_MAX_LEN; 
++        } else {
++            nextlength = rk28dma->residue;
++            rk28dma->residue = 0; 
++        }
++        rk28dma->length = nextlength;
++        
++        if (rk28dma->dma_t.dma_mode == DMA_MODE_READ) {
++            rk28dma_reg.sar = rk28dma->dev_info->dev_addr_r;
++            rk28dma_reg.dar = nextaddr;
++            rk28dma_reg.ctll = rk28_dma_ctl_for_read(dma_ch, rk28dma->dev_info, &rk28dma->dma_t);
++            dma_if = rk28dma->dev_info->hd_if_r;
++        } else {
++            rk28dma_reg.sar = nextaddr;
++            rk28dma_reg.dar = rk28dma->dev_info->dev_addr_w;
++            rk28dma_reg.ctll = rk28_dma_ctl_for_write(dma_ch, rk28dma->dev_info, &rk28dma->dma_t);
++            dma_if = rk28dma->dev_info->hd_if_w;
++        }
++        rk28dma_reg.llp = NULL;
++        rk28dma_reg.size = nextlength;
++        
++        rk28_dma_set_reg(dma_ch, &rk28dma_reg, dma_if);
++        
++        ENABLE_DWDMA(dma_ch);
++        
++        return nextlength;
++	} 
++
++	return 0;
++}
++
++/**
++ * rk28_dma_irq_handler - irq callback function   
++ *
++ */
++static irqreturn_t rk28_dma_irq_handler(int irq, void *dev_id)
++{
++	int i, raw_status;
++    struct rk2818_dma *rk28dma;
++    		     
++    raw_status = read_dma_reg(DWDMA_RawBlock);
++    
++	for (i = 0; i < MAX_DMA_CHANNELS; i++) {
++        if (raw_status & (1 << i)) {
++            CLR_DWDMA_INTR(i);
++            
++            rk28dma = &rk2818_dma[i];
++            
++            if ((!rk28dma->dma_t.sg) && (rk28_dma_next(i))) {
++                printk(KERN_WARNING "dma_irq: don't finish  for channel %d\n", i);
++                continue;
++            }  
++            /* already complete transfer */
++            rk28dma->dma_t.active = 0;
++            
++            if (rk28dma->dma_t.irqHandle) {
++                rk28dma->dma_t.irqHandle(i, rk28dma->dma_t.data);
++            } else {
++                printk(KERN_WARNING "dma_irq: no IRQ handler for DMA channel %d\n", i);
++            }
++        }
++	}
++	return IRQ_HANDLED;
++}
++
++
++static struct dma_ops rk2818_dma_ops = {
++    .request = rk28_dma_request,
++    .free = rk28_dma_free,
++    .enable = rk28_dma_enable,
++    .disable = rk28_dma_disable,
++};
++
++/**
++ * rk28_dma_init - dma information initialize   
++ *
++ */
++static int __init rk28_dma_init(void)
++{
++	int ret;
++	int i;
++
++    printk(KERN_INFO "enter dwdma init\n");
++
++	ret = request_irq(RK28_DMA_IRQ_NUM, rk28_dma_irq_handler, 0, "DMA", NULL);
++	if (ret < 0) {
++		printk(KERN_CRIT "Can't register IRQ for DMA\n");
++		return ret;
++	}
++
++	for (i = 0; i < MAX_DMA_CHANNELS; i++) {
++		rk2818_dma[i].dma_t.irqHandle = NULL;
++		rk2818_dma[i].dma_t.data = NULL;
++		rk2818_dma[i].dma_t.sg = NULL;
++		rk2818_dma[i].dma_t.d_ops = &rk2818_dma_ops;
++	    dma_add(i, &rk2818_dma[i].dma_t);
++
++        rk2818_dma[i].dma_llp_vir = NULL;
++        rk2818_dma[i].dma_llp_phy = NULL;
++        rk2818_dma[i].residue = 0;
++        rk2818_dma[i].length = 0;
++	}
++    	
++	/* enable DMA module */
++	write_dma_reg(DWDMA_DmaCfgReg, 0x01);
++
++	/* clear all interrupts */
++	write_dma_reg(DWDMA_ClearBlock, 0x3f3f);
++
++    printk(KERN_INFO "exit dwdma init\n");
++    
++	return 0;
++}
++arch_initcall(rk28_dma_init);
++
++MODULE_AUTHOR("nzy@rock-chips.com");
++MODULE_DESCRIPTION("Driver for rk2818 dma device");
++MODULE_LICENSE("GPL");
+diff --git a/arch/arm/mach-rk2818/include/mach/dma.h b/arch/arm/mach-rk2818/include/mach/dma.h
+index 8612af837945..af8e98f2c199 100644
+--- a/arch/arm/mach-rk2818/include/mach/dma.h
++++ b/arch/arm/mach-rk2818/include/mach/dma.h
+@@ -1,5 +1,4 @@
+-/*
+- * arch/arm/mach-rk2818/include/mach/dma.h
++/* arch/arm/mach-rk2818/dma.h
+  *
+  * Copyright (C) 2010 ROCKCHIP, Inc.
+  *
+@@ -11,199 +10,238 @@
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
++ *
+  */
+ 
+-#ifndef __ASM_RK2818_DMA_H
+-#define __ASM_RK2818_DMA_H
++#ifndef __ASM_ARCH_RK2818_DMA_H
++#define __ASM_ARCH_RK2818_DMA_H
+ 
++#include <asm/mach/dma.h>
+ #include <asm/dma.h>
+ 
+ 
+-#define SAR 			0x000	/* Source Address Register */
+-#define DAR 			0x008	/* Destination Address Register */
+-#define LLP 			0x010	/* Linked List Pointer Register */
+-#define CTL_L 			0x018	/* Control Register LOW */
+-#define CTL_H			0x01C	/* Control Register HIGH */
+-#define CFG_L 			0x040	/* Configuration Register */
+-#define CFG_H 			0x044	/* Configuration Register */
+-#define SGR 			0x048	/* Source Gather Register */
+-#define DSR 			0x050	/* Destination Scatter Register */
+-
+-#define RawTfr 			0x2c0 	/* Raw Status for IntTfr Interrupt */
+-#define RawBlock 		0x2c8 	/* Raw Status for IntBlock Interrupt */
+-#define RawSrcTran 		0x2d0 	/* Raw Status for IntSrcTran Interrupt */
+-#define RawDstTran 		0x2d8 	/* Raw Status for IntDstTran Interrupt */
+-#define RawErr 			0x2e0 	/* Raw Status for IntErr Interrupt */
+-
+-#define StatusTfr		0x2e8 	/* Status for IntTfr Interrupt */
+-#define StatusBlock		0x2f0 	/* Status for IntBlock Interrupt */
+-#define StatusSrcTran		0x2f8 	/* Status for IntSrcTran Interrupt */
+-#define StatusDstTran		0x300 	/* Status for IntDstTran Interrupt */
+-#define StatusErr		0x308 	/* Status for IntErr Interrupt */
+-
+-#define MaskTfr			0x310	/*Mask for IntTfr Interrupt */
+-#define MaskBlock 		0x318	/*Mask for IntBlock Interrupt */
+-#define MaskSrcTran 		0x320	/*Mask for IntSrcTran Interrupt */
+-#define MaskDstTran 		0x328	/*Mask for IntDstTran Interrupt */
+-#define MaskErr 		0x330	/*Mask for IntErr Interrupt */
+-
+-#define ClearTfr		0x338 	/* Clear for IntTfr Interrupt */
+-#define ClearBlock 		0x340 	/* Clear for IntBlock Interrupt */
+-#define ClearSrcTran 		0x348 	/* Clear for IntSrcTran Interrupt */
+-#define ClearDstTran 		0x350 	/* Clear for IntDstTran Interrupt */
+-#define ClearErr 		0x358 	/* Clear for IntErr Interrupt */
+-#define StatusInt 		0x360 	/* Status for each interrupt type */
+-
+-#define DmaCfgReg 		0x398 	/* DMA Configuration Register */
+-#define ChEnReg 		0x3a0 	/* DMA Channel Enable Register */
+-
+-/* Detail CFG_L  Register Description */
+-#define CH_PRIOR_MASK     	(0x7 << 5)
+-#define CH_PRIOR_OFFSET		5
+-#define CH_SUSP           	(0x1 << 8)
+-#define FIFO_EMPTY        	(0x1 << 9)
+-#define HS_SEL_DST         	(0x1 << 10)
+-#define HS_SEL_SRC         	(0x1 << 11)
+-#define LOCK_CH_L_MASK 		(0x3 << 12)
+-#define LOCK_CH_L_OFFSET	12
+-#define LOCK_B_L_MASK     	(0x3 << 14)
+-#define LOCK_B_L_OFFSET		14
+-#define LOCK_CH			(0x1 << 16)
+-#define LOCK_B         		(0x1 << 17)
+-#define DST_HS_POL      	(0x1 << 18)
+-#define SRC_HS_POL      	(0x1 << 19)
+-#define MAX_ABRST_MASK		(0x3FF << 20)
+-#define MAX_ABRST_OFFSET	20
+-#define RELOAD_SRC        	(0x1 << 30)
+-#define RELOAD_DST        	(0x1 << 31)
+-
+-/* Detail CFG_H  Register Description */
+-#define FCMODE			(0x1 << 0)
+-#define FIFO_MODE		(0x1 << 1)
+-#define PROTCTL_MASK		(0x7 << 2)
+-#define PROTCTL_OFFSET		2
+-#define DS_UPD_EN		(0x1 << 5)
+-#define SS_UPD_EN		(0x1 << 6)
+-#define SRC_PER_MASK		(0xF << 7)
+-#define SRC_PER_OFFSET		7
+-#define DST_PER_MASK		(0xF << 11)
+-#define DST_PER_OFFSET		11
+-
+-/* Detail CTL_L  Register Description */
+-#define INT_EN            	(0x1 << 0)
+-#define DST_TR_WIDTH_MASK    	(0x7 << 1)
+-#define DST_TR_WIDTH_OFFSET	1
+-#define SRC_TR_WIDTH_MASK    	(0x7 << 4)
+-#define SRC_TR_WIDTH_OFFSET	4
+-#define DINC_MASK		(0x3 << 7)
+-#define DINC_OFFSET		7
+-#define SINC_MASK		(0x3 << 9)
+-#define SINC_OFFSET		9
+-#define DST_MSIZE_MASK		(0x7 << 11)
+-#define DST_MSIZE_OFFSET	11
+-#define SRC_MSIZE_MASK		(0x7 << 14)
+-#define SRC_MSIZE_OFFSET	14
+-#define SRC_GATHER_EN		(0x1 << 17)
+-#define DST_SCATTER_EN		(0x1 << 18)
+-#define TT_FC_MASK		(0x7 << 20)
+-#define TT_FC_OFFSET		20
+-#define DMS_MASK		(0x3 << 23)
+-#define DMS_OFFSET		23
+-#define SMS_MASK		(0x3 << 25)
+-#define SMS_OFFSET		25
+-#define LLP_DST_EN		(0x1 << 27)
+-#define LLP_SRC_EN		(0x1 << 28)
+-
+-#define AHBMASTER_1		0x0
+-#define AHBMASTER_2		0x1
+-
+-#define INCREMENT		0x0
+-#define DECREMENT		0x1
+-#define NOCHANGE		0x2
+-
+-#define MSIZE_1			0x0
+-#define MSIZE_4			0x1
+-#define MSIZE_8			0x2
+-#define MSIZE_16		0x3
+-#define MSIZE_32		0x4
+-
+-#define TR_WIDTH_8		0x0
+-#define TR_WIDTH_16		0x1
+-#define TR_WIDTH_32		0x2
+-
+-#define M2M			0x0
+-#define M2P			0x1
+-#define P2M			0x2
+-#define P2P			0x3
+-
+-/* Detail ChEnReg  Register Description */
+-#define CH_EN_MASK		(0xF << 0)
+-#define CH_EN_OFFSET		0
+-#define CH_EN_WE_MASK		(0xF << 8)
+-#define CH_EN_WE_OFFSET		8
+-
+-
+-/* Detail DmaCfgReg  Register Description */
+-#define DMA_EN			(0x1 << 0)
+-
+-
+-#define ROCKCHIP_DMA_CHANNELS  3
+-typedef enum {
+-	DMA_PRIO_HIGH = 0,
+-	DMA_PRIO_MEDIUM = 1,
+-	DMA_PRIO_LOW = 2
+-} rockchip_dma_prio;
+-
+-struct rockchip_dma_channel {
+-	const char *name;
+-	void (*irq_handler) (int, void *);
+-	void (*err_handler) (int, void *, int errcode);
+-	void *data;
+-	unsigned int  dma_mode;
+-	struct scatterlist *sg;
+-	unsigned int sgbc;
+-	unsigned int sgcount;
+-	unsigned int resbytes;
+-	dma_addr_t LLI;
+-	void *dma_vaddr;
+-	unsigned int curLLI;
+-	unsigned int lli_count;
+-	int dma_num;
+-	unsigned int channel_base;
+-};
+ 
+-struct LLI_INFO {
+-    unsigned int SARx;
+-    unsigned int DARx;
+-    unsigned int LLPx;
+-    unsigned int CTL_Lx;
+-    unsigned int CTL_Hx;
+-//    unsigned int SSATx;
+-//    unsigned int DSATx;
++/******dam registers*******/
++//cfg low word
++#define         B_CFGL_CH_PRIOR(P)       ((P)<<5)//pri = 0~2
++#define         B_CFGL_CH_SUSP           (1<<8)
++#define         B_CFGL_FIFO_EMPTY        (1<<9)
++#define         B_CFGL_H_SEL_DST         (0<<10)
++#define         B_CFGL_S_SEL_DST         (1<<10)
++#define         B_CFGL_H_SEL_SRC         (0<<11)
++#define         B_CFGL_S_SEL_SRC         (1<<11)
++#define         B_CFGL_LOCK_CH_L_OTF     (0<<12)
++#define         B_CFGL_LOCK_CH_L_OBT     (1<<12)
++#define         B_CFGL_LOCK_CH_L_OTN     (2<<12)
++#define         B_CFGL_LOCK_B_L_OTF      (0<<14)
++#define         B_CFGL_LOCK_B_L_OBT      (1<<14)
++#define         B_CFGL_LOCK_B_L_OTN      (2<<14)
++#define         B_CFGL_LOCK_CH_EN        (0<<16)
++#define         B_CFGL_LOCK_B_EN         (0<<17)
++#define         B_CFGL_DST_HS_POL_H      (0<<18)
++#define         B_CFGL_DST_HS_POL_L      (1<<18)
++#define         B_CFGL_SRC_HS_POL_H      (0<<19)
++#define         B_CFGL_SRC_HS_POL_L      (1<<19)
++#define         B_CFGL_RELOAD_SRC        (1<<30)
++#define         B_CFGL_RELOAD_DST        (1<<31)
++//cfg high word
++#define         B_CFGH_FCMODE            (1<<0)
++#define         B_CFGH_FIFO_MODE         (1<<1)
++#define         B_CFGH_PROTCTL           (1<<2)
++#define         B_CFGH_DS_UPD_EN         (1<<5)
++#define         B_CFGH_SS_UPD_EN         (1<<6)
++#define         B_CFGH_SRC_PER(HS)       ((HS)<<7)
++#define         B_CFGH_DST_PER(HS)       ((HS)<<11)
++    
++//ctl low word
++#define         B_CTLL_INT_EN            (1<<0)
++#define         B_CTLL_DST_TR_WIDTH_8    (0<<1)
++#define         B_CTLL_DST_TR_WIDTH_16   (1<<1)
++#define         B_CTLL_DST_TR_WIDTH_32   (2<<1)
++#define         B_CTLL_DST_TR_WIDTH(W)   ((W)<<1)
++#define         B_CTLL_SRC_TR_WIDTH_8    (0<<4)
++#define         B_CTLL_SRC_TR_WIDTH_16   (1<<4)
++#define         B_CTLL_SRC_TR_WIDTH_32   (2<<4)
++#define         B_CTLL_SRC_TR_WIDTH(W)   ((W)<<4)
++#define         B_CTLL_DINC_INC          (0<<7)
++#define         B_CTLL_DINC_DEC          (1<<7)
++#define         B_CTLL_DINC_UNC          (2<<7)
++#define         B_CTLL_DINC(W)           ((W)<<7)
++#define         B_CTLL_SINC_INC          (0<<9)
++#define         B_CTLL_SINC_DEC          (1<<9)
++#define         B_CTLL_SINC_UNC          (2<<9)
++#define         B_CTLL_SINC(W)           ((W)<<9)
++#define         B_CTLL_DST_MSIZE_1       (0<<11)
++#define         B_CTLL_DST_MSIZE_4       (1<<11)
++#define         B_CTLL_DST_MSIZE_8       (2<<11)
++#define         B_CTLL_DST_MSIZE_16      (3<<11)
++#define         B_CTLL_DST_MSIZE_32      (4<<11)
++#define         B_CTLL_SRC_MSIZE_1       (0<<14)
++#define         B_CTLL_SRC_MSIZE_4       (1<<14)
++#define         B_CTLL_SRC_MSIZE_8       (2<<14)
++#define         B_CTLL_SRC_MSIZE_16      (3<<14)
++#define         B_CTLL_SRC_MSIZE_32      (4<<14)
++#define         B_CTLL_SRC_GATHER        (1<<17)
++#define         B_CTLL_DST_SCATTER       (1<<18)
++#define         B_CTLL_MEM2MEM_DMAC      (0<<20)
++#define         B_CTLL_MEM2PER_DMAC      (1<<20)
++#define         B_CTLL_PER2MEM_DMAC      (2<<20)
++#define         B_CTLL_PER2MEM_PER       (4<<20)
++#define         B_CTLL_DMS_EXP           (0<<23)
++#define         B_CTLL_DMS_ARMD          (1<<23)
++#define         B_CTLL_SMS_EXP           (0<<25)
++#define         B_CTLL_SMS_ARMD          (1<<25)
++#define         B_CTLL_LLP_DST_EN        (1<<27)
++#define         B_CTLL_LLP_SRC_EN        (1<<28)
++
++#define         DWDMA_SAR(chn)      0x00+0x58*(chn)
++#define         DWDMA_DAR(chn)      0x08+0x58*(chn)
++#define         DWDMA_LLP(chn)      0x10+0x58*(chn)
++#define         DWDMA_CTLL(chn)     0x18+0x58*(chn)
++#define         DWDMA_CTLH(chn)     0x1c+0x58*(chn)
++#define         DWDMA_SSTAT(chn)    0x20+0x58*(chn)
++#define         DWDMA_DSTAT(chn)    0x28+0x58*(chn)
++#define         DWDMA_SSTATAR(chn)  0x30+0x58*(chn)
++#define         DWDMA_DSTATAR(chn)  0x38+0x58*(chn)
++#define         DWDMA_CFGL(chn)     0x40+0x58*(chn)
++#define         DWDMA_CFGH(chn)     0x44+0x58*(chn)
++#define         DWDMA_SGR(chn)      0x48+0x58*(chn)
++#define         DWDMA_DSR(chn)      0x50+0x58*(chn)
++
++#define         DWDMA_RawTfr        0x2c0
++#define         DWDMA_RawBlock      0x2c8
++#define         DWDMA_RawSrcTran    0x2d0
++#define         DWDMA_RawDstTran    0x2d8
++#define         DWDMA_RawErr        0x2e0
++#define         DWDMA_StatusTfr     0x2e8
++#define         DWDMA_StatusBlock   0x2f0
++#define         DWDMA_StatusSrcTran 0x2f8
++#define         DWDMA_StatusDstTran 0x300
++#define         DWDMA_StatusErr     0x308
++#define         DWDMA_MaskTfr       0x310
++#define         DWDMA_MaskBlock     0x318
++#define         DWDMA_MaskSrcTran   0x320
++#define         DWDMA_MaskDstTran   0x328
++#define         DWDMA_MaskErr       0x330
++#define         DWDMA_ClearTfr      0x338
++#define         DWDMA_ClearBlock    0x340
++#define         DWDMA_ClearSrcTran  0x348
++#define         DWDMA_ClearDstTran  0x350
++#define         DWDMA_ClearErr      0x358
++#define         DWDMA_StatusInt     0x360
++#define         DWDMA_ReqSrcReg     0x368
++#define         DWDMA_ReqDstReg     0x370
++#define         DWDMA_SglReqSrcReg  0x378
++#define         DWDMA_SglReqDstReg  0x380
++#define         DWDMA_LstSrcReg     0x388
++#define         DWDMA_LstDstReg     0x390
++#define         DWDMA_DmaCfgReg     0x398
++#define         DWDMA_ChEnReg       0x3a0
++#define         DWDMA_DmaIdReg      0x3a8
++#define         DWDMA_DmaTestReg    0x3b0
++/**************************/
++
++#define write_dma_reg(addr, val)        __raw_writel(val, addr+RK2818_DWDMA_BASE) 
++#define read_dma_reg(addr)              __raw_readl(addr+RK2818_DWDMA_BASE)    
++#define mask_dma_reg(addr, msk, val)    write_dma_reg(addr, (val)|((~(msk))&read_dma_reg(addr)))
++
++   /* clear interrupt */
++#define CLR_DWDMA_INTR(dma_ch)            write_dma_reg(DWDMA_ClearBlock, 0x101<<dma_ch)
++
++   /* Unmask interrupt */
++#define UN_MASK_DWDMA_INTR(dma_ch)        mask_dma_reg(DWDMA_MaskBlock, 0x101<<dma_ch, 0x101<<dma_ch)
++
++   /* Mask interrupt */
++#define MASK_DWDMA_INTR(dma_ch)           mask_dma_reg(DWDMA_MaskBlock, 0x101<<dma_ch, 0x100<<dma_ch)
++
++   /* Enable channel */
++#define ENABLE_DWDMA(dma_ch)              mask_dma_reg(DWDMA_ChEnReg, 0x101<<dma_ch, 0x101<<dma_ch)
++
++   /* Disable channel */
++#define DISABLE_DWDMA(dma_ch)             mask_dma_reg(DWDMA_ChEnReg, 0x101<<dma_ch, 0x100<<dma_ch)
++
++/**************************/
++
++#define RK28_DMA_IRQ_NUM   0
++#define RK28_MAX_DMA_LLPS      100 /*max dma sg count*/
++
++#define RK28_DMA_CH0A1_MAX_LEN      4095U
++#define RK28_DMA_CH2_MAX_LEN        2047U
++
++
++
++struct rk28_dma_llp;
++typedef struct rk28_dma_llp llp_t;
++
++struct rk28_dma_llp {
++    u32      sar;
++    u32      dar;
++    llp_t   *llp;
++    u32      ctll;
++    u32      size; 
+ };
+ 
+-extern struct rockchip_dma_channel rockchip_dma_channels[ROCKCHIP_DMA_CHANNELS];
++struct rk28_dma_dev {
++    u32      hd_if_r;   /* hardware interface for reading */
++    u32      hd_if_w;   /* hardware interface for writing */
++    u32      dev_addr_r;   /* device basic addresss for reading */
++    u32      dev_addr_w;   /* device basic addresss for reading */
++    u32      fifo_width;  /* fifo width of device */
++};
+ 
+-int rockchip_dma_setup_single(int dma_ch, dma_addr_t dma_address,
+-		     unsigned int dma_length, unsigned int dev_addr,
+-		     unsigned int  dmamode);
++struct rk2818_dma {
++    dma_t  dma_t;
++	struct rk28_dma_dev *dev_info;/* basic address of sg in memory */
++    struct rk28_dma_llp *dma_llp_vir;  /* virtual cpu addrress of linked list */
++    u32 dma_llp_phy;                   /* physical bus address of linked list */
++	u32 length;     /* current transfer block */ 
++	u32 residue;     /* residue block of current dma transfer */
++};
+ 
+-int rockchip_dma_setup_sg(int dma_ch,
+-		 struct scatterlist *sg, unsigned int sgcount, unsigned int dma_length,
+-		 unsigned int dev_addr, unsigned int  dmamode);
++#define test_dma
++
++/*devicd id list*/
++#define RK28_DMA_SD_MMC        0
++#define RK28_DMA_URAT2         1
++#define RK28_DMA_URAT3         2
++#define RK28_DMA_SDIO          3
++#define RK28_DMA_I2S           4
++#define RK28_DMA_SPI_M         5
++#define RK28_DMA_SPI_S         6
++#define RK28_DMA_URAT0         7
++#define RK28_DMA_URAT1         8
++
++#ifdef test_dma
++#define RK28_DMA_SDRAM         9
++#define RK28_DMA_DEV_NUM_MAX   10 /*max number of device that support dwdma*/
++
++#define BUF_READ_ARRR          0x66000000         
++#define BUF_WRITE_ARRR         0x66000000
++#else
++#define RK28_DMA_DEV_NUM_MAX   9 /*max number of device that support dwdma*/
++#endif
+ 
+-int rockchip_dma_setup_handlers(int dma_ch,
+-		void (*irq_handler) (int, void *),
+-		void (*err_handler) (int, void *, int), void *data);
+ 
+-void rockchip_dma_enable(int dma_ch);
++/*device hardware interface to dwdma*/
++#define RK28_DMA_SD_MMC0       0
++#define RK28_DMA_URAT2_TXD     1
++#define RK28_DMA_URAT2_RXD     2
++#define RK28_DMA_URAT3_TXD     3
++#define RK28_DMA_URAT3_RXD     4
++#define RK28_DMA_SD_MMC1       5
++#define RK28_DMA_I2S_TXD       6
++#define RK28_DMA_I2S_RXD       7
++#define RK28_DMA_SPI_M_TXD     8
++#define RK28_DMA_SPI_M_RXD     9
++#define RK28_DMA_SPI_S_TXD     10
++#define RK28_DMA_SPI_S_RXD     11
++#define RK28_DMA_URAT0_TXD     12
++#define RK28_DMA_URAT0_RXD     13
++#define RK28_DMA_URAT1_TXD     14
++#define RK28_DMA_URAT1_RXD     15
+ 
+-void rockchip_dma_disable(int dma_ch);
+ 
+-int rockchip_dma_request(int dma_ch, const char *name);
+ 
+-void rockchip_dma_free(int dma_ch);
+ 
+-int rockchip_dma_request_by_prio(const char *name, rockchip_dma_prio prio);
+ 
+-#endif
++#endif	/* _ASM_ARCH_RK28_DMA_H */
+-- 
+2.35.3
+

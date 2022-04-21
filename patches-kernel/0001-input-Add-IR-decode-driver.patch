@@ -1,0 +1,360 @@
+From e36814cb282a0cf932e07349bc4e8f4247f9a018 Mon Sep 17 00:00:00 2001
+From: Zhangbin Tong <zebulun.tong@rock-chips.com>
+Date: Wed, 15 Jun 2016 11:07:58 +0800
+Subject: [PATCH] input: Add IR decode driver
+
+Change-Id: I7e6f36b70fd1f5356ad64cad9a0b9f2aab18c2b1
+Signed-off-by: Zhangbin Tong <zebulun.tong@rock-chips.com>
+---
+ drivers/input/Kconfig                         |   2 +
+ drivers/input/Makefile                        |   1 +
+ drivers/input/remotectl/Kconfig               |   9 +-
+ drivers/input/remotectl/Makefile              |   6 +-
+ .../input/remotectl/rockchip_pwm_remotectl.c  | 131 ++++++------------
+ .../input/remotectl/rockchip_pwm_remotectl.h  |  42 +++---
+ 6 files changed, 78 insertions(+), 113 deletions(-)
+ mode change 100755 => 100644 drivers/input/remotectl/Kconfig
+ mode change 100755 => 100644 drivers/input/remotectl/Makefile
+ mode change 100755 => 100644 drivers/input/remotectl/rockchip_pwm_remotectl.c
+ mode change 100755 => 100644 drivers/input/remotectl/rockchip_pwm_remotectl.h
+
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index 2557dcda7621..d6ae5fb197cf 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -212,6 +212,8 @@ source "drivers/input/tablet/Kconfig"
+ 
+ source "drivers/input/touchscreen/Kconfig"
+ 
++source "drivers/input/remotectl/Kconfig"
++
+ source "drivers/input/misc/Kconfig"
+ 
+ endif
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index 2a6d05ab9170..0dce1d891242 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_INPUT_MOUSE)	+= mouse/
+ obj-$(CONFIG_INPUT_JOYSTICK)	+= joystick/
+ obj-$(CONFIG_INPUT_TABLET)	+= tablet/
+ obj-$(CONFIG_INPUT_TOUCHSCREEN)	+= touchscreen/
++obj-$(CONFIG_ROCKCHIP_REMOTECTL)+= remotectl/
+ obj-$(CONFIG_INPUT_MISC)	+= misc/
+ 
+ obj-$(CONFIG_INPUT_APMPOWER)	+= apm-power.o
+diff --git a/drivers/input/remotectl/Kconfig b/drivers/input/remotectl/Kconfig
+old mode 100755
+new mode 100644
+index eb8f7bd33c99..7879c6e538fc
+--- a/drivers/input/remotectl/Kconfig
++++ b/drivers/input/remotectl/Kconfig
+@@ -1,5 +1,5 @@
+ #
+-# Touchscreen driver configuration
++# Input remotectl driver configuration
+ #
+ menuconfig ROCKCHIP_REMOTECTL
+ 	bool "rockchip remotectl"
+@@ -8,10 +8,11 @@ menuconfig ROCKCHIP_REMOTECTL
+ 	  Say Y here, will suport rk remotectl.
+ 	  This option doesn't affect the kernel.
+ 	  If unsure, say Y.
+-	  
+-if ROCKCHIP_REMOTECTL  
++
++if ROCKCHIP_REMOTECTL
+ 
+ config ROCKCHIP_REMOTECTL_PWM
+-    bool "rockchip remoctrl pwm capture"
++	bool "rockchip remoctrl pwm capture"
+ 	default n
++
+ endif
+diff --git a/drivers/input/remotectl/Makefile b/drivers/input/remotectl/Makefile
+old mode 100755
+new mode 100644
+index 3b6f4e299ad6..f84b64131c0d
+--- a/drivers/input/remotectl/Makefile
++++ b/drivers/input/remotectl/Makefile
+@@ -1,7 +1,7 @@
+ #
+-# Makefile for the touchscreen drivers.
++# Makefile for the input remotectl drivers.
+ #
+-# Each configuration option enables a list of files.
+ 
++# Each configuration option enables a list of files.
+ 
+-obj-$(CONFIG_ROCKCHIP_REMOTECTL_PWM)      += rockchip_pwm_remotectl.o
++obj-$(CONFIG_ROCKCHIP_REMOTECTL_PWM)	+= rockchip_pwm_remotectl.o
+diff --git a/drivers/input/remotectl/rockchip_pwm_remotectl.c b/drivers/input/remotectl/rockchip_pwm_remotectl.c
+old mode 100755
+new mode 100644
+index d474bed30e82..831d46cc9bb5
+--- a/drivers/input/remotectl/rockchip_pwm_remotectl.c
++++ b/drivers/input/remotectl/rockchip_pwm_remotectl.c
+@@ -60,11 +60,14 @@ struct rkxx_remotectl_drvdata {
+ 	int keycode;
+ 	int press;
+ 	int pre_press;
+-	int period;
+ 	int irq;
+ 	int remote_pwm_id;
+ 	int handle_cpu_id;
+ 	int wakeup;
++	int clk_rate;
++	unsigned long period;
++	unsigned long temp_period;
++	int pwm_freq_nstime;
+ 	struct input_dev *input;
+ 	struct timer_list timer;
+ 	struct tasklet_struct remote_tasklet;
+@@ -73,7 +76,6 @@ struct rkxx_remotectl_drvdata {
+ 
+ static struct rkxx_remotectl_button *remotectl_button;
+ 
+-
+ static int remotectl_keybd_num_lookup(struct rkxx_remotectl_drvdata *ddata)
+ {
+ 	int i;
+@@ -242,7 +244,7 @@ static void rk_pwm_remotectl_do_something(unsigned long  data)
+ 	}
+ 	break;
+ 	case RMC_SEQUENCE:{
+-		DBG("S=%d\n", ddata->period);
++		DBG("S=%ld\n", ddata->period);
+ 		if ((RK_PWM_TIME_RPT_MIN < ddata->period) &&
+ 		    (ddata->period < RK_PWM_TIME_RPT_MAX)) {
+ 			DBG("S1\n");
+@@ -290,93 +292,43 @@ static void rk_pwm_remotectl_timer(unsigned long _data)
+ 
+ static irqreturn_t rockchip_pwm_irq(int irq, void *dev_id)
+ {
+-	struct rkxx_remotectl_drvdata *ddata;
++	struct rkxx_remotectl_drvdata *ddata = dev_id;
+ 	int val;
+-
+-	ddata = (struct rkxx_remotectl_drvdata *)dev_id;
+-	switch (ddata->remote_pwm_id) {
+-	case 0: {
+-		val = readl_relaxed(ddata->base + PWM0_REG_INTSTS);
+-		if (val & PWM_CH0_INT) {
+-			if ((val & PWM_CH0_POL) == 0) {
+-				val = readl_relaxed(ddata->base + PWM_REG_HPR);
+-				ddata->period = val;
+-				tasklet_hi_schedule(&ddata->remote_tasklet);
+-				DBG("hpr=0x%x\n", val);
+-			} else {
+-				val = readl_relaxed(ddata->base + PWM_REG_LPR);
+-				DBG("lpr=0x%x\n", val);
+-			}
+-			writel_relaxed(PWM_CH0_INT, ddata->base + PWM0_REG_INTSTS);
+-			if (ddata->state == RMC_PRELOAD)
+-				wake_lock_timeout(&ddata->remotectl_wake_lock, HZ);
+-			return IRQ_HANDLED;
+-		}
+-	}
+-	break;
+-	case 1:	{
+-		val = readl_relaxed(ddata->base + PWM1_REG_INTSTS);
+-		if (val & PWM_CH1_INT) {
+-			if ((val & PWM_CH1_POL) == 0) {
+-				val = readl_relaxed(ddata->base + PWM_REG_HPR);
+-				ddata->period = val;
+-				tasklet_hi_schedule(&ddata->remote_tasklet);
+-				DBG("hpr=0x%x\n", val);
+-			} else {
+-				val = readl_relaxed(ddata->base + PWM_REG_LPR);
+-				DBG("lpr=0x%x\n", val);
+-			}
+-			writel_relaxed(PWM_CH1_INT, ddata->base + PWM1_REG_INTSTS);
+-			if (ddata->state == RMC_PRELOAD)
+-				wake_lock_timeout(&ddata->remotectl_wake_lock, HZ);
+-			return IRQ_HANDLED;
+-		}
+-	}
+-	break;
+-	case 2:	{
+-		val = readl_relaxed(ddata->base + PWM2_REG_INTSTS);
+-		if (val & PWM_CH2_INT) {
+-			if ((val & PWM_CH2_POL) == 0) {
+-				val = readl_relaxed(ddata->base + PWM_REG_HPR);
+-				ddata->period = val;
+-				tasklet_hi_schedule(&ddata->remote_tasklet);
+-				DBG("hpr=0x%x\n", val);
+-			} else {
+-				val = readl_relaxed(ddata->base + PWM_REG_LPR);
+-				DBG("lpr=0x%x\n", val);
+-			}
+-			writel_relaxed(PWM_CH2_INT, ddata->base + PWM2_REG_INTSTS);
+-			if (ddata->state == RMC_PRELOAD)
+-				wake_lock_timeout(&ddata->remotectl_wake_lock, HZ);
+-			return IRQ_HANDLED;
+-		}
+-	}
+-	break;
+-	case 3:	{
+-		val = readl_relaxed(ddata->base + PWM3_REG_INTSTS);
+-		if (val & PWM_CH3_INT) {
+-			if ((val & PWM_CH3_POL) == 0) {
+-				val = readl_relaxed(ddata->base + PWM_REG_HPR);
+-				ddata->period = val;
+-				tasklet_hi_schedule(&ddata->remote_tasklet);
+-				DBG("hpr=0x%x\n", val);
+-			} else {
+-				val = readl_relaxed(ddata->base + PWM_REG_LPR);
+-				DBG("lpr=0x%x\n", val);
+-			}
+-			writel_relaxed(PWM_CH3_INT, ddata->base + PWM3_REG_INTSTS);
+-			if (ddata->state == RMC_PRELOAD)
+-				wake_lock_timeout(&ddata->remotectl_wake_lock, HZ);
+-			return IRQ_HANDLED;
++	int temp_hpr;
++	int temp_lpr;
++	int temp_period;
++	unsigned int id = ddata->remote_pwm_id;
++
++	if (id > 3)
++		return IRQ_NONE;
++	val = readl_relaxed(ddata->base + PWM_REG_INTSTS(id));
++	if ((val & PWM_CH_INT(id)) == 0)
++		return IRQ_NONE;
++	if ((val & PWM_CH_POL(id)) == 0) {
++		temp_hpr = readl_relaxed(ddata->base + PWM_REG_HPR);
++		DBG("hpr=%d\n", temp_hpr);
++		temp_lpr = readl_relaxed(ddata->base + PWM_REG_LPR);
++		DBG("lpr=%d\n", temp_lpr);
++		temp_period = ddata->pwm_freq_nstime * temp_lpr / 1000;
++		if (temp_period > RK_PWM_TIME_BIT0_MIN) {
++			ddata->period = ddata->temp_period
++			    + ddata->pwm_freq_nstime * temp_hpr / 1000;
++			tasklet_hi_schedule(&ddata->remote_tasklet);
++			ddata->temp_period = 0;
++			DBG("period+ =%ld\n", ddata->period);
++		} else {
++			ddata->temp_period += ddata->pwm_freq_nstime
++			    * (temp_hpr + temp_lpr) / 1000;
+ 		}
+ 	}
+-	break;
+-	default:
+-	break;
+-	}
+-	return IRQ_NONE;
++	writel_relaxed(PWM_CH_INT(id), ddata->base + PWM_REG_INTSTS(id));
++	if (ddata->state == RMC_PRELOAD)
++		wake_lock_timeout(&ddata->remotectl_wake_lock, HZ);
++	return IRQ_HANDLED;
+ }
+ 
++
++
+ static int rk_pwm_remotectl_hw_init(struct rkxx_remotectl_drvdata *ddata)
+ {
+ 	int val;
+@@ -388,7 +340,7 @@ static int rk_pwm_remotectl_hw_init(struct rkxx_remotectl_drvdata *ddata)
+ 	val = (val & 0xFFFFFFF9) | PWM_MODE_CAPTURE;
+ 	writel_relaxed(val, ddata->base + PWM_REG_CTRL);
+ 	val = readl_relaxed(ddata->base + PWM_REG_CTRL);
+-	val = (val & 0xFF008DFF) | 0x00646200;
++	val = (val & 0xFF008DFF) | 0x0006000;
+ 	writel_relaxed(val, ddata->base + PWM_REG_CTRL);
+ 	switch (ddata->remote_pwm_id) {
+ 	case 0: {
+@@ -425,7 +377,6 @@ static int rk_pwm_remotectl_hw_init(struct rkxx_remotectl_drvdata *ddata)
+ }
+ 
+ 
+-
+ static int rk_pwm_probe(struct platform_device *pdev)
+ {
+ 	struct rkxx_remotectl_drvdata *ddata;
+@@ -440,6 +391,7 @@ static int rk_pwm_probe(struct platform_device *pdev)
+ 	int i, j;
+ 	int cpu_id;
+ 	int pwm_id;
++	int pwm_freq;
+ 
+ 	pr_err(".. rk pwm remotectl v1.1 init\n");
+ 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -454,10 +406,11 @@ static int rk_pwm_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	}
+ 	ddata->state = RMC_PRELOAD;
++	ddata->temp_period = 0;
+ 	ddata->base = devm_ioremap_resource(&pdev->dev, r);
+ 	if (IS_ERR(ddata->base))
+ 		return PTR_ERR(ddata->base);
+-	clk = devm_clk_get(&pdev->dev, "pclk_pwm");
++	clk = devm_clk_get(&pdev->dev, NULL);
+ 	if (IS_ERR(clk))
+ 		return PTR_ERR(clk);
+ 	platform_set_drvdata(pdev, ddata);
+@@ -533,6 +486,8 @@ static int rk_pwm_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 	rk_pwm_remotectl_hw_init(ddata);
++	pwm_freq = clk_get_rate(clk) / 64;
++	ddata->pwm_freq_nstime = 1000000000 / pwm_freq;
+ 	return ret;
+ }
+ 
+diff --git a/drivers/input/remotectl/rockchip_pwm_remotectl.h b/drivers/input/remotectl/rockchip_pwm_remotectl.h
+old mode 100755
+new mode 100644
+index 99b9039f5c2b..d1228d002db4
+--- a/drivers/input/remotectl/rockchip_pwm_remotectl.h
++++ b/drivers/input/remotectl/rockchip_pwm_remotectl.h
+@@ -92,24 +92,30 @@ enum pwm_div {
+ /********************************************************************
+ **                            宏定义                                *
+ ********************************************************************/
+-#define RK_PWM_TIME_PRE_MIN      19   /*4500*/
+-#define RK_PWM_TIME_PRE_MAX      30   /*5500*/           /*PreLoad 4.5+0.56 = 5.06ms*/
+-
+-#define RK_PWM_TIME_BIT0_MIN     1  /*Bit0  1.125ms*/
+-#define RK_PWM_TIME_BIT0_MAX     5
+-
+-#define RK_PWM_TIME_BIT1_MIN     7  /*Bit1  2.25ms*/
+-#define RK_PWM_TIME_BIT1_MAX     15
+-
+-#define RK_PWM_TIME_RPT_MIN      0x215   /*101000*/
+-#define RK_PWM_TIME_RPT_MAX      0x235   /*103000*/         /*Repeat  105-2.81=102.19ms*/  //110-9-2.25-0.56=98.19ms
+-
+-#define RK_PWM_TIME_SEQ1_MIN     2   /*2650*/
+-#define RK_PWM_TIME_SEQ1_MAX     0x20   /*3000*/           /*sequence  2.25+0.56=2.81ms*/ //11.25ms
+-
+-#define RK_PWM_TIME_SEQ2_MIN     0xDE   /*101000*/
+-#define RK_PWM_TIME_SEQ2_MAX     0x120   /*103000*/         /*Repeat  105-2.81=102.19ms*/  //110-9-2.25-0.56=98.19ms
+-
++#define RK_PWM_TIME_PRE_MIN	4000
++#define RK_PWM_TIME_PRE_MAX	5000
++
++#define RK_PWM_TIME_BIT0_MIN	480
++#define RK_PWM_TIME_BIT0_MAX	700
++
++#define RK_PWM_TIME_BIT1_MIN	1300
++#define RK_PWM_TIME_BIT1_MAX	2000
++
++#define RK_PWM_TIME_RPT_MIN	2000
++#define RK_PWM_TIME_RPT_MAX	2500
++
++#define RK_PWM_TIME_SEQ1_MIN	95000
++#define RK_PWM_TIME_SEQ1_MAX	98000
++
++#define RK_PWM_TIME_SEQ2_MIN	30000
++#define RK_PWM_TIME_SEQ2_MAX	55000
++
++
++#define PWM_REG_INTSTS(n)       ((4 - (n)) * 0x10)
++#define PWM_CH_INT(n)   BIT(n)
++#define PWM_CH_POL(n)   BIT(n+8)
++
++
+ /********************************************************************
+ **                          结构定义                                *
+ ********************************************************************/
+-- 
+2.35.3
+

@@ -1,0 +1,306 @@
+From eb91b3bb9dbe2da2df4a77f3940c073b2a647c78 Mon Sep 17 00:00:00 2001
+From: chenli <chenli@rock-chips.com>
+Date: Mon, 16 Jan 2012 14:46:23 +0800
+Subject: [PATCH] modify the GPU's MMU mechanism to avoid accessing the freed
+ pagetables
+
+---
+ .../XAQ2/hal/kernel/gc_hal_kernel_hardware.c  |  10 +-
+ .../rk29/vivante/hal/inc/gc_hal_options.h     |  10 ++
+ .../rk29/vivante/hal/kernel/gc_hal_kernel.h   |   5 +
+ .../vivante/hal/kernel/gc_hal_kernel_mmu.c    | 111 +++++++++++++++++-
+ 4 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/staging/rk29/vivante/arch/XAQ2/hal/kernel/gc_hal_kernel_hardware.c b/drivers/staging/rk29/vivante/arch/XAQ2/hal/kernel/gc_hal_kernel_hardware.c
+index 08540815e6f4..547cb2fedc07 100755
+--- a/drivers/staging/rk29/vivante/arch/XAQ2/hal/kernel/gc_hal_kernel_hardware.c
++++ b/drivers/staging/rk29/vivante/arch/XAQ2/hal/kernel/gc_hal_kernel_hardware.c
+@@ -710,9 +710,17 @@ gckHARDWARE_InitializeHardware(
+     )
+     {
+         /* Reset MMU. */
++#if gcdENABLE_MMU_PROTECTING
++		//chenli:logical address added pageTableEntries to store the the physical addresses
+         gcmkONERROR(
+             gckHARDWARE_SetMMU(Hardware,
+-                               Hardware->kernel->mmu->pageTableLogical));
++                               Hardware->kernel->mmu->pageTableLogical + Hardware->kernel->mmu->pageTableEntries));
++#else
++		gcmkONERROR(
++		   gckHARDWARE_SetMMU(Hardware,
++							  Hardware->kernel->mmu->pageTableLogical));
++#endif
++                           
+     }
+ 
+     /* Success. */
+diff --git a/drivers/staging/rk29/vivante/hal/inc/gc_hal_options.h b/drivers/staging/rk29/vivante/hal/inc/gc_hal_options.h
+index d98fa36a0b34..e8133d0a60cf 100644
+--- a/drivers/staging/rk29/vivante/hal/inc/gc_hal_options.h
++++ b/drivers/staging/rk29/vivante/hal/inc/gc_hal_options.h
+@@ -360,5 +360,15 @@
+ #define USE_DMA_COHERENT                    1
+ 
+ 
++/*
++	chenli: gcdENABLE_MMU_PROTECTING
++	
++	avoid GPU accessing the freed PageTables
++	gcdENABLE_MMU_PROTECTING:
++	   0 - no use,original code
++	   1 - use
++*/
++#define gcdENABLE_MMU_PROTECTING 1
++
+ #endif /* __gc_hal_options_h_ */
+ 
+diff --git a/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel.h b/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel.h
+index 8fe566bb1263..c961074e8d70 100644
+--- a/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel.h
++++ b/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel.h
+@@ -366,6 +366,11 @@ struct _gckMMU
+     gctUINT32_PTR               pageTableLogical;
+     gctUINT32                   pageTableEntries;
+ 
++#if gcdENABLE_MMU_PROTECTING
++	gctPHYS_ADDR                FreePagePhysical;
++	gctUINT32_PTR				FreePageLogical;
++#endif
++
+     /* Free entries. */
+     gctUINT32                   heapList;
+     gctBOOL                     freeNodes;
+diff --git a/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel_mmu.c b/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel_mmu.c
+index b23dcf6b3a32..d7053961b81f 100644
+--- a/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel_mmu.c
++++ b/drivers/staging/rk29/vivante/hal/kernel/gc_hal_kernel_mmu.c
+@@ -25,6 +25,10 @@
+ 
+ #define _GC_OBJ_ZONE	gcvZONE_MMU
+ 
++#if gcdENABLE_MMU_PROTECTING
++#include "../os/linux/kernel/gc_hal_kernel_os.h"
++#endif
++
+ typedef enum _gceMMU_TYPE
+ {
+ 	gcvMMU_USED = 0,
+@@ -214,6 +218,11 @@ gckMMU_Construct(
+ 	gckMMU mmu = gcvNULL;
+ 	gctUINT32_PTR pageTable;
+ 	
++#if gcdENABLE_MMU_PROTECTING
++	gctSIZE_T pageTableSize_x2;
++	gctSIZE_T OnePage = PAGE_SIZE;
++#endif
++
+ 	gcmkHEADER_ARG("Kernel=0x%x MmuSize=%lu", Kernel, MmuSize);
+ 
+ 	/* Verify the arguments. */
+@@ -254,12 +263,39 @@ gckMMU_Construct(
+ 
+ 	/* Allocate the page table (not more than 256 kB). */
+ 	mmu->pageTableSize = gcmMIN(MmuSize, 256 << 10);
++
++	
++#if gcdENABLE_MMU_PROTECTING 
++	//one pageTableSize to store the labels ,another pageTableSize to store the physical addresses
++	pageTableSize_x2 = mmu->pageTableSize*2;
++	gcmkONERROR(
++		gckOS_AllocateContiguous(os,
++								 gcvFALSE,
++								 &pageTableSize_x2,
++								 &mmu->pageTablePhysical,
++								 (gctPOINTER *) &mmu->pageTableLogical));
++	
++	if(pageTableSize_x2 != mmu->pageTableSize*2)
++	{
++		printk("pageTableSize_x2 != mmu->pageTableSize*2\n");
++		goto OnError;
++	}
++
++	//this page's physical address is set to the freed pageTable in gckMMU_FreePages
++	gcmkONERROR(
++		gckOS_AllocateContiguous(os,
++								 gcvFALSE,
++								 &OnePage,
++								 &mmu->FreePagePhysical,
++								 (gctPOINTER *)&mmu->FreePageLogical));
++#else
+ 	gcmkONERROR(
+ 		gckOS_AllocateContiguous(os,
+ 								 gcvFALSE,
+ 								 &mmu->pageTableSize,
+ 								 &mmu->pageTablePhysical,
+ 								 (gctPOINTER *) &mmu->pageTableLogical));
++#endif
+ 
+ 	/* Compute number of entries in page table. */
+ 	mmu->pageTableEntries = mmu->pageTableSize / sizeof(gctUINT32);
+@@ -272,8 +308,14 @@ gckMMU_Construct(
+ 	mmu->freeNodes = gcvFALSE;
+ 
+ 	/* Set page table address. */
++#if gcdENABLE_MMU_PROTECTING
++	//logical address added pageTableEntries to store the the physical addresses
++	gcmkONERROR(
++		gckHARDWARE_SetMMU(hardware, (gctPOINTER) (mmu->pageTableLogical + mmu->pageTableEntries)));
++#else
+ 	gcmkONERROR(
+ 		gckHARDWARE_SetMMU(hardware, (gctPOINTER) mmu->pageTableLogical));
++#endif
+ 
+ 	/* Return the gckMMU object pointer. */
+ 	*Mmu = mmu;
+@@ -283,17 +325,33 @@ gckMMU_Construct(
+ 	return gcvSTATUS_OK;
+ 
+ OnError:
++	
+ 	/* Roll back. */
+ 	if (mmu != gcvNULL)
+ 	{
+ 		if (mmu->pageTableLogical != gcvNULL)
+ 		{
+ 			/* Free the page table. */
++#if gcdENABLE_MMU_PROTECTING
++			gcmkVERIFY_OK(
++				gckOS_FreeContiguous(os, 
++									 mmu->pageTablePhysical,
++									 (gctPOINTER) mmu->pageTableLogical,
++									 mmu->pageTableSize*2));
++
++			gcmkVERIFY_OK(
++				gckOS_FreeContiguous(os, 
++									 mmu->FreePagePhysical,
++									 (gctPOINTER) mmu->FreePageLogical,
++									 PAGE_SIZE));
++
++#else
+ 			gcmkVERIFY_OK(
+ 				gckOS_FreeContiguous(os, 
+ 									 mmu->pageTablePhysical,
+ 									 (gctPOINTER) mmu->pageTableLogical,
+ 									 mmu->pageTableSize));
++#endif 
+ 		}
+ 
+ 		if (mmu->pageTableMutex != gcvNULL)
+@@ -363,11 +421,24 @@ gckMMU_Destroy(
+ #endif
+ 
+ 	/* Free the page table. */
++#if gcdENABLE_MMU_PROTECTING
++	gcmkVERIFY_OK(
++		gckOS_FreeContiguous(Mmu->os,
++							 Mmu->pageTablePhysical,
++							 (gctPOINTER) Mmu->pageTableLogical,
++							 Mmu->pageTableSize*2));
++	gcmkVERIFY_OK(
++		gckOS_FreeContiguous(Mmu->os,
++							 Mmu->FreePagePhysical,
++							 (gctPOINTER) Mmu->FreePageLogical,
++							 PAGE_SIZE));
++#else
+ 	gcmkVERIFY_OK(
+ 		gckOS_FreeContiguous(Mmu->os,
+ 							 Mmu->pageTablePhysical,
+ 							 (gctPOINTER) Mmu->pageTableLogical,
+ 							 Mmu->pageTableSize));
++#endif
+ 
+ #ifdef __QNXNTO__
+ 	/* Delete the node list mutex. */
+@@ -438,7 +509,7 @@ gckMMU_AllocatePages(
+ 		/* Not enough pages avaiable. */
+ 		gcmkONERROR(gcvSTATUS_OUT_OF_RESOURCES);
+ 	}
+-
++		
+ 	/* Grab the mutex. */
+ 	gcmkONERROR(gckOS_AcquireMutex(Mmu->os, Mmu->pageTableMutex, gcvINFINITE));
+ 	mutex = gcvTRUE;
+@@ -542,7 +613,15 @@ gckMMU_AllocatePages(
+ 	pageTable[index] = gcvMMU_USED;
+ 
+ 	/* Return pointer to page table. */
++#if gcdENABLE_MMU_PROTECTING
++	//index add pageTableEntries to store real physical address 
++	*PageTable = &pageTable[index +Mmu->pageTableEntries];
++
++	//must do memset because the elements may be set to ~0U in gckMMU_FreePages or _AddFree
++	memset(&pageTable[index], gcvMMU_USED, PageCount*4);
++#else
+ 	*PageTable = &pageTable[index];
++#endif
+ 
+ 	/* Build virtual address. */
+ 	gcmkONERROR(
+@@ -562,6 +641,7 @@ gckMMU_AllocatePages(
+ 	return gcvSTATUS_OK;
+ 
+ OnError:
++	
+ 	if (mutex)
+ 	{
+ 		/* Release the mutex. */
+@@ -602,10 +682,15 @@ gckMMU_FreePages(
+ 	)
+ {
+ 	gctUINT32_PTR pageTable;
+-	
++
++#if gcdENABLE_MMU_PROTECTING
++	int i;
++#endif
++
+ 	gcmkHEADER_ARG("Mmu=0x%x PageTable=0x%x PageCount=%lu",
+ 				   Mmu, PageTable, PageCount);
+ 
++
+ 	/* Verify the arguments. */
+ 	gcmkVERIFY_OBJECT(Mmu, gcvOBJ_MMU);
+ 	gcmkVERIFY_ARGUMENT(PageTable != gcvNULL);
+@@ -614,18 +699,38 @@ gckMMU_FreePages(
+ 	/* Convert the pointer. */
+ 	pageTable = (gctUINT32_PTR) PageTable;
+ 
++#if gcdENABLE_MMU_PROTECTING
++	//sub pageTableEntries to get the address that store lables
++	pageTable -= Mmu->pageTableEntries;
++#endif
++
+ 	if (PageCount == 1)
+ 	{
+ 		/* Single page node. */
+ 		pageTable[0] = (~0U << 8) | gcvMMU_SINGLE;
++		
++#if gcdENABLE_MMU_PROTECTING
++		//set the special phsical address to avoid GPU accessing other addresses 
++		pageTable[Mmu->pageTableEntries] =  ((PLINUX_MDL)(Mmu->FreePagePhysical))->dmaHandle;
++#endif 
++
+ 	}
+ 	else
+ 	{
+ 		/* Mark the node as free. */
+ 		pageTable[0] = (PageCount << 8) | gcvMMU_FREE;
+ 		pageTable[1] = ~0U;
+-	}
++		
++#if gcdENABLE_MMU_PROTECTING
++		//set the special phsical address to avoid GPU accessing other addresses 
++		for(i=0; i<PageCount; i++)
++		{
++			pageTable[Mmu->pageTableEntries+i] = ((PLINUX_MDL)(Mmu->FreePagePhysical))->dmaHandle;
++		}
++#endif 
+ 
++	}
++	
+ 	/* We have free nodes. */
+ 	Mmu->freeNodes = gcvTRUE;
+ 	
+-- 
+2.35.3
+

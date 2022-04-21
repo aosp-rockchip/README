@@ -1,0 +1,163 @@
+From 169d5b0f670e659e1cf9d1f78d09bc11f815b649 Mon Sep 17 00:00:00 2001
+From: xxm <xxm@rock-chips.com>
+Date: Fri, 28 Mar 2014 17:43:07 +0800
+Subject: [PATCH] 1, support iommu
+
+2, invalidate iommu tlb when page table updating finished
+3, fix rockchip_sysmmu_irq function
+---
+ drivers/iommu/Kconfig          | 31 +++++++++++++++++++++++++++++++
+ drivers/iommu/Makefile         |  2 ++
+ drivers/iommu/rockchip-iommu.c | 14 ++++++++++++--
+ drivers/iommu/rockchip-iovmm.c |  6 +++++-
+ 4 files changed, 50 insertions(+), 3 deletions(-)
+ mode change 100644 => 100755 drivers/iommu/Kconfig
+ mode change 100644 => 100755 drivers/iommu/Makefile
+
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+old mode 100644
+new mode 100755
+index c332fb98480d..262c36efda41
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -127,6 +127,37 @@ config IRQ_REMAP
+ 	  To use x2apic mode in the CPU's which support x2APIC enhancements or
+ 	  to support platforms with CPU's having > 8 bit APIC ID, say Y.
+ 
++config ROCKCHIP_IOMMU
++	bool "Rockchip IOMMU Support"
++	depends on ARCH_ROCKCHIP
++	select IOMMU_API
++	help
++	  Support for the IOMMU(System MMU) of Rockchip rk32xx application
++	  processor family. This enables H/W multimedia accellerators to see
++	  non-linear physical memory chunks as a linear memory in their
++	  address spaces
++
++	  If unsure, say N here.
++
++config ROCKCHIP_IOVMM
++	bool "IO Virtual Memory Manager for Rockcihp IOMMUs"
++	select GENERIC_ALLOCATOR
++	depends on ROCKCHIP_IOMMU
++	default n
++	help
++	  Supporting the users of Rockchip IOMMU for allocating and mapping
++	  an IO virtual memory region with a physical memory region
++	  and managing the allocated virtual memory regions.
++
++config ROCKCHIP_IOMMU_DEBUG
++	bool "Debugging log for Rockchip IOMMU"
++	depends on ROCKCHIP_IOMMU
++	help
++	  Select this to see the detailed log message that shows what
++	  happens in the IOMMU driver
++
++	  Say N unless you need kernel log message for IOMMU debugging
++
+ # OMAP IOMMU support
+ config OMAP_IOMMU
+ 	bool "OMAP IOMMU Support"
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+old mode 100644
+new mode 100755
+index ef0e5207ad69..a3978dcd5e83
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -6,6 +6,8 @@ obj-$(CONFIG_AMD_IOMMU_V2) += amd_iommu_v2.o
+ obj-$(CONFIG_DMAR_TABLE) += dmar.o
+ obj-$(CONFIG_INTEL_IOMMU) += iova.o intel-iommu.o
+ obj-$(CONFIG_IRQ_REMAP) += intel_irq_remapping.o irq_remapping.o
++obj-$(CONFIG_ROCKCHIP_IOVMM) += rockchip-iovmm.o
++obj-$(CONFIG_ROCKCHIP_IOMMU) += rockchip-iommu.o
+ obj-$(CONFIG_OMAP_IOMMU) += omap-iommu.o
+ obj-$(CONFIG_OMAP_IOMMU) += omap-iommu2.o
+ obj-$(CONFIG_OMAP_IOVMM) += omap-iovmm.o
+diff --git a/drivers/iommu/rockchip-iommu.c b/drivers/iommu/rockchip-iommu.c
+index b8e685511c78..4c290921be79 100755
+--- a/drivers/iommu/rockchip-iommu.c
++++ b/drivers/iommu/rockchip-iommu.c
+@@ -430,6 +430,7 @@ static irqreturn_t rockchip_sysmmu_irq(int irq, void *dev_id)
+ 	enum rk_sysmmu_inttype itype = SYSMMU_FAULT_UNKNOWN;
+ 	u32 status;
+ 	u32 rawstat;
++	u32 int_status;
+ 	u32 fault_address;
+ 	int i, ret = -ENOSYS;
+ 
+@@ -451,9 +452,12 @@ static irqreturn_t rockchip_sysmmu_irq(int irq, void *dev_id)
+ 	} 
+ 	else 
+ 	{
+-		status = __raw_readl(data->res_bases[i] + SYSMMU_REGISTER_STATUS);
+-		if(status != 0)
++		int_status = __raw_readl(data->res_bases[i] + SYSMMU_REGISTER_INT_STATUS);
++		if(int_status != 0)
+ 		{
++			/*mask status*/
++			__raw_writel(0x00,data->res_bases[i] + SYSMMU_REGISTER_INT_MASK);
++			
+ 			rawstat = __raw_readl(data->res_bases[i] + SYSMMU_REGISTER_INT_RAWSTAT);
+ 			if(rawstat & SYSMMU_INTERRUPT_PAGE_FAULT)
+ 			{
+@@ -469,6 +473,8 @@ static irqreturn_t rockchip_sysmmu_irq(int irq, void *dev_id)
+ 				goto out;
+ 			}
+ 		}
++		else
++			goto out;
+ 	}
+ 
+ 	if (data->domain)
+@@ -479,13 +485,17 @@ static irqreturn_t rockchip_sysmmu_irq(int irq, void *dev_id)
+ 		unsigned long base = data->pgtable;
+ 		if (itype != SYSMMU_FAULT_UNKNOWN)
+ 			base = __raw_readl(data->res_bases[i] + SYSMMU_REGISTER_DTE_ADDR);
++		status = __raw_readl(data->res_bases[i] + SYSMMU_REGISTER_STATUS);
+ 		ret = data->fault_handler(data->dev, itype, base, fault_address,status);
+ 	}
+ 
+ 	if (!ret && (itype != SYSMMU_FAULT_UNKNOWN))
+ 	{
+ 		if(SYSMMU_PAGEFAULT == itype)
++		{
++			sysmmu_zap_tlb(data->res_bases[i]);
+ 			sysmmu_page_fault_done(data->res_bases[i],data->dbgname);
++		}
+ 		sysmmu_reset(data->res_bases[i],data->dbgname);
+ 	}
+ 	else
+diff --git a/drivers/iommu/rockchip-iovmm.c b/drivers/iommu/rockchip-iovmm.c
+index c43f34787157..402a5f3fa3c0 100755
+--- a/drivers/iommu/rockchip-iovmm.c
++++ b/drivers/iommu/rockchip-iovmm.c
+@@ -53,7 +53,7 @@ dma_addr_t iovmm_map(struct device *dev,struct scatterlist *sg, off_t offset,siz
+ 	struct rk_iovmm *vmm = rockchip_get_iovmm(dev);
+ 	int order;
+ 	int ret;
+-
++	
+ 	for (; sg_dma_len(sg) < offset; sg = sg_next(sg))
+ 		offset -= sg_dma_len(sg);
+ 
+@@ -135,6 +135,8 @@ dma_addr_t iovmm_map(struct device *dev,struct scatterlist *sg, off_t offset,siz
+ 
+ 	spin_unlock(&vmm->lock);
+ 
++	rockchip_sysmmu_tlb_invalidate(dev);
++
+ 	dev_dbg(dev, "IOVMM: Allocated VM region @ %#x/%#X bytes.\n",region->start, region->size);
+ 
+ 	return region->start;
+@@ -221,6 +223,8 @@ int iovmm_map_oto(struct device *dev, phys_addr_t phys, size_t size)
+ 	list_add(&region->node, &vmm->regions_list);
+ 
+ 	spin_unlock(&vmm->lock);
++	
++	rockchip_sysmmu_tlb_invalidate(dev);
+ 
+ 	return 0;
+ }
+-- 
+2.35.3
+

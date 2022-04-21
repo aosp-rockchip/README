@@ -1,0 +1,98 @@
+From dd937ee8646c4057c513448528241b7c47a6b617 Mon Sep 17 00:00:00 2001
+From: William Wu <william.wu@rock-chips.com>
+Date: Tue, 12 Feb 2019 10:54:20 +0800
+Subject: [PATCH] usb: dwc3: rockchip: fix rk3399 dwc3 host power on fail
+
+RK3399 Excavator Board has an USB 3.0 PHY power on issue
+when Type-A USB 3.0 Host port connects with an USB 3.0
+device and do system PM suspend/resume test.
+
+When the issue happens, we gets the following error log:
+
+phy phy-ff800000.phy.4: phy poweron failed --> -110
+dpm_run_callback(): platform_pm_resume+0x0/0x54 returns -110
+PM: Device fe900000.dwc3 failed to resume: error -110
+xhci-hcd xhci-hcd.12.auto: port 0 resume PLC timeout
+
+It's because that the Type-C PHY docs say that the DWC3
+controller "needs to be held in reset to set the PIPE
+power state in P2 before initializing the Type-C PHY",
+but actually the PIPE is in P0 state because an USB 3.0
+device is connected, and the current code doesn't reset
+the DWC3 controller upon PM resume.
+
+This patch prevents powering off the USB 3.0 PHY of
+RK3399 Type-A USB 3.0 Host port when system enters
+syspend. As a side effect, the power consumption in
+standby mode will increase. However, if you want to
+optimize the power consumption in standby mode and
+allow the USB device to be reenumerated upon PM resume,
+you can add a property "needs-reset-on-resume" in
+DWC3 DTS like this:
+
+&usbdrd3_1 {
+	needs-reset-on-resume;
+};
+
+Change-Id: Ia1cdf6e09cac520e99931a15423b8de7be2ba52b
+Signed-off-by: William Wu <william.wu@rock-chips.com>
+---
+ drivers/usb/dwc3/dwc3-rockchip.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/dwc3/dwc3-rockchip.c b/drivers/usb/dwc3/dwc3-rockchip.c
+index 9b549b48f74f..4810d45deeed 100644
+--- a/drivers/usb/dwc3/dwc3-rockchip.c
++++ b/drivers/usb/dwc3/dwc3-rockchip.c
+@@ -50,6 +50,7 @@ struct dwc3_rockchip {
+ 	bool			skip_suspend;
+ 	bool			suspended;
+ 	bool			force_mode;
++	bool			reset_on_resume;
+ 	enum usb_dr_mode	original_dr_mode;
+ 	struct device		*dev;
+ 	struct clk		**clks;
+@@ -659,6 +660,9 @@ static void dwc3_rockchip_async_probe(void *data, async_cookie_t cookie)
+ 
+ 	mutex_lock(&rockchip->lock);
+ 
++	rockchip->reset_on_resume =
++		device_property_read_bool(dev, "needs-reset-on-resume");
++
+ 	if (rockchip->edev) {
+ 		ret = extcon_register_notifier(rockchip->edev, EXTCON_USB,
+ 					       &rockchip->device_nb);
+@@ -704,6 +708,21 @@ static void dwc3_rockchip_async_probe(void *data, async_cookie_t cookie)
+ 		 * usb device to be reenumerated.
+ 		 */
+ 		rockchip->connected = true;
++
++		if (!rockchip->reset_on_resume &&
++		    of_machine_is_compatible("rockchip,rk3399")) {
++			/*
++			 * RK3399 USB 3.0 PHY is Type-C PHY, needs to
++			 * power on USB 3.0 PHY here in addition to
++			 * dwc3_core_init() to prevent it powering
++			 * off USB 3.0 PHY during suspend.
++			 */
++			ret = phy_power_on(dwc->usb3_generic_phy);
++			if (ret < 0) {
++				dev_err(dwc->dev, "Failed to power on usb3 phy\n");
++				goto err;
++			}
++		}
+ 	}
+ 
+ 	ret = sysfs_create_group(&dev->kobj, &dwc3_rockchip_attr_group);
+@@ -958,7 +977,7 @@ static int __maybe_unused dwc3_rockchip_resume(struct device *dev)
+ 	struct dwc3_rockchip *rockchip = dev_get_drvdata(dev);
+ 	struct dwc3 *dwc = rockchip->dwc;
+ 
+-	if (!rockchip->connected) {
++	if (!rockchip->connected || rockchip->reset_on_resume) {
+ 		reset_control_assert(rockchip->otg_rst);
+ 		udelay(1);
+ 		reset_control_deassert(rockchip->otg_rst);
+-- 
+2.35.3
+

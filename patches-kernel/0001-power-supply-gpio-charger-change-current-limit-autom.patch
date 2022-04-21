@@ -1,0 +1,104 @@
+From 56a786838b7bf95dba205b88f2c6aa5bcc4c3085 Mon Sep 17 00:00:00 2001
+From: Ziyuan Xu <xzy.xu@rock-chips.com>
+Date: Thu, 12 Nov 2020 17:55:31 +0800
+Subject: [PATCH] power: supply: gpio-charger: change current limit
+ automatically by *USB_DCP*
+
+The usb phy could update the state of the EXTCON_CHG_USB_DCP duly, so
+that we can change the current limit to maximum within the USB dedicated
+charging port.
+
+Signed-off-by: Ziyuan Xu <xzy.xu@rock-chips.com>
+Change-Id: I32f0361a2f0153424627bef0bd75c3b93e51ec03
+---
+ drivers/power/supply/gpio-charger.c | 41 +++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/power/supply/gpio-charger.c b/drivers/power/supply/gpio-charger.c
+index a79e5f969b01..a2428d9699a7 100644
+--- a/drivers/power/supply/gpio-charger.c
++++ b/drivers/power/supply/gpio-charger.c
+@@ -13,6 +13,7 @@
+  *
+  */
+ 
++#include <linux/extcon-provider.h>
+ #include <linux/device.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+@@ -39,11 +40,13 @@ struct gpio_charger {
+ 
+ 	struct power_supply *charger;
+ 	struct power_supply_desc charger_desc;
++	struct extcon_dev *edev;
+ 	struct gpio_desc *gpiod;
+ 	struct gpio_desc *charge_status;
+ 
+ 	struct gpio_descs *current_limit_gpios;
+ 	struct gpio_mapping *current_limit_map;
++	struct notifier_block cable_cg_nb;
+ 	u32 current_limit_map_size;
+ 	u32 charge_current_limit;
+ };
+@@ -246,6 +249,22 @@ static int init_charge_current_limit(struct device *dev,
+ 	return 0;
+ }
+ 
++static int gpio_charger_evt_notifier(struct notifier_block *nb,
++				     unsigned long event, void *ptr)
++{
++	int limit_ua;
++	struct gpio_charger *charger =
++		container_of(nb, struct gpio_charger, cable_cg_nb);
++
++	limit_ua = charger->current_limit_map[charger->current_limit_map_size - 1].limit_ua;
++	if (extcon_get_state(charger->edev, EXTCON_CHG_USB_DCP) > 0)
++		limit_ua = charger->current_limit_map[0].limit_ua;
++
++	set_charge_current_limit(charger, limit_ua);
++
++	return NOTIFY_DONE;
++}
++
+ /*
+  * The entries will be overwritten by driver's probe routine depending
+  * on the available features. This list ensures, that the array is big
+@@ -261,6 +280,7 @@ static int gpio_charger_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	const struct gpio_charger_platform_data *pdata = dev->platform_data;
++	struct extcon_dev *edev;
+ 	struct power_supply_config psy_cfg = {};
+ 	struct gpio_charger *gpio_charger;
+ 	struct power_supply_desc *charger_desc;
+@@ -279,6 +299,27 @@ static int gpio_charger_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	gpio_charger->dev = dev;
+ 
++	if (of_property_read_bool(dev->of_node, "extcon")) {
++		edev = extcon_get_edev_by_phandle(dev, 0);
++		if (IS_ERR(edev)) {
++			if (PTR_ERR(edev) != -EPROBE_DEFER)
++				dev_err(dev, "Invalid or missing extcon\n");
++			return PTR_ERR(edev);
++		}
++		gpio_charger->edev = edev;
++		gpio_charger->cable_cg_nb.notifier_call =
++			gpio_charger_evt_notifier;
++		ret = devm_extcon_register_notifier(dev, edev,
++						    EXTCON_CHG_USB_DCP,
++						    &gpio_charger->cable_cg_nb);
++		if (ret) {
++			dev_err(dev, "failed to register notifier for CDP\n");
++			return ret;
++		}
++	} else {
++		gpio_charger->edev = ERR_PTR(-ENODEV);
++	}
++
+ 	/*
+ 	 * This will fetch a GPIO descriptor from device tree, ACPI or
+ 	 * boardfile descriptor tables. It's good to try this first.
+-- 
+2.35.3
+

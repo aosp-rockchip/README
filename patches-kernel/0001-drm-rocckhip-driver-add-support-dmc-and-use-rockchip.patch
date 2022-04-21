@@ -1,0 +1,432 @@
+From a109506620a1b329f52f4fa92645344dad2a76e2 Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 19 Jun 2019 20:43:42 +0800
+Subject: [PATCH] drm/rocckhip: driver: add support dmc and use rockchip
+ atomic_commit
+
+Change-Id: I30f7937d23a8092fc01d6d0baacb949264c7af0b
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.c |  32 ++-
+ drivers/gpu/drm/rockchip/rockchip_drm_drv.h |  12 ++
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.c  | 218 ++++++++++++++++++--
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.h  |   9 +
+ 4 files changed, 251 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+index ce3a86f83e2d..2430ef81593f 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.c
+@@ -20,6 +20,7 @@
+ #include <drm/drm_fb_helper.h>
+ #include <drm/drm_gem_cma_helper.h>
+ #include <drm/drm_of.h>
++#include <linux/devfreq.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/dma-iommu.h>
+ #include <linux/genalloc.h>
+@@ -192,7 +193,7 @@ struct drm_connector *find_connector_by_bridge(struct drm_device *drm_dev,
+ 	return connector;
+ }
+ 
+-static void rockchip_free_loader_memory(struct drm_device *drm)
++void rockchip_free_loader_memory(struct drm_device *drm)
+ {
+ 	struct rockchip_drm_private *private = drm->dev_private;
+ 	struct rockchip_logo *logo;
+@@ -721,8 +722,7 @@ static void show_loader_logo(struct drm_device *drm_dev)
+ 				continue;
+ 			}
+ 		}
+-#if 0
+-//todo
++
+ 		if (!find_used_crtc) {
+ 			struct drm_crtc *crtc = unset->crtc;
+ 			int pipe = drm_crtc_index(crtc);
+@@ -732,7 +732,7 @@ static void show_loader_logo(struct drm_device *drm_dev)
+ 			if (unset->hdisplay && unset->vdisplay)
+ 				priv->crtc_funcs[pipe]->crtc_close(crtc);
+ 		}
+-#endif
++
+ 		list_del(&unset->head);
+ 		kfree(unset);
+ 	}
+@@ -1148,6 +1148,8 @@ static int rockchip_drm_bind(struct device *dev)
+ 	struct drm_device *drm_dev;
+ 	struct rockchip_drm_private *private;
+ 	int ret;
++	struct device_node *np = dev->of_node;
++	struct device_node *parent_np;
+ 
+ 	drm_dev = drm_dev_alloc(&rockchip_drm_driver, dev);
+ 	if (IS_ERR(drm_dev))
+@@ -1161,8 +1163,30 @@ static int rockchip_drm_bind(struct device *dev)
+ 		goto err_free;
+ 	}
+ 
++	mutex_init(&private->commit_lock);
++	INIT_WORK(&private->commit_work, rockchip_drm_atomic_work);
+ 	drm_dev->dev_private = private;
+ 
++	private->dmc_support = false;
++	private->devfreq = devfreq_get_devfreq_by_phandle(dev, 0);
++	if (IS_ERR(private->devfreq)) {
++		if (PTR_ERR(private->devfreq) == -EPROBE_DEFER) {
++			parent_np = of_parse_phandle(np, "devfreq", 0);
++			if (parent_np &&
++			    of_device_is_available(parent_np)) {
++				private->dmc_support = true;
++				dev_warn(dev, "defer getting devfreq\n");
++			} else {
++				dev_info(dev, "dmc is disabled\n");
++			}
++		} else {
++			dev_info(dev, "devfreq is not set\n");
++		}
++		private->devfreq = NULL;
++	} else {
++		private->dmc_support = true;
++		dev_info(dev, "devfreq is ready\n");
++	}
+ 	INIT_LIST_HEAD(&private->psr_list);
+ 	mutex_init(&private->psr_list_lock);
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+index 4e1e10a740ff..1bb801143854 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -156,16 +156,28 @@ struct rockchip_drm_private {
+ 	struct drm_gem_object *fbdev_bo;
+ 	const struct rockchip_crtc_funcs *crtc_funcs[ROCKCHIP_MAX_CRTC];
+ 	struct drm_atomic_state *state;
++
++	struct rockchip_atomic_commit *commit;
++	/* protect async commit */
++	struct mutex commit_lock;
++	struct work_struct commit_work;
+ 	struct iommu_domain *domain;
+ 	struct gen_pool *secure_buffer_pool;
++	/* protect drm_mm on multi-threads */
+ 	struct mutex mm_lock;
+ 	struct drm_mm mm;
+ 	struct rockchip_dclk_pll default_pll;
+ 	struct rockchip_dclk_pll hdmi_pll;
++	struct devfreq *devfreq;
++	u8 dmc_support;
+ 	struct list_head psr_list;
+ 	struct mutex psr_list_lock;
+ };
+ 
++#ifndef MODULE
++void rockchip_free_loader_memory(struct drm_device *drm);
++#endif
++void rockchip_drm_atomic_work(struct work_struct *work);
+ int rockchip_drm_dma_attach_device(struct drm_device *drm_dev,
+ 				   struct device *dev);
+ void rockchip_drm_dma_detach_device(struct drm_device *drm_dev,
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+index ead96f66bb8c..05b262bc9503 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+@@ -20,22 +20,13 @@
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <linux/memblock.h>
++#include <soc/rockchip/rockchip_dmc.h>
+ 
+ #include "rockchip_drm_drv.h"
+ #include "rockchip_drm_fb.h"
+ #include "rockchip_drm_gem.h"
+ #include "rockchip_drm_psr.h"
+ 
+-#define to_rockchip_fb(x) container_of(x, struct rockchip_drm_fb, fb)
+-
+-struct rockchip_drm_fb {
+-	struct drm_framebuffer fb;
+-	dma_addr_t dma_addr[ROCKCHIP_MAX_FB_BUFFER];
+-	void *kvaddr[ROCKCHIP_MAX_FB_BUFFER];
+-	struct drm_gem_object *obj[ROCKCHIP_MAX_FB_BUFFER];
+-	struct rockchip_logo *logo;
+-};
+-
+ bool rockchip_fb_is_logo(struct drm_framebuffer *fb)
+ {
+ 	struct rockchip_drm_fb *rk_fb = to_rockchip_fb(fb);
+@@ -66,12 +57,37 @@ void *rockchip_fb_get_kvaddr(struct drm_framebuffer *fb, unsigned int plane)
+ 
+ static void rockchip_drm_fb_destroy(struct drm_framebuffer *fb)
+ {
++	struct drm_gem_object *obj;
++	int i;
+ 	struct rockchip_drm_fb *rockchip_fb = to_rockchip_fb(fb);
+ 
+-	drm_gem_fb_destroy(fb);
++	for (i = 0; i < ROCKCHIP_MAX_FB_BUFFER; i++) {
++		obj = rockchip_fb->obj[i];
++		if (obj)
++			drm_gem_object_unreference_unlocked(obj);
++	}
++
++#ifndef MODULE
++	if (rockchip_fb->logo)
++		rockchip_free_loader_memory(fb->dev);
++#else
++	WARN_ON(rockchip_fb->logo);
++#endif
++
++	drm_framebuffer_cleanup(fb);
+ 	kfree(rockchip_fb);
+ }
+ 
++static int rockchip_drm_fb_create_handle(struct drm_framebuffer *fb,
++					 struct drm_file *file_priv,
++					 unsigned int *handle)
++{
++	struct rockchip_drm_fb *rockchip_fb = to_rockchip_fb(fb);
++
++	return drm_gem_handle_create(file_priv,
++				     rockchip_fb->obj[0], handle);
++}
++
+ static int rockchip_drm_fb_dirty(struct drm_framebuffer *fb,
+ 				 struct drm_file *file,
+ 				 unsigned int flags, unsigned int color,
+@@ -84,7 +100,7 @@ static int rockchip_drm_fb_dirty(struct drm_framebuffer *fb,
+ 
+ static const struct drm_framebuffer_funcs rockchip_drm_fb_funcs = {
+ 	.destroy       = rockchip_drm_fb_destroy,
+-	.create_handle = drm_gem_fb_create_handle,
++	.create_handle = rockchip_drm_fb_create_handle,
+ 	.dirty	       = rockchip_drm_fb_dirty,
+ };
+ 
+@@ -126,11 +142,13 @@ rockchip_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2 *mode_cm
+ 			if (fb_helper && fb_helper->fbdev && rk_obj->kvaddr)
+ 				fb_helper->fbdev->screen_base = rk_obj->kvaddr;
+ 		}
++#ifndef MODULE
+ 	} else if (logo) {
+ 		rockchip_fb->dma_addr[0] = logo->dma_addr;
+ 		rockchip_fb->kvaddr[0] = logo->kvaddr;
+ 		rockchip_fb->logo = logo;
+ 		logo->count++;
++#endif
+ 	} else {
+ 		ret = -EINVAL;
+ 		dev_err(dev->dev, "Failed to find available buffer\n");
+@@ -203,8 +221,53 @@ rockchip_user_fb_create(struct drm_device *dev, struct drm_file *file_priv,
+ 	return ERR_PTR(ret);
+ }
+ 
+-static void
+-rockchip_drm_psr_inhibit_get_state(struct drm_atomic_state *state)
++static void rockchip_drm_output_poll_changed(struct drm_device *dev)
++{
++	struct rockchip_drm_private *private = dev->dev_private;
++	struct drm_fb_helper *fb_helper = private->fbdev_helper;
++
++	if (fb_helper)
++		drm_fb_helper_hotplug_event(fb_helper);
++}
++
++static int rockchip_drm_bandwidth_atomic_check(struct drm_device *dev,
++					       struct drm_atomic_state *state,
++					       size_t *bandwidth,
++					       unsigned int *plane_num)
++{
++	struct rockchip_drm_private *priv = dev->dev_private;
++	struct drm_crtc_state *crtc_state;
++	const struct rockchip_crtc_funcs *funcs;
++	struct drm_crtc *crtc;
++	int i, ret = 0;
++
++	*bandwidth = 0;
++	*plane_num = 0;
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		funcs = priv->crtc_funcs[drm_crtc_index(crtc)];
++
++		if (funcs && funcs->bandwidth)
++			*bandwidth += funcs->bandwidth(crtc, crtc_state,
++						       plane_num);
++	}
++
++	/*
++	 * Check ddr frequency support here here.
++	 */
++	if (priv->dmc_support && !priv->devfreq) {
++		priv->devfreq = devfreq_get_devfreq_by_phandle(dev->dev, 0);
++		if (IS_ERR(priv->devfreq))
++			priv->devfreq = NULL;
++	}
++
++	if (priv->devfreq)
++		ret = rockchip_dmcfreq_vop_bandwidth_request(priv->devfreq,
++							     *bandwidth);
++
++	return ret;
++}
++
++static void rockchip_drm_psr_inhibit_get_state(struct drm_atomic_state *state)
+ {
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *crtc_state;
+@@ -266,11 +329,134 @@ static const struct drm_mode_config_helper_funcs rockchip_mode_config_helpers =
+ 	.atomic_commit_tail = rockchip_atomic_helper_commit_tail_rpm,
+ };
+ 
++static void
++rockchip_atomic_commit_complete(struct rockchip_atomic_commit *commit)
++{
++	struct drm_atomic_state *state = commit->state;
++	struct drm_device *dev = commit->dev;
++	struct rockchip_drm_private *prv = dev->dev_private;
++	size_t bandwidth = commit->bandwidth;
++	unsigned int plane_num = commit->plane_num;
++
++	/*
++	 * TODO: do fence wait here.
++	 */
++
++	/*
++	 * Rockchip crtc support runtime PM, can't update display planes
++	 * when crtc is disabled.
++	 *
++	 * drm_atomic_helper_commit comments detail that:
++	 *     For drivers supporting runtime PM the recommended sequence is
++	 *
++	 *     drm_atomic_helper_commit_modeset_disables(dev, state);
++	 *
++	 *     drm_atomic_helper_commit_modeset_enables(dev, state);
++	 *
++	 *     drm_atomic_helper_commit_planes(dev, state, true);
++	 *
++	 * See the kerneldoc entries for these three functions for more details.
++	 */
++	drm_atomic_helper_wait_for_dependencies(state);
++
++	drm_atomic_helper_commit_modeset_disables(dev, state);
++
++	drm_atomic_helper_commit_modeset_enables(dev, state);
++
++	if (prv->dmc_support && !prv->devfreq) {
++		prv->devfreq = devfreq_get_devfreq_by_phandle(dev->dev, 0);
++		if (IS_ERR(prv->devfreq))
++			prv->devfreq = NULL;
++	}
++	if (prv->devfreq)
++		rockchip_dmcfreq_vop_bandwidth_update(prv->devfreq, bandwidth,
++						      plane_num);
++
++	drm_atomic_helper_commit_planes(dev, state, true);
++
++	drm_atomic_helper_commit_hw_done(state);
++
++	drm_atomic_helper_wait_for_vblanks(dev, state);
++
++	drm_atomic_helper_cleanup_planes(dev, state);
++
++	drm_atomic_helper_commit_cleanup_done(state);
++
++	drm_atomic_state_put(state);
++
++	kfree(commit);
++}
++
++void rockchip_drm_atomic_work(struct work_struct *work)
++{
++	struct rockchip_drm_private *private = container_of(work,
++				struct rockchip_drm_private, commit_work);
++
++	rockchip_atomic_commit_complete(private->commit);
++	private->commit = NULL;
++}
++
++static int rockchip_drm_atomic_commit(struct drm_device *dev,
++				      struct drm_atomic_state *state,
++				      bool async)
++{
++	struct rockchip_drm_private *private = dev->dev_private;
++	struct rockchip_atomic_commit *commit;
++	size_t bandwidth;
++	unsigned int plane_num;
++	int ret;
++
++	ret = drm_atomic_helper_setup_commit(state, false);
++	if (ret)
++		return ret;
++
++	ret = drm_atomic_helper_prepare_planes(dev, state);
++	if (ret)
++		return ret;
++
++	ret = rockchip_drm_bandwidth_atomic_check(dev, state, &bandwidth,
++						  &plane_num);
++	if (ret) {
++		/*
++		 * TODO:
++		 * Just report bandwidth can't support now.
++		 */
++		DRM_ERROR("vop bandwidth too large %zd\n", bandwidth);
++	}
++
++	WARN_ON(drm_atomic_helper_swap_state(state, true) < 0);
++
++	drm_atomic_state_get(state);
++	commit = kmalloc(sizeof(*commit), GFP_KERNEL);
++	if (!commit)
++		return -ENOMEM;
++
++	commit->dev = dev;
++	commit->state = state;
++	commit->bandwidth = bandwidth;
++	commit->plane_num = plane_num;
++
++	if (async) {
++		mutex_lock(&private->commit_lock);
++
++		flush_work(&private->commit_work);
++		WARN_ON(private->commit);
++		private->commit = commit;
++		schedule_work(&private->commit_work);
++
++		mutex_unlock(&private->commit_lock);
++	} else {
++		rockchip_atomic_commit_complete(commit);
++	}
++
++	return 0;
++}
++
+ static const struct drm_mode_config_funcs rockchip_drm_mode_config_funcs = {
+ 	.fb_create = rockchip_user_fb_create,
+-	.output_poll_changed = drm_fb_helper_output_poll_changed,
++	.output_poll_changed = rockchip_drm_output_poll_changed,
+ 	.atomic_check = drm_atomic_helper_check,
+-	.atomic_commit = drm_atomic_helper_commit,
++	.atomic_commit = rockchip_drm_atomic_commit,
+ };
+ 
+ struct drm_framebuffer *
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.h b/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
+index f3c24edaffed..9429c11d0ce1 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
+@@ -31,4 +31,13 @@ rockchip_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2 *mode_cm
+ dma_addr_t rockchip_fb_get_dma_addr(struct drm_framebuffer *fb,
+ 				    unsigned int plane);
+ void *rockchip_fb_get_kvaddr(struct drm_framebuffer *fb, unsigned int plane);
++#define to_rockchip_fb(x) container_of(x, struct rockchip_drm_fb, fb)
++
++struct rockchip_drm_fb {
++	struct drm_framebuffer fb;
++	dma_addr_t dma_addr[ROCKCHIP_MAX_FB_BUFFER];
++	void *kvaddr[ROCKCHIP_MAX_FB_BUFFER];
++	struct drm_gem_object *obj[ROCKCHIP_MAX_FB_BUFFER];
++	struct rockchip_logo *logo;
++};
+ #endif /* _ROCKCHIP_DRM_FB_H */
+-- 
+2.35.3
+

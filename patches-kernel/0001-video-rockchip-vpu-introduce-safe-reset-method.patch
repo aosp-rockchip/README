@@ -1,0 +1,161 @@
+From 027e3c027cb6b85055880755f50d234007be8554 Mon Sep 17 00:00:00 2001
+From: Randy Li <randy.li@rock-chips.com>
+Date: Fri, 21 Apr 2017 17:39:05 +0800
+Subject: [PATCH] video: rockchip: vpu: introduce safe reset method
+
+Even the same type video IP would request a different numbers
+of reset control.
+
+From the RK3328 times, the video IP also request decrease the
+frequency of the clock to lower than 300 MHZ before resetting.
+It seems no hard to apply it into the previous platform.
+
+Change-Id: Iacf1accf24c8776bb8b425b613e6e34215380203
+Signed-off-by: Randy Li <randy.li@rock-chips.com>
+---
+ .../video/rockchip/vcodec/vcodec_service.c    | 89 ++++++++++++-------
+ 1 file changed, 57 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/video/rockchip/vcodec/vcodec_service.c b/drivers/video/rockchip/vcodec/vcodec_service.c
+index 03ef51341d91..13a0adc31958 100644
+--- a/drivers/video/rockchip/vcodec/vcodec_service.c
++++ b/drivers/video/rockchip/vcodec/vcodec_service.c
+@@ -405,6 +405,8 @@ struct vpu_service_info {
+ 	struct reset_control *rst_a;
+ 	struct reset_control *rst_h;
+ 	struct reset_control *rst_v;
++	struct reset_control *rst_niu_a;
++	struct reset_control *rst_niu_h;
+ #endif
+ 	struct device *dev;
+ 
+@@ -479,6 +481,20 @@ static void time_diff(struct vpu_task_info *task)
+ 		  (task->end.tv_usec - task->start.tv_usec) / 1000);
+ }
+ 
++static inline int try_reset_assert(struct reset_control *rst)
++{
++	if (rst)
++		return reset_control_assert(rst);
++	return -EINVAL;
++}
++
++static inline int try_reset_deassert(struct reset_control *rst)
++{
++	if (rst)
++		return reset_control_deassert(rst);
++	return -EINVAL;
++}
++
+ static inline int grf_combo_switch(const struct vpu_subdev_data *data)
+ {
+ 	struct vpu_service_info *pservice = data->pservice;
+@@ -658,10 +674,7 @@ static int vpu_get_clk(struct vpu_service_info *pservice)
+ static void _vpu_reset(struct vpu_subdev_data *data)
+ {
+ 	struct vpu_service_info *pservice = data->pservice;
+-	enum pmu_idle_req type = IDLE_REQ_VIDEO;
+-
+-	if (pservice->dev_id == VCODEC_DEVICE_ID_HEVC)
+-		type = IDLE_REQ_HEVC;
++	unsigned long rate = 0;
+ 
+ 	dev_info(pservice->dev, "resetting...\n");
+ 	WARN_ON(pservice->reg_codec != NULL);
+@@ -672,31 +685,31 @@ static void _vpu_reset(struct vpu_subdev_data *data)
+ 	pservice->reg_resev = NULL;
+ 
+ #ifdef CONFIG_RESET_CONTROLLER
+-	dev_info(pservice->dev, "for 3288/3368...");
+-	if (of_machine_is_compatible("rockchip,rk3288"))
+-		rockchip_pmu_idle_request(pservice->dev, true);
+-	if (pservice->rst_a && pservice->rst_h) {
+-		dev_info(pservice->dev, "vpu reset in\n");
+-
+-		if (pservice->rst_v)
+-			reset_control_assert(pservice->rst_v);
+-		reset_control_assert(pservice->rst_a);
+-		reset_control_assert(pservice->rst_h);
+-		udelay(5);
+-
+-		reset_control_deassert(pservice->rst_h);
+-		reset_control_deassert(pservice->rst_a);
+-		if (pservice->rst_v)
+-			reset_control_deassert(pservice->rst_v);
+-	} else if (pservice->rst_v) {
+-		dev_info(pservice->dev, "hevc reset in\n");
+-		reset_control_assert(pservice->rst_v);
+-		udelay(5);
+-
+-		reset_control_deassert(pservice->rst_v);
+-	}
+-	if (of_machine_is_compatible("rockchip,rk3288"))
+-		rockchip_pmu_idle_request(pservice->dev, false);
++	rockchip_pmu_idle_request(pservice->dev, true);
++	rate = clk_get_rate(pservice->aclk_vcodec);
++	/*
++	 * Some old platforms can't run at 300MHZ, they don't request
++	 * decrease the frequency at resetting either. It is safe to
++	 * keep here in 200 MHZ.
++	 */
++	clk_set_rate(pservice->aclk_vcodec, 200 * MHZ);
++
++	try_reset_assert(pservice->rst_niu_a);
++	try_reset_assert(pservice->rst_niu_h);
++	try_reset_assert(pservice->rst_v);
++	try_reset_assert(pservice->rst_a);
++	try_reset_assert(pservice->rst_h);
++	udelay(5);
++
++	try_reset_deassert(pservice->rst_h);
++	try_reset_deassert(pservice->rst_a);
++	try_reset_deassert(pservice->rst_v);
++	try_reset_deassert(pservice->rst_niu_h);
++	try_reset_deassert(pservice->rst_niu_a);
++
++	rockchip_pmu_idle_request(pservice->dev, false);
++	clk_set_rate(pservice->aclk_vcodec, rate);
++	dev_info(pservice->dev, "reset done\n");
+ #endif
+ }
+ 
+@@ -2536,21 +2549,33 @@ static void vcodec_read_property(struct device_node *np,
+ 	pservice->rst_a = devm_reset_control_get(pservice->dev, "video_a");
+ 	pservice->rst_h = devm_reset_control_get(pservice->dev, "video_h");
+ 	pservice->rst_v = devm_reset_control_get(pservice->dev, "video");
++	pservice->rst_niu_a = devm_reset_control_get(pservice->dev, "niu_a");
++	pservice->rst_niu_h = devm_reset_control_get(pservice->dev, "niu_h");
+ 
+ 	if (IS_ERR_OR_NULL(pservice->rst_a)) {
+-		dev_warn(pservice->dev, "No aclk reset resource define\n");
++		dev_dbg(pservice->dev, "No aclk reset resource define\n");
+ 		pservice->rst_a = NULL;
+ 	}
+ 
+ 	if (IS_ERR_OR_NULL(pservice->rst_h)) {
+-		dev_warn(pservice->dev, "No hclk reset resource define\n");
++		dev_dbg(pservice->dev, "No hclk reset resource define\n");
+ 		pservice->rst_h = NULL;
+ 	}
+ 
+ 	if (IS_ERR_OR_NULL(pservice->rst_v)) {
+-		dev_warn(pservice->dev, "No core reset resource define\n");
++		dev_dbg(pservice->dev, "No core reset resource define\n");
+ 		pservice->rst_v = NULL;
+ 	}
++
++	if (IS_ERR_OR_NULL(pservice->rst_niu_a)) {
++		dev_dbg(pservice->dev, "No NIU aclk reset resource define\n");
++		pservice->rst_niu_a = NULL;
++	}
++
++	if (IS_ERR_OR_NULL(pservice->rst_niu_h)) {
++		dev_dbg(pservice->dev, "No NIU hclk reset resource define\n");
++		pservice->rst_niu_h = NULL;
++	}
+ #endif
+ 
+ 	of_property_read_string(np, "name", (const char **)&pservice->name);
+-- 
+2.35.3
+

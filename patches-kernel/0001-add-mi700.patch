@@ -1,0 +1,511 @@
+From 34bcc3db74e06b9fd867318afe6d07e443a3355d Mon Sep 17 00:00:00 2001
+From: wlq <wlq@rock-chips.com>
+Date: Tue, 31 Jul 2012 15:19:35 +0800
+Subject: [PATCH] add mi700
+
+---
+ arch/arm/mach-rk30/board-rk30-phonepad.c |  52 ++++
+ drivers/misc/3g_module/Kconfig           |   3 +
+ drivers/misc/3g_module/Makefile          |   2 +-
+ drivers/misc/3g_module/mi700.c           | 352 +++++++++++++++++++++++
+ include/linux/mi700.h                    |  27 ++
+ 5 files changed, 435 insertions(+), 1 deletion(-)
+ create mode 100755 drivers/misc/3g_module/mi700.c
+ create mode 100644 include/linux/mi700.h
+
+diff --git a/arch/arm/mach-rk30/board-rk30-phonepad.c b/arch/arm/mach-rk30/board-rk30-phonepad.c
+index 711fdb8ba7a5..da846b986009 100755
+--- a/arch/arm/mach-rk30/board-rk30-phonepad.c
++++ b/arch/arm/mach-rk30/board-rk30-phonepad.c
+@@ -71,6 +71,11 @@
+ #if defined(CONFIG_SEW868)
+ #include <linux/sew868.h>
+ #endif
++
++#if defined(CONFIG_MI700)
++#include <linux/mi700.h>
++#endif
++
+ #if defined(CONFIG_ANDROID_TIMED_GPIO)
+ #include "../../../drivers/staging/android/timed_gpio.h"
+ #endif
+@@ -960,7 +965,51 @@ struct platform_device rk30_device_sew868 = {
+ 	}    	
+     };
+ #endif
++#if defined(CONFIG_MI700)
++#define BP_POWER        RK29_PIN6_PB1   
++#define BP_RESET        RK29_PIN6_PC7
++static int mi700_io_init(void)
++{
++        int result;
++        result = gpio_request(BP_RESET, NULL);
++        if (result)
++        {
++                gpio_free(BP_RESET);
++                printk("failed to request BP_RESET gpio\n");
++        }
++        result = gpio_request(BP_POWER, NULL);
++        if (result)
++        {
++                gpio_free(BP_POWER);
++                printk("failed to request BP_POWER gpio\n");
++        }
++        return 0;
++}
+ 
++static int mi700_io_deinit(void)
++{
++        gpio_free(BP_RESET);
++        gpio_free(BP_POWER);
++
++        return 0;
++}
++
++struct rk29_mi700_data rk29_mi700_info = {
++        .io_init = mi700_io_init,
++        .io_deinit = mi700_io_deinit,
++        .bp_power = RK29_PIN6_PB1,//RK29_PIN0_PB4,
++        .bp_reset = RK29_PIN6_PC7,//RK29_PIN0_PB3,
++        .bp_wakeup_ap = RK29_PIN6_PC6,//RK29_PIN0_PC2,
++        .ap_wakeup_bp = NULL,//RK29_PIN0_PB0, 
++};
++struct platform_device rk29_device_mi700 = {
++        .name = "MI700",
++        .id = -1,
++        .dev            = {
++                .platform_data = &rk29_mi700_info,
++        }
++    };
++#endif
+ /*MMA8452 gsensor*/
+ #if defined (CONFIG_GS_MMA8452)
+ #define MMA8452_INT_PIN   RK30_PIN4_PC0
+@@ -1629,6 +1678,9 @@ static struct platform_device *devices[] __initdata = {
+ #if defined (CONFIG_RK_HEADSET_DET) ||  defined (CONFIG_RK_HEADSET_IRQ_HOOK_ADC_DET)
+ 	&rk_device_headset,
+ #endif
++#if defined(CONFIG_MI700)
++        &rk29_device_mi700,
++#endif
+ #ifdef CONFIG_BATTERY_RK30_ADC
+  	&rk30_device_adc_battery,
+ #endif
+diff --git a/drivers/misc/3g_module/Kconfig b/drivers/misc/3g_module/Kconfig
+index 2074779c92f4..d702973a2d09 100644
+--- a/drivers/misc/3g_module/Kconfig
++++ b/drivers/misc/3g_module/Kconfig
+@@ -23,6 +23,9 @@ choice
+     config SEW868
+ 	bool "SEW868"	
+ 
++    config MI700
++	bool "MI700"	
++
+ 
+ endchoice
+ 
+diff --git a/drivers/misc/3g_module/Makefile b/drivers/misc/3g_module/Makefile
+index 33af3f5a603f..768a2d535124 100644
+--- a/drivers/misc/3g_module/Makefile
++++ b/drivers/misc/3g_module/Makefile
+@@ -2,4 +2,4 @@ obj-$(CONFIG_MU509)    += mu509.o
+ obj-$(CONFIG_MW100)    += mw100.o
+ obj-$(CONFIG_MT6229)   += mt6229.o
+ obj-$(CONFIG_SEW868)   += sew868.o
+-
++obj-$(CONFIG_MI700)   += mi700.o
+diff --git a/drivers/misc/3g_module/mi700.c b/drivers/misc/3g_module/mi700.c
+new file mode 100755
+index 000000000000..3b6ecb1c6ca4
+--- /dev/null
++++ b/drivers/misc/3g_module/mi700.c
+@@ -0,0 +1,352 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/i2c.h>
++#include <linux/irq.h>
++#include <linux/gpio.h>
++#include <linux/input.h>
++#include <linux/platform_device.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/miscdevice.h>
++#include <linux/circ_buf.h>
++#include <linux/interrupt.h>
++#include <linux/miscdevice.h>
++#include <mach/iomux.h>
++#include <mach/gpio.h>
++#include <linux/delay.h>
++#include <linux/poll.h>
++#include <linux/wait.h>
++#include <linux/wakelock.h>
++#include <linux/workqueue.h>
++#include <linux/mi700.h>
++#include <mach/iomux.h>
++#include<linux/ioctl.h>
++#include <linux/slab.h>
++   
++MODULE_LICENSE("GPL");
++
++#define DEBUG
++#ifdef DEBUG
++#define MODEMDBG(x...) printk(x)
++#else
++#define MODEMDBG(fmt,argss...)
++#endif
++
++#define   	MW100IO	0XA1
++#define	MW_IOCTL_RESET	_IO(MW100IO,0X01)
++
++#define SLEEP 1
++#define READY 0
++#define MI700_RESET 0x01
++static struct wake_lock modem_wakelock;
++#define IRQ_BB_WAKEUP_AP_TRIGGER    IRQF_TRIGGER_RISING
++struct rk29_mi700_data *gpdata = NULL;
++static int  bp_wakeup_ap_irq = 0;
++struct class *modem_class = NULL; 
++static int do_wakeup_irq = 1;
++static int modem_status;
++static int online = 0;
++
++static void ap_wakeup_bp(struct platform_device *pdev, int wake)
++{
++	struct rk29_mi700_data *pdata = pdev->dev.platform_data;
++	MODEMDBG("ap_wakeup_bp\n");
++
++	gpio_set_value(pdata->ap_wakeup_bp, wake);  
++
++}
++extern void rk28_send_wakeup_key(void);
++
++static void do_wakeup(struct work_struct *work)
++{
++    MODEMDBG("%s[%d]: %s\n", __FILE__, __LINE__, __FUNCTION__);
++    //rk28_send_wakeup_key();
++}
++
++static DECLARE_DELAYED_WORK(wakeup_work, do_wakeup);
++static irqreturn_t detect_irq_handler(int irq, void *dev_id)
++{
++    if(do_wakeup_irq)
++    {
++        do_wakeup_irq = 0;
++        printk("%s[%d]: %s\n", __FILE__, __LINE__, __FUNCTION__);
++        wake_lock_timeout(&modem_wakelock, 10 * HZ);
++        schedule_delayed_work(&wakeup_work, HZ / 10);
++    } else
++        printk("%s: already wakeup\n", __FUNCTION__);
++
++    return IRQ_HANDLED;
++}
++int modem_poweron_off(int on_off)
++{
++	struct rk29_mi700_data *pdata = gpdata;	
++	
++  	mutex_lock(&pdata->bp_mutex);
++	if(on_off)
++	{
++		MODEMDBG("------------modem_poweron\n");
++		gpio_set_value(pdata->bp_reset, GPIO_LOW);
++		msleep(100);
++		gpio_set_value(pdata->bp_reset, GPIO_HIGH);
++		gpio_set_value(pdata->bp_power, GPIO_HIGH);
++		msleep(1000);
++		gpio_set_value(pdata->bp_power, GPIO_LOW);
++		msleep(700);
++		gpio_set_value(pdata->bp_power, GPIO_HIGH);
++	}
++	else
++	{
++		MODEMDBG("------------modem_poweroff\n");
++		gpio_set_value(pdata->bp_power, GPIO_LOW);
++		gpio_set_value(pdata->bp_power, GPIO_HIGH);
++		msleep(2500);
++		gpio_set_value(pdata->bp_power, GPIO_LOW);
++	}
++  	mutex_unlock(&pdata->bp_mutex);
++        return 0;
++}
++static int mi700_open(struct inode *inode, struct file *file)
++{
++	//MODEMDBG("-------------%s\n",__FUNCTION__);
++	struct rk29_mi700_data *pdata = gpdata;
++//	struct platform_data *pdev = container_of(pdata, struct device, platform_data);
++	device_init_wakeup(pdata->dev, 1);
++	return 0;
++}
++
++static int mi700_release(struct inode *inode, struct file *file)
++{
++	MODEMDBG("%s::%d--bruins--\n",__func__,__LINE__);
++	//modem_poweron_off(0);
++	return 0;
++}
++
++static long mi700_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct rk29_mi700_data *pdata = gpdata;
++	switch(cmd)
++	{
++		case MI700_RESET:					
++			gpio_set_value(pdata->bp_reset, GPIO_LOW);
++			msleep(100);
++			gpio_set_value(pdata->bp_reset, GPIO_HIGH);
++			msleep(100);
++			gpio_set_value(pdata->bp_power, GPIO_HIGH);
++			msleep(1000);
++			gpio_set_value(pdata->bp_power, GPIO_LOW);
++			msleep(700);
++			gpio_set_value(pdata->bp_power, GPIO_HIGH);
++			break;
++		default:
++			break;
++	}
++	return 0;
++}
++
++static struct file_operations mi700_fops = {
++	.owner = THIS_MODULE,
++	.open = mi700_open,
++	.release = mi700_release,
++	.unlocked_ioctl = mi700_ioctl
++};
++
++static struct miscdevice mi700_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "mi700",
++	.fops = &mi700_fops
++};
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static ssize_t modem_status_read(struct class *cls, struct class_attribute *attr, char *_buf)
++#else
++static ssize_t modem_status_read(struct class *cls, char *_buf)
++#endif
++{
++
++	return sprintf(_buf, "%d\n", modem_status);
++	
++}
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static ssize_t modem_status_write(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
++#else
++static ssize_t modem_status_write(struct class *cls, const char *_buf, size_t _count)
++#endif
++{
++      int new_state = simple_strtoul(_buf, NULL, 16);
++      if(new_state == modem_status) 
++            return _count;
++   
++      if (new_state == 1){
++              printk("%s, c(%d), open modem \n", __FUNCTION__, new_state);
++	      modem_poweron_off(1);
++      }else if(new_state == 0){
++              printk("%s, c(%d), close modem \n", __FUNCTION__, new_state);
++	      modem_poweron_off(0);
++      }else{
++              printk("%s, invalid parameter \n", __FUNCTION__);
++      }
++	
++      modem_status = new_state;
++      return _count; 
++}
++static CLASS_ATTR(modem_status, 0777, modem_status_read, modem_status_write);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static ssize_t online_read(struct class *cls, struct class_attribute *attr, char *_buf)
++#else
++static ssize_t online_read(struct class *cls, char *_buf)
++#endif
++{
++	return sprintf(_buf, "%d\n", online);
++	
++}
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37))
++static ssize_t online_write(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
++#else
++static ssize_t online_write(struct class *cls, const char *_buf, size_t _count)
++#endif
++{
++   int new_value = simple_strtoul(_buf, NULL, 16);
++   if(new_value == online) return _count;
++	online = new_value;
++    return _count; 
++}
++static CLASS_ATTR(online, 0777, online_read, online_write);
++static int mi700_probe(struct platform_device *pdev)
++{
++	struct rk29_mi700_data *pdata = gpdata = pdev->dev.platform_data;
++	struct modem_dev *mi700_data = NULL;
++	int result, irq = 0;	
++	MODEMDBG("-------------%s\n",__FUNCTION__);
++	
++	pdata->dev = &pdev->dev;
++	if(pdata->io_init)
++		pdata->io_init();
++	
++	mi700_data = kzalloc(sizeof(struct modem_dev), GFP_KERNEL);
++	if(mi700_data == NULL)
++	{
++		printk("failed to request mi700_data\n");
++		goto err2;
++	}
++	platform_set_drvdata(pdev, mi700_data);
++        #if 0
++	result = gpio_request(pdata->ap_wakeup_bp, "mi700");
++	if (result) {
++		printk("failed to request AP_BP_WAKEUP gpio\n");
++		goto err1;
++	}
++        #endif
++	irq	= gpio_to_irq(pdata->bp_wakeup_ap);
++	enable_irq_wake(irq);
++	if(irq < 0)
++	{
++		gpio_free(pdata->bp_wakeup_ap);
++		printk("failed to request bp_wakeup_ap\n");
++	}
++	result = gpio_request(pdata->bp_wakeup_ap, "bp_wakeup_ap");
++	if (result < 0) {
++		printk("%s: gpio_request(%d) failed\n", __func__, pdata->bp_wakeup_ap);
++	}
++	wake_lock_init(&modem_wakelock, WAKE_LOCK_SUSPEND, "bp_wakeup_ap");
++	gpio_direction_input(pdata->bp_wakeup_ap);
++        gpio_pull_updown(pdata->bp_wakeup_ap, 1);	
++	result = request_irq(irq, detect_irq_handler, IRQ_BB_WAKEUP_AP_TRIGGER, "bp_wakeup_ap", NULL);
++	if (result < 0) {
++		printk("%s: request_irq(%d) failed\n", __func__, irq);
++		gpio_free(pdata->bp_wakeup_ap);
++		goto err0;
++	}
++	enable_irq_wake(gpio_to_irq(pdata->bp_wakeup_ap)); 
++	
++  	mutex_init(&pdata->bp_mutex);
++
++	modem_poweron_off(1);
++	modem_status = 1;
++		
++	result = misc_register(&mi700_misc);
++	if(result)
++	{
++		printk("misc_register err\n");
++	}	
++	return result;
++err0:
++	cancel_work_sync(&mi700_data->work);
++	gpio_free(pdata->bp_wakeup_ap);
++err1:
++	//gpio_free(pdata->ap_wakeup_bp);
++err2:
++	kfree(mi700_data);
++	return 0;
++}
++
++int mi700_suspend(struct platform_device *pdev)
++{
++	
++	struct rk29_mi700_data *pdata = pdev->dev.platform_data;
++        do_wakeup_irq = 1;
++	MODEMDBG("%s::%d--\n",__func__,__LINE__);
++	//gpio_set_value(pdata->ap_wakeup_bp, GPIO_LOW);
++	return 0;
++}
++
++int mi700_resume(struct platform_device *pdev)
++{
++	MODEMDBG("-------------%s\n",__FUNCTION__);
++	//ap_wakeup_bp(pdev, 0);
++	//rk29_mux_api_set(GPIO1C1_UART0RTSN_SDMMC1WRITEPRT_NAME, GPIO1H_UART0_RTS_N);
++	return 0;
++}
++
++void mi700_shutdown(struct platform_device *pdev, pm_message_t state)
++{
++	struct rk29_mi700_data *pdata = pdev->dev.platform_data;
++	struct modem_dev *mi700_data = platform_get_drvdata(pdev);
++	
++	MODEMDBG("-------------%s\n",__FUNCTION__);
++	modem_poweron_off(0);
++
++	if(pdata->io_deinit)
++		pdata->io_deinit();
++	cancel_work_sync(&mi700_data->work);
++	//gpio_free(pdata->bp_power);
++	//gpio_free(pdata->bp_reset);
++	//gpio_free(pdata->ap_wakeup_bp);
++	gpio_free(pdata->bp_wakeup_ap);
++	kfree(mi700_data);
++}
++
++static struct platform_driver mi700_driver = {
++	.probe	        = mi700_probe,
++	.shutdown	= mi700_shutdown,
++	.suspend  	= mi700_suspend,
++	.resume		= mi700_resume,
++	.driver	= {
++		.name	= "MW100",
++		.owner	= THIS_MODULE,
++	},
++};
++
++static int __init mi700_init(void)
++{
++	MODEMDBG("-------------%s\n",__FUNCTION__);
++	int ret ;
++	
++	modem_class = class_create(THIS_MODULE, "rk291x_modem");
++	ret =  class_create_file(modem_class, &class_attr_modem_status);
++	ret =  class_create_file(modem_class, &class_attr_online);
++	if (ret)
++	{
++		printk("Fail to class rk291x_modem.\n");
++	}
++	return platform_driver_register(&mi700_driver);
++}
++
++static void __exit mi700_exit(void)
++{
++	MODEMDBG("%s::%d--bruins--\n",__func__,__LINE__);
++	platform_driver_unregister(&mi700_driver);
++	class_remove_file(modem_class, &class_attr_modem_status);
++	class_remove_file(modem_class, &class_attr_online);
++}
++
++module_init(mi700_init);
++module_exit(mi700_exit);
+diff --git a/include/linux/mi700.h b/include/linux/mi700.h
+new file mode 100644
+index 000000000000..df20b2c9d93a
+--- /dev/null
++++ b/include/linux/mi700.h
+@@ -0,0 +1,27 @@
++#include <linux/types.h>
++#include <linux/ioctl.h>
++#include <linux/miscdevice.h>
++
++struct modem_dev
++{
++	const char *name;
++	struct miscdevice miscdev;
++	struct work_struct work;
++};
++
++/* 耳机数据结构体 */
++struct rk29_mi700_data {
++	struct device *dev;
++	int (*io_init)(void);
++	int (*io_deinit)(void);
++	unsigned int bp_power;
++	unsigned int bp_power_active_low;
++	unsigned int bp_reset;
++	unsigned int bp_reset_active_low;
++	unsigned int bp_wakeup_ap;
++	unsigned int ap_wakeup_bp;
++	unsigned int modem_power_en;
++	struct mutex bp_mutex;
++};
++
++#define MODEM_NAME "mi700"
+-- 
+2.35.3
+

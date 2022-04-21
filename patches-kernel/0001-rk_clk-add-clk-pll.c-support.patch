@@ -1,0 +1,743 @@
+From 828ecbcca8745030b90815ede8347e3b4ccbc94e Mon Sep 17 00:00:00 2001
+From: dkl <dkl@rock-chips.com>
+Date: Wed, 8 Jan 2014 20:22:28 +0800
+Subject: [PATCH] rk_clk: add clk-pll.c support         support pll
+ recalc_rate/round_rate except apll
+
+---
+ arch/arm/boot/dts/rk3188-clocks.dtsi |   4 +
+ drivers/clk/rockchip/Makefile        |   1 +
+ drivers/clk/rockchip/clk-pll.c       | 237 +++++++++++++++++++++++++++
+ drivers/clk/rockchip/clk-pll.h       | 143 ++++++++++++++++
+ drivers/clk/rockchip/clk.c           | 149 +++++++++--------
+ drivers/clk/rockchip/clkops-dtsi.h   |   9 +
+ 6 files changed, 477 insertions(+), 66 deletions(-)
+ create mode 100644 drivers/clk/rockchip/clk-pll.c
+ create mode 100644 drivers/clk/rockchip/clk-pll.h
+
+diff --git a/arch/arm/boot/dts/rk3188-clocks.dtsi b/arch/arm/boot/dts/rk3188-clocks.dtsi
+index 46a4a4371307..154a461cb430 100755
+--- a/arch/arm/boot/dts/rk3188-clocks.dtsi
++++ b/arch/arm/boot/dts/rk3188-clocks.dtsi
+@@ -83,6 +83,7 @@
+ 					clock-frequency = <24000000>;
+ 					clocks = <&xin24m>;
+ 					clock-output-names = "clk_apll";
++					rockchip,pll-id = <APLL_ID>;
+ 					#clock-cells = <0>;
+ 				};
+ 
+@@ -92,6 +93,7 @@
+ 					reg = <0x20000010 0x10>;
+ 					clocks = <&xin24m>;
+ 					clock-output-names = "clk_dpll";
++					rockchip,pll-id = <DPLL_ID>;
+ 					#clock-cells = <0>;
+ 				};
+ 
+@@ -101,6 +103,7 @@
+ 					reg = <0x20000020 0x10>;
+ 					clocks = <&xin24m>;
+ 					clock-output-names = "clk_cpll";
++					rockchip,pll-id = <CPLL_ID>;
+ 					#clock-cells = <0>;
+ 					#clock-init-cells = <1>;
+ 				};
+@@ -111,6 +114,7 @@
+ 					reg = <0x20000030 0x10>;
+ 					clocks = <&xin24m>;
+ 					clock-output-names = "clk_gpll";
++					rockchip,pll-id = <GPLL_ID>;
+ 					#clock-cells = <0>;
+ 					#clock-init-cells = <1>;
+ 				};
+diff --git a/drivers/clk/rockchip/Makefile b/drivers/clk/rockchip/Makefile
+index ae86b42576d7..090212d78008 100644
+--- a/drivers/clk/rockchip/Makefile
++++ b/drivers/clk/rockchip/Makefile
+@@ -1,2 +1,3 @@
+ obj-y	+= clk.o
+ obj-y	+= clk-ops.o
++obj-y	+= clk-pll.o
+diff --git a/drivers/clk/rockchip/clk-pll.c b/drivers/clk/rockchip/clk-pll.c
+new file mode 100644
+index 000000000000..9a53b7245f8f
+--- /dev/null
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -0,0 +1,237 @@
++#include <linux/slab.h>
++#include <asm/io.h>
++
++#include "clk-ops.h"
++#include "clk-pll.h"
++
++
++//static unsigned long lpj_gpll;
++
++//fixme
++extern void __iomem *reg_start;
++#define RK30_CRU_BASE	(reg_start)
++
++#define cru_readl(offset)	readl(RK30_CRU_BASE + offset)
++#define cru_writel(v, offset)	do {writel(v, RK30_CRU_BASE + offset); dsb();} \
++	while (0)
++
++#define PLLS_IN_NORM(pll_id) (((cru_readl(CRU_MODE_CON)&PLL_MODE_MSK(pll_id))\
++			==(PLL_MODE_NORM(pll_id)&PLL_MODE_MSK(pll_id)))\
++		&&!(cru_readl(PLL_CONS(pll_id,3))&PLL_BYPASS))
++
++
++
++static const struct apll_clk_set apll_table[] = {
++};
++
++static const struct pll_clk_set pll_com_table[] = {
++	_PLL_SET_CLKS(1200000,	1,	50,	1),
++	_PLL_SET_CLKS(1188000,	2,	99,	1),
++	_PLL_SET_CLKS(891000,	8,	594,	2),
++	_PLL_SET_CLKS(768000,	1,	64,	2),
++	_PLL_SET_CLKS(594000,	2,	198,	4),
++	_PLL_SET_CLKS(408000,	1,	68,	4),
++	_PLL_SET_CLKS(384000,	2,	128,	4),
++	_PLL_SET_CLKS(360000,	1,	60,	4),
++	_PLL_SET_CLKS(300000,	1,	50,	4),
++	_PLL_SET_CLKS(297000,	2,	198,	8),
++	_PLL_SET_CLKS(148500,	2,	99,	8),
++	_PLL_SET_CLKS(0,	0,	0,	0),
++};
++
++/*recalc_rate*/
++static unsigned long clk_pll_recalc_rate(struct clk_hw *hw,
++		unsigned long parent_rate)
++{
++	struct clk_pll *pll = to_clk_pll(hw);
++	u8 pll_id = pll->id;
++	unsigned long rate;
++
++	if (PLLS_IN_NORM(pll_id)) {
++		u32 pll_con0 = cru_readl(PLL_CONS(pll_id, 0));
++		u32 pll_con1 = cru_readl(PLL_CONS(pll_id, 1));
++
++		u64 rate64 = (u64)parent_rate * PLL_NF(pll_con1);
++
++		do_div(rate64, PLL_NR(pll_con0));
++		do_div(rate64, PLL_NO(pll_con0));
++
++		rate = rate64;
++	} else {
++		rate = parent_rate;
++		clk_debug("pll id=%d  by pass mode\n", pll_id);
++	}
++
++	clk_debug("pll id=%d, recalc rate =%lu\n", pll->id, rate);
++
++	return rate;
++}
++
++/*round_rate*/
++/*get rate that is most close to target*/
++static const struct pll_clk_set *pll_clk_get_best_set(unsigned long rate,
++		const struct pll_clk_set *table)
++{
++	const struct pll_clk_set *ps, *pt;
++
++	ps = pt = table;
++	while (pt->rate) {
++		if (pt->rate == rate) {
++			ps = pt;
++			break;
++		}
++
++		if ((pt->rate > rate || (rate - pt->rate < ps->rate - rate)))
++			ps = pt;
++		if (pt->rate < rate)
++			break;
++		pt++;
++	}
++
++	return ps;
++}
++
++static long clk_apll_round_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long *prate)
++{
++	return rate;
++}
++
++static long clk_pll_com_round_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long *prate)
++{
++	return (pll_clk_get_best_set(rate, pll_com_table)->rate);
++}
++
++static long clk_pll_round_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long *prate)
++{
++	struct clk_pll *pll = to_clk_pll(hw);
++	long rate_out = 0;
++
++	switch (pll->id){
++		case APLL_ID: {
++				      rate_out = clk_apll_round_rate(hw, rate, prate);
++				      break;
++			      }
++		default: {
++				 rate_out = clk_pll_com_round_rate(hw, rate, prate);
++				 break;
++			 }
++	}
++
++	return rate_out;
++}
++
++/*set_rate*/
++static int clk_apll_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	return 0;
++}
++
++static int clk_dpll_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	return 0;
++}
++
++static int clk_gpll_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	return 0;
++}
++
++static int clk_pll_com_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	return 0;
++}
++
++static int clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++		unsigned long parent_rate)
++{
++	struct clk_pll *pll = to_clk_pll(hw);
++	int ret = 0;
++
++	switch (pll->id){
++		case APLL_ID: {
++				      ret = clk_apll_set_rate(hw, rate, parent_rate);
++				      break;
++			      }
++		case DPLL_ID: {
++				      ret = clk_dpll_set_rate(hw, rate, parent_rate);
++				      break;
++			      }
++		case GPLL_ID: {
++				      ret = clk_gpll_set_rate(hw, rate, parent_rate);
++				      break;
++			      }
++		default: {
++				 ret = clk_pll_com_set_rate(hw, rate, parent_rate);
++				 break;
++			 }
++	}
++
++	return ret;
++}
++
++const struct clk_ops clk_pll_ops = {
++	.recalc_rate = clk_pll_recalc_rate,
++	.round_rate = clk_pll_round_rate,
++	.set_rate = clk_pll_set_rate,
++};
++
++EXPORT_SYMBOL_GPL(clk_pll_ops);
++
++
++struct clk *rk_clk_register_pll(struct device *dev, const char *name,
++		const char *parent_name, unsigned long flags, void __iomem *reg,
++		u32 width, u8 id, spinlock_t *lock)
++{
++	struct clk_pll *pll;
++	struct clk *clk;
++	struct clk_init_data init;
++
++
++	clk_debug("%s: pll name = %s, id = %d, register start!\n",__func__,name,id);
++
++#if 0
++	if(id >= END_PLL_ID){
++		clk_err("%s: PLL id = %d >= END_PLL_ID = %d\n", __func__,
++				id, END_PLL_ID);
++		return ERR_PTR(-EINVAL);
++	}
++#endif
++
++	/* allocate the pll */
++	pll = kzalloc(sizeof(struct clk_pll), GFP_KERNEL);
++	if (!pll) {
++		clk_err("%s: could not allocate pll clk\n", __func__);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	init.name = name;
++	init.flags = flags;
++	init.parent_names = (parent_name ? &parent_name: NULL);
++	init.num_parents = (parent_name ? 1 : 0);
++	init.ops = &clk_pll_ops;
++
++	/* struct clk_pll assignments */
++	pll->reg = reg;
++	pll->width = width;
++	pll->id = id;
++	pll->lock = lock;
++	pll->hw.init = &init;
++
++	/* register the clock */
++	clk = clk_register(dev, &pll->hw);
++
++	if (IS_ERR(clk))
++		kfree(pll);
++
++	clk_debug("%s: pll name = %s, id = %d, register finish!\n",__func__,name,id);
++
++	return clk;
++}
++
+diff --git a/drivers/clk/rockchip/clk-pll.h b/drivers/clk/rockchip/clk-pll.h
+new file mode 100644
+index 000000000000..33a73d9c3bdc
+--- /dev/null
++++ b/drivers/clk/rockchip/clk-pll.h
+@@ -0,0 +1,143 @@
++#ifndef __RK_CLK_PLL_H
++#define __RK_CLK_PLL_H
++
++#include <linux/clk-provider.h>
++
++
++
++#define MHZ			(1000UL * 1000UL)
++#define KHZ			(1000UL)
++
++/*******************cru reg offset***************************/
++#define CRU_MODE_CON		0x40
++#define PLL_CONS(id, i)		((id) * 0x10 + ((i) * 4))
++
++/*******************cru BITS*********************************/
++#define CRU_GET_REG_BITS_VAL(reg,bits_shift, msk)  (((reg) >> (bits_shift))&(msk))
++#define CRU_W_MSK(bits_shift, msk)	((msk) << ((bits_shift) + 16))
++#define CRU_SET_BITS(val,bits_shift, msk)	(((val)&(msk)) << (bits_shift))
++#define CRU_W_MSK_SETBITS(val,bits_shift,msk) \
++	(CRU_W_MSK(bits_shift, msk)|CRU_SET_BITS(val,bits_shift, msk))
++
++/*******************PLL CON0 BITS***************************/
++#define PLL_CLKFACTOR_SET(val, shift, msk) \
++	((((val) - 1) & (msk)) << (shift))
++
++#define PLL_CLKFACTOR_GET(reg, shift, msk) \
++	((((reg) >> (shift)) & (msk)) + 1)
++
++#define PLL_OD_MSK		(0x3f)
++#define PLL_OD_SHIFT 		(0x0)
++
++#define PLL_CLKOD(val)		PLL_CLKFACTOR_SET(val, PLL_OD_SHIFT, PLL_OD_MSK)
++#define PLL_NO(reg)		PLL_CLKFACTOR_GET(reg, PLL_OD_SHIFT, PLL_OD_MSK)
++
++#define PLL_NO_SHIFT(reg)	PLL_CLKFACTOR_GET(reg, PLL_OD_SHIFT, PLL_OD_MSK)
++
++#define PLL_CLKOD_SET(val)	(PLL_CLKOD(val) | CRU_W_MSK(PLL_OD_SHIFT, PLL_OD_MSK))
++
++#define PLL_NR_MSK		(0x3f)
++#define PLL_NR_SHIFT		(8)
++#define PLL_CLKR(val)		PLL_CLKFACTOR_SET(val, PLL_NR_SHIFT, PLL_NR_MSK)
++#define PLL_NR(reg)		PLL_CLKFACTOR_GET(reg, PLL_NR_SHIFT, PLL_NR_MSK)
++
++#define PLL_CLKR_SET(val)	(PLL_CLKR(val) | CRU_W_MSK(PLL_NR_SHIFT, PLL_NR_MSK))
++
++#define PLUS_PLL_OD_MSK		(0xf)
++#define PLUS_PLL_NO(reg)	(PLL_NO(reg) & PLUS_PLL_OD_MSK)
++
++#define PLUS_PLL_NR_MSK		(0x3f)
++#define PLUS_PLL_NR(reg)	(PLL_NR(reg) & PLUS_PLL_NR_MSK)
++
++#define PLUS_PLL_CLKR_SET(val)	PLL_CLKR_SET(val & PLUS_PLL_NR_MSK)
++#define PLUS_PLL_CLKOD_SET(val)	PLL_CLKOD_SET(val & PLUS_PLL_OD_MSK)
++
++/*******************PLL CON1 BITS***************************/
++#define PLL_NF_MSK		(0xffff)
++#define PLL_NF_SHIFT		(0)
++#define PLL_CLKF(val)		PLL_CLKFACTOR_SET(val, PLL_NF_SHIFT, PLL_NF_MSK)
++#define PLL_NF(reg)		PLL_CLKFACTOR_GET(reg, PLL_NF_SHIFT, PLL_NF_MSK)
++#define PLL_CLKF_SET(val)	(PLL_CLKF(val) | CRU_W_MSK(PLL_NF_SHIFT, PLL_NF_MSK))
++
++#define PLUS_PLL_NF_MSK		(0x1fff)
++#define PLUS_PLL_NF(reg)	(PLL_NF(reg) & PLUS_PLL_NF_MSK)
++#define PLUS_PLL_CLKF_SET(val)	PLL_CLKF_SET(val & PLUS_PLL_NF_MSK)
++
++/*******************PLL CON2 BITS***************************/
++#define PLL_BWADJ_MSK		(0xfff)
++#define PLL_BWADJ_SHIFT		(0)
++#define PLL_CLK_BWADJ_SET(val)	((val) | CRU_W_MSK(PLL_BWADJ_SHIFT, PLL_BWADJ_MSK))
++
++/*******************PLL CON3 BITS***************************/
++#define PLL_RESET_MSK		(1 << 5)
++#define PLL_RESET_W_MSK		(PLL_RESET_MSK << 16)
++#define PLL_RESET		(1 << 5)
++#define PLL_RESET_RESUME	(0 << 5)
++
++#define PLL_BYPASS_MSK		(1 << 0)
++#define PLL_BYPASS		(1 << 0)
++#define PLL_NO_BYPASS		(0 << 0)
++
++#define PLL_PWR_DN_MSK		(1 << 1)
++#define PLL_PWR_DN_W_MSK	(PLL_PWR_DN_MSK << 16)
++#define PLL_PWR_DN		(1 << 1)
++#define PLL_PWR_ON		(0 << 1)
++
++#define PLL_STANDBY_MSK		(1 << 2)
++#define PLL_STANDBY		(1 << 2)
++#define PLL_NO_STANDBY		(0 << 2)
++
++/*******************PLL MODE BITS***************************/
++#define PLL_MODE_MSK(id)	(0x3 << ((id) * 4))
++#define PLL_MODE_SLOW(id)	((0x0<<((id)*4))|(0x3<<(16+(id)*4)))
++#define PLL_MODE_NORM(id)	((0x1<<((id)*4))|(0x3<<(16+(id)*4)))
++#define PLL_MODE_DEEP(id)	((0x2<<((id)*4))|(0x3<<(16+(id)*4)))
++
++/*******************PLL SET*********************************/
++#define _PLL_SET_CLKS(_mhz, nr, nf, no) \
++{ \
++	.rate   = (_mhz) * KHZ, \
++	.pllcon0 = PLL_CLKR_SET(nr)|PLL_CLKOD_SET(no), \
++	.pllcon1 = PLL_CLKF_SET(nf),\
++	.pllcon2 = PLL_CLK_BWADJ_SET(nf >> 1),\
++	.rst_dly=((nr*500)/24+1),\
++}
++
++struct pll_clk_set {
++	unsigned long	rate;
++	u32	pllcon0;
++	u32	pllcon1;
++	u32	pllcon2;
++	unsigned long	rst_dly;//us
++};
++
++struct apll_clk_set {
++	unsigned long	rate;
++	u32	pllcon0;
++	u32	pllcon1;
++	u32	pllcon2;
++	u32 	rst_dly;//us
++	u32	clksel0;
++	u32	clksel1;
++	unsigned long	lpj;
++};
++
++
++#define to_clk_pll(_hw) container_of(_hw, struct clk_pll, hw)
++
++struct clk_pll {
++	struct clk_hw	hw;
++	void __iomem	*reg;
++	u32		width;
++	u8		id;
++	const void	*table;
++	spinlock_t	*lock;
++};
++
++extern const struct clk_ops clk_pll_ops;
++struct clk *rk_clk_register_pll(struct device *dev, const char *name,
++		const char *parent_name, unsigned long flags, void __iomem *reg,
++		u32 width, u8 id, spinlock_t *lock);
++
++
++#endif /* __RK_CLK_PLL_H */
+diff --git a/drivers/clk/rockchip/clk.c b/drivers/clk/rockchip/clk.c
+index faa6ae9f79c8..5653a404065b 100755
+--- a/drivers/clk/rockchip/clk.c
++++ b/drivers/clk/rockchip/clk.c
+@@ -17,10 +17,13 @@
+ #include <linux/clkdev.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+-#include "clk-ops.h"
+ #include <linux/clk-private.h>
+ #include <asm/io.h>
+ 
++#include "clk-ops.h"
++#include "clk-pll.h"
++
++
+ static DEFINE_SPINLOCK(clk_lock);
+ 
+ struct rkclk_divmap_table {
+@@ -78,7 +81,6 @@ struct rkclk_gateinfo {
+ 
+ struct rkclk_pllinfo {
+ 	struct clk_hw	hw;
+-	struct clk_ops	*ops;
+ 	void __iomem	*addr;
+ 	u32		width;
+ 	const char	*clk_name;
+@@ -86,6 +88,8 @@ struct rkclk_pllinfo {
+ 	/*
+ 	 * const char	**clkout_names;
+ 	 */
++	u32		clkops_idx;
++	u32		id;
+ 	struct list_head	node;
+ };
+ 
+@@ -484,12 +488,18 @@ static int __init rkclk_init_pllcon(struct device_node *np)
+ 
+ 			ret = of_property_read_u32_index(node, "reg", 1, &pllinfo->width);
+ 			if (ret != 0) {
+-				clk_err("%s: cat not get reg info\n", __func__);
++				clk_err("%s: can not get reg info\n", __func__);
+ 			}
+ 
+-			clk_debug("%s: parent=%s, pllname=%s, reg =%08x, cnt=%d\n", __func__,
+-					pllinfo->parent_name, pllinfo->clk_name,
+-					(u32)pllinfo->addr, pllinfo->width);
++			ret = of_property_read_u32(node, "rockchip,pll-id", &pllinfo->id);
++			if (ret != 0) {
++				clk_err("%s: can not get pll-id\n", __func__);
++			}
++
++			clk_debug("%s: parent=%s, pllname=%s, reg =%08x, id = %d, cnt=%d\n",
++					__func__,pllinfo->parent_name,
++					pllinfo->clk_name,(u32)pllinfo->addr,
++					pllinfo->id,pllinfo->width);
+ 
+ 			found = 0;
+ 			list_for_each_entry(rkclk, &rk_clks, node) {
+@@ -519,40 +529,7 @@ static int __init rkclk_init_pllcon(struct device_node *np)
+ 	return 0;
+ }
+ 
+-#define MHZ (1000 * 1000)
+-static unsigned long clk_pll_recalc_rate(struct clk_hw *hw,
+-		unsigned long parent_rate)
+-{
+-	clk_debug("%s\n", __func__);
+-	if (strncmp(hw->clk->name, "clk_apll", sizeof("clk_apll")) == 0) {
+-		return 600 * MHZ;
+-	} else if (strncmp(hw->clk->name, "clk_dpll", sizeof("clk_dpll")) == 0) {
+-		return 300 * MHZ;
+-	}else if (strncmp(hw->clk->name, "clk_cpll", sizeof("clk_cpll")) == 0) {
+-		return 132 * MHZ;
+-	}else if (strncmp(hw->clk->name, "clk_gpll", sizeof("clk_gpll")) == 0) {
+-		return 891 * MHZ;
+-	} else
+-		clk_err("Unknown PLL\n");
+-	return -EINVAL;
+-}
+-static long clk_pll_round_rate(struct clk_hw *hw, unsigned long rate,
+-		unsigned long *prate)
+-{
+-	clk_debug("%s\n", __func__);
+-	return rate;
+-}
+-static int clk_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+-		unsigned long parent_rate)
+-{
+-	clk_debug("%s\n", __func__);
+-	return 0;
+-}
+-const struct clk_ops clk_pll_ops = {
+-	.recalc_rate = clk_pll_recalc_rate,
+-	.round_rate = clk_pll_round_rate,
+-	.set_rate = clk_pll_set_rate,
+-};
++
+ static unsigned long clk_frac_recalc_rate(struct clk_hw *hw,
+ 		unsigned long parent_rate)
+ {
+@@ -599,6 +576,7 @@ static int rkclk_register(struct rkclk *rkclk)
+ 	struct clk_mux		*mux = NULL;
+ 	struct clk_divider	*div = NULL;
+ 	struct clk_gate		*gate = NULL;
++	struct clk_pll		*pll = NULL;
+ 
+ 	const struct clk_ops	*rate_ops = NULL;
+ 	const struct clk_ops	*mux_ops = NULL;
+@@ -611,14 +589,15 @@ static int rkclk_register(struct rkclk *rkclk)
+ 	/* Single clk */
+ 	clk_debug("%s: %s clk_type=%x\n", __func__,
+ 			rkclk->clk_name, rkclk->clk_type);
++
+ 	if (rkclk->clk_type & RKCLK_PLL_TYPE) {
+-		div = kzalloc(sizeof(struct clk_divider), GFP_KERNEL);
++		pll = kzalloc(sizeof(struct clk_pll), GFP_KERNEL);
+ 		rate_ops = &clk_pll_ops;
+-		div->reg = rkclk->pll_info->addr;
+-		div->shift = 0;
+-		div->width = rkclk->pll_info->width;
+-		div->flags = CLK_DIVIDER_HIWORD_MASK;
+-		rate_hw = &div->hw;
++		pll->reg = rkclk->pll_info->addr;
++		//pll->shift = 0;
++		pll->width = rkclk->pll_info->width;
++		pll->id = rkclk->pll_info->id;
++		rate_hw = &pll->hw;
+ 
+ 		parent_num = 1;
+ 		parent_names = &rkclk->pll_info->parent_name;
+@@ -706,6 +685,11 @@ static int rkclk_register(struct rkclk *rkclk)
+ 				CLK_IGNORE_UNUSED, gate->reg,
+ 				gate->bit_idx,
+ 				gate->flags, &clk_lock);
++	} else if (rkclk->clk_type == RKCLK_PLL_TYPE) {
++		clk = rk_clk_register_pll(NULL, rkclk->clk_name,
++				rkclk->pll_info->parent_name,
++				0, pll->reg, pll->width, pll->id,
++				&clk_lock);
+ 	} else {
+ 		int i = 0;
+ 		clk_debug("%s: composite clk(\"%s\") parents:\n",
+@@ -715,6 +699,7 @@ static int rkclk_register(struct rkclk *rkclk)
+ 			clk_debug("\t\t%s: parent[%d]=%s\n", __func__,
+ 					i, parent_names[i]);
+ 		}
++
+ 		clk = clk_register_composite(NULL, rkclk->clk_name,
+ 				parent_names, parent_num,
+ 				mux ? &mux->hw : NULL, mux ? mux_ops : NULL,
+@@ -729,6 +714,7 @@ static int rkclk_register(struct rkclk *rkclk)
+ 		clk_err("%s: clk(\"%s\") register clk error\n",
+ 				__func__, rkclk->clk_name);
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -737,26 +723,31 @@ struct test_table {
+ 	u32 rate;
+ };
+ struct test_table t_table[] = {
+-	{.name = "clk_gpu", .rate = 297000000},
+-	{.name = "dclk_lcdc0", .rate = 297000000},
+-	{.name = "clk_i2s", .rate = 11289600},
+-	{.name = "clk_spdif", .rate = 11289600},
+-	{.name = "clk_sdmmc", .rate = 50000000},
+-	{.name = "clk_emmc", .rate = 50000000},
+-	{.name = "clk_sdio", .rate = 50000000},
+-	{.name = "clk_uart0", .rate = 12288000},
+-	{.name = "clk_hsadc", .rate = 12288000},
+-	{.name = "clk_mac",   .rate = 50000000},
+-	{.name = "clk_cif0",   .rate = 12000000},
+-	{.name = "aclk_lcdc0",   .rate = 297000000},
++	{.name = "clk_gpu",	.rate = 297000000},
++	{.name = "dclk_lcdc0",	.rate = 297000000},
++	{.name = "clk_i2s",	.rate = 11289600},
++	{.name = "clk_spdif",	.rate = 11289600},
++	{.name = "clk_sdmmc",	.rate = 50000000},
++	{.name = "clk_emmc",	.rate = 50000000},
++	{.name = "clk_sdio",	.rate = 50000000},
++	{.name = "clk_uart0",	.rate = 12288000},
++	{.name = "clk_hsadc",	.rate = 12288000},
++	{.name = "clk_mac",  	.rate = 50000000},
++	{.name = "clk_cif0",	.rate = 12000000},
++	{.name = "aclk_lcdc0",	.rate = 297000000},
++	{.name = "clk_apll",	.rate = 600000000},
++	{.name = "clk_dpll",	.rate = 600000000},
++	{.name = "clk_cpll",	.rate = 600000000},
++	{.name = "clk_gpll",	.rate = 800000000},
+ };
+ 
++
+ #ifdef RKCLK_DEBUG
+ void rk_clk_test(void)
+ {
+ 	const char *clk_name;
+ 	struct clk *clk;
+-	u32 rate = 0;
++	u32 rate,recalc_rate,round_rate = 0;
+ 
+ 	u32 i = 0, j = 0;
+ 	for (j = 0; j < ARRAY_SIZE(t_table); j++) {
+@@ -771,6 +762,17 @@ void rk_clk_test(void)
+ 			clk_debug("%s: clk(\"%s\") \tclk_get success\n",
+ 					__func__, __clk_get_name(clk));
+ 
++		/*TEST: clk_round_rate*/
++		if (clk->ops->round_rate) {
++			round_rate = clk_round_rate(clk, rate);
++			clk_debug("%s: clk(\"%s\") \tclk_round_rate from %lu to %lu\n",
++						__func__, __clk_get_name(clk),
++						rate, round_rate);
++		} else {
++			clk_debug("%s: clk(\"%s\") have no round ops\n",
++					__func__, clk->name);
++		}
++
+ 		/* TEST: clk_set_rate */
+ 		if (clk->ops->set_rate) {
+ 			if (0 != clk_set_rate(clk, rate)) {
+@@ -785,14 +787,29 @@ void rk_clk_test(void)
+ 					__func__, clk->name);
+ 		}
+ 
+-		for (i = 0; i * 4 <= 0xf4; i++) {
+-			if (i % 4 == 0)
+-				printk("\n%s: \t[0x%08x]: ",
+-						__func__, 0x20000000 + i * 4);
+-			printk("%08x ", readl(reg_start + i * 4));
++		/*TEST: clk_recalc_rate*/
++		if (clk->ops->recalc_rate) {
++			recalc_rate = clk->ops->recalc_rate(clk->hw,
++							clk->parent->rate);
++			clk_debug("%s: clk(\"%s\") \tclk_recalc_rate %lu\n",
++						__func__, __clk_get_name(clk),
++						recalc_rate);
++		} else {
++			clk_debug("%s: clk(\"%s\") have no recalc ops\n",
++					__func__, clk->name);
+ 		}
+-		printk("\n\n");
++
++	}
++
++	printk("dump cru regs:\n");
++	for (i = 0; i * 4 <= 0xf4; i++) {
++		if (i % 4 == 0)
++			printk("\n%s: \t[0x%08x]: ",
++					__func__, 0x20000000 + i * 4);
++		printk("%08x ", readl(reg_start + i * 4));
+ 	}
++	printk("\n\n");
++
+ }
+ EXPORT_SYMBOL_GPL(rk_clk_test);
+ #else
+@@ -815,7 +832,7 @@ static void __init rk_clk_tree_init(struct device_node *np)
+ 	if(!node_init)
+ 	{	
+ 		printk("%s:can not get  clocks-init node\n",__FUNCTION__);	
+-		return;	
++		return;
+ 	}
+ 
+ 
+diff --git a/drivers/clk/rockchip/clkops-dtsi.h b/drivers/clk/rockchip/clkops-dtsi.h
+index 9df11f9a1be9..4f5c607de0f6 100644
+--- a/drivers/clk/rockchip/clkops-dtsi.h
++++ b/drivers/clk/rockchip/clkops-dtsi.h
+@@ -1,6 +1,15 @@
+ #ifndef __RK_CLKOPS_DTSI_H
+ #define __RK_CLKOPS_DTSI_H
+ 
++
++/* pll id */
++#define APLL_ID 	0
++#define DPLL_ID 	1
++#define CPLL_ID 	2
++#define GPLL_ID 	3
++
++
++
+ /* rate_ops index */
+ #define CLKOPS_RATE_MUX_DIV		0
+ #define CLKOPS_RATE_EVENDIV		1
+-- 
+2.35.3
+

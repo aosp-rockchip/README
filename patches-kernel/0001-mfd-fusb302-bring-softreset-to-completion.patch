@@ -1,0 +1,197 @@
+From fc19dcd36a49613aa5af999357d4639b09121afa Mon Sep 17 00:00:00 2001
+From: zain wang <wzz@rock-chips.com>
+Date: Thu, 19 Oct 2017 17:36:04 +0800
+Subject: [PATCH] mfd: fusb302: bring softreset to completion
+
+Change-Id: I27e10b8b9197e6526d3fb59d0a88c28414637a9a
+Signed-off-by: zain wang <wzz@rock-chips.com>
+---
+ drivers/mfd/fusb302.c | 85 +++++++++++++++++++++++++++++++++++++------
+ drivers/mfd/fusb302.h |  2 +
+ 2 files changed, 75 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/mfd/fusb302.c b/drivers/mfd/fusb302.c
+index a7a3303d09cc..f95b8851445d 100644
+--- a/drivers/mfd/fusb302.c
++++ b/drivers/mfd/fusb302.c
+@@ -1521,15 +1521,21 @@ static void fusb_state_attached_sink(struct fusb30x_chip *chip, int evt)
+ 	dev_info(chip->dev, "CC connected in %d as UFP\n", chip->cc_polarity);
+ }
+ 
+-static void fusb_state_src_startup(struct fusb30x_chip *chip, int evt)
++static void fusb_soft_reset_parameter(struct fusb30x_chip *chip)
+ {
+ 	chip->caps_counter = 0;
+-	chip->notify.is_pd_connected = 0;
+ 	chip->msg_id = 0;
+ 	chip->vdm_state = 0;
+ 	chip->vdm_substate = 0;
+ 	chip->vdm_send_state = 0;
+ 	chip->val_tmp = 0;
++	chip->pos_power = 0;
++}
++
++static void fusb_state_src_startup(struct fusb30x_chip *chip, int evt)
++{
++	chip->notify.is_pd_connected = 0;
++	fusb_soft_reset_parameter(chip);
+ 
+ 	memset(chip->partner_cap, 0, sizeof(chip->partner_cap));
+ 
+@@ -1833,6 +1839,28 @@ static void fusb_state_src_send_hardreset(struct fusb30x_chip *chip, int evt)
+ 	}
+ }
+ 
++static void fusb_state_src_softreset(struct fusb30x_chip *chip)
++{
++	u32 tmp;
++
++	switch (chip->sub_state) {
++	case 0:
++		set_mesg(chip, CMT_ACCEPT, CONTROLMESSAGE);
++		chip->tx_state = tx_idle;
++		chip->sub_state++;
++		/* without break */
++	default:
++		tmp = policy_send_data(chip);
++		if (tmp == tx_success) {
++			fusb_soft_reset_parameter(chip);
++			set_state(chip, policy_src_send_caps);
++		} else if (tmp == tx_failed) {
++			set_state(chip, policy_src_send_hardrst);
++		}
++		break;
++	}
++}
++
+ static void fusb_state_src_send_softreset(struct fusb30x_chip *chip, int evt)
+ {
+ 	u32 tmp;
+@@ -1859,8 +1887,10 @@ static void fusb_state_src_send_softreset(struct fusb30x_chip *chip, int evt)
+ 	default:
+ 		if (evt & EVENT_RX) {
+ 			if ((!PD_HEADER_CNT(chip->rec_head)) &&
+-			    (PD_HEADER_TYPE(chip->rec_head) == CMT_ACCEPT))
++			    (PD_HEADER_TYPE(chip->rec_head) == CMT_ACCEPT)) {
++				fusb_soft_reset_parameter(chip);
+ 				set_state(chip, policy_src_send_caps);
++			}
+ 		} else if (evt & EVENT_TIMER_STATE) {
+ 			set_state(chip, policy_src_send_hardrst);
+ 		}
+@@ -1871,12 +1901,7 @@ static void fusb_state_src_send_softreset(struct fusb30x_chip *chip, int evt)
+ static void fusb_state_snk_startup(struct fusb30x_chip *chip, int evt)
+ {
+ 	chip->notify.is_pd_connected = 0;
+-	chip->msg_id = 0;
+-	chip->vdm_state = 0;
+-	chip->vdm_substate = 0;
+-	chip->vdm_send_state = 0;
+-	chip->val_tmp = 0;
+-	chip->pos_power = 0;
++	fusb_soft_reset_parameter(chip);
+ 
+ 	memset(chip->partner_cap, 0, sizeof(chip->partner_cap));
+ 
+@@ -2109,6 +2134,31 @@ static void fusb_state_snk_send_hardreset(struct fusb30x_chip *chip, int evt)
+ 	}
+ }
+ 
++static void fusb_state_snk_softreset(struct fusb30x_chip *chip)
++{
++	u32 tmp;
++
++	switch (chip->sub_state) {
++	case 0:
++		set_mesg(chip, CMT_ACCEPT, CONTROLMESSAGE);
++		chip->tx_state = tx_idle;
++		chip->sub_state++;
++		/* without break */
++	default:
++		tmp = policy_send_data(chip);
++		if (tmp == tx_success) {
++			fusb_soft_reset_parameter(chip);
++			chip->timer_state = T_TYPEC_SINK_WAIT_CAP;
++			fusb_timer_start(&chip->timer_state_machine,
++					 chip->timer_state);
++			set_state(chip, policy_snk_wait_caps);
++		} else if (tmp == tx_failed) {
++			set_state(chip, policy_snk_send_hardrst);
++		}
++		break;
++	}
++}
++
+ static void fusb_state_snk_send_softreset(struct fusb30x_chip *chip, int evt)
+ {
+ 	u32 tmp;
+@@ -2135,8 +2185,13 @@ static void fusb_state_snk_send_softreset(struct fusb30x_chip *chip, int evt)
+ 	default:
+ 		if (evt & EVENT_RX) {
+ 			if ((!PD_HEADER_CNT(chip->rec_head)) &&
+-			    (PD_HEADER_TYPE(chip->rec_head) == CMT_ACCEPT))
++			    (PD_HEADER_TYPE(chip->rec_head) == CMT_ACCEPT)) {
++				fusb_soft_reset_parameter(chip);
++				chip->timer_state = T_TYPEC_SINK_WAIT_CAP;
++				fusb_timer_start(&chip->timer_state_machine,
++						 chip->timer_state);
+ 				set_state(chip, policy_snk_wait_caps);
++			}
+ 		} else if (evt & EVENT_TIMER_STATE) {
+ 			set_state(chip, policy_snk_send_hardrst);
+ 		}
+@@ -2177,9 +2232,9 @@ static void state_machine_typec(struct fusb30x_chip *chip)
+ 		if ((!PD_HEADER_CNT(chip->rec_head)) &&
+ 		    (PD_HEADER_TYPE(chip->rec_head) == CMT_SOFTRESET)) {
+ 			if (chip->notify.power_role)
+-				set_state(chip, policy_src_send_softrst);
++				set_state(chip, policy_src_softrst);
+ 			else
+-				set_state(chip, policy_snk_send_softrst);
++				set_state(chip, policy_snk_softrst);
+ 		}
+ 	}
+ 
+@@ -2245,6 +2300,9 @@ static void state_machine_typec(struct fusb30x_chip *chip)
+ 	case policy_src_send_softrst:
+ 		fusb_state_src_send_softreset(chip, evt);
+ 		break;
++	case policy_src_softrst:
++		fusb_state_src_softreset(chip);
++		break;
+ 
+ 	/* UFP */
+ 	case policy_snk_startup:
+@@ -2277,6 +2335,9 @@ static void state_machine_typec(struct fusb30x_chip *chip)
+ 	case policy_snk_send_softrst:
+ 		fusb_state_snk_send_softreset(chip, evt);
+ 		break;
++	case policy_snk_softrst:
++		fusb_state_snk_softreset(chip);
++		break;
+ 
+ 	default:
+ 		break;
+diff --git a/drivers/mfd/fusb302.h b/drivers/mfd/fusb302.h
+index e2740ae5fa2f..e526a473064c 100644
+--- a/drivers/mfd/fusb302.h
++++ b/drivers/mfd/fusb302.h
+@@ -74,6 +74,7 @@ enum connection_state {
+ 	policy_src_get_sink_caps,
+ 
+ 	policy_src_send_softrst,
++	policy_src_softrst,
+ 	policy_src_send_hardrst,
+ 
+ 	policy_snk_startup,
+@@ -85,6 +86,7 @@ enum connection_state {
+ 	policy_snk_ready,
+ 
+ 	policy_snk_send_softrst,
++	policy_snk_softrst,
+ 	policy_snk_send_hardrst,
+ 
+ 	policy_snk_transition_default,
+-- 
+2.35.3
+

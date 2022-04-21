@@ -1,0 +1,169 @@
+From 70998d8ddab58a6f6d1286e2b083d1adeb8e0075 Mon Sep 17 00:00:00 2001
+From: Xiao Feng <xf@rock-chips.com>
+Date: Thu, 15 Jan 2015 14:22:13 +0800
+Subject: [PATCH] rk3368: add pvtm support
+
+Signed-off-by: Xiao Feng <xf@rock-chips.com>
+---
+ arch/arm/mach-rockchip/pvtm.c   | 95 ++++++++++++++++++++++++++++++---
+ arch/arm64/boot/dts/rk3368.dtsi |  5 ++
+ 2 files changed, 93 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm/mach-rockchip/pvtm.c b/arch/arm/mach-rockchip/pvtm.c
+index 0a514f054c07..d8aa8f77f223 100644
+--- a/arch/arm/mach-rockchip/pvtm.c
++++ b/arch/arm/mach-rockchip/pvtm.c
+@@ -16,6 +16,9 @@
+ #include <linux/mutex.h>
+ #include <linux/rockchip/iomap.h>
+ #include <linux/rockchip/cpu.h>
++#include <linux/of.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
+ 
+ #define RK3288_PVTM_CON0 (0x368)
+ #define RK3288_PVTM_CON1 (0x36c)
+@@ -33,6 +36,13 @@
+ #define RK312X_PVTM_STATUS2 (0x218)
+ #define RK312X_PVTM_STATUS3 (0x21c)
+ 
++#define RK3368_PVTM_CON0 (0x800)
++#define RK3368_PVTM_CON1 (0x804)
++#define RK3368_PVTM_CON2 (0x808)
++#define RK3368_PVTM_STATUS0 (0x80c)
++#define RK3368_PVTM_STATUS1 (0x810)
++#define RK3368_PVTM_STATUS2 (0x814)
++
+ #define grf_readl(offset)	readl_relaxed(RK_GRF_VIRT+offset)
+ #define grf_writel(val, offset)	writel_relaxed(val, RK_GRF_VIRT+offset)
+ 
+@@ -40,8 +50,55 @@
+ 
+ static struct clk *ch_clk[3];
+ 
++struct rockchip_pvtm {
++	u32 (*get_value)(u32 ch , u32 time_us);
++};
++static struct rockchip_pvtm pvtm;
++
++static struct regmap *grf_regmap;
++
+ static DEFINE_MUTEX(pvtm_mutex);
+ 
++/* 0 core, 1 gpu */
++static u32 rk3368_pvtm_get_value(u32 ch , u32 time_us)
++{
++	u32 val = 0, clk_cnt, check_cnt, pvtm_done_bit;
++	u32 sta = 0;
++
++	if (ch > 1)
++		return 0;
++	/* 24m clk ,24cnt=1us */
++	clk_cnt = time_us*24;
++
++	regmap_write(grf_regmap, RK3368_PVTM_CON0+(ch+1)*4, clk_cnt);
++	regmap_write(grf_regmap, RK3368_PVTM_CON0, wr_msk_bit(3, ch*8, 0x3));
++
++	if (time_us >= 1000)
++		mdelay(time_us / 1000);
++	udelay(time_us % 1000);
++
++	if (ch == 0)
++		pvtm_done_bit = 0;
++	else if (ch == 1)
++		pvtm_done_bit = 1;
++
++	check_cnt = 100;
++	while (!((regmap_read(grf_regmap, RK3368_PVTM_STATUS0, &sta) == 0) &&
++		 (sta & (1 << pvtm_done_bit)))) {
++		udelay(4);
++		check_cnt--;
++		if (!check_cnt)
++			break;
++	}
++
++	if (check_cnt)
++		regmap_read(grf_regmap, RK3368_PVTM_STATUS0+(ch+1)*4, &val);
++
++	regmap_write(grf_regmap, RK3368_PVTM_CON0, wr_msk_bit(0, ch*8, 0x3));
++
++	return val;
++}
++
+ /* 0 core, 1 gpu*/
+ static u32 rk3288_pvtm_get_value(u32 ch , u32 time_us)
+ {
+@@ -136,10 +193,7 @@ u32 pvtm_get_value(u32 ch, u32 time_us)
+ 
+ 	clk_prepare_enable(ch_clk[ch]);
+ 	mutex_lock(&pvtm_mutex);
+-	if (cpu_is_rk3288())
+-		val = rk3288_pvtm_get_value(ch, time_us);
+-	else if (cpu_is_rk312x())
+-		val = rk312x_pvtm_get_value(ch, time_us);
++	val = pvtm.get_value(ch, time_us);
+ 	mutex_unlock(&pvtm_mutex);
+ 	clk_disable_unprepare(ch_clk[ch]);
+ 
+@@ -148,12 +202,39 @@ u32 pvtm_get_value(u32 ch, u32 time_us)
+ 
+ static int __init pvtm_init(void)
+ {
+-	ch_clk[0] = clk_get(NULL, "g_clk_pvtm_core");
+-	ch_clk[1] = clk_get(NULL, "g_clk_pvtm_gpu");
+-	ch_clk[2] = clk_get(NULL, "g_clk_pvtm_func");
++	struct device_node *np;
++
++	np = of_find_node_by_name(NULL, "pvtm");
++	if (!IS_ERR_OR_NULL(np)) {
++		grf_regmap = syscon_regmap_lookup_by_phandle(np,
++							     "rockchip,grf");
++		if (IS_ERR(grf_regmap)) {
++			pr_err("pvtm: dts couldn't find grf regmap\n");
++			return PTR_ERR(grf_regmap);
++		}
++		if (of_device_is_compatible(np, "rockchip,rk3368-pvtm")) {
++			ch_clk[0] = clk_get(NULL, "clk_pvtm_core");
++			ch_clk[1] = clk_get(NULL, "clk_pvtm_gpu");
++			pvtm.get_value = rk3368_pvtm_get_value;
++		}
++		return 0;
++	}
+ 
++	if (cpu_is_rk3288() || cpu_is_rk312x()) {
++		ch_clk[0] = clk_get(NULL, "g_clk_pvtm_core");
++		ch_clk[1] = clk_get(NULL, "g_clk_pvtm_gpu");
++		ch_clk[2] = clk_get(NULL, "g_clk_pvtm_func");
++		if (cpu_is_rk3288())
++			pvtm.get_value = rk3288_pvtm_get_value;
++		else if (cpu_is_rk312x())
++			pvtm.get_value = rk312x_pvtm_get_value;
++	}
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_ARM64
++arch_initcall_sync(pvtm_init);
++#else
+ core_initcall(pvtm_init);
++#endif
+ 
+diff --git a/arch/arm64/boot/dts/rk3368.dtsi b/arch/arm64/boot/dts/rk3368.dtsi
+index d9e275af6250..d521d9415adf 100755
+--- a/arch/arm64/boot/dts/rk3368.dtsi
++++ b/arch/arm64/boot/dts/rk3368.dtsi
+@@ -873,6 +873,11 @@
+ 		status = "disabled";
+ 	};
+ 
++	pvtm {
++		compatible = "rockchip,rk3368-pvtm";
++		rockchip,grf = <&grf>;
++	};
++
+ 	dvfs {
+ 
+ 		vd_arm: vd_arm {
+-- 
+2.35.3
+

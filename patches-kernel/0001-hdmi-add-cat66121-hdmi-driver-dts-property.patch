@@ -1,0 +1,694 @@
+From 1cef1923fbaf937e502482bc5e52961c52184355 Mon Sep 17 00:00:00 2001
+From: zwl <zwl@rock-chips.com>
+Date: Tue, 18 Feb 2014 15:51:42 +0800
+Subject: [PATCH] hdmi: add cat66121 hdmi driver dts property
+
+---
+ arch/arm/boot/dts/rk616.dtsi                  |   3 -
+ drivers/video/rockchip/hdmi/Makefile          |   2 +-
+ .../hdmi/chips/cat66121/cat66121_hdmi.c       | 149 ++++++++--------
+ .../hdmi/chips/cat66121/cat66121_hdmi.h       |  20 +--
+ .../hdmi/chips/cat66121/cat66121_hdmi_hw.c    |  55 +++---
+ drivers/video/rockchip/hdmi/rk_hdmi.h         |   5 +
+ .../video/rockchip/hdmi/rk_hdmi_parse_dt.c    | 163 ++++++++++++++++++
+ include/linux/rk_fb.h                         |   1 +
+ 8 files changed, 281 insertions(+), 117 deletions(-)
+ create mode 100644 drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
+
+diff --git a/arch/arm/boot/dts/rk616.dtsi b/arch/arm/boot/dts/rk616.dtsi
+index 6c3e66f0ebc2..0c1b91435959 100644
+--- a/arch/arm/boot/dts/rk616.dtsi
++++ b/arch/arm/boot/dts/rk616.dtsi
+@@ -10,8 +10,5 @@
+ 	rk616,lcd0_func = <INPUT>;
+ 	rk616,lcd1_func = <UNUSED>;
+ 	rk616,lvds_ch_nr = <1>;
+-	pinctrl-names = "default", "gpio";
+-	pinctrl-0 = <&lcdc1_lcdc>;
+-	pinctrl-1 = <&lcdc1_gpio>;
+ 
+ };
+diff --git a/drivers/video/rockchip/hdmi/Makefile b/drivers/video/rockchip/hdmi/Makefile
+index ed00a162460d..267b8b528ecb 100755
+--- a/drivers/video/rockchip/hdmi/Makefile
++++ b/drivers/video/rockchip/hdmi/Makefile
+@@ -4,5 +4,5 @@
+ 
+ ccflags-$(CONFIG_RK_HDMI_DEBUG) = -DDEBUG -DHDMI_DEBUG
+ 
+-obj-$(CONFIG_RK_HDMI) += rk_hdmi_edid.o rk_hdmi_lcdc.o rk_hdmi_task.o rk_hdmi_sysfs.o
++obj-$(CONFIG_RK_HDMI) += rk_hdmi_edid.o rk_hdmi_lcdc.o rk_hdmi_task.o rk_hdmi_sysfs.o rk_hdmi_parse_dt.o
+ obj-$(CONFIG_RK_HDMI) += chips/
+diff --git a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
+index 0ff54a0956f3..4b417099931a 100755
+--- a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
++++ b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.c
+@@ -3,8 +3,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/interrupt.h>
+-#include <mach/gpio.h>
+-#include <mach/iomux.h>
++#include <linux/of_gpio.h>
+ #include <linux/i2c.h>
+ #include <linux/uaccess.h>
+ #if defined(CONFIG_DEBUG_FS)
+@@ -85,11 +84,11 @@ static void cat66121_irq_work_func(struct work_struct *work)
+ {
+ 	if(hdmi->suspend == 0) {
+ 		if(hdmi->enable == 1) {
+-			cat66121_hdmi_interrupt();
++			cat66121_hdmi_interrupt(hdmi);
+ 			if(hdmi->hdcp_irq_cb)
+ 				hdmi->hdcp_irq_cb(0);
+ 		}
+-		if(hdmi->irq == INVALID_GPIO){
++		if(!gpio_is_valid(hdmi->irq)){
+ 			queue_delayed_work(cat66121_hdmi->workqueue, &cat66121_hdmi->delay_work, HDMI_POLL_MDELAY);
+ 		}
+ 	}
+@@ -106,12 +105,14 @@ static irqreturn_t cat66121_thread_interrupt(int irq, void *dev_id)
+ #if defined(CONFIG_DEBUG_FS)
+ static int hdmi_read_p0_reg(struct i2c_client *client, char reg, char *val)
+ {
+-	return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
++	//return i2c_master_reg8_recv(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;	//TODO Daisen
++	return 0;
+ }
+ 
+ static int hdmi_write_p0_reg(struct i2c_client *client, char reg, char *val)
+ {
+-	return i2c_master_reg8_send(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;
++	//return i2c_master_reg8_send(client, reg, val, 1, 100*1000) > 0? 0: -EINVAL;	//TODO Daisen
++	return 0;
+ }
+ static int hdmi_reg_show(struct seq_file *s, void *v)
+ {
+@@ -161,11 +162,64 @@ static const struct file_operations hdmi_reg_fops = {
+ 	.release	= single_release,
+ };
+ #endif
++
++static int rk_hdmi_drv_init(struct hdmi *hdmi_drv)
++{
++	int ret = 0;
++
++	if(HDMI_SOURCE_DEFAULT == HDMI_SOURCE_LCDC0)
++		hdmi_drv->lcdc = rk_get_lcdc_drv("lcdc0");
++	else
++		hdmi_drv->lcdc = rk_get_lcdc_drv("lcdc1");
++	if(hdmi_drv->lcdc == NULL)
++	{
++		dev_err(hdmi_drv->dev, "can not connect to video source lcdc\n");
++		ret = -ENXIO;
++		return ret;
++	}
++
++#ifdef SUPPORT_HDCP
++	hdmi_drv->irq = INVALID_GPIO;
++#endif
++
++	hdmi_sys_init(hdmi_drv);
++	hdmi_drv->xscale = 100;
++	hdmi_drv->yscale = 100;
++	hdmi_drv->insert = cat66121_hdmi_sys_insert;
++	hdmi_drv->remove = cat66121_hdmi_sys_remove;
++	hdmi_drv->control_output = cat66121_hdmi_sys_enalbe_output;
++	hdmi_drv->config_video = cat66121_hdmi_sys_config_video;
++	hdmi_drv->config_audio = cat66121_hdmi_sys_config_audio;
++	hdmi_drv->detect_hotplug = cat66121_hdmi_sys_detect_hpd;
++	hdmi_drv->read_edid = cat66121_hdmi_sys_read_edid;
++
++	hdmi_drv->workqueue = create_singlethread_workqueue("hdmi");
++	INIT_DELAYED_WORK(&(hdmi->delay_work), hdmi_work);
++
++	#ifdef CONFIG_HAS_EARLYSUSPEND
++	hdmi_drv->early_suspend.suspend = hdmi_early_suspend;
++	hdmi_drv->early_suspend.resume = hdmi_early_resume;
++	hdmi_drv->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB - 10;
++	register_early_suspend(&hdmi_drv->early_suspend);
++	#endif
++
++	hdmi_register_display_sysfs(hdmi_drv, NULL);
++
++	#ifdef CONFIG_SWITCH
++	hdmi_drv->switch_hdmi.name="hdmi";
++	switch_dev_register(&(hdmi_drv->switch_hdmi));
++	#endif
++
++	spin_lock_init(&hdmi_drv->irq_lock);
++	mutex_init(&hdmi_drv->enable_mutex);
++
++	return 0;
++}
++
+ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_device_id *id)
+ {
+ 	int rc = 0;
+-	struct rk_hdmi_platform_data *pdata = client->dev.platform_data;
+-	
++
+ 	cat66121_hdmi = kzalloc(sizeof(struct cat66121_hdmi_pdata), GFP_KERNEL);
+ 	if(!cat66121_hdmi)
+ 	{
+@@ -183,23 +237,6 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 	}
+ 	memset(hdmi, 0, sizeof(struct hdmi));
+ 	hdmi->dev = &client->dev;
+-	
+-	if(HDMI_SOURCE_DEFAULT == HDMI_SOURCE_LCDC0)
+-		hdmi->lcdc = rk_get_lcdc_drv("lcdc0");
+-	else
+-		hdmi->lcdc = rk_get_lcdc_drv("lcdc1");
+-	if(hdmi->lcdc == NULL)
+-	{
+-		dev_err(hdmi->dev, "can not connect to video source lcdc\n");
+-		rc = -ENXIO;
+-		goto err_request_lcdc;
+-	}
+-	if(pdata->io_init){
+-		if(pdata->io_init()<0){
+-			dev_err(&client->dev, "fail to rst chip\n");
+-			goto err_request_lcdc;
+-		}
+-	}
+ 
+ 	if(cat66121_detect_device()!=1){
+ 		dev_err(hdmi->dev, "can't find it66121 device \n");
+@@ -207,52 +244,14 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 		goto err_request_lcdc;
+ 	}
+ 
+-	if(client->irq == 0){
+-		dev_err(hdmi->dev, "can't find it66121 irq\n");
+-			dev_err(hdmi->dev, " please set irq or use irq INVALID_GPIO for poll mode\n");
+-		rc = -ENXIO;
+-		goto err_request_lcdc;
+-	}
+-
+-        cat66121_hdmi->plug_status = -1;
+-#ifdef SUPPORT_HDCP
+-	hdmi->irq = INVALID_GPIO;
+-#else
+-	hdmi->irq = gpio_to_irq(client->irq);
+-#endif
+-
+-	hdmi->xscale = 100;
+-	hdmi->yscale = 100;
+-	hdmi->insert = cat66121_hdmi_sys_insert;
+-	hdmi->remove = cat66121_hdmi_sys_remove;
+-	hdmi->control_output = cat66121_hdmi_sys_enalbe_output;
+-	hdmi->config_video = cat66121_hdmi_sys_config_video;
+-	hdmi->config_audio = cat66121_hdmi_sys_config_audio;
+-	hdmi->detect_hotplug = cat66121_hdmi_sys_detect_hpd;
+-	hdmi->read_edid = cat66121_hdmi_sys_read_edid;
+-	hdmi_sys_init();
++	cat66121_hdmi->plug_status = -1;
+ 	
+-	hdmi->workqueue = create_singlethread_workqueue("hdmi");
+-	INIT_DELAYED_WORK(&(hdmi->delay_work), hdmi_work);
++	rk_hdmi_parse_dt(hdmi);
++	rk_hdmi_drv_init(hdmi);
+ 	
+-	#ifdef CONFIG_HAS_EARLYSUSPEND
+-	hdmi->early_suspend.suspend = hdmi_early_suspend;
+-	hdmi->early_suspend.resume = hdmi_early_resume;
+-	hdmi->early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB - 10;
+-	register_early_suspend(&hdmi->early_suspend);
+-	#endif
+-	
+-	hdmi_register_display_sysfs(hdmi, NULL);
+-	#ifdef CONFIG_SWITCH
+-	hdmi->switch_hdmi.name="hdmi";
+-	switch_dev_register(&(hdmi->switch_hdmi));
+-	#endif
+-		
+-	spin_lock_init(&hdmi->irq_lock);
+-	mutex_init(&hdmi->enable_mutex);
+-	
+-
+-	cat66121_hdmi_sys_init();
++	//power on
++	rk_hdmi_pwr_enable(hdmi);
++	cat66121_hdmi_sys_init(hdmi);
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ 	{
+@@ -266,17 +265,17 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 	}
+ #endif
+ 
+-	if(hdmi->irq != INVALID_GPIO) {
++	if(gpio_is_valid(hdmi->irq)) {
+ 		cat66121_irq_work_func(NULL);
+-		if((rc = gpio_request(client->irq, "hdmi gpio")) < 0)
++		if((rc = gpio_request(hdmi->irq, "hdmi gpio")) < 0)
+ 		{
+ 			dev_err(&client->dev, "fail to request gpio %d\n", client->irq);
+ 			goto err_request_lcdc;
+ 		}
+ 
+-		cat66121_hdmi->gpio = client->irq;
+-		gpio_pull_updown(client->irq, GPIOPullUp);
+-		gpio_direction_input(client->irq);
++		cat66121_hdmi->gpio = hdmi->irq;
++		//gpio_pull_updown(hdmi->irq, GPIOPullUp);	//TODO Daisen
++		gpio_direction_input(hdmi->irq);
+ 		if((rc = request_threaded_irq(hdmi->irq, NULL ,cat66121_thread_interrupt, IRQF_TRIGGER_LOW | IRQF_ONESHOT, dev_name(&client->dev), hdmi)) < 0)
+ 		{
+ 			dev_err(&client->dev, "fail to request hdmi irq\n");
+@@ -305,7 +304,7 @@ static int cat66121_hdmi_i2c_probe(struct i2c_client *client,const struct i2c_de
+ 
+ }
+ 
+-static int __devexit cat66121_hdmi_i2c_remove(struct i2c_client *client)
++static int cat66121_hdmi_i2c_remove(struct i2c_client *client)
+ {	
+ 	hdmi_dbg(hdmi->dev, "%s\n", __func__);
+ 	if(hdmi) {
+diff --git a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.h b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.h
+index 064ee5a6243c..0896c39b9949 100755
+--- a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.h
++++ b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi.h
+@@ -14,21 +14,21 @@ struct cat66121_hdmi_pdata {
+ 	struct i2c_client *client;
+ 	struct delayed_work delay_work;
+ 	struct workqueue_struct *workqueue;
+-        int plug_status;
++	int plug_status;
+ };
+ 
+ extern struct cat66121_hdmi_pdata *cat66121_hdmi;
+ 
+ extern int cat66121_detect_device(void);
+-extern int cat66121_hdmi_sys_init(void);
+-extern void cat66121_hdmi_interrupt(void);
+-extern int cat66121_hdmi_sys_detect_hpd(void);
+-extern int cat66121_hdmi_sys_insert(void);
+-extern int cat66121_hdmi_sys_remove(void);
+-extern int cat66121_hdmi_sys_read_edid(int block, unsigned char *buff);
+-extern int cat66121_hdmi_sys_config_video(struct hdmi_video_para *vpara);
+-extern int cat66121_hdmi_sys_config_audio(struct hdmi_audio *audio);
+-extern void cat66121_hdmi_sys_enalbe_output(int enable);
++extern int cat66121_hdmi_sys_init(struct hdmi *hdmi_drv);
++extern void cat66121_hdmi_interrupt(struct hdmi *hdmi_drv);
++extern int cat66121_hdmi_sys_detect_hpd(struct hdmi *hdmi_drv);
++extern int cat66121_hdmi_sys_insert(struct hdmi *hdmi_drv);
++extern int cat66121_hdmi_sys_remove(struct hdmi *hdmi_drv);
++extern int cat66121_hdmi_sys_read_edid(struct hdmi *hdmi_drv, int block, unsigned char *buff);
++extern int cat66121_hdmi_sys_config_video(struct hdmi *hdmi_drv, struct hdmi_video_para *vpara);
++extern int cat66121_hdmi_sys_config_audio(struct hdmi *hdmi_drv,struct hdmi_audio *audio);
++extern void cat66121_hdmi_sys_enalbe_output(struct hdmi *hdmi_drv, int enable);
+ extern int cat66121_hdmi_register_hdcp_callbacks(void (*hdcp_cb)(void),
+ 					 void (*hdcp_irq_cb)(int status),
+ 					 int (*hdcp_power_on_cb)(void),
+diff --git a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi_hw.c b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi_hw.c
+index 75b84e0a54be..bcfe8c8ae47e 100755
+--- a/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi_hw.c
++++ b/drivers/video/rockchip/hdmi/chips/cat66121/cat66121_hdmi_hw.c
+@@ -2,9 +2,8 @@
+ #include "cat66121_hdmi.h"
+ #include "cat66121_hdmi_hw.h"
+ #include <asm/atomic.h>
+-#include <mach/io.h>
+-#include <mach/gpio.h>
+-#include <mach/iomux.h>
++//#include <mach/io.h>
++//#include <mach/gpio.h>
+ #include "hdmitx.h"
+ 
+ extern HDMITXDEV hdmiTxDev[HDMITX_MAX_DEV_COUNT] ;
+@@ -186,9 +185,9 @@ int cat66121_detect_device(void)
+ 
+ 	return 0;
+ }
+-int cat66121_hdmi_sys_init(void)
++int cat66121_hdmi_sys_init(struct hdmi *hdmi_drv)
+ {
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	hdmi_dbg(hdmi_drv->dev, "[%s]\n", __FUNCTION__);
+ 	HDMITX_InitTxDev(&InstanceData);
+ 	InitHDMITX();
+ 	msleep(1);
+@@ -232,7 +231,7 @@ void cat66121_InterruptClr(void)
+ 	intclr3 &= ~(B_TX_INTACTDONE);
+ 	HDMITX_WriteI2C_Byte(REG_TX_SYS_STATUS,intclr3); // INTACTDONE reset to zero.
+ }
+-void cat66121_hdmi_interrupt(void)
++void cat66121_hdmi_interrupt(struct hdmi *hdmi_drv)
+ {
+ 	char sysstat = 0; 
+ 	mutex_lock(&handler_mutex);
+@@ -314,9 +313,9 @@ void cat66121_hdmi_interrupt(void)
+ 				HDMITX_DEBUG_PRINTF(("HPD unplug\n") );
+ 			}
+ 			cat66121_hdmi->plug_status = sysstat;
+-			if(hdmi->state == HDMI_SLEEP)
+-				hdmi->state = WAIT_HOTPLUG;
+-			queue_delayed_work(hdmi->workqueue, &hdmi->delay_work, msecs_to_jiffies(0));	
++			if(hdmi_drv->state == HDMI_SLEEP)
++				hdmi_drv->state = WAIT_HOTPLUG;
++			queue_delayed_work(hdmi_drv->workqueue, &hdmi_drv->delay_work, msecs_to_jiffies(0));
+ 		}
+ 		if(intdata1 & (B_TX_INT_RX_SENSE)) {
+ 				hdmiTxDev[0].bAuthenticated = FALSE;
+@@ -324,7 +323,7 @@ void cat66121_hdmi_interrupt(void)
+ 	}
+     
+ #ifdef SUPPORT_HDCP
+-        if(hdmi->display == HDMI_ENABLE)
++        if(hdmi_drv->display == HDMI_ENABLE)
+         {
+                 if(getHDMITX_LinkStatus())
+                 {
+@@ -342,7 +341,7 @@ void cat66121_hdmi_interrupt(void)
+ 	mutex_unlock(&handler_mutex);
+ }
+ 
+-int cat66121_hdmi_sys_detect_hpd(void)
++int cat66121_hdmi_sys_detect_hpd(struct hdmi *hdmi_drv)
+ {
+ 	char HPD= 0;
+ 	BYTE sysstat;
+@@ -364,9 +363,9 @@ int cat66121_hdmi_sys_detect_hpd(void)
+ 		return HDMI_HPD_REMOVED;
+ }
+ 
+-int cat66121_hdmi_sys_read_edid(int block, unsigned char *buff)
++int cat66121_hdmi_sys_read_edid(struct hdmi *hdmi_drv, int block, unsigned char *buff)
+ {
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	hdmi_dbg(hdmi_drv->dev, "[%s]\n", __FUNCTION__);
+ 	return (getHDMITX_EDIDBlock(block, buff) == TRUE)?HDMI_ERROR_SUCESS:HDMI_ERROR_FALSE;
+ }
+ 
+@@ -401,7 +400,7 @@ void ConfigfHdmiVendorSpecificInfoFrame(BYTE _3D_Stru)
+ static void cat66121_sys_config_avi(int VIC, int bOutputColorMode, int aspec, int Colorimetry, int pixelrep)
+ {
+ 	AVI_InfoFrame *AviInfo;
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	//hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
+ 	AviInfo = (AVI_InfoFrame *)CommunBuff ;
+ 
+ 	AviInfo->pktbyte.AVI_HB[0] = AVI_INFOFRAME_TYPE|0x80 ;
+@@ -444,7 +443,7 @@ static void cat66121_sys_config_avi(int VIC, int bOutputColorMode, int aspec, in
+ 
+ }
+ 
+-int cat66121_hdmi_sys_config_video(struct hdmi_video_para *vpara)
++int cat66121_hdmi_sys_config_video(struct hdmi *hdmi_drv, struct hdmi_video_para *vpara)
+ {
+ 	struct fb_videomode *mode;
+ 	HDMI_Aspec aspec ;
+@@ -452,7 +451,7 @@ int cat66121_hdmi_sys_config_video(struct hdmi_video_para *vpara)
+ 	VIDEOPCLKLEVEL level ;
+ 
+ 	if(vpara == NULL) {
+-		hdmi_err(hdmi->dev, "[%s] input parameter error\n", __FUNCTION__);
++		hdmi_err(hdmi_drv->dev, "[%s] input parameter error\n", __FUNCTION__);
+ 		return -1;
+ 	}
+ 
+@@ -483,11 +482,11 @@ int cat66121_hdmi_sys_config_video(struct hdmi_video_para *vpara)
+ 	mode = (struct fb_videomode *)hdmi_vic_to_videomode(vpara->vic);
+ 	if(mode == NULL)
+ 	{
+-		hdmi_err(hdmi->dev, "[%s] not found vic %d\n", __FUNCTION__, vpara->vic);
++		hdmi_err(hdmi_drv->dev, "[%s] not found vic %d\n", __FUNCTION__, vpara->vic);
+ 		return -ENOENT;
+ 	}
+ 
+-	hdmi->tmdsclk = mode->pixclock;
++	hdmi_drv->tmdsclk = mode->pixclock;
+ 	switch(vpara->vic)
+ 	{
+ 		case HDMI_640x480p60:
+@@ -606,11 +605,11 @@ int cat66121_hdmi_sys_config_video(struct hdmi_video_para *vpara)
+ 		bInputColorMode &= ~F_VIDMODE_16_235 ;
+ 	}
+ 	
+-	if( (hdmi->tmdsclk*(pixelrep+1))>80000000L )
++	if( (hdmi_drv->tmdsclk*(pixelrep+1))>80000000L )
+ 	{
+ 		level = PCLK_HIGH ;
+ 	}
+-	else if((hdmi->tmdsclk*(pixelrep+1))>20000000L)
++	else if((hdmi_drv->tmdsclk*(pixelrep+1))>20000000L)
+ 	{
+ 		level = PCLK_MEDIUM ;
+ 	}
+@@ -660,7 +659,7 @@ static void cat66121_hdmi_config_aai(void)
+ 	HDMITX_EnableAudioInfoFrame(TRUE, (unsigned char *)AudioInfo);
+ }
+ 
+-int cat66121_hdmi_sys_config_audio(struct hdmi_audio *audio)
++int cat66121_hdmi_sys_config_audio(struct hdmi *hdmi_drv, struct hdmi_audio *audio)
+ {
+ 	cat66121_hdmi_config_aai();
+ 	HDMITX_EnableAudioOutput(
+@@ -669,13 +668,13 @@ int cat66121_hdmi_sys_config_audio(struct hdmi_audio *audio)
+ 			INPUT_SAMPLE_FREQ_HZ,
+ 			audio->channel,
+ 			NULL, // pointer to cahnnel status.
+-			hdmi->tmdsclk*(pixelrep+1));
++			hdmi_drv->tmdsclk*(pixelrep+1));
+ 	return HDMI_ERROR_SUCESS;
+ }
+ 
+-void cat66121_hdmi_sys_enalbe_output(int enable)
++void cat66121_hdmi_sys_enalbe_output(struct hdmi *hdmi_drv, int enable)
+ {
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	hdmi_dbg(hdmi_drv->dev, "[%s]\n", __FUNCTION__);
+ 	
+ 	if(enable){
+ #if 0//def SUPPORT_HDCP
+@@ -689,9 +688,9 @@ void cat66121_hdmi_sys_enalbe_output(int enable)
+ 	DumpHDMITXReg() ;
+ }
+ 
+-int cat66121_hdmi_sys_insert(void)
++int cat66121_hdmi_sys_insert(struct hdmi *hdmi_drv)
+ {
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	hdmi_dbg(hdmi_drv->dev, "[%s]\n", __FUNCTION__);
+ 	if(getHDMI_PowerStatus()==FALSE)
+ 		HDMITX_PowerOn();
+ 
+@@ -699,9 +698,9 @@ int cat66121_hdmi_sys_insert(void)
+ 	return 0;
+ }
+ 
+-int cat66121_hdmi_sys_remove(void)
++int cat66121_hdmi_sys_remove(struct hdmi *hdmi_drv)
+ {
+-	hdmi_dbg(hdmi->dev, "[%s]\n", __FUNCTION__);
++	hdmi_dbg(hdmi_drv->dev, "[%s]\n", __FUNCTION__);
+ #if 0//def SUPPORT_HDCP
+ 	cancel_delayed_work_sync(&hdcp_delay_work);
+ 	HDMITX_EnableHDCP(FALSE);
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi.h b/drivers/video/rockchip/hdmi/rk_hdmi.h
+index 6a41e550d19d..a1355ae9a602 100755
+--- a/drivers/video/rockchip/hdmi/rk_hdmi.h
++++ b/drivers/video/rockchip/hdmi/rk_hdmi.h
+@@ -293,6 +293,8 @@ struct hdmi {
+ 	int xscale;					// x direction scale value
+ 	int yscale;					// y directoon scale value
+ 	int tmdsclk;				// TDMS Clock frequency
++
++	struct list_head pwrlist_head;
+ 	
+ 	int (*insert)(struct hdmi  *hdmi);
+ 	int (*remove)(struct hdmi  *hdmi);
+@@ -336,4 +338,7 @@ extern int hdmi_find_best_mode(struct hdmi* hdmi, int vic);
+ extern int hdmi_ouputmode_select(struct hdmi *hdmi, int edid_ok);
+ extern int hdmi_switch_fb(struct hdmi *hdmi, int vic);
+ extern void hdmi_work(struct work_struct *work);
++int rk_hdmi_parse_dt(struct hdmi *hdmi_drv);
++int rk_hdmi_pwr_enable(struct hdmi *dev_drv);
++int rk_hdmi_pwr_disable(struct hdmi *dev_drv);
+ #endif
+diff --git a/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c b/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
+new file mode 100644
+index 000000000000..bc7d1dd4d965
+--- /dev/null
++++ b/drivers/video/rockchip/hdmi/rk_hdmi_parse_dt.c
+@@ -0,0 +1,163 @@
++#include "rk_hdmi.h"
++#ifdef CONFIG_OF
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++
++
++/* rk hdmi power control parse from dts
++ *
++*/
++int rk_hdmi_pwr_ctr_parse_dt(struct hdmi *dev_drv)
++{
++	struct device_node *root  = of_parse_phandle(dev_drv->dev->of_node,
++				"power_ctr", 0);
++	struct device_node *child;
++	struct rk_disp_pwr_ctr_list *pwr_ctr;
++	struct list_head *pos;
++	enum of_gpio_flags flags;
++	u32 val = 0;
++	u32 debug = 0;
++	int ret;
++
++	INIT_LIST_HEAD(&dev_drv->pwrlist_head);
++	if (!root) {
++		dev_err(dev_drv->dev, "can't find power_ctr node %d\n",dev_drv->id);
++		return -ENODEV;
++	}
++
++	for_each_child_of_node(root, child) {
++		pwr_ctr = kmalloc(sizeof(struct rk_disp_pwr_ctr_list), GFP_KERNEL);
++		strcpy(pwr_ctr->pwr_ctr.name, child->name);
++		if (!of_property_read_u32(child, "rockchip,power_type", &val)) {
++			if (val == GPIO) {
++				pwr_ctr->pwr_ctr.type = GPIO;
++				pwr_ctr->pwr_ctr.gpio = of_get_gpio_flags(child, 0, &flags);
++				if (!gpio_is_valid(pwr_ctr->pwr_ctr.gpio)) {
++					dev_err(dev_drv->dev, "%s ivalid gpio\n", child->name);
++					return -EINVAL;
++				}
++				pwr_ctr->pwr_ctr.atv_val = flags & OF_GPIO_ACTIVE_LOW;
++				ret = gpio_request(pwr_ctr->pwr_ctr.gpio,child->name);
++				if (ret) {
++					dev_err(dev_drv->dev, "request %s gpio fail:%d\n",
++						child->name,ret);
++					return -1;
++				}
++
++			} else {
++				pwr_ctr->pwr_ctr.type = REGULATOR;
++
++			}
++		};
++		of_property_read_u32(child, "rockchip,delay", &val);
++		pwr_ctr->pwr_ctr.delay = val;
++		of_property_read_u32(child, "rockchip,is_rst", &val);
++		pwr_ctr->pwr_ctr.is_rst = val;
++		list_add_tail(&pwr_ctr->list, &dev_drv->pwrlist_head);
++	}
++
++	of_property_read_u32(root, "rockchip,debug", &debug);
++
++	if (debug) {
++		list_for_each(pos, &dev_drv->pwrlist_head) {
++			pwr_ctr = list_entry(pos, struct rk_disp_pwr_ctr_list, list);
++			printk(KERN_INFO "pwr_ctr_name:%s\n"
++					 "pwr_type:%s\n"
++					 "gpio:%d\n"
++					 "atv_val:%d\n"
++					 "delay:%d\n\n",
++					 pwr_ctr->pwr_ctr.name,
++					 (pwr_ctr->pwr_ctr.type == GPIO) ? "gpio" : "regulator",
++					 pwr_ctr->pwr_ctr.gpio,
++					 pwr_ctr->pwr_ctr.atv_val,
++					 pwr_ctr->pwr_ctr.delay);
++		}
++	}
++
++	return 0;
++
++}
++
++int rk_hdmi_pwr_enable(struct hdmi *dev_drv)
++{
++	struct list_head *pos;
++	struct rk_disp_pwr_ctr_list *pwr_ctr_list;
++	struct pwr_ctr *pwr_ctr;
++
++	if (list_empty(&dev_drv->pwrlist_head))
++		return 0;
++
++	list_for_each(pos, &dev_drv->pwrlist_head) {
++		pwr_ctr_list = list_entry(pos, struct rk_disp_pwr_ctr_list, list);
++		pwr_ctr = &pwr_ctr_list->pwr_ctr;
++		if (pwr_ctr->type == GPIO) {
++			gpio_direction_output(pwr_ctr->gpio,pwr_ctr->atv_val);
++			mdelay(pwr_ctr->delay);
++			if(pwr_ctr->is_rst == 1)
++				gpio_direction_output(pwr_ctr->gpio,((pwr_ctr->atv_val == 1) ? 0:1));
++		}
++	}
++
++	return 0;
++}
++
++int rk_hdmi_pwr_disable(struct hdmi *dev_drv)
++{
++	struct list_head *pos;
++	struct rk_disp_pwr_ctr_list *pwr_ctr_list;
++	struct pwr_ctr *pwr_ctr;
++
++	if (list_empty(&dev_drv->pwrlist_head))
++		return 0;
++
++	list_for_each(pos, &dev_drv->pwrlist_head) {
++		pwr_ctr_list = list_entry(pos, struct rk_disp_pwr_ctr_list, list);
++		pwr_ctr = &pwr_ctr_list->pwr_ctr;
++		if (pwr_ctr->type == GPIO) {
++			gpio_set_value(pwr_ctr->gpio,pwr_ctr->atv_val);
++			if(pwr_ctr->is_rst == 1)
++				gpio_direction_output(pwr_ctr->gpio,((pwr_ctr->atv_val == 1) ? 0:1));
++		}
++	}
++
++	return 0;
++}
++
++int rk_hdmi_parse_dt(struct hdmi *hdmi_drv)
++{
++	struct device_node *np = hdmi_drv->dev->of_node;
++	int ret = 0,gpio = 0;
++
++	if (!np) {
++		dev_err(hdmi_drv->dev, "could not find hdmi node\n");
++		return -1;
++	}
++
++	gpio = of_get_named_gpio(np,"rockchips,hdmi_irq_gpio", 0);
++	if (!gpio_is_valid(gpio))
++		dev_info(hdmi_drv->dev, "invalid hdmi_irq_gpio: %d\n",gpio);
++	hdmi_drv->irq = gpio;
++
++	ret = rk_hdmi_pwr_ctr_parse_dt(hdmi_drv);
++
++	return ret;
++}
++
++#else
++int rk_hdmi_pwr_enable(struct hdmi *dev_drv)
++{
++	return 0;
++}
++
++int rk_hdmi_pwr_disable(struct hdmi *dev_drv)
++{
++	return 0;
++}
++
++int rk_hdmi_parse_dt(struct hdmi *hdmi_drv)
++{
++	return 0;
++}
++#endif
++
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index 2723fd7bcb07..7627817bf2b3 100755
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -201,6 +201,7 @@ struct color_key_cfg {
+ struct pwr_ctr {
+ 	char name[32];
+ 	int type;
++	int is_rst;
+ 	int gpio;
+ 	int atv_val;
+ 	char rgl_name[32];
+-- 
+2.35.3
+

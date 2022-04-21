@@ -1,0 +1,245 @@
+From 157c77620de26eea0b69d8c9addfa35142bc190f Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 24 Feb 2021 15:13:05 +0800
+Subject: [PATCH] media: rockchip: isp and ispp add shutdown
+
+Change-Id: Iec748f28a6662c104b66a2ab44e0946515061320
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp/csi.c     |  5 ++++-
+ drivers/media/platform/rockchip/isp/hw.c      | 12 ++++++++++++
+ drivers/media/platform/rockchip/isp/hw.h      |  6 +++---
+ drivers/media/platform/rockchip/ispp/common.c |  2 ++
+ drivers/media/platform/rockchip/ispp/fec.c    |  3 ++-
+ drivers/media/platform/rockchip/ispp/hw.c     | 14 ++++++++++++++
+ drivers/media/platform/rockchip/ispp/hw.h     |  1 +
+ drivers/media/platform/rockchip/ispp/stream.c | 17 ++++++++++++-----
+ 8 files changed, 50 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index f67ca02c716c..25ce980f5eec 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -590,7 +590,8 @@ void rkisp_trigger_read_back(struct rkisp_csi_device *csi, u8 dma2frm, u32 mode)
+ 	v4l2_dbg(2, rkisp_debug, &dev->v4l2_dev,
+ 		 "readback frame:%d time:%d 0x%x\n",
+ 		 cur_frame_id, dma2frm + 1, val);
+-	rkisp_write(dev, CSI2RX_CTRL0, val, true);
++	if (!hw->is_shutdown)
++		rkisp_write(dev, CSI2RX_CTRL0, val, true);
+ }
+ 
+ static void rkisp_dev_trigger_handle(struct rkisp_device *dev, u32 cmd)
+@@ -606,6 +607,8 @@ static void rkisp_dev_trigger_handle(struct rkisp_device *dev, u32 cmd)
+ 	spin_lock_irqsave(&hw->rdbk_lock, lock_flags);
+ 	if (cmd == T_CMD_END)
+ 		hw->is_idle = true;
++	if (hw->is_shutdown)
++		hw->is_idle = false;
+ 	if (!hw->is_idle)
+ 		goto end;
+ 	for (i = 0; i < hw->dev_num; i++) {
+diff --git a/drivers/media/platform/rockchip/isp/hw.c b/drivers/media/platform/rockchip/isp/hw.c
+index abe7940777df..494f899bf96f 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -717,6 +717,7 @@ static int rkisp_hw_probe(struct platform_device *pdev)
+ 	hw_dev->is_mi_update = false;
+ 	hw_dev->is_dma_contig = true;
+ 	hw_dev->is_buf_init = false;
++	hw_dev->is_shutdown = false;
+ 	hw_dev->is_mmu = is_iommu_enable(dev);
+ 	ret = of_reserved_mem_device_init(dev);
+ 	if (ret) {
+@@ -748,6 +749,16 @@ static int rkisp_hw_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static void rkisp_hw_shutdown(struct platform_device *pdev)
++{
++	struct rkisp_hw_dev *hw_dev = platform_get_drvdata(pdev);
++
++	hw_dev->is_shutdown = true;
++	if (pm_runtime_active(&pdev->dev))
++		writel(0xffff, hw_dev->base_addr + CIF_IRCL);
++	dev_info(&pdev->dev, "%s\n", __func__);
++}
++
+ static int __maybe_unused rkisp_runtime_suspend(struct device *dev)
+ {
+ 	struct rkisp_hw_dev *hw_dev = dev_get_drvdata(dev);
+@@ -793,6 +804,7 @@ static struct platform_driver rkisp_hw_drv = {
+ 	},
+ 	.probe = rkisp_hw_probe,
+ 	.remove = rkisp_hw_remove,
++	.shutdown = rkisp_hw_shutdown,
+ };
+ 
+ #if IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISP) && IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISPP)
+diff --git a/drivers/media/platform/rockchip/isp/hw.h b/drivers/media/platform/rockchip/isp/hw.h
+index df1356af4d3d..a9490865dd66 100644
+--- a/drivers/media/platform/rockchip/isp/hw.h
++++ b/drivers/media/platform/rockchip/isp/hw.h
+@@ -55,16 +55,16 @@ struct rkisp_hw_dev {
+ 	struct list_head rpt_list;
+ 	struct rkisp_dummy_buffer dummy_buf;
+ 	const struct vb2_mem_ops *mem_ops;
++	u64 iq_feature;
++	bool is_feature_on;
+ 	bool is_dma_contig;
+ 	bool is_mmu;
+ 	bool is_idle;
+ 	bool is_single;
+ 	bool is_mi_update;
+ 	bool is_thunderboot;
+-
+-	bool is_feature_on;
+-	u64 iq_feature;
+ 	bool is_buf_init;
++	bool is_shutdown;
+ };
+ 
+ int rkisp_register_irq(struct rkisp_hw_dev *dev);
+diff --git a/drivers/media/platform/rockchip/ispp/common.c b/drivers/media/platform/rockchip/ispp/common.c
+index a9777aad991f..94ec5c59697b 100644
+--- a/drivers/media/platform/rockchip/ispp/common.c
++++ b/drivers/media/platform/rockchip/ispp/common.c
+@@ -345,6 +345,8 @@ static void rkispp_queue_dmabuf(struct rkispp_hw_dev *hw, struct rkisp_ispp_buf
+ 	spin_lock_irqsave(&hw->buf_lock, lock_flags);
+ 	if (!dbufs)
+ 		hw->is_idle = true;
++	if (hw->is_shutdown)
++		hw->is_idle = false;
+ 	if (dbufs && list_empty(list) && hw->is_idle) {
+ 		/* ispp idle or handle same device */
+ 		buf = dbufs;
+diff --git a/drivers/media/platform/rockchip/ispp/fec.c b/drivers/media/platform/rockchip/ispp/fec.c
+index cc3bfbfbab27..e5f14fa2ae57 100644
+--- a/drivers/media/platform/rockchip/ispp/fec.c
++++ b/drivers/media/platform/rockchip/ispp/fec.c
+@@ -295,7 +295,8 @@ static int fec_running(struct rkispp_fec_dev *fec,
+ 		 RKISPP_FEC_CORE_CTRL, readl(base + RKISPP_FEC_CORE_CTRL),
+ 		 RKISPP_FEC_PIC_SIZE, readl(base + RKISPP_FEC_PIC_SIZE),
+ 		 RKISPP_FEC_MESH_SIZE, readl(base + RKISPP_FEC_MESH_SIZE));
+-	writel(FEC_ST, base + RKISPP_CTRL_STRT);
++	if (!fec->hw->is_shutdown)
++		writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 
+ 	ret = wait_for_completion_timeout(&fec->cmpl, msecs_to_jiffies(300));
+ 	if (!ret) {
+diff --git a/drivers/media/platform/rockchip/ispp/hw.c b/drivers/media/platform/rockchip/ispp/hw.c
+index c68427b8a428..89f21665beaf 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.c
++++ b/drivers/media/platform/rockchip/ispp/hw.c
+@@ -290,6 +290,7 @@ static int rkispp_hw_probe(struct platform_device *pdev)
+ 	hw_dev->is_single = true;
+ 	hw_dev->is_fec_ext = false;
+ 	hw_dev->is_dma_contig = true;
++	hw_dev->is_shutdown = false;
+ 	hw_dev->is_mmu = is_iommu_enable(dev);
+ 	ret = of_reserved_mem_device_init(dev);
+ 	if (ret) {
+@@ -323,6 +324,18 @@ static int rkispp_hw_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static void rkispp_hw_shutdown(struct platform_device *pdev)
++{
++	struct rkispp_hw_dev *hw_dev = platform_get_drvdata(pdev);
++
++	hw_dev->is_shutdown = true;
++	if (pm_runtime_active(&pdev->dev)) {
++		writel(0, hw_dev->base_addr + RKISPP_CTRL_INT_MSK);
++		writel(GLB_SOFT_RST_ALL, hw_dev->base_addr + RKISPP_CTRL_RESET);
++	}
++	dev_info(&pdev->dev, "%s\n", __func__);
++}
++
+ static int __maybe_unused rkispp_runtime_suspend(struct device *dev)
+ {
+ 	struct rkispp_hw_dev *hw_dev = dev_get_drvdata(dev);
+@@ -376,6 +389,7 @@ static struct platform_driver rkispp_hw_drv = {
+ 	},
+ 	.probe = rkispp_hw_probe,
+ 	.remove = rkispp_hw_remove,
++	.shutdown = rkispp_hw_shutdown,
+ };
+ 
+ #if IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISP) && IS_BUILTIN(CONFIG_VIDEO_ROCKCHIP_ISPP)
+diff --git a/drivers/media/platform/rockchip/ispp/hw.h b/drivers/media/platform/rockchip/ispp/hw.h
+index 8600aa019851..089d76a52cf8 100644
+--- a/drivers/media/platform/rockchip/ispp/hw.h
++++ b/drivers/media/platform/rockchip/ispp/hw.h
+@@ -57,5 +57,6 @@ struct rkispp_hw_dev {
+ 	bool is_single;
+ 	bool is_fec_ext;
+ 	bool is_dma_contig;
++	bool is_shutdown;
+ };
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index a0959230c86d..54b115f6ec43 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -2202,7 +2202,8 @@ static void restart_module(struct rkispp_device *dev)
+ 		if (!completion_done(&monitor->fec.cmpl))
+ 			complete(&monitor->fec.cmpl);
+ 	}
+-	writel(val, base + RKISPP_CTRL_STRT);
++	if (!dev->hw_dev->is_shutdown)
++		writel(val, base + RKISPP_CTRL_STRT);
+ 	monitor->is_restart = false;
+ 	monitor->restart_module = 0;
+ end:
+@@ -2233,7 +2234,8 @@ static void restart_monitor(struct work_struct *work)
+ 		if (!(monitor->monitoring_module & m_monitor->module) ||
+ 		    ret || !monitor->is_en)
+ 			continue;
+-
++		if (dev->hw_dev->is_shutdown)
++			break;
+ 		v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 			 "module:0x%x wait %ldms timeout ret:%d, monitoring:0x%x\n",
+ 			 m_monitor->module, time, ret, monitor->monitoring_module);
+@@ -2420,7 +2422,8 @@ static void fec_work_event(struct rkispp_device *dev,
+ 			reg_buf->reg_size = offset;
+ 		}
+ 
+-		writel(FEC_ST, base + RKISPP_CTRL_STRT);
++		if (!dev->hw_dev->is_shutdown)
++			writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->fec.is_end = false;
+ 	}
+ restart_unlock:
+@@ -2661,7 +2664,7 @@ static void nr_work_event(struct rkispp_device *dev,
+ 			reg_buf->reg_size = offset;
+ 		}
+ 
+-		if (!is_quick)
++		if (!is_quick && !dev->hw_dev->is_shutdown)
+ 			writel(NR_SHP_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->nr.is_end = false;
+ 	}
+@@ -2920,7 +2923,8 @@ static void tnr_work_event(struct rkispp_device *dev,
+ 			reg_buf->reg_size = offset;
+ 		}
+ 
+-		writel(TNR_ST, base + RKISPP_CTRL_STRT);
++		if (!dev->hw_dev->is_shutdown)
++			writel(TNR_ST, base + RKISPP_CTRL_STRT);
+ 		vdev->tnr.is_end = false;
+ 	}
+ 
+@@ -3046,6 +3050,9 @@ void rkispp_module_work_event(struct rkispp_device *dev,
+ {
+ 	bool is_fec_en = (dev->stream_vdev.module_ens & ISPP_MODULE_FEC);
+ 
++	if (dev->hw_dev->is_shutdown)
++		return;
++
+ 	if (dev->ispp_sdev.state != ISPP_STOP) {
+ 		if (module & ISPP_MODULE_TNR)
+ 			tnr_work_event(dev, buf_rd, buf_wr, is_isr);
+-- 
+2.35.3
+

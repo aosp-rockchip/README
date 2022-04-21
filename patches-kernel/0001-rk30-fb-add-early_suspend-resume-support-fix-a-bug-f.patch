@@ -1,0 +1,456 @@
+From 6273a1f4448cc838727085aa64df0c11059883fb Mon Sep 17 00:00:00 2001
+From: yxj <yxj@rock-chips.com>
+Date: Sat, 31 Mar 2012 12:43:04 +0800
+Subject: [PATCH] rk30 fb: add early_suspend/resume support,fix a bug for sync
+
+	 when set a new frame buffer addr for MST register ,we must
+	 wait until the lcdc start display this frame before we
+	 return,otherwise this buffer may be override by android
+---
+ arch/arm/mach-rk30/board-rk30-sdk.c      |  16 ++-
+ drivers/video/rockchip/chips/rk30_lcdc.c |  28 +++--
+ drivers/video/rockchip/chips/rk30_lcdc.h |  30 ++++-
+ drivers/video/rockchip/rk_fb.c           |  50 +++++++-
+ include/linux/rk_fb.h                    |   9 +-
+ include/linux/rk_screen.h                | 150 +++++++++++++++++++++++
+ 6 files changed, 256 insertions(+), 27 deletions(-)
+ create mode 100644 include/linux/rk_screen.h
+
+diff --git a/arch/arm/mach-rk30/board-rk30-sdk.c b/arch/arm/mach-rk30/board-rk30-sdk.c
+index 13476de14966..245c840dc6b4 100755
+--- a/arch/arm/mach-rk30/board-rk30-sdk.c
++++ b/arch/arm/mach-rk30/board-rk30-sdk.c
+@@ -604,8 +604,22 @@ static int rk_fb_io_init(void)
+ 	}
+ 	return 0;
+ }
+-static struct rk29lcd_info rk_fb_info = {
++static int rk_fb_io_disable(void)
++{
++	gpio_set_value(LCD_EN_PIN, ~LCD_EN_VALUE);
++	return 0;
++}
++static int rk_fb_io_enable(void)
++{
++	gpio_set_value(LCD_EN_PIN, LCD_EN_VALUE);
++	return 0;
++}
++
++
++static struct rk29fb_info rk_fb_info = {
+ 	.io_init   = rk_fb_io_init,
++	.io_disable = rk_fb_io_disable,
++	.io_enable = rk_fb_io_enable,
+ };
+ 
+ static struct resource resource_fb[] = {
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.c b/drivers/video/rockchip/chips/rk30_lcdc.c
+index 13d1c6bace46..0e83c7c7aaef 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.c
++++ b/drivers/video/rockchip/chips/rk30_lcdc.c
+@@ -31,9 +31,6 @@
+ #include <linux/fb.h>
+ #include <asm/div64.h>
+ #include <asm/uaccess.h>
+-
+-#include <mach/board.h>
+-#include "../../display/screen/screen.h"
+ #include <linux/rk_fb.h>
+ #include "rk30_lcdc.h"
+ 
+@@ -75,7 +72,7 @@ static int init_rk30_lcdc(struct rk30_lcdc_device *lcdc_dev)
+ 	LcdSetBit(lcdc_dev,DSP_CTRL0, m_LCDC_AXICLK_AUTO_ENABLE);//eanble axi-clk auto gating for low power
+ 	LcdMskReg(lcdc_dev,INT_STATUS,m_FRM_START_INT_CLEAR | m_BUS_ERR_INT_CLEAR | m_LINE_FLAG_INT_EN |
+               m_FRM_START_INT_EN | m_HOR_START_INT_EN,v_FRM_START_INT_CLEAR(1) | v_BUS_ERR_INT_CLEAR(0) |
+-              v_LINE_FLAG_INT_EN(0) | v_FRM_START_INT_EN(1) | v_HOR_START_INT_EN(0));
++              v_LINE_FLAG_INT_EN(0) | v_FRM_START_INT_EN(1) | v_HOR_START_INT_EN(0));  //enable frame start interrupt for sync
+ 	LcdWrReg(lcdc_dev, REG_CFG_DONE, 0x01);  // write any value to  REG_CFG_DONE let config become effective
+ 	return 0;
+ }
+@@ -318,7 +315,10 @@ static  int win0_set_par(struct rk30_lcdc_device *lcdc_dev,rk_screen *screen,
+ 	struct layer_par *par )
+ {
+     u32 xact, yact, xvir, yvir, xpos, ypos;
+-    u32 ScaleYrgbX,ScaleYrgbY, ScaleCbrX, ScaleCbrY;
++    u32 ScaleYrgbX = 0x1000;
++    u32 ScaleYrgbY = 0x1000;
++    u32 ScaleCbrX = 0x1000;
++    u32 ScaleCbrY = 0x1000;
+     
+     xact = par->xact;			    //active (origin) picture window width/height		
+     yact = par->yact;
+@@ -488,7 +488,6 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		printk(KERN_ERR "screen is null!\n");
+ 		return -ENOENT;	
+ 	}
+-	wait_for_completion(&dev_drv->frame_done);
+ 	if(layer_id==0)
+ 	{
+ 		par = &(dev_drv->layer_par[0]);
+@@ -499,7 +498,7 @@ int rk30_lcdc_pan_display(struct rk_lcdc_device_driver * dev_drv,int layer_id)
+ 		par = &(dev_drv->layer_par[1]);
+         	win1_display(lcdc_dev,par);
+ 	}
+-	INIT_COMPLETION(dev_drv->frame_done);
++	wait_for_completion(&dev_drv->frame_done);
+ 	
+     return 0;
+ }
+@@ -524,16 +523,19 @@ int rk30_lcdc_ioctl(struct rk_lcdc_device_driver * dev_drv,unsigned int cmd, uns
+    return 0;
+ }
+ 
+-int rk30_lcdc_suspend(struct layer_par *layer_par)
++int rk30_lcdc_suspend(struct rk_lcdc_device_driver *dev_drv)
+ {
+-    return 0;
++	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
++	LcdMskReg(lcdc_dev, SYS_CTRL0,m_LCDC_STANDBY,v_LCDC_STANDBY(1));
++	return 0;
+ }
+ 
+ 
+-int rk30_lcdc_resume(struct layer_par *layer_par)
++int rk30_lcdc_resume(struct rk_lcdc_device_driver *dev_drv)
+ {  
+-    
+-    return 0;
++	struct rk30_lcdc_device *lcdc_dev = container_of(dev_drv,struct rk30_lcdc_device,driver);
++	LcdMskReg(lcdc_dev, SYS_CTRL0,m_LCDC_STANDBY,v_LCDC_STANDBY(0));
++    	return 0;
+ }
+ 
+ static irqreturn_t rk30_lcdc_isr(int irq, void *dev_id)
+@@ -541,7 +543,7 @@ static irqreturn_t rk30_lcdc_isr(int irq, void *dev_id)
+ 	struct rk30_lcdc_device *lcdc_dev = (struct rk30_lcdc_device *)dev_id;
+ 	LcdMskReg(lcdc_dev, INT_STATUS, m_FRM_START_INT_CLEAR, v_FRM_START_INT_CLEAR(1));
+ 	//LcdMskReg(lcdc_dev, INT_STATUS, m_LINE_FLAG_INT_CLEAR, v_LINE_FLAG_INT_CLEAR(1));
+-	complete_all(&(lcdc_dev->driver.frame_done));
++	complete(&(lcdc_dev->driver.frame_done));
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/video/rockchip/chips/rk30_lcdc.h b/drivers/video/rockchip/chips/rk30_lcdc.h
+index 2e48095ddabd..286f9e40e14d 100644
+--- a/drivers/video/rockchip/chips/rk30_lcdc.h
++++ b/drivers/video/rockchip/chips/rk30_lcdc.h
+@@ -76,19 +76,39 @@ typedef volatile struct tagLCDC_REG
+ 
+ #define m_LCDC_DMA_STOP              (1<<0)
+ #define m_LCDC_STANDBY               (1<<1)
+-#define m_HWC_RELOAD_EN         	 (1<<2)
+-#define m_W0_AXI_OUTSTANDING_DISABLE (1<<3)
++#define m_HWC_RELOAD_EN               (1<<2)
++#define m_W0_AXI_OUTSTANDING_DISABLE (1<<3) 
+ #define m_W1_AXI_OUTSTANDING_DISABLE (1<<4)
+ #define m_W2_AXI_OUTSTANDING_DISABLE (1<<5)
+-#define m_DMA_BURST_LENGTH			 (3<<6)
++#define m_DMA_BURST_LENGTH	      (3<<6)
++#define m_WIN0_YRGB_CHANNEL0_ID	      ((0x07)<<8)
++#define m_WIN0_CBR_CHANNEL0_ID	      ((0x07)<<11)
++#define m_WIN0_YRGB_CHANNEL1_ID	      ((0x07)<<14)
++#define m_WIN0_CBR_CHANNEL1_ID	      ((0x07)<<17)
++#define m_WIN1_YRGB_CHANNEL_ID	      ((0x07)<<20)
++#define m_WIN1_CBR_CHANNEL_ID	      ((0x07)<<23)
++#define m_WIN2_CHANNEL_ID	      ((0x07)<<26)
++#define m_HWC_CHANNEL_ID	      ((0x07)<<29)
++
++
++
++
+ 
+ #define v_LCDC_DMA_STOP(x)              (((x)&1)<<0)
+ #define v_LCDC_STANDBY(x)              (((x)&1)<<1)
+-#define v_HWC_RELOAD_EN(x)         	    (((x)&1)<<2)
++#define v_HWC_RELOAD_EN(x)             (((x)&1)<<2)
+ #define v_W0_AXI_OUTSTANDING_DISABLE(x) (((x)&1)<<3)
+ #define v_W1_AXI_OUTSTANDING_DISABLE(x) (((x)&1)<<4)
+ #define v_W2_AXI_OUTSTANDING_DISABLE(x) (((x)&1)<<5)
+-#define v_DMA_BURST_LENGTH(x)			 (((x)&3)<<6)
++#define v_DMA_BURST_LENGTH(x)		(((x)&3)<<6)
++#define v_WIN0_YRGB_CHANNEL0_ID(x)	(((x)&7)<<8)
++#define v_WIN0_CBR_CHANNEL0_ID(x)	(((x)&7)<<11)
++#define v_WIN0_YRGB_CHANNEL1_ID(x)      (((x)&7)<<14)
++#define v_WIN0_CBR_CHANNEL1_ID(x)	(((x)&7)<<17)
++#define v_WIN1_YRGB_CHANNEL_ID(x)	(((x)&7)<<20)
++#define v_WIN1_CBR_CHANNEL_ID(x)	(((x)&7)<<23)
++#define v_WIN2_CHANNEL_ID(x)	        (((x)&7)<<26)
++#define v_HWC_CHANNEL_ID(x)	        (((x)&7)<<29)
+ 
+ 
+ 
+diff --git a/drivers/video/rockchip/rk_fb.c b/drivers/video/rockchip/rk_fb.c
+index abd811ab368f..511b53027e6c 100644
+--- a/drivers/video/rockchip/rk_fb.c
++++ b/drivers/video/rockchip/rk_fb.c
+@@ -28,8 +28,6 @@
+ #include <linux/earlysuspend.h>
+ #include <asm/div64.h>
+ #include <asm/uaccess.h>
+-#include <mach/board.h>
+-#include "../display/screen/screen.h"
+ #include<linux/rk_fb.h>
+ 
+ 
+@@ -737,13 +735,49 @@ int init_lcdc_device_driver(struct rk_lcdc_device_driver *def_drv,
+ 	
+ 	return 0;
+ }
++
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++struct suspend_info {
++	struct early_suspend early_suspend;
++	struct rk_fb_inf *inf;
++};
++
++static void rkfb_early_suspend(struct early_suspend *h)
++{
++	struct suspend_info *info = container_of(h, struct suspend_info,
++						early_suspend);
++	struct rk_fb_inf *inf = info->inf;
++   	inf->lcd_info->io_disable();
++	inf->lcdc_dev_drv[0]->suspend(inf->lcdc_dev_drv[0]);
++	inf->lcdc_dev_drv[1]->suspend(inf->lcdc_dev_drv[1]);
++}
++static void rkfb_early_resume(struct early_suspend *h)
++{
++	struct suspend_info *info = container_of(h, struct suspend_info,
++						early_suspend);
++	struct rk_fb_inf *inf = info->inf;
++   	inf->lcd_info->io_enable();
++	inf->lcdc_dev_drv[0]->resume(inf->lcdc_dev_drv[0]);
++	inf->lcdc_dev_drv[1]->resume(inf->lcdc_dev_drv[1]);
++
++}
++
++
++
++static struct suspend_info suspend_info = {
++	.early_suspend.suspend = rkfb_early_suspend,
++	.early_suspend.resume = rkfb_early_resume,
++	.early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB,
++};
++#endif
++
+ static int __devinit rk_fb_probe (struct platform_device *pdev)
+ {
+ 	struct rk_fb_inf *fb_inf = NULL;
+-	struct rk29lcd_info *lcd_info = NULL;
++	struct rk29fb_info * lcd_info = NULL;
+ 	int ret = 0;
+ 	g_fb_pdev=pdev;
+-	lcd_info =  pdev->dev.platform_data;
+     	/* Malloc rk_fb_inf and set it to pdev for drvdata */
+ 	fb_inf = kzalloc(sizeof(struct rk_fb_inf), GFP_KERNEL);
+ 	if(!fb_inf)
+@@ -752,8 +786,14 @@ static int __devinit rk_fb_probe (struct platform_device *pdev)
+         	ret = -ENOMEM;
+     	}
+ 	platform_set_drvdata(pdev,fb_inf);
++	lcd_info =  pdev->dev.platform_data;
++	fb_inf->lcd_info = lcd_info;
+ 	if(lcd_info->io_init)
+-		lcd_info->io_init();
++		lcd_info->io_init(NULL);
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	suspend_info.inf = fb_inf;
++	register_early_suspend(&suspend_info.early_suspend);
++#endif
+ 	printk("rk fb probe ok!\n");
+     return 0;
+ }
+diff --git a/include/linux/rk_fb.h b/include/linux/rk_fb.h
+index e1a3ee3452ae..421cdc47e5b5 100644
+--- a/include/linux/rk_fb.h
++++ b/include/linux/rk_fb.h
+@@ -16,8 +16,10 @@
+ #ifndef __ARCH_ARM_MACH_RK30_FB_H
+ #define __ARCH_ARM_MACH_RK30_FB_H
+ 
+-
+ #include<linux/completion.h>
++#include <mach/board.h>
++#include<linux/rk_screen.h>
++
+ 
+ #define RK30_MAX_LCDC_SUPPORT	4
+ #define RK30_MAX_LAYER_SUPPORT	4
+@@ -190,8 +192,8 @@ struct rk_lcdc_device_driver{
+ 	struct completion  frame_done;
+ 	
+ 	int (*ioctl)(struct rk_lcdc_device_driver *dev_drv, unsigned int cmd,unsigned long arg,int layer_id);
+-	int (*suspend)(struct layer_par *layer_par);
+-	int (*resume)(struct layer_par *layer_par);
++	int (*suspend)(struct rk_lcdc_device_driver *dev_drv);
++	int (*resume)(struct rk_lcdc_device_driver *dev_drv);
+ 	int (*blank)(struct rk_lcdc_device_driver *dev_drv,int layer_id,int blank_mode);
+ 	int (*set_par)(struct rk_lcdc_device_driver *dev_drv,int layer_id);
+ 	int (*pan_display)(struct rk_lcdc_device_driver *dev_drv,int layer_id);
+@@ -201,6 +203,7 @@ struct rk_lcdc_device_driver{
+ };
+ 
+ struct rk_fb_inf {
++    struct rk29fb_info * lcd_info;     //lcd io control info
+     struct fb_info *fb[RK_MAX_FB_SUPPORT];
+     int num_fb;
+     
+diff --git a/include/linux/rk_screen.h b/include/linux/rk_screen.h
+new file mode 100644
+index 000000000000..5096d7cda698
+--- /dev/null
++++ b/include/linux/rk_screen.h
+@@ -0,0 +1,150 @@
++#ifndef _SCREEN_H
++#define _SCREEN_H
++#include <mach/board.h>
++
++#ifdef CONFIG_HDMI_DUAL_DISP
++/* Scaler PLL CONFIG */
++#define S_PLL_NO_1	0
++#define S_PLL_NO_2	1
++#define S_PLL_NO_4	2
++#define S_PLL_NO_8	3
++#define S_PLL_M(x)  (((x)&0xff)<<8)
++#define S_PLL_N(x)  (((x)&0xf)<<4)
++#define S_PLL_NO(x) ((S_PLL_NO_##x)&0x3)
++
++enum{
++    HDMI_RATE_148500000,
++    HDMI_RATE_74250000,
++    HDMI_RATE_27000000,
++};
++/*     Scaler   clk setting */
++#define SCALE_PLL(_parent_rate,_rate,_m,_n,_no) \
++        HDMI_RATE_ ## _parent_rate ##_S_RATE_ ## _rate \
++        =  S_PLL_M(_m) | S_PLL_N(_n) | S_PLL_NO(_no)    
++#define SCALE_RATE(_parent_rate , _rate) \
++        (HDMI_RATE_ ## _parent_rate ## _S_RATE_ ## _rate)
++        
++enum{
++    SCALE_PLL(148500000,    66000000,   16, 9,  4),
++    SCALE_PLL(148500000,    54000000,   16, 11, 4),
++    SCALE_PLL(148500000,    33000000,   16, 9,  8),
++    SCALE_PLL(148500000,    30375000,   18, 11, 8),
++    SCALE_PLL(148500000,    29700000,   16, 10, 8),
++    SCALE_PLL(148500000,    25312500,   15, 11, 8),
++
++    SCALE_PLL(74250000,     66000000,   32, 9,  4),
++    SCALE_PLL(74250000,     54000000,   32, 11, 4),
++    SCALE_PLL(74250000,     33000000,   32, 9,  8),
++    SCALE_PLL(74250000,     30375000,   36, 11, 8),
++    SCALE_PLL(74250000,     25312500,   30, 11, 8),
++
++    SCALE_PLL(27000000,     31500000,   28, 3,  8),
++    SCALE_PLL(27000000,     30000000,   80, 9,  8),
++};
++#endif
++typedef enum _SCREEN_TYPE {
++    SCREEN_NULL = 0,
++    SCREEN_RGB,
++    SCREEN_LVDS,
++	SCREEN_MCU,
++    SCREEN_TVOUT,
++    SCREEN_HDMI,
++} SCREEN_TYPE;
++
++typedef enum _REFRESH_STAGE {
++    REFRESH_PRE = 0,
++    REFRESH_END,
++
++} REFRESH_STAGE;
++
++
++typedef enum _MCU_IOCTL {
++    MCU_WRCMD = 0,
++    MCU_WRDATA,
++    MCU_SETBYPASS,
++
++} MCU_IOCTL;
++
++
++typedef enum _MCU_STATUS {
++    MS_IDLE = 0,
++    MS_MCU,
++    MS_EBOOK,
++    MS_EWAITSTART,
++    MS_EWAITEND,
++    MS_EEND,
++
++} MCU_STATUS;
++
++
++
++/* Screen description */
++typedef struct rk29fb_screen {
++    /* screen type & hardware connect format & out face */
++    u16 type;
++    u16 hw_format;
++    u16 face;
++
++	/* Screen size */
++	u16 x_res;
++	u16 y_res;
++    u16 width;
++    u16 height;
++
++    u32 mode;
++    /* Timing */
++	u32 pixclock;
++	u16 left_margin;
++	u16 right_margin;
++	u16 hsync_len;
++	u16 upper_margin;
++	u16 lower_margin;
++	u16 vsync_len;
++#ifdef CONFIG_HDMI_DUAL_DISP
++    /* Scaler mode Timing */
++	u32 s_pixclock;
++	u16 s_left_margin;
++	u16 s_right_margin;
++	u16 s_hsync_len;
++	u16 s_upper_margin;
++	u16 s_lower_margin;
++	u16 s_vsync_len; 
++	u16 s_hsync_st;
++	u16 s_vsync_st;
++#endif
++	u8 hdmi_resolution;
++    /* mcu need */
++	u8 mcu_wrperiod;
++    u8 mcu_usefmk;
++    u8 mcu_frmrate;
++
++	/* Pin polarity */
++	u8 pin_hsync;
++	u8 pin_vsync;
++	u8 pin_den;
++	u8 pin_dclk;
++    u32 lcdc_aclk;
++	u8 pin_dispon;
++
++	/* Swap rule */
++    u8 swap_rb;
++    u8 swap_rg;
++    u8 swap_gb;
++    u8 swap_delta;
++    u8 swap_dumy;
++
++    /* Operation function*/
++    int (*init)(void);
++    int (*standby)(u8 enable);
++    int (*refresh)(u8 arg);
++    int (*scandir)(u16 dir);
++    int (*disparea)(u8 area);
++    int (*sscreen_get)(struct rk29fb_screen *screen, u8 resolution);
++    int (*sscreen_set)(struct rk29fb_screen *screen, bool type);// 1: use scaler 0:bypass
++} rk_screen;
++
++extern void set_lcd_info(struct rk29fb_screen *screen, struct rk29lcd_info *lcd_info);
++extern void set_tv_info(struct rk29fb_screen *screen);
++extern void set_hdmi_info(struct rk29fb_screen *screen);
++
++#endif
+-- 
+2.35.3
+

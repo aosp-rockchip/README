@@ -1,0 +1,499 @@
+From 5cf8f634b46e86da62423fa36d40abe28f436cbd Mon Sep 17 00:00:00 2001
+From: zyh <zyh@rock-chips.com>
+Date: Thu, 17 Apr 2014 17:30:48 +0800
+Subject: [PATCH] rk3288:enable-disable camera clk dynamically to reduce
+ consumption
+
+---
+ arch/arm/boot/dts/rk3288.dtsi                 |   6 +-
+ drivers/media/video/rk_camsys/camsys_cif.c    | 218 ++++++++++--------
+ .../media/video/rk_camsys/camsys_internal.h   |   4 +-
+ drivers/media/video/rk_camsys/camsys_marvin.c |  44 ++--
+ 4 files changed, 145 insertions(+), 127 deletions(-)
+
+diff --git a/arch/arm/boot/dts/rk3288.dtsi b/arch/arm/boot/dts/rk3288.dtsi
+index cfa032626d43..680af0815de1 100755
+--- a/arch/arm/boot/dts/rk3288.dtsi
++++ b/arch/arm/boot/dts/rk3288.dtsi
+@@ -728,7 +728,7 @@
+ 		interrupts = <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>;
+ 		clocks = <&clk_edp>, <&clk_edp_24m>, <&clk_gates16 8>;
+ 		clock-names = "clk_edp", "clk_edp_24m", "pclk_edp";
+-        };
++		};
+ 	
+ 	hdmi: hdmi@ff980000 {
+                 compatible = "rockchip,rk3288-hdmi";
+@@ -1185,8 +1185,8 @@
+ 	        compatible = "rockchip,isp";
+ 	        reg = <0xff910000 0x10000>;
+ 	        interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
+-	        clocks = <&clk_gates16 2>, <&clk_gates16 1>, <&clk_isp>, <&clk_isp_jpe>, <&clkin_isp>, <&clk_cif_out>,<&clk_gates5 15>;
+-			clock-names = "aclk_isp", "hclk_isp", "clk_isp", "clk_isp_jpe", "pclkin_isp", "clk_vipout","clk_mipi_24m";
++	        clocks = <&clk_gates16 2>, <&clk_gates16 1>, <&clk_isp>, <&clk_isp_jpe>, <&clkin_isp>, <&clk_cif_out>,<&clk_gates5 15>,<&clk_cif_pll>,<&pd_isp>;
++			clock-names = "aclk_isp", "hclk_isp", "clk_isp", "clk_isp_jpe", "pclkin_isp", "clk_vipout","clk_mipi_24m","cif0_out_div","pd_isp";
+ 			pinctrl-names = "default", "isp_dvp8bit","isp_dvp10bit","isp_dvp12bit";
+ 			pinctrl-0 = <&isp_mipi>;
+ 			pinctrl-1 = <&isp_mipi &isp_dvp_sync_d2d9>;
+diff --git a/drivers/media/video/rk_camsys/camsys_cif.c b/drivers/media/video/rk_camsys/camsys_cif.c
+index 96e596482230..fb75953b3fb5 100755
+--- a/drivers/media/video/rk_camsys/camsys_cif.c
++++ b/drivers/media/video/rk_camsys/camsys_cif.c
+@@ -5,94 +5,104 @@ static const char miscdev_cif1_name[] = CAMSYS_CIF1_DEVNAME;
+ 
+ static int camsys_cif_iomux_cb(camsys_extdev_t *extdev,void *ptr)
+ {
+-    unsigned int cif_index;
+-    camsys_dev_t *camsys_dev = (camsys_dev_t*)ptr;
++    unsigned int cif_vol_sel;
++#if 0    
++    if (extdev->dev_cfg & CAMSYS_DEVCFG_FLASHLIGHT) {
++        iomux_set(ISP_FLASH_TRIG);  
++        if (extdev->fl.fl.io != 0xffffffff) {
++            iomux_set(ISP_FL_TRIG);
++        }
++    } 
+ 
+-    if (strcmp(dev_name(camsys_dev->miscdev.this_device), CAMSYS_CIF1_DEVNAME)==0) {
+-        cif_index = 1;
+-    } else {
+-        cif_index = 0;
++    if (extdev->dev_cfg & CAMSYS_DEVCFG_PREFLASHLIGHT) {
++        iomux_set(ISP_PRELIGHT_TRIG);
+     }
+     
+-#if defined(CONFIG_ARCH_RK3066B) || defined(CONFIG_ARCH_RK3188)
+-    switch(cif_index){
+-        case 0:
+-        {
+-		    iomux_set(CIF0_CLKOUT);
+-            write_grf_reg(GRF_IO_CON3, (CIF_DRIVER_STRENGTH_MASK|CIF_DRIVER_STRENGTH_8MA));
+-            write_grf_reg(GRF_IO_CON4, (CIF_CLKOUT_AMP_MASK|CIF_CLKOUT_AMP_1V8));            
+-            break;
+-        }
+-        default:
+-            camsys_err("Cif index(%d) is invalidate!!!\n",cif_index);
+-            break;
++    if (extdev->dev_cfg & CAMSYS_DEVCFG_SHUTTER) {
++        iomux_set(ISP_SHUTTER_OPEN);
++        iomux_set(ISP_SHUTTER_TRIG);
+     }
+-#elif defined(CONFIG_ARCH_RK30)
+-    switch(cif_index){
+-        case 0:
+-        {
+-            rk30_mux_api_set(GPIO1B3_CIF0CLKOUT_NAME, GPIO1B_CIF0_CLKOUT);            
+-            break;
++
++    iomux_set(CIF0_CLKOUT);
++#endif
++
++    struct pinctrl      *pinctrl;
++    struct pinctrl_state    *state;
++    int retval = 0;
++    char state_str[20] = {0};
++
++    struct device *dev = &(extdev->pdev->dev);
++    
++    if (extdev->phy.type == CamSys_Phy_Cif) {
++        if ((extdev->phy.info.cif.fmt >= CamSys_Fmt_Raw_8b)&& (extdev->phy.info.cif.fmt <= CamSys_Fmt_Raw_12b)) {
++
++           strcpy(state_str,"isp_dvp8bit");
++
+         }
+-        case 1:
+-        {
+-            rk30_mux_api_set(GPIO1C0_CIF1DATA2_RMIICLKOUT_RMIICLKIN_NAME,GPIO1C_CIF1_DATA2);
+-            rk30_mux_api_set(GPIO1C1_CIFDATA3_RMIITXEN_NAME,GPIO1C_CIF_DATA3);
+-            rk30_mux_api_set(GPIO1C2_CIF1DATA4_RMIITXD1_NAME,GPIO1C_CIF1_DATA4);
+-            rk30_mux_api_set(GPIO1C3_CIFDATA5_RMIITXD0_NAME,GPIO1C_CIF_DATA5);
+-            rk30_mux_api_set(GPIO1C4_CIFDATA6_RMIIRXERR_NAME,GPIO1C_CIF_DATA6);
+-            rk30_mux_api_set(GPIO1C5_CIFDATA7_RMIICRSDVALID_NAME,GPIO1C_CIF_DATA7);
+-            rk30_mux_api_set(GPIO1C6_CIFDATA8_RMIIRXD1_NAME,GPIO1C_CIF_DATA8);
+-            rk30_mux_api_set(GPIO1C7_CIFDATA9_RMIIRXD0_NAME,GPIO1C_CIF_DATA9);
+-            
+-            rk30_mux_api_set(GPIO1D0_CIF1VSYNC_MIIMD_NAME,GPIO1D_CIF1_VSYNC);
+-            rk30_mux_api_set(GPIO1D1_CIF1HREF_MIIMDCLK_NAME,GPIO1D_CIF1_HREF);
+-            rk30_mux_api_set(GPIO1D2_CIF1CLKIN_NAME,GPIO1D_CIF1_CLKIN);
+-            rk30_mux_api_set(GPIO1D3_CIF1DATA0_NAME,GPIO1D_CIF1_DATA0);
+-            rk30_mux_api_set(GPIO1D4_CIF1DATA1_NAME,GPIO1D_CIF1_DATA1);
+-            rk30_mux_api_set(GPIO1D5_CIF1DATA10_NAME,GPIO1D_CIF1_DATA10);
+-            rk30_mux_api_set(GPIO1D6_CIF1DATA11_NAME,GPIO1D_CIF1_DATA11);
+-            rk30_mux_api_set(GPIO1D7_CIF1CLKOUT_NAME,GPIO1D_CIF1_CLKOUT);
+-            break;
++
++        if ((extdev->phy.info.cif.fmt >= CamSys_Fmt_Raw_10b)&& (extdev->phy.info.cif.fmt <= CamSys_Fmt_Raw_12b)) {
++           strcpy(state_str,"isp_dvp10bit");
+         }
+-        default:
+-            camsys_err("Cif index(%d) is invalidate!!!\n", cif_index);
+-            break;
++
++        if (extdev->phy.info.cif.fmt == CamSys_Fmt_Raw_12b) {
++           strcpy(state_str,"isp_dvp12bit");
++
+         }
+-#elif defined(CONFIG_ARCH_RK319X)
+-    switch(cif_index){
+-        case 0:
+-        {
+-            unsigned int cif_vol_sel;
+-            //set cif vol domain
+-            cif_vol_sel = __raw_readl(RK30_GRF_BASE+0x018c);
+-        	__raw_writel( (cif_vol_sel |0x20002),RK30_GRF_BASE+0x018c);
+-            //set driver strength
+-        	__raw_writel(0xffffffff, RK30_GRF_BASE+0x01dc);
+-        	
+-            iomux_set(CIF0_CLKOUT);
+-            iomux_set(CIF0_CLKIN);
+-            iomux_set(CIF0_HREF);
+-            iomux_set(CIF0_VSYNC);
+-            iomux_set(CIF0_D0);
+-            iomux_set(CIF0_D1);
+-            iomux_set(CIF0_D2);
+-            iomux_set(CIF0_D3);
+-            iomux_set(CIF0_D4);
+-            iomux_set(CIF0_D5);
+-            iomux_set(CIF0_D6);
+-            iomux_set(CIF0_D7);
+-            iomux_set(CIF0_D8);
+-            iomux_set(CIF0_D9);
+-            camsys_trace(1, "%s cif iomux success\n",dev_name(camsys_dev->miscdev.this_device));
+-            break;
++    }else{
++           strcpy(state_str,"default");
++    }
++
++    //mux CIF0_CLKOUT
++
++    pinctrl = devm_pinctrl_get(dev);
++    if (IS_ERR(pinctrl)) {
++        camsys_err("%s:Get pinctrl failed!\n",__func__);
++        return -1;
++    }
++    state = pinctrl_lookup_state(pinctrl,
++                         state_str);
++    if (IS_ERR(state)){
++        dev_err(dev, "%s:could not get %s pinstate\n",__func__,state_str);
++        return -1;
+         }
+-        case 1:
+-        default:
+-            camsys_err("Cif index(%d) is invalidate!!!\n", cif_index);
+-            break;
++
++    if (!IS_ERR(state)) {
++        retval = pinctrl_select_state(pinctrl, state);
++        if (retval){
++            dev_err(dev,
++                "%s:could not set %s pins\n",__func__,state_str);
++                return -1;
++
++                }
++    }
++
++    //set 1.8v vol domain for rk32
++    __raw_writel(((1<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);
++   __raw_writel(0xffffffff, RK_GRF_VIRT+0x01d4);   
++
++    //set cif vol domain
++    if (extdev->phy.type == CamSys_Phy_Cif) {
++
++        #if 0
++        if (!IS_ERR_OR_NULL(extdev->dovdd.ldo)) {
++            if (extdev->dovdd.max_uv >= 25000000) {
++                __raw_writel(((1<<1)|(1<<(1+16))),RK30_GRF_BASE+0x018c);
++            } else {
++                __raw_writel((1<<(1+16)),RK30_GRF_BASE+0x018c);
++            }
++        } else {
++            __raw_writel(((1<<1)|(1<<(1+16))),RK30_GRF_BASE+0x018c);
+         }
+-#endif
++        #else
++
++        //set 1.8v vol domain
++        __raw_writel(((1<<1)|(1<<(1+16))),RK_GRF_VIRT+0x0380);
++        #endif
++        
++        //set driver strength
++      //  __raw_writel(0xffffffff, RK_GRF_VIRT+0x01dc);   
++    }
++    
+                 
+     return 0;
+ }
+@@ -103,18 +113,16 @@ static int camsys_cif_clkin_cb(void *ptr, unsigned int on)
+     
+     spin_lock(&clk->lock);
+     if (on && !clk->in_on) {        
+-        clk_enable(clk->pd_cif);
+-        clk_enable(clk->aclk_cif);
+-    	clk_enable(clk->hclk_cif);
+-    	clk_enable(clk->cif_clk_in);
++        clk_prepare_enable(clk->aclk_cif);
++    	clk_prepare_enable(clk->hclk_cif);
++    	clk_prepare_enable(clk->cif_clk_in);
+     	
+         clk->in_on = true;
+         camsys_trace(1, "%s clock in turn on",dev_name(camsys_dev->miscdev.this_device));
+     } else if (!on && clk->in_on) {
+-        clk_disable(clk->aclk_cif);
+-    	clk_disable(clk->hclk_cif);
+-    	clk_disable(clk->cif_clk_in);    	
+-    	clk_disable(clk->pd_cif);
++    	clk_disable_unprepare(clk->hclk_cif);
++    	clk_disable_unprepare(clk->cif_clk_in);    	
++    	clk_disable_unprepare(clk->pd_cif);
+         clk->in_on = false;
+         camsys_trace(1, "%s clock in turn off",dev_name(camsys_dev->miscdev.this_device));
+     }
+@@ -122,7 +130,7 @@ static int camsys_cif_clkin_cb(void *ptr, unsigned int on)
+     return 0;
+ }
+ 
+-static int camsys_cif_clkout_cb(void *ptr, unsigned int on)
++static int camsys_cif_clkout_cb(void *ptr, unsigned int on,unsigned int clkin)
+ {
+     camsys_dev_t *camsys_dev = (camsys_dev_t*)ptr;
+     camsys_cif_clk_t *clk = (camsys_cif_clk_t*)camsys_dev->clk;
+@@ -131,8 +139,8 @@ static int camsys_cif_clkout_cb(void *ptr, unsigned int on)
+     
+     spin_lock(&clk->lock);
+     if (on && (clk->out_on != on)) {        
+-        clk_enable(clk->cif_clk_out);
+-        clk_set_rate(clk->cif_clk_out,on);
++        clk_prepare_enable(clk->cif_clk_out);
++        clk_set_rate(clk->cif_clk_out,clkin);
+     	
+         clk->out_on = on;
+         camsys_trace(1, "%s clock out(rate: %dHz) turn on",dev_name(camsys_dev->miscdev.this_device),
+@@ -153,7 +161,7 @@ static int camsys_cif_clkout_cb(void *ptr, unsigned int on)
+         } else {
+             camsys_warn("%s clock out may be not off!", dev_name(camsys_dev->miscdev.this_device));
+         }
+-        clk_disable(clk->cif_clk_out);
++        clk_disable_unprepare(clk->cif_clk_out);
+         clk->out_on = 0;
+ 
+         camsys_trace(1, "%s clock out turn off",dev_name(camsys_dev->miscdev.this_device));
+@@ -217,7 +225,7 @@ static int camsys_cif_remove(struct platform_device *pdev)
+     if (camsys_dev->clk != NULL) {
+         cif_clk = (camsys_cif_clk_t*)camsys_dev->clk;
+         if (cif_clk->out_on) 
+-            camsys_cif_clkout_cb(camsys_dev->clk, 0);
++            camsys_cif_clkout_cb(camsys_dev->clk, 0,0);
+         if (cif_clk->in_on)
+             camsys_cif_clkin_cb(camsys_dev->clk, 0);
+ 
+@@ -260,24 +268,30 @@ int camsys_cif_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+     }
+     
+     if (strcmp(dev_name(&pdev->dev),CAMSYS_PLATFORM_CIF1_NAME) == 0) {
+-        cif_clk->pd_cif = clk_get(NULL, "pd_cif1");
+-        cif_clk->aclk_cif = clk_get(NULL, "aclk_cif1");
+-        cif_clk->hclk_cif = clk_get(NULL, "hclk_cif1");
+-        cif_clk->cif_clk_in = clk_get(NULL, "cif1_in");
+-        cif_clk->cif_clk_out = clk_get(NULL, "cif1_out");
++        cif_clk->aclk_cif = devm_clk_get(&pdev->dev, "g_aclk_vip");
++        cif_clk->hclk_cif = devm_clk_get(&pdev->dev, "g_hclk_vip");
++        cif_clk->cif_clk_in = devm_clk_get(&pdev->dev, "g_pclkin_cif");
++        cif_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_cif_out");
+         spin_lock_init(&cif_clk->lock);
+         cif_clk->in_on = false;
+         cif_clk->out_on = false;
+     } else {           
+-        cif_clk->pd_cif = clk_get(NULL, "pd_cif0");
+-        cif_clk->aclk_cif = clk_get(NULL, "aclk_cif0");
+-        cif_clk->hclk_cif = clk_get(NULL, "hclk_cif0");
+-        cif_clk->cif_clk_in = clk_get(NULL, "pclkin_cif0");
+-        cif_clk->cif_clk_out = clk_get(NULL, "cif0_out");
++        cif_clk->aclk_cif = devm_clk_get(&pdev->dev, "g_aclk_vip");
++        cif_clk->hclk_cif = devm_clk_get(&pdev->dev, "g_hclk_vip");
++        cif_clk->cif_clk_in = devm_clk_get(&pdev->dev, "g_pclkin_ci");
++        cif_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_cif_out");
+         spin_lock_init(&cif_clk->lock);
+         cif_clk->in_on = false;
+         cif_clk->out_on = false;
+     }
++
++ //   clk_prepare_enable(cif_clk->aclk_cif);
++ //   clk_prepare_enable(cif_clk->hclk_cif);
++ //   clk_prepare_enable(cif_clk->cif_clk_in);
++ //   clk_prepare_enable(cif_clk->cif_clk_out);
++
++
++    
+     camsys_dev->clk = (void*)cif_clk;
+     camsys_dev->clkin_cb = camsys_cif_clkin_cb;
+     camsys_dev->clkout_cb = camsys_cif_clkout_cb;
+diff --git a/drivers/media/video/rk_camsys/camsys_internal.h b/drivers/media/video/rk_camsys/camsys_internal.h
+index b901ebc4671e..e652aec383e6 100755
+--- a/drivers/media/video/rk_camsys/camsys_internal.h
++++ b/drivers/media/video/rk_camsys/camsys_internal.h
+@@ -216,7 +216,7 @@ typedef struct camsys_dev_s {
+     struct platform_device *pdev;
+ 
+     int (*clkin_cb)(void *ptr, unsigned int on);
+-    int (*clkout_cb)(void *ptr,unsigned int on);
++    int (*clkout_cb)(void *ptr,unsigned int on,unsigned int clk);
+     int (*reset_cb)(void *ptr);
+     int (*phy_cb) (camsys_extdev_phy_t *phy,void* ptr, unsigned int on);
+     int (*iomux)(camsys_extdev_t *extdev,void *ptr);
+@@ -301,7 +301,7 @@ static inline int camsys_sysctl_extdev(camsys_extdev_t *extdev, camsys_sysctrl_t
+         }
+     } else if (devctl->ops == CamSys_ClkIn) {
+         if (camsys_dev->clkout_cb)
+-            camsys_dev->clkout_cb(camsys_dev, extdev->clk.in_rate);
++            camsys_dev->clkout_cb(camsys_dev,devctl->on,extdev->clk.in_rate);
+         if (camsys_dev->phy_cb)
+             camsys_dev->phy_cb(&extdev->phy, camsys_dev, devctl->on);
+     }
+diff --git a/drivers/media/video/rk_camsys/camsys_marvin.c b/drivers/media/video/rk_camsys/camsys_marvin.c
+index 486b2ffbd6b2..751f749def50 100755
+--- a/drivers/media/video/rk_camsys/camsys_marvin.c
++++ b/drivers/media/video/rk_camsys/camsys_marvin.c
+@@ -121,10 +121,11 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+ {
+     camsys_dev_t *camsys_dev = (camsys_dev_t*)ptr;
+     camsys_mrv_clk_t *clk = (camsys_mrv_clk_t*)camsys_dev->clk;
+-    
+-  //  spin_lock(&clk->lock);
++    struct clk *cif_clk_out_div;
++	//  spin_lock(&clk->lock);
+     if (on && !clk->in_on) {
+-        clk_set_rate(clk->isp,180000000);
++        
++		clk_set_rate(clk->isp,180000000);
+         clk_set_rate(clk->isp_jpe, 180000000);
+    //     clk_set_rate(clk->aclk_isp,24000000);
+    //     clk_set_rate(clk->hclk_isp,24000000);
+@@ -136,7 +137,7 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+         clk_prepare_enable(clk->isp_jpe);
+         clk_prepare_enable(clk->clk_mipi_24m); 
+         clk_prepare_enable(clk->pclkin_isp); 
+-
++		clk_prepare_enable(clk->pd_isp);
+ 
+ 
+  //       clk_enable(clk->pd_isp);
+@@ -160,7 +161,7 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+         clk_disable_unprepare(clk->isp_jpe);
+         clk_disable_unprepare(clk->clk_mipi_24m); 
+         clk_disable_unprepare(clk->pclkin_isp); 
+-
++		clk_disable_unprepare(clk->pd_isp);
+   //      clk_disable(clk->pd_isp);
+   //      clk_disable(clk->aclk_isp);
+    // 	clk_disable(clk->hclk_isp);
+@@ -168,6 +169,7 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+   //  	clk_disable(clk->isp_jpe);
+  //   	clk_disable(clk->pclkin_isp);
+ 
++
+         clk->in_on = false;
+         camsys_trace(1, "%s clock in turn off",dev_name(camsys_dev->miscdev.this_device));
+     }
+@@ -175,7 +177,7 @@ static int camsys_mrv_clkin_cb(void *ptr, unsigned int on)
+     return 0;
+ }
+ 
+-static int camsys_mrv_clkout_cb(void *ptr, unsigned int on)
++static int camsys_mrv_clkout_cb(void *ptr, unsigned int on,unsigned int inclk)
+ {
+     camsys_dev_t *camsys_dev = (camsys_dev_t*)ptr;
+     camsys_mrv_clk_t *clk = (camsys_mrv_clk_t*)camsys_dev->clk;
+@@ -183,18 +185,18 @@ static int camsys_mrv_clkout_cb(void *ptr, unsigned int on)
+     
+     spin_lock(&clk->lock);
+     if (on && (clk->out_on != on)) {  
+-        clk_prepare_enable(clk->cif_clk_out);
+ 
+-//        clk_enable(clk->cif_clk_out);
+-        clk_set_rate(clk->cif_clk_out,on);
+-    	
+-        clk->out_on = on;
++        clk_set_rate(clk->cif_clk_out,inclk);
++        clk_prepare_enable(clk->cif_clk_out);
++        
++		clk->out_on = on;
+         camsys_trace(1, "%s clock out(rate: %dHz) turn on",dev_name(camsys_dev->miscdev.this_device),
+                     clk->out_on);
+     } else if (!on && clk->out_on) {
+         cif_clk_out_div =  clk_get(NULL, "cif0_out_div");
+         if(IS_ERR_OR_NULL(cif_clk_out_div)) {
+             cif_clk_out_div =  clk_get(NULL, "cif_out_div");
++			printk("can't get clk_cif_pll");
+         }
+ 
+         if(!IS_ERR_OR_NULL(cif_clk_out_div)) {
+@@ -288,12 +290,12 @@ static int camsys_mrv_remove_cb(struct platform_device *pdev)
+ 
+         mrv_clk = (camsys_mrv_clk_t*)camsys_dev->clk;
+         if (mrv_clk->out_on)
+-            camsys_mrv_clkout_cb(mrv_clk,0);
++            camsys_mrv_clkout_cb(mrv_clk,0,0);
+         if (mrv_clk->in_on)
+             camsys_mrv_clkin_cb(mrv_clk,0);
+     
+         if (!IS_ERR_OR_NULL(mrv_clk->pd_isp)) {
+-            clk_put(mrv_clk->pd_isp);
++		 	clk_put(mrv_clk->pd_isp);
+         }
+         if (!IS_ERR_OR_NULL(mrv_clk->aclk_isp)) {
+             clk_put(mrv_clk->aclk_isp);
+@@ -324,9 +326,10 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+ {
+     int err = 0;   
+     camsys_mrv_clk_t *mrv_clk=NULL;
+-    //struct clk *clk_parent;
++    //struct clk *clk_parent; 
++    struct clk *cif_clk_out_div;
+     
+-    err = request_irq(camsys_dev->irq.irq_id, camsys_mrv_irq, 0, CAMSYS_MARVIN_IRQNAME,camsys_dev);
++	err = request_irq(camsys_dev->irq.irq_id, camsys_mrv_irq, 0, CAMSYS_MARVIN_IRQNAME,camsys_dev);
+     if (err) {
+         camsys_err("request irq for %s failed",CAMSYS_MARVIN_IRQNAME);
+         goto end;
+@@ -340,8 +343,7 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+         goto clk_failed;
+     }
+      
+-   // mrv_clk->pd_isp = devm_clk_get(&pdev->dev, "pd_isp");
+-    mrv_clk->pd_isp = NULL;
++    mrv_clk->pd_isp = devm_clk_get(&pdev->dev, "pd_isp");
+     mrv_clk->aclk_isp = devm_clk_get(&pdev->dev, "aclk_isp");
+     mrv_clk->hclk_isp = devm_clk_get(&pdev->dev, "hclk_isp");
+     mrv_clk->isp = devm_clk_get(&pdev->dev, "clk_isp");
+@@ -349,7 +351,8 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+     mrv_clk->pclkin_isp = devm_clk_get(&pdev->dev, "pclkin_isp");
+     mrv_clk->cif_clk_out = devm_clk_get(&pdev->dev, "clk_vipout");
+     mrv_clk->clk_mipi_24m = devm_clk_get(&pdev->dev,"clk_mipi_24m"); 
+-    if (/*IS_ERR_OR_NULL(mrv_clk->pd_isp) ||*/ IS_ERR_OR_NULL(mrv_clk->aclk_isp) || IS_ERR_OR_NULL(mrv_clk->hclk_isp) ||
++    
++	if (IS_ERR_OR_NULL(mrv_clk->pd_isp) || IS_ERR_OR_NULL(mrv_clk->aclk_isp) || IS_ERR_OR_NULL(mrv_clk->hclk_isp) ||
+         IS_ERR_OR_NULL(mrv_clk->isp) || IS_ERR_OR_NULL(mrv_clk->isp_jpe) || IS_ERR_OR_NULL(mrv_clk->pclkin_isp) || 
+         IS_ERR_OR_NULL(mrv_clk->cif_clk_out) || IS_ERR_OR_NULL(mrv_clk->clk_mipi_24m)) {
+         camsys_err("Get %s clock resouce failed!\n",miscdev_name);
+@@ -357,7 +360,7 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+         goto clk_failed;
+     }
+ 
+-    
++   
+ //    clk_set_rate(mrv_clk->isp,1800000000);
+ //    clk_set_rate(mrv_clk->isp_jpe,180000000);
+     
+@@ -386,7 +389,8 @@ int camsys_mrv_probe_cb(struct platform_device *pdev, camsys_dev_t *camsys_dev)
+     //Variable init
+     camsys_dev->dev_id = CAMSYS_DEVID_MARVIN;
+     camsys_dev->platform_remove = camsys_mrv_remove_cb;
+-    
++   
++   	 
+     return 0;
+ misc_register_failed:
+     if (!IS_ERR_OR_NULL(camsys_dev->miscdev.this_device)) {
+-- 
+2.35.3
+

@@ -1,0 +1,163 @@
+From 756de2a340fdb5591fd1cc157c0f2c573d45a3b5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=BC=A0=E6=99=B4?= <zhangqing@rock-chips.com>
+Date: Fri, 25 Oct 2013 15:44:43 +0800
+Subject: [PATCH] rk31:pmu:rt5025:to slove without battery can turns on system
+
+---
+ arch/arm/mach-rk30/board-pmu-rt5025.c |  4 ++--
+ drivers/mfd/rt5025-irq.c              | 24 ++++++++++++++-------
+ drivers/power/rt5025-battery.c        |  2 +-
+ drivers/power/rt5025-swjeita.c        | 30 ++++++++++++++++++++++++++-
+ include/linux/mfd/rt5025.h            |  2 +-
+ 5 files changed, 49 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm/mach-rk30/board-pmu-rt5025.c b/arch/arm/mach-rk30/board-pmu-rt5025.c
+index e6aee327ff7a..9c3c1260e7c0 100644
+--- a/arch/arm/mach-rk30/board-pmu-rt5025.c
++++ b/arch/arm/mach-rk30/board-pmu-rt5025.c
+@@ -419,8 +419,8 @@ static struct rt5025_irq_data rt5025_irq_data = {
+ 
+ //temp unit: 'c*10 degree
+ static int jeita_temp[4] = { 0, 150, 500, 600};
+-			     //-5',  5',   15', 20',   45'   55'   55',  65'
+-static u8 jeita_scalar[8] = { 0x30, 0x2B, 0x25, 0x20, 0x15, 0x10, 0x10, 0x0D };
++			     //-5',  5',   10', 20',   45'   55'   55',  65'
++static u8 jeita_scalar[8] = { 0x30, 0x2B, 0x28, 0x22, 0x15, 0x10, 0x10, 0x0D };
+ //cc unit: xxx mA
+ static int jeita_temp_cc[][5] = {{ 500,  500,  500,  500, 500},    // not plugin
+ 			   	 {   0 , 500,  500,  500,   0},    // normal USB
+diff --git a/drivers/mfd/rt5025-irq.c b/drivers/mfd/rt5025-irq.c
+index 84619d7bca15..c0fa0dae5b5e 100644
+--- a/drivers/mfd/rt5025-irq.c
++++ b/drivers/mfd/rt5025-irq.c
+@@ -38,6 +38,7 @@ struct rt5025_irq_info {
+ 	int intr_pin;
+ 	int irq;
+ 	int suspend;
++	int init_once;
+ };
+ 
+ static void rt5025_work_func(struct work_struct *work)
+@@ -114,14 +115,17 @@ static void rt5025_work_func(struct work_struct *work)
+ 
+ 			if (chg_event & (CHG_EVENT_INAC_PLUGIN | CHG_EVENT_INUSB_PLUGIN))
+ 			{
+-				rt5025_set_charging_buck(ii->i2c, 0);
+-				mdelay(50);
+-				rt5025_set_charging_buck(ii->i2c, 1);
+-				mdelay(100);
+-				rt5025_set_charging_buck(ii->i2c, 0);
+-				mdelay(50);
+-				rt5025_set_charging_buck(ii->i2c, 1);
+-				mdelay(200);
++				if (!ii->init_once)
++				{
++					rt5025_set_charging_buck(ii->i2c, 0);
++					mdelay(50);
++					rt5025_set_charging_buck(ii->i2c, 1);
++					mdelay(100);
++					rt5025_set_charging_buck(ii->i2c, 0);
++					mdelay(50);
++					rt5025_set_charging_buck(ii->i2c, 1);
++					mdelay(200);
++				}
+ 			}
+ 
+ 			if (ii->chip->power_info->chg_term <= 3)
+@@ -150,6 +154,9 @@ static void rt5025_work_func(struct work_struct *work)
+ 		rt5025_gauge_irq_handler(ii->chip->battery_info, irq_stat[5] & RT5025_FLG_VOLT);
+ 	#endif /* CONFIG_POWER_RT5025 */
+ 
++	if (ii->init_once)
++		ii->init_once = 0;
++
+ 	/* restore all irq enable bit */
+ 	rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN1, irq_enable[0]);
+ 	rt5025_reg_write(ii->i2c, RT5025_REG_IRQEN2, irq_enable[1]);
+@@ -258,6 +265,7 @@ static int __devinit rt5025_irq_probe(struct platform_device *pdev)
+ 	if (pdata->cb)
+ 		ii->event_cb = pdata->cb;
+ 	wake_lock_init(&ii->irq_wake_lock, WAKE_LOCK_SUSPEND, "rt_irq_wake");
++	ii->init_once = 1;
+ 
+ 	rt5025_irq_reg_init(ii, pdata->irq_data);
+ 	rt5025_interrupt_init(ii);
+diff --git a/drivers/power/rt5025-battery.c b/drivers/power/rt5025-battery.c
+index ba7cb2061a35..6590417897a2 100644
+--- a/drivers/power/rt5025-battery.c
++++ b/drivers/power/rt5025-battery.c
+@@ -506,7 +506,7 @@ static void rt5025_get_dchg_cc(struct rt5025_battery_info *bi)
+ {
+   u8 data[4];
+   u32 qh_old,ql_old,qh_new,ql_new;
+-  u32 cc_masec,offset;
++  u32 cc_masec,offset=0;
+   
+   if (rt5025_read_reg(bi->client, RT5025_REG_QDCHGH_MSB, data, 4) < 0){
+     printk(KERN_ERR "%s: Failed to read QDCHG\n", __func__);
+diff --git a/drivers/power/rt5025-swjeita.c b/drivers/power/rt5025-swjeita.c
+index 965fe64fc42e..cb72a33a50dd 100644
+--- a/drivers/power/rt5025-swjeita.c
++++ b/drivers/power/rt5025-swjeita.c
+@@ -327,16 +327,44 @@ static void thermal_reg_work_func(struct work_struct *work)
+ {
+ 	struct delayed_work *delayed_work = (struct delayed_work *)container_of(work, struct delayed_work, work);
+ 	struct rt5025_swjeita_info *swji = (struct rt5025_swjeita_info *)container_of(delayed_work, struct rt5025_swjeita_info, thermal_reg_work);
+-	int therm_region;
++	int therm_region = 0;
+ 	
+ 	RTINFO("%s ++", __func__);
+ 	rt5025_get_internal_temp(swji);
++
++	#if 1
++	switch (swji->cur_therm_region)
++	{
++		case 0:
++			if (swji->cur_inttemp >=820)
++				therm_region = 1;
++			else
++				therm_region = 0;
++			break;
++		case 1:
++			if (swji->cur_inttemp <= 780)
++				therm_region = 0;
++			else if (swji->cur_inttemp >= 1020)
++				therm_region = 2;
++			else
++				therm_region = 1; 
++			break;
++		case 2:
++			if (swji->cur_inttemp <= 980)
++				therm_region = 1;
++			else
++				therm_region = 2;
++			break;
++			
++	}
++	#else
+ 	if (swji->cur_inttemp < 800)
+ 		therm_region = 0;
+ 	else if (swji->cur_inttemp >= 800 && swji->cur_inttemp < 1000)
+ 		therm_region = 1;
+ 	else
+ 		therm_region = 2;
++	#endif /* #if 1*/
+ 
+ 	if (therm_region != swji->cur_therm_region)
+ 	{
+diff --git a/include/linux/mfd/rt5025.h b/include/linux/mfd/rt5025.h
+index 267766deeeff..fd8b9fe8a3e9 100644
+--- a/include/linux/mfd/rt5025.h
++++ b/include/linux/mfd/rt5025.h
+@@ -17,7 +17,7 @@
+ #include <linux/android_alarm.h>
+ 
+ #define RT5025_DEVICE_NAME "RT5025"
+-#define RT5025_DRV_VER	   "1.0.5_R"
++#define RT5025_DRV_VER	   "1.0.6_R"
+ 
+ enum {
+ 	RT5025_RSTDELAY1_100MS,
+-- 
+2.35.3
+

@@ -1,0 +1,142 @@
+From b9faec95ac962da8f3513a551f7636593a1d994f Mon Sep 17 00:00:00 2001
+From: luowei <lw@rock-chips.com>
+Date: Fri, 27 Aug 2010 20:51:08 +0800
+Subject: [PATCH] improve spi_i2c by using wait_event_timeout function
+
+---
+ arch/arm/mach-rk2818/include/mach/spi_fpga.h |  6 ++-
+ drivers/fpga/spi_i2c.c                       | 46 ++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm/mach-rk2818/include/mach/spi_fpga.h b/arch/arm/mach-rk2818/include/mach/spi_fpga.h
+index 31376de88e86..f507f8311804 100755
+--- a/arch/arm/mach-rk2818/include/mach/spi_fpga.h
++++ b/arch/arm/mach-rk2818/include/mach/spi_fpga.h
+@@ -13,7 +13,8 @@ defines of FPGA chip ICE65L08's register
+ #define SPI_FPGA_STANDBY_PIN RK2818_PIN_PH7
+ #define SPI_FPGA_RST_PIN RK2818_PIN_PF4
+ 
+-#define SPI_FPGA_POLL_WAIT	1
++#define SPI_FPGA_I2C_EVENT	1
++#define SPI_FPGA_POLL_WAIT	0
+ #define SPI_FPGA_TRANS_WORK	0
+ #define SPI_FPGA_TEST_DEBUG	0
+ #if SPI_FPGA_TEST_DEBUG
+@@ -94,6 +95,9 @@ struct spi_i2c
+ 	unsigned char interrupt;
+ 	unsigned char i2c_data_width[2];
+ 	unsigned int  speed[2];
++	#if SPI_FPGA_I2C_EVENT
++	wait_queue_head_t wait_w,wait_r;
++	#endif
+ };
+ 
+ struct spi_dpram
+diff --git a/drivers/fpga/spi_i2c.c b/drivers/fpga/spi_i2c.c
+index 35f81509acba..3c7b67d701cc 100755
+--- a/drivers/fpga/spi_i2c.c
++++ b/drivers/fpga/spi_i2c.c
+@@ -39,6 +39,7 @@
+ #define I2C_COUNT       20
+ #define DRV_NAME    "spi_i2c"
+ #define SPI_I2C_TEST 0
++
+ #if SPI_I2C_TEST
+ struct i2c_adapter *adap;
+ #endif
+@@ -56,13 +57,24 @@ int spi_i2c_handle_irq(struct spi_fpga_port *port,unsigned char channel)
+ 	ret = spi_in(port,reg,SEL_I2C);
+ 	DBG("Enter::%s,LINE=%d ret = [%d]\n",__FUNCTION__,__LINE__,ret);
+ 	if(INT_I2C_READ_ACK == (ret & 0x07))
+-		port->i2c.interrupt = INT_I2C_READ_ACK;		
++	{
++
++		port->i2c.interrupt = INT_I2C_READ_ACK;	
++	#if SPI_FPGA_I2C_EVENT
++		wake_up(&port->i2c.wait_r);
++	#endif
++	}
+ 	else if(INT_I2C_READ_NACK ==(ret & 0x07))
+ 	{
+ 		printk("Error::read no ack!!check the I2C slave device ret=%d \n",ret);
+ 	}
+ 	else if(INT_I2C_WRITE_ACK == (ret & 0x07))
++	{
+ 		port->i2c.interrupt = INT_I2C_WRITE_ACK;
++		#if SPI_FPGA_I2C_EVENT
++		wake_up(&port->i2c.wait_w);
++		#endif
++	}
+ 	else if(INT_I2C_WRITE_NACK == (ret & 0x07))
+ 	{
+ 		printk("Error::write no ack!!check the I2C slave device ret=%d \n",ret);
+@@ -139,7 +151,20 @@ int spi_i2c_readbuf(struct spi_fpga_port *port ,struct i2c_msg *pmsg,int ch)
+ 	//len;
+ 	reg = channel |ICE_SEL_I2C_FIFO |ICE_SEL_I2C_STOP;
+ 	spi_out(port,reg,len,SEL_I2C);
+-	
++
++#if SPI_FPGA_I2C_EVENT
++	wait_event_timeout(port->i2c.wait_r, port->i2c.interrupt == INT_I2C_READ_ACK, msecs_to_jiffies(30));	
++	for(i = 0;i<len;i++)
++	{
++		result = spi_in(port,channel,SEL_I2C);
++		pmsg->buf[i] = 0;
++		pmsg->buf[i] = result & 0xff ;
++	}
++	spin_lock(&port->i2c.i2c_lock);
++	port->i2c.interrupt &= INT_I2C_READ_MASK;
++	spin_unlock(&port->i2c.i2c_lock);
++	ret = pmsg->len;
++#else
+ 	j = I2C_COUNT;
+ 	while(j--)
+ 
+@@ -162,6 +187,8 @@ int spi_i2c_readbuf(struct spi_fpga_port *port ,struct i2c_msg *pmsg,int ch)
+ 		else
+ 			msleep(2);
+ 	}
++	
++#endif
+ 	//for(i = 0;i<len;i++)
+ 		//printk("pmsg->buf[%d] = 0x%x \n",i,pmsg->buf[i]);	
+ 	return ret>0 ? ret:-1;
+@@ -210,7 +237,13 @@ int spi_i2c_writebuf(struct spi_fpga_port *port ,struct i2c_msg *pmsg,int ch)
+ 		{
+ 		reg = channel|ICE_SEL_I2C_STOP;
+ 		spi_out(port,reg,pmsg->buf[i],SEL_I2C);
+-	
++	#if SPI_FPGA_I2C_EVENT
++		wait_event_timeout(port->i2c.wait_w, port->i2c.interrupt == INT_I2C_WRITE_ACK, msecs_to_jiffies(30));
++		spin_lock(&port->i2c.i2c_lock);
++		port->i2c.interrupt &= INT_I2C_WRITE_MASK;
++		spin_unlock(&port->i2c.i2c_lock);
++		ret =  pmsg->len;
++	#else
+ 		j = I2C_COUNT;	
+ 		while(j--)
+ 		{		
+@@ -226,7 +259,7 @@ int spi_i2c_writebuf(struct spi_fpga_port *port ,struct i2c_msg *pmsg,int ch)
+ 			else
+ 				msleep(2);
+ 		}
+-	
++	#endif
+ 		}
+ 		else if(i==len-1 &&  pmsg->read_type == I2C_NO_STOP)
+ 		{					
+@@ -509,6 +542,11 @@ int spi_i2c_register(struct spi_fpga_port *port,int num)
+ 	
+ #endif
+ 
++#if SPI_FPGA_I2C_EVENT
++	init_waitqueue_head(&port->i2c.wait_w);
++	init_waitqueue_head(&port->i2c.wait_r);
++#endif
++
+ 	return 0;	
+ 	
+ }
+-- 
+2.35.3
+

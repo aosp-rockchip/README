@@ -1,0 +1,110 @@
+From 46e7d9882b8b048ab0dc575b084cd56888e442e7 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Wed, 6 Jan 2021 17:55:33 +0800
+Subject: [PATCH] media: videobuf2-dma-sg: support contiguous page by dma attrs
+
+device maybe support alloc dma from contiguous memory area,
+but dma sg page isn't contiguous default, add dma_attrs
+(DMA_ATTR_FORCE_CONTIGUOUS) to alloc contiguous pages.
+
+Change-Id: I909385ff3165f604ed498c71bc18f573064d3595
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ .../media/common/videobuf2/videobuf2-dma-sg.c | 39 ++++++++++++++++---
+ 1 file changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/common/videobuf2/videobuf2-dma-sg.c b/drivers/media/common/videobuf2/videobuf2-dma-sg.c
+index e9bfea986cc4..70c66f199bee 100644
+--- a/drivers/media/common/videobuf2/videobuf2-dma-sg.c
++++ b/drivers/media/common/videobuf2/videobuf2-dma-sg.c
+@@ -10,6 +10,7 @@
+  * the Free Software Foundation.
+  */
+ 
++#include <linux/dma-contiguous.h>
+ #include <linux/module.h>
+ #include <linux/mm.h>
+ #include <linux/refcount.h>
+@@ -37,6 +38,7 @@ struct vb2_dma_sg_buf {
+ 	struct page			**pages;
+ 	struct frame_vector		*vec;
+ 	int				offset;
++	unsigned long			attrs;
+ 	enum dma_data_direction		dma_dir;
+ 	struct sg_table			sg_table;
+ 	/*
+@@ -96,6 +98,23 @@ static int vb2_dma_sg_alloc_compacted(struct vb2_dma_sg_buf *buf,
+ 	return 0;
+ }
+ 
++static int vb2_dma_sg_alloc_contiguous(struct device *dev,
++		struct vb2_dma_sg_buf *buf, gfp_t gfp_flags)
++{
++	struct page *page;
++	unsigned int i;
++
++	page = dma_alloc_from_contiguous(dev, buf->num_pages,
++			get_order(buf->size), gfp_flags & __GFP_NOWARN);
++	if (!page)
++		return -ENOMEM;
++
++	for (i = 0; i < buf->num_pages; i++)
++		buf->pages[i] = page + i;
++
++	return 0;
++}
++
+ static void *vb2_dma_sg_alloc(struct device *dev, unsigned long dma_attrs,
+ 			      unsigned long size, enum dma_data_direction dma_dir,
+ 			      gfp_t gfp_flags)
+@@ -113,6 +132,7 @@ static void *vb2_dma_sg_alloc(struct device *dev, unsigned long dma_attrs,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	buf->vaddr = NULL;
++	buf->attrs = dma_attrs;
+ 	buf->dma_dir = dma_dir;
+ 	buf->offset = 0;
+ 	buf->size = size;
+@@ -125,7 +145,10 @@ static void *vb2_dma_sg_alloc(struct device *dev, unsigned long dma_attrs,
+ 	if (!buf->pages)
+ 		goto fail_pages_array_alloc;
+ 
+-	ret = vb2_dma_sg_alloc_compacted(buf, gfp_flags);
++	if (dma_attrs & DMA_ATTR_FORCE_CONTIGUOUS)
++		ret = vb2_dma_sg_alloc_contiguous(dev, buf, gfp_flags);
++	else
++		ret = vb2_dma_sg_alloc_compacted(buf, gfp_flags);
+ 	if (ret)
+ 		goto fail_pages_alloc;
+ 
+@@ -162,8 +185,11 @@ static void *vb2_dma_sg_alloc(struct device *dev, unsigned long dma_attrs,
+ 	sg_free_table(buf->dma_sgt);
+ fail_table_alloc:
+ 	num_pages = buf->num_pages;
+-	while (num_pages--)
+-		__free_page(buf->pages[num_pages]);
++	if (dma_attrs & DMA_ATTR_FORCE_CONTIGUOUS)
++		dma_release_from_contiguous(dev, buf->pages[0], num_pages);
++	else
++		while (num_pages--)
++			__free_page(buf->pages[num_pages]);
+ fail_pages_alloc:
+ 	kvfree(buf->pages);
+ fail_pages_array_alloc:
+@@ -185,8 +211,11 @@ static void vb2_dma_sg_put(void *buf_priv)
+ 		if (buf->vaddr)
+ 			vm_unmap_ram(buf->vaddr, buf->num_pages);
+ 		sg_free_table(buf->dma_sgt);
+-		while (--i >= 0)
+-			__free_page(buf->pages[i]);
++		if (buf->attrs & DMA_ATTR_FORCE_CONTIGUOUS)
++			dma_release_from_contiguous(buf->dev, buf->pages[0], i);
++		else
++			while (--i >= 0)
++				__free_page(buf->pages[i]);
+ 		kvfree(buf->pages);
+ 		put_device(buf->dev);
+ 		kfree(buf);
+-- 
+2.35.3
+

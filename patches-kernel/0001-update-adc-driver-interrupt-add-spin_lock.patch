@@ -1,0 +1,115 @@
+From fbb46ea6d6e8adc9162ae37ecda555436a6a206d Mon Sep 17 00:00:00 2001
+From: kfx <kfx@rock-chips.com>
+Date: Mon, 20 Jun 2011 10:06:28 +0800
+Subject: [PATCH] update adc driver: interrupt add spin_lock
+
+---
+ drivers/adc/core.c          | 21 ++++++++++++++-------
+ drivers/adc/plat/rk29_adc.c |  2 +-
+ include/linux/adc.h         |  2 +-
+ 3 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/adc/core.c b/drivers/adc/core.c
+index dea19cc744d9..0756c7ea4f80 100755
+--- a/drivers/adc/core.c
++++ b/drivers/adc/core.c
+@@ -91,14 +91,14 @@ static int
+ adc_enqueue_request(struct adc_host *adc, struct adc_request *req)
+ {
+ 	int head, tail;
+-
+-	mutex_lock(&adc->queue_mutex);
+-
++	unsigned long flags;
++	
++	spin_lock_irqsave(&adc->lock, flags);
+ 	head = adc->queue_head;
+ 	tail = adc->queue_tail;
+ 
+ 	if (adc->queue[tail]) {
+-		mutex_unlock(&adc->queue_mutex);
++		spin_unlock_irqrestore(&adc->lock,flags);
+ 		dev_err(adc->dev, "ADC queue is full, dropping request\n");
+ 		return -EBUSY;
+ 	}
+@@ -108,7 +108,7 @@ adc_enqueue_request(struct adc_host *adc, struct adc_request *req)
+ 		trigger_next_adc_job_if_any(adc);
+ 	adc->queue_tail = (tail + 1) & (MAX_ADC_FIFO_DEPTH - 1);
+ 
+-	mutex_unlock(&adc->queue_mutex);
++	spin_unlock_irqrestore(&adc->lock,flags);
+ 
+ 	return 0;
+ }
+@@ -169,6 +169,7 @@ EXPORT_SYMBOL(adc_sync_read);
+ 
+ int adc_async_read(struct adc_client *client)
+ {
++	int ret = 0;
+ 	struct adc_request *req = NULL;
+ 	
+ 	if(client == NULL) {
+@@ -190,7 +191,11 @@ int adc_async_read(struct adc_client *client)
+ 	req->client = client;
+ 	req->status = ASYNC_READ;
+ 
+-	return adc_enqueue_request(client->adc, req);
++	ret = adc_enqueue_request(client->adc, req);
++	if(ret < 0)
++		kfree(req);
++
++	return ret;
+ }
+ EXPORT_SYMBOL(adc_async_read);
+ 
+@@ -198,11 +203,12 @@ void adc_core_irq_handle(struct adc_host *adc)
+ {
+ 	struct adc_request *req;
+ 	int head, res;
+-
++	spin_lock(adc->lock);
+ 	head = adc->queue_head;
+ 
+ 	req = adc->queue[head];
+ 	if (WARN_ON(!req)) {
++		spin_unlock(&adc->lock);
+ 		dev_err(adc->dev, "adc irq: ADC queue empty!\n");
+ 		return;
+ 	}
+@@ -218,6 +224,7 @@ void adc_core_irq_handle(struct adc_host *adc)
+ 		kfree(req);
+ 		req = NULL;
+ 	}
++	spin_unlock(&adc->lock);
+ }
+ EXPORT_SYMBOL(adc_core_irq_handle);
+ 
+diff --git a/drivers/adc/plat/rk29_adc.c b/drivers/adc/plat/rk29_adc.c
+index 6bf01ba8c56f..2471abafff0b 100755
+--- a/drivers/adc/plat/rk29_adc.c
++++ b/drivers/adc/plat/rk29_adc.c
+@@ -123,7 +123,7 @@ static int rk29_adc_probe(struct platform_device *pdev)
+ 	adc = adc_alloc_host(sizeof(struct rk29_adc_device), &pdev->dev);
+ 	if (!adc)
+ 		return -ENOMEM;
+-	mutex_init(&adc->queue_mutex);
++	spin_lock_init(&adc->lock);
+ 	adc->dev = &pdev->dev;
+ 	adc->is_suspended = 0;
+ 	adc->ops = &rk29_adc_ops;
+diff --git a/include/linux/adc.h b/include/linux/adc.h
+index d9ed72afbe0f..22c781fbd305 100755
+--- a/include/linux/adc.h
++++ b/include/linux/adc.h
+@@ -49,7 +49,7 @@ struct adc_host {
+ 	struct adc_request *queue[MAX_ADC_FIFO_DEPTH];
+ 	int queue_head;
+ 	int queue_tail;
+-	struct mutex queue_mutex;
++	spinlock_t			lock;
+ 	struct adc_client *cur;
+ 	const struct adc_ops *ops;
+ 	unsigned long		private[0];
+-- 
+2.35.3
+

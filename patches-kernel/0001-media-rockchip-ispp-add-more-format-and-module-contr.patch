@@ -1,0 +1,923 @@
+From e980b4f14d1ff080517b7212cd230e818cd31118 Mon Sep 17 00:00:00 2001
+From: Cai YiWei <cyw@rock-chips.com>
+Date: Fri, 6 Mar 2020 11:22:43 +0800
+Subject: [PATCH] media: rockchip: ispp: add more format and module control
+
+Change-Id: I982d4d8529ac2b55dc4a695456554f6ca7c4985c
+Signed-off-by: Cai YiWei <cyw@rock-chips.com>
+---
+ drivers/media/platform/rockchip/ispp/common.h |   1 -
+ drivers/media/platform/rockchip/ispp/dev.c    |  14 +-
+ drivers/media/platform/rockchip/ispp/dev.h    |  11 -
+ drivers/media/platform/rockchip/ispp/ispp.c   |  12 +-
+ drivers/media/platform/rockchip/ispp/params.c |  11 +-
+ drivers/media/platform/rockchip/ispp/regs.h   |  15 +-
+ drivers/media/platform/rockchip/ispp/stream.c | 315 +++++++++++-------
+ drivers/media/platform/rockchip/ispp/stream.h |   2 +
+ include/uapi/linux/rkispp-config.h            |   1 +
+ 9 files changed, 227 insertions(+), 155 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/ispp/common.h b/drivers/media/platform/rockchip/ispp/common.h
+index f7b24afa8a5e..c83928a69477 100644
+--- a/drivers/media/platform/rockchip/ispp/common.h
++++ b/drivers/media/platform/rockchip/ispp/common.h
+@@ -39,7 +39,6 @@ struct rkispp_dummy_buffer {
+ 	u32 size;
+ };
+ 
+-extern int rkispp_tnr_3to1;
+ extern int rkispp_debug;
+ 
+ static inline struct rkispp_vdev_node *vdev_to_node(struct video_device *vdev)
+diff --git a/drivers/media/platform/rockchip/ispp/dev.c b/drivers/media/platform/rockchip/ispp/dev.c
+index 67dc8bc72460..63e737b6ebd0 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.c
++++ b/drivers/media/platform/rockchip/ispp/dev.c
+@@ -35,10 +35,6 @@ struct ispp_match_data {
+ 	int num_irqs;
+ };
+ 
+-int rkispp_tnr_3to1;
+-module_param_named(tnr_3to1, rkispp_tnr_3to1, int, 0644);
+-MODULE_PARM_DESC(tnr_3to1, "tnr 3to1 mode");
+-
+ int rkispp_debug;
+ module_param_named(debug, rkispp_debug, int, 0644);
+ MODULE_PARM_DESC(debug, "Debug level (0-3)");
+@@ -185,12 +181,10 @@ static int rkispp_create_links(struct rkispp_device *ispp_dev)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	//TODO
+-	ispp_dev->module_en[ISPP_3DNR] = true;
+-	ispp_dev->module_en[ISPP_2DNR] = true;
+-	ispp_dev->module_en[ISPP_SHP] = true;
+-	ispp_dev->module_en[ISPP_FEC] = false;
+-	ispp_dev->module_en[ISPP_SCL] = true;
++	/* default enable tnr (2to1), nr, sharp */
++	ispp_dev->stream_vdev.module_ens =
++		ISPP_MODULE_TNR | ISPP_MODULE_NR | ISPP_MODULE_SHP;
++	ispp_dev->stream_vdev.tnr_mode = 0;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/dev.h b/drivers/media/platform/rockchip/ispp/dev.h
+index dc69bdbc2415..d170272b36d3 100644
+--- a/drivers/media/platform/rockchip/ispp/dev.h
++++ b/drivers/media/platform/rockchip/ispp/dev.h
+@@ -22,15 +22,6 @@ enum rkispp_ver {
+ 	ISPP_V10 = 0x00,
+ };
+ 
+-enum rkispp_module_id {
+-	ISPP_3DNR,
+-	ISPP_2DNR,
+-	ISPP_SHP,
+-	ISPP_FEC,
+-	ISPP_SCL,
+-	ISPP_MD_MAX,
+-};
+-
+ enum rkispp_input {
+ 	INP_INVAL = 0,
+ 	INP_ISP,
+@@ -60,8 +51,6 @@ struct rkispp_device {
+ 	struct mutex apilock;
+ 	/* lock for fec and ispp irq */
+ 	spinlock_t irq_lock;
+-
+-	u8 module_en[ISPP_MD_MAX];
+ 	enum rkispp_input inp;
+ };
+ #endif
+diff --git a/drivers/media/platform/rockchip/ispp/ispp.c b/drivers/media/platform/rockchip/ispp/ispp.c
+index 69dede8adf85..9adfc4735e8f 100644
+--- a/drivers/media/platform/rockchip/ispp/ispp.c
++++ b/drivers/media/platform/rockchip/ispp/ispp.c
+@@ -101,8 +101,10 @@ static int rkispp_sd_get_fmt(struct v4l2_subdev *sd,
+ 	const struct isppsd_fmt *ispp_fmt;
+ 	int ret = 0;
+ 
+-	if (dev->inp != INP_ISP)
++	if (dev->inp != INP_ISP) {
++		*fmt = ispp_sdev->in_fmt;
+ 		return 0;
++	}
+ 
+ 	ret = v4l2_subdev_call(ispp_sdev->remote_sd,
+ 			       pad, get_fmt, cfg, fmt);
+@@ -127,8 +129,10 @@ static int rkispp_sd_set_fmt(struct v4l2_subdev *sd,
+ 	struct rkispp_device *dev = ispp_sdev->dev;
+ 	const struct isppsd_fmt *ispp_fmt;
+ 
+-	if (dev->inp != INP_ISP)
++	if (dev->inp != INP_ISP) {
++		ispp_sdev->in_fmt = *fmt;
+ 		return 0;
++	}
+ 
+ 	ispp_fmt = find_fmt(fmt->format.code);
+ 	if (!ispp_fmt)
+@@ -153,14 +157,14 @@ static int rkispp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ 	if (on) {
+ 		void *buf, *size;
+ 
+-		if (dev->module_en[ISPP_3DNR]) {
++		if (vdev->module_ens & ISPP_MODULE_TNR) {
+ 			buf = &vdev->tnr_buf.pic_cur.dma_addr;
+ 			size = &vdev->tnr_buf.pic_cur.size;
+ 			v4l2_subdev_call(ispp_sdev->remote_sd,
+ 				video, s_rx_buffer, buf, size);
+ 			buf = &vdev->tnr_buf.gain_cur.dma_addr;
+ 			size = &vdev->tnr_buf.gain_cur.size;
+-			if (rkispp_tnr_3to1) {
++			if (vdev->tnr_mode) {
+ 				v4l2_subdev_call(ispp_sdev->remote_sd,
+ 					video, s_rx_buffer, buf, size);
+ 				buf = &vdev->tnr_buf.pic_next.dma_addr;
+diff --git a/drivers/media/platform/rockchip/ispp/params.c b/drivers/media/platform/rockchip/ispp/params.c
+index 359956ebe9f0..f258e33b62f7 100644
+--- a/drivers/media/platform/rockchip/ispp/params.c
++++ b/drivers/media/platform/rockchip/ispp/params.c
+@@ -459,8 +459,8 @@ static void fec_config(struct rkispp_params_vdev *params_vdev,
+ 
+ 	val = 0;
+ 	if (arg->mesh_density)
+-		val = SW_MESH_DDENSITY;
+-	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_MESH_DDENSITY, val);
++		val = SW_MESH_DENSITY;
++	rkispp_set_bits(base + RKISPP_FEC_CORE_CTRL, SW_MESH_DENSITY, val);
+ 
+ 	rkispp_write(base + RKISPP_FEC_MESH_SIZE, arg->mesh_size);
+ 
+@@ -590,6 +590,7 @@ static void rkispp_params_vb2_buf_queue(struct vb2_buffer *vb)
+ 	struct rkispp_buffer *params_buf = to_rkispp_buffer(vbuf);
+ 	struct vb2_queue *vq = vb->vb2_queue;
+ 	struct rkispp_params_vdev *params_vdev = vq->drv_priv;
++	struct rkispp_stream_vdev *stream_vdev = &params_vdev->dev->stream_vdev;
+ 	struct rkispp_params_cfg *new_params;
+ 	unsigned long flags;
+ 
+@@ -599,6 +600,8 @@ static void rkispp_params_vb2_buf_queue(struct vb2_buffer *vb)
+ 		vb2_buffer_done(&params_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+ 		params_vdev->first_params = false;
+ 		params_vdev->cur_params = *new_params;
++		stream_vdev->module_ens = new_params->module_ens;
++		stream_vdev->tnr_mode = new_params->tnr_cfg.mode;
+ 		return;
+ 	}
+ 
+@@ -790,6 +793,10 @@ void rkispp_params_configure(struct rkispp_params_vdev *params_vdev)
+ 	u32 module_cfg_update = params_vdev->cur_params.module_cfg_update;
+ 	u32 module_ens = params_vdev->cur_params.module_ens;
+ 
++	if (!module_cfg_update && !module_en_update)
++		v4l2_warn(&params_vdev->dev->v4l2_dev,
++			  "can not get first iq setting in stream on\n");
++
+ 	if (module_cfg_update & ISPP_MODULE_TNR)
+ 		tnr_config(params_vdev,
+ 			   &params_vdev->cur_params.tnr_cfg);
+diff --git a/drivers/media/platform/rockchip/ispp/regs.h b/drivers/media/platform/rockchip/ispp/regs.h
+index d573c79bfacc..c7be7c950621 100644
+--- a/drivers/media/platform/rockchip/ispp/regs.h
++++ b/drivers/media/platform/rockchip/ispp/regs.h
+@@ -315,12 +315,13 @@
+ #define RKISPP_FEC_DMA_STATUS		(RKISPP_FEC + 0x0090)
+ #define RKISPP_FEC_CROP			(RKISPP_FEC + 0x0094)
+ 
+-#define FMT_WR_MASK			GENMASK(7, 5)
+-#define FMT_RD_MASK			GENMASK(3, 1)
++#define FMT_WR_MASK			GENMASK(7, 4)
++#define FMT_RD_MASK			GENMASK(3, 0)
++#define FMT_YUV420			0
+ #define FMT_YC_SWAP			BIT(3)
+ #define FMT_YUYV			BIT(2)
+ #define FMT_YUV422			BIT(1)
+-#define FMT_YUV420			0
++#define FMT_FBC				BIT(0)
+ 
+ /* ISPP_STRT */
+ #define FEC_ST				BIT(2)
+@@ -375,8 +376,8 @@
+ #define QUICK_INT			BIT(0)
+ 
+ /* TNR CTRL */
+-#define SW_TNR_WR_FORMAT_MASK		GENMASK(7, 5)
+-#define SW_TNR_RD_FORMAT_MASK		GENMASK(3, 1)
++#define SW_TNR_WR_FORMAT_MASK		GENMASK(7, 4)
++#define SW_TNR_RD_FORMAT_MASK		GENMASK(3, 0)
+ #define SW_TNR_THROUGH_MODE		BIT(10)
+ #define SW_TNR_1ST_FRM			BIT(9)
+ #define SW_TNR_RD_PINGPONG2TO1		BIT(8)
+@@ -421,7 +422,7 @@
+ #define SW_NR_EN			BIT(0)
+ 
+ /* SHP CTRL*/
+-#define SW_SHP_WR_FORMAT_MASK		GENMASK(3, 1)
++#define SW_SHP_WR_FORMAT_MASK		GENMASK(3, 0)
+ #define SW_SHP_WR_ROT_MODE(a)		(((a) & 0x3) << 5)
+ #define SW_SHP_WR_YUV_LIMIT		BIT(4)
+ #define SW_SHP_WR_YUYV_YCSWAP		BIT(3)
+@@ -463,7 +464,7 @@
+ #define SW_FEC_EN_SHD			BIT(31)
+ #define SW_MINBUF_NON_UPDATE_SHD	BIT(30)
+ #define SW_MINBUF_NON_UPDATE		BIT(6)
+-#define SW_MESH_DDENSITY		BIT(5)
++#define SW_MESH_DENSITY			BIT(5)
+ #define SW_FEC2DDR_DIS			BIT(1)
+ #define SW_FEC_EN			BIT(0)
+ 
+diff --git a/drivers/media/platform/rockchip/ispp/stream.c b/drivers/media/platform/rockchip/ispp/stream.c
+index e5df5e3deaac..2e571731ee49 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.c
++++ b/drivers/media/platform/rockchip/ispp/stream.c
+@@ -16,13 +16,13 @@
+ #define STREAM_OUT_REQ_BUFS_MIN 0
+ 
+ /*
+- * DDR->|                                    |->MB------->DDR
+- *      |->3DNR->DDR->2DNR->SHARP->DDR->FEC->|->SCL0----->DDR
+- * ISP->|                                    |->SCL1----->DDR
+- *                                           |->SCL2----->DDR
++ * DDR->|                                 |->MB------->DDR
++ *      |->TNR->DDR->NR->SHARP->DDR->FEC->|->SCL0----->DDR
++ * ISP->|                                 |->SCL1----->DDR
++ *                                        |->SCL2----->DDR
+  */
+ 
+-static const struct capture_fmt pixel_fmts[] = {
++static const struct capture_fmt input_fmts[] = {
+ 	{
+ 		.fourcc = V4L2_PIX_FMT_YUYV,
+ 		.bpp = { 16 },
+@@ -50,19 +50,81 @@ static const struct capture_fmt pixel_fmts[] = {
+ 	}
+ };
+ 
++static const struct capture_fmt mb_fmts[] = {
++	{
++		.fourcc = V4L2_PIX_FMT_YUYV,
++		.bpp = { 16 },
++		.cplanes = 1,
++		.mplanes = 1,
++		.wr_fmt = FMT_YC_SWAP | FMT_YUYV | FMT_YUV422,
++	}, {
++		.fourcc = V4L2_PIX_FMT_UYVY,
++		.bpp = { 16 },
++		.cplanes = 1,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUYV | FMT_YUV422,
++	}, {
++		.fourcc = V4L2_PIX_FMT_NV16,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUV422,
++	}, {
++		.fourcc = V4L2_PIX_FMT_NV12,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUV420,
++	}, {
++		.fourcc = V4L2_PIX_FMT_FBC2,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 2,
++		.wr_fmt = FMT_YUV422 | FMT_FBC,
++	}, {
++		.fourcc = V4L2_PIX_FMT_FBC0,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 2,
++		.wr_fmt = FMT_YUV420 | FMT_FBC,
++	}
++};
++
++static const struct capture_fmt scl_fmts[] = {
++	{
++		.fourcc = V4L2_PIX_FMT_NV16,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUV422,
++	}, {
++		.fourcc = V4L2_PIX_FMT_NV12,
++		.bpp = { 8, 16 },
++		.cplanes = 2,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUV420,
++	}, {
++		.fourcc = V4L2_PIX_FMT_GREY,
++		.bpp = { 8 },
++		.cplanes = 1,
++		.mplanes = 1,
++		.wr_fmt = FMT_YUV420,
++	}
++};
++
+ static struct stream_config input_config = {
+-	.fmts = pixel_fmts,
+-	.fmt_size = ARRAY_SIZE(pixel_fmts),
++	.fmts = input_fmts,
++	.fmt_size = ARRAY_SIZE(input_fmts),
+ };
+ 
+ static struct stream_config mb_config = {
+-	.fmts = pixel_fmts,
+-	.fmt_size = ARRAY_SIZE(pixel_fmts),
++	.fmts = mb_fmts,
++	.fmt_size = ARRAY_SIZE(mb_fmts),
+ };
+ 
+ static struct stream_config scl0_config = {
+-	.fmts = pixel_fmts,
+-	.fmt_size = ARRAY_SIZE(pixel_fmts),
++	.fmts = scl_fmts,
++	.fmt_size = ARRAY_SIZE(scl_fmts),
+ 	.frame_end_id = SCL0_INT,
+ 	.reg = {
+ 		.ctrl = RKISPP_SCL0_CTRL,
+@@ -76,8 +138,8 @@ static struct stream_config scl0_config = {
+ };
+ 
+ static struct stream_config scl1_config = {
+-	.fmts = pixel_fmts,
+-	.fmt_size = ARRAY_SIZE(pixel_fmts),
++	.fmts = scl_fmts,
++	.fmt_size = ARRAY_SIZE(scl_fmts),
+ 	.frame_end_id = SCL1_INT,
+ 	.reg = {
+ 		.ctrl = RKISPP_SCL1_CTRL,
+@@ -91,8 +153,8 @@ static struct stream_config scl1_config = {
+ };
+ 
+ static struct stream_config scl2_config = {
+-	.fmts = pixel_fmts,
+-	.fmt_size = ARRAY_SIZE(pixel_fmts),
++	.fmts = scl_fmts,
++	.fmt_size = ARRAY_SIZE(scl_fmts),
+ 	.frame_end_id = SCL2_INT,
+ 	.reg = {
+ 		.ctrl = RKISPP_SCL2_CTRL,
+@@ -114,11 +176,13 @@ static int fcc_xysubs(u32 fcc, u32 *xsubs, u32 *ysubs)
+ 		break;
+ 	case V4L2_PIX_FMT_NV16:
+ 	case V4L2_PIX_FMT_NV61:
++	case V4L2_PIX_FMT_FBC2:
+ 		*xsubs = 2;
+ 		*ysubs = 1;
+ 		break;
+ 	case V4L2_PIX_FMT_NV12:
+ 	case V4L2_PIX_FMT_NV21:
++	case V4L2_PIX_FMT_FBC0:
+ 		*xsubs = 2;
+ 		*ysubs = 2;
+ 		break;
+@@ -145,6 +209,7 @@ struct capture_fmt *find_fmt(struct rkispp_stream *stream,
+ 
+ static void update_mi(struct rkispp_stream *stream)
+ {
++	struct rkispp_stream_vdev *vdev = &stream->isppdev->stream_vdev;
+ 	void __iomem *base = stream->isppdev->base_addr;
+ 	struct rkispp_dummy_buffer *dummy_buf;
+ 	u8 en = 0;
+@@ -155,11 +220,12 @@ static void update_mi(struct rkispp_stream *stream)
+ 		set_uv_addr(stream,
+ 			stream->next_buf->buff_addr[RKISPP_PLANE_UV]);
+ 		if (stream->type == STREAM_INPUT && stream->curr_buf) {
+-			if (stream->isppdev->module_en[ISPP_FEC])
++			if (vdev->module_ens & ISPP_MODULE_FEC)
+ 				en = FEC_ST;
+-			if (stream->isppdev->module_en[ISPP_2DNR])
++			if (vdev->module_ens &
++			    (ISPP_MODULE_NR | ISPP_MODULE_SHP))
+ 				en = NR_SHP_ST;
+-			if (stream->isppdev->module_en[ISPP_3DNR])
++			if (vdev->module_ens & ISPP_MODULE_TNR)
+ 				en = TNR_ST;
+ 			writel(en, base + RKISPP_CTRL_STRT);
+ 		}
+@@ -176,7 +242,7 @@ static void update_mi(struct rkispp_stream *stream)
+ 
+ 	if (stream->id == STREAM_MB &&
+ 	    stream->isppdev->inp == INP_DDR &&
+-	    stream->last_module == ISPP_3DNR) {
++	    stream->last_module == ISPP_MODULE_TNR) {
+ 		writel(readl(base + RKISPP_TNR_WR_Y_BASE_SHD),
+ 			base + RKISPP_TNR_IIR_Y_BASE);
+ 		writel(readl(base + RKISPP_TNR_WR_UV_BASE_SHD),
+@@ -229,48 +295,42 @@ static int rkispp_frame_end(struct rkispp_stream *stream)
+ 	return 0;
+ }
+ 
+-static int config_3dnr(struct rkispp_device *dev)
++static int config_tnr(struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+ 	void __iomem *base = dev->base_addr;
+-	bool fbc_mode = false;
+ 	int ret, mult = 1;
+ 	u32 i, width, height, fmt;
+ 	u32 pic_size, gain_size, kg_size;
+-	u32 addr_offs;
++	u32 addr_offs, w, h;
+ 
+ 	vdev = &dev->stream_vdev;
+-	if (!dev->module_en[ISPP_3DNR])
++	if (!(vdev->module_ens & ISPP_MODULE_TNR))
+ 		return 0;
+ 
+ 	if (dev->inp == INP_DDR) {
+ 		stream = &vdev->stream[STREAM_II];
+-		width = stream->out_fmt.width;
+-		height = stream->out_fmt.height;
+-		pic_size = stream->out_fmt.plane_fmt[0].sizeimage;
+ 		fmt = stream->out_cap_fmt.wr_fmt;
+-		addr_offs = width * height;
+ 	} else {
+-		u32 w, h;
++		fmt = dev->ispp_sdev.out_fmt.wr_fmt | FMT_FBC;
++	}
+ 
+-		fbc_mode = true;
+-		width = dev->ispp_sdev.out_fmt.width;
+-		height = dev->ispp_sdev.out_fmt.height;
+-		fmt = dev->ispp_sdev.out_fmt.wr_fmt;
+-		w = ALIGN(width, 16);
+-		h = ALIGN(height, 16);
+-		addr_offs = w * h >> 4;
+-		/* header and payload */
+-		pic_size = fmt ? w * h * 2 : w * h * 3 >> 1;
++	width = dev->ispp_sdev.out_fmt.width;
++	height = dev->ispp_sdev.out_fmt.height;
++	w = (fmt & FMT_FBC) ? ALIGN(width, 16) : width;
++	h = (fmt & FMT_FBC) ? ALIGN(height, 16) : height;
++	addr_offs = (fmt & FMT_FBC) ? w * h >> 4 : w * h;
++	pic_size = (fmt & FMT_YUV422) ? w * h * 2 : w * h * 3 >> 1;
++	if (fmt & FMT_FBC)
+ 		pic_size += w * h >> 4;
+-	}
++
+ 	gain_size = ALIGN(width, 64) * ALIGN(height, 128) >> 5;
+ 	kg_size = gain_size * 4;
+ 	if (fmt & FMT_YUYV)
+ 		mult = 2;
+ 
+-	if (dev->module_en[ISPP_2DNR] || dev->module_en[ISPP_FEC]) {
++	if (vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
+ 		struct rkispp_dummy_buffer *buf;
+ 
+ 		if (dev->inp == INP_ISP) {
+@@ -302,7 +362,7 @@ static int config_3dnr(struct rkispp_device *dev)
+ 			if (ret < 0)
+ 				goto err;
+ 
+-			if (rkispp_tnr_3to1) {
++			if (vdev->tnr_mode) {
+ 				buf = &vdev->tnr_buf.pic_next;
+ 				buf->size = pic_size;
+ 				ret = rkispp_allow_buffer(dev, buf);
+@@ -368,15 +428,11 @@ static int config_3dnr(struct rkispp_device *dev)
+ 	}
+ 
+ 	rkispp_set_bits(base + RKISPP_TNR_CTRL, FMT_RD_MASK, fmt);
+-	if (fbc_mode) {
+-		rkispp_set_bits(base + RKISPP_TNR_CTRL, 0,
+-				SW_TNR_FBCD_MODE | SW_TNR_WR_FBCE_MODE);
++	if (fmt & FMT_FBC) {
+ 		writel(0, base + RKISPP_TNR_CUR_VIR_STRIDE);
+ 		writel(0, base + RKISPP_TNR_IIR_VIR_STRIDE);
+ 		writel(0, base + RKISPP_TNR_NXT_VIR_STRIDE);
+ 	} else {
+-		rkispp_clear_bits(base + RKISPP_TNR_CTRL,
+-				  SW_TNR_FBCD_MODE | SW_TNR_WR_FBCE_MODE);
+ 		writel(ALIGN(width * mult, 16) >> 2,
+ 			base + RKISPP_TNR_CUR_VIR_STRIDE);
+ 		writel(ALIGN(width * mult, 16) >> 2,
+@@ -384,9 +440,8 @@ static int config_3dnr(struct rkispp_device *dev)
+ 		writel(ALIGN(width * mult, 16) >> 2,
+ 			base + RKISPP_TNR_NXT_VIR_STRIDE);
+ 	}
+-	//writel(0xf, base + RKISPP_TNR_CORE_CTRL);//3to1
+-	//writel(0xd, base + RKISPP_TNR_CORE_CTRL);//2to1
+-	writel(rkispp_tnr_3to1 << 1, base + RKISPP_TNR_CORE_CTRL);//bypass tnr
++	rkispp_set_bits(base + RKISPP_TNR_CORE_CTRL, SW_TNR_MODE,
++		(vdev->tnr_mode && dev->inp == INP_ISP) ? SW_TNR_MODE : 0);
+ 	writel(ALIGN(width, 64) >> 4,
+ 		base + RKISPP_TNR_GAIN_CUR_VIR_STRIDE);
+ 	writel(ALIGN(width, 64) >> 4,
+@@ -414,7 +469,7 @@ static int config_3dnr(struct rkispp_device *dev)
+ 	return ret;
+ }
+ 
+-static int config_2dnr_shp(struct rkispp_device *dev)
++static int config_nr_shp(struct rkispp_device *dev)
+ {
+ 	struct rkispp_stream_vdev *vdev;
+ 	struct rkispp_stream *stream = NULL;
+@@ -422,40 +477,34 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 	struct rkispp_dummy_buffer *buf;
+ 	u32 width, height, fmt;
+ 	u32 pic_size, gain_size;
+-	u32 i, addr_offs;
++	u32 i, addr_offs, w, h;
+ 	int ret, mult = 1;
+-	bool fbcd_mode = false;
+ 
+ 	vdev = &dev->stream_vdev;
+-	if (!dev->module_en[ISPP_2DNR])
++	if (!(vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)))
+ 		return 0;
+ 
+ 	if (dev->inp == INP_DDR) {
+ 		stream = &vdev->stream[STREAM_II];
+-		width = stream->out_fmt.width;
+-		height = stream->out_fmt.height;
+-		pic_size = stream->out_fmt.plane_fmt[0].sizeimage;
+ 		fmt = stream->out_cap_fmt.wr_fmt;
+-		addr_offs = width * height;
+ 	} else {
+-		u32 w, h;
++		fmt = dev->ispp_sdev.out_fmt.wr_fmt | FMT_FBC;
++	}
+ 
+-		fbcd_mode = true;
+-		width = dev->ispp_sdev.out_fmt.width;
+-		height = dev->ispp_sdev.out_fmt.height;
+-		fmt = dev->ispp_sdev.out_fmt.wr_fmt;
+-		w = ALIGN(width, 16);
+-		h = ALIGN(height, 16);
+-		addr_offs = w * h >> 4;
+-		/* header and payload */
+-		pic_size = fmt ? w * h * 2 : w * h * 3 >> 1;
++	width = dev->ispp_sdev.out_fmt.width;
++	height = dev->ispp_sdev.out_fmt.height;
++	w = (fmt & FMT_FBC) ? ALIGN(width, 16) : width;
++	h = (fmt & FMT_FBC) ? ALIGN(height, 16) : height;
++	addr_offs = (fmt & FMT_FBC) ? w * h >> 4 : w * h;
++	pic_size = (fmt & FMT_YUV422) ? w * h * 2 : w * h * 3 >> 1;
++	if (fmt & FMT_FBC)
+ 		pic_size += w * h >> 4;
+-	}
++
+ 	gain_size = ALIGN(width, 64) * ALIGN(height, 128) >> 5;
+ 	if (fmt & FMT_YUYV)
+ 		mult = 2;
+ 
+-	if (dev->module_en[ISPP_3DNR]) {
++	if (vdev->module_ens & ISPP_MODULE_TNR) {
+ 		writel(readl(base + RKISPP_TNR_WR_Y_BASE),
+ 			base + RKISPP_NR_ADDR_BASE_Y);
+ 		writel(readl(base + RKISPP_TNR_WR_UV_BASE),
+@@ -464,10 +513,10 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 			base + RKISPP_NR_ADDR_BASE_GAIN);
+ 		rkispp_set_bits(base + RKISPP_CTRL_QUICK, 0, GLB_NR_SD32_TNR);
+ 	} else {
++		/* tnr need to set same format with nr in the fbc mode */
++		rkispp_set_bits(base + RKISPP_TNR_CTRL,
++				FMT_RD_MASK, fmt);
+ 		if (dev->inp == INP_ISP) {
+-			/* tnr need to set same format with nr in the fbc mode */
+-			rkispp_set_bits(base + RKISPP_TNR_CTRL,
+-					FMT_RD_MASK, fmt);
+ 			rkispp_set_bits(base + RKISPP_CTRL_QUICK,
+ 					GLB_QUICK_MODE_MASK,
+ 					GLB_QUICK_MODE(2));
+@@ -497,7 +546,7 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 	}
+ 
+ 	rkispp_clear_bits(base + RKISPP_CTRL_QUICK, GLB_FEC2SCL_EN);
+-	if (dev->module_en[ISPP_FEC]) {
++	if (vdev->module_ens & ISPP_MODULE_FEC) {
+ 		pic_size = (fmt & FMT_YUV422) ? width * height * 2 :
+ 			width * height * 3 >> 1;
+ 		addr_offs = width * height;
+@@ -513,7 +562,7 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 		writel(ALIGN(width * mult, 16) >> 2,
+ 			base + RKISPP_SHARP_WR_VIR_STRIDE);
+ 		rkispp_set_bits(base + RKISPP_SHARP_CTRL,
+-				SW_SHP_WR_FORMAT_MASK, fmt);
++				SW_SHP_WR_FORMAT_MASK, fmt & (~FMT_FBC));
+ 	}
+ 
+ 	buf = &vdev->nr_buf.tmp_yuv;
+@@ -524,17 +573,13 @@ static int config_2dnr_shp(struct rkispp_device *dev)
+ 	writel(buf->dma_addr, base + RKISPP_SHARP_TMP_YUV_BASE);
+ 
+ 	rkispp_set_bits(base + RKISPP_NR_CTRL, FMT_RD_MASK, fmt);
+-	if (fbcd_mode) {
+-		rkispp_set_bits(base + RKISPP_NR_CTRL, 0, SW_NR_RD_FBCD_MODE);
++	if (fmt & FMT_FBC) {
+ 		writel(0, base + RKISPP_NR_VIR_STRIDE);
+ 		writel(ALIGN(height, 16), base + RKISPP_FBC_VIR_HEIGHT);
+ 	} else {
+-		rkispp_clear_bits(base + RKISPP_NR_CTRL, SW_NR_RD_FBCD_MODE);
+ 		writel(ALIGN(width * mult, 16) >> 2, base + RKISPP_NR_VIR_STRIDE);
+ 	}
+ 	writel(ALIGN(width, 64) >> 4, base + RKISPP_NR_VIR_STRIDE_GAIN);
+-	writel(0, base + 0x480);//ynr&uvnr bypass
+-	writel(0, base + 0x680);//sharp_enable
+ 	writel(height << 16 | width, base + RKISPP_CTRL_SIZE);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+@@ -567,23 +612,23 @@ static int config_fec(struct rkispp_device *dev)
+ 	int ret;
+ 
+ 	vdev = &dev->stream_vdev;
+-	if (!dev->module_en[ISPP_FEC])
++	if (!(vdev->module_ens & ISPP_MODULE_FEC))
+ 		return 0;
+ 
+ 	if (dev->inp == INP_DDR) {
+ 		stream = &vdev->stream[STREAM_II];
+-		width = stream->out_fmt.width;
+-		height = stream->out_fmt.height;
+ 		fmt = stream->out_cap_fmt.wr_fmt;
+ 	} else {
+-		width = dev->ispp_sdev.out_fmt.width;
+-		height = dev->ispp_sdev.out_fmt.height;
+ 		fmt = dev->ispp_sdev.out_fmt.wr_fmt;
+ 	}
++
++	width = dev->ispp_sdev.out_fmt.width;
++	height = dev->ispp_sdev.out_fmt.height;
++
+ 	if (fmt & FMT_YUYV)
+ 		mult = 2;
+ 
+-	if (dev->module_en[ISPP_2DNR]) {
++	if (vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP)) {
+ 		writel(readl(base + RKISPP_SHARP_WR_Y_BASE),
+ 			base + RKISPP_FEC_RD_Y_BASE);
+ 		writel(readl(base + RKISPP_SHARP_WR_UV_BASE),
+@@ -648,11 +693,14 @@ static int config_modules(struct rkispp_device *dev)
+ {
+ 	int ret;
+ 
+-	ret = config_3dnr(dev);
++	if (dev->inp == INP_ISP)
++		dev->stream_vdev.module_ens |= ISPP_MODULE_NR;
++
++	ret = config_tnr(dev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = config_2dnr_shp(dev);
++	ret = config_nr_shp(dev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -693,18 +741,18 @@ static int config_mb(struct rkispp_stream *stream)
+ {
+ 	struct rkispp_device *dev = stream->isppdev;
+ 	void __iomem *base = dev->base_addr;
+-	int i, mult = 1;
++	u32 i, limit_range, mult = 1;
+ 
+-	for (i = ISPP_FEC; i >= ISPP_3DNR; i--) {
+-		if (dev->module_en[i])
++	for (i = ISPP_MODULE_FEC; i > 0; i = i >> 1) {
++		if (dev->stream_vdev.module_ens >> i)
+ 			break;
+ 	}
+-	if (i < 0)
++	if (!i)
+ 		return -EINVAL;
+ 
+ 	stream->last_module = i;
+ 	switch (i) {
+-	case ISPP_3DNR:
++	case ISPP_MODULE_TNR:
+ 		stream->config->frame_end_id = TNR_INT;
+ 		stream->config->reg.cur_y_base = RKISPP_TNR_WR_Y_BASE;
+ 		stream->config->reg.cur_uv_base = RKISPP_TNR_WR_UV_BASE;
+@@ -714,16 +762,19 @@ static int config_mb(struct rkispp_stream *stream)
+ 		rkispp_set_bits(base + RKISPP_TNR_CTRL, FMT_WR_MASK,
+ 				SW_TNR_1ST_FRM | stream->out_cap_fmt.wr_fmt << 4);
+ 		break;
+-	case ISPP_2DNR:
+-	case ISPP_SHP:
++	case ISPP_MODULE_NR:
++	case ISPP_MODULE_SHP:
+ 		stream->config->frame_end_id = SHP_INT;
+ 		stream->config->reg.cur_y_base = RKISPP_SHARP_WR_Y_BASE;
+ 		stream->config->reg.cur_uv_base = RKISPP_SHARP_WR_UV_BASE;
+ 		stream->config->reg.cur_vir_stride = RKISPP_SHARP_WR_VIR_STRIDE;
+ 		stream->config->reg.cur_y_base_shd = RKISPP_SHARP_WR_Y_BASE_SHD;
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_SHARP_WR_UV_BASE_SHD;
+-		rkispp_set_bits(base + RKISPP_SHARP_CTRL, SW_SHP_WR_FORMAT_MASK,
+-				stream->out_cap_fmt.wr_fmt);
++		limit_range = (stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
++			0 : SW_SHP_WR_YUV_LIMIT;
++		rkispp_set_bits(base + RKISPP_SHARP_CTRL,
++				SW_SHP_WR_YUV_LIMIT | SW_SHP_WR_FORMAT_MASK,
++				limit_range | stream->out_cap_fmt.wr_fmt);
+ 		rkispp_clear_bits(base + RKISPP_SHARP_CORE_CTRL, SW_SHP_DMA_DIS);
+ 		break;
+ 	default:
+@@ -733,8 +784,10 @@ static int config_mb(struct rkispp_stream *stream)
+ 		stream->config->reg.cur_vir_stride = RKISPP_FEC_WR_VIR_STRIDE;
+ 		stream->config->reg.cur_y_base_shd = RKISPP_FEC_WR_Y_BASE_SHD;
+ 		stream->config->reg.cur_uv_base_shd = RKISPP_FEC_WR_UV_BASE_SHD;
+-		rkispp_set_bits(base + RKISPP_FEC_CTRL, FMT_WR_MASK,
+-				stream->out_cap_fmt.wr_fmt << 4);
++		limit_range = (stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
++			0 : SW_FEC_WR_YUV_LIMIT;
++		rkispp_set_bits(base + RKISPP_FEC_CTRL, SW_FEC_WR_YUV_LIMIT | FMT_WR_MASK,
++				limit_range | stream->out_cap_fmt.wr_fmt << 4);
+ 		writel((stream->out_fmt.height << 16) | stream->out_fmt.width,
+ 			base + RKISPP_FEC_PIC_SIZE);
+ 	}
+@@ -752,11 +805,11 @@ static void stop_mb(struct rkispp_stream *stream)
+ 	void __iomem *base = dev->base_addr;
+ 
+ 	switch (stream->last_module) {
+-	case ISPP_3DNR:
++	case ISPP_MODULE_TNR:
+ 		rkispp_clear_bits(base + RKISPP_TNR_CORE_CTRL, SW_TNR_EN);
+ 		break;
+-	case ISPP_2DNR:
+-	case ISPP_SHP:
++	case ISPP_MODULE_NR:
++	case ISPP_MODULE_SHP:
+ 		rkispp_clear_bits(base + RKISPP_NR_UVNR_CTRL_PARA, SW_NR_EN);
+ 		rkispp_clear_bits(base + RKISPP_SHARP_CORE_CTRL, SW_SHP_EN);
+ 		break;
+@@ -772,12 +825,12 @@ static int is_stopped_mb(struct rkispp_stream *stream)
+ 	u32 val, en;
+ 
+ 	switch (stream->last_module) {
+-	case ISPP_3DNR:
++	case ISPP_MODULE_TNR:
+ 		en = SW_TNR_EN_SHD;
+ 		val = readl(base + RKISPP_TNR_CORE_CTRL);
+ 		break;
+-	case ISPP_2DNR:
+-	case ISPP_SHP:
++	case ISPP_MODULE_NR:
++	case ISPP_MODULE_SHP:
+ 		en = SW_SHP_EN;
+ 		val = readl(base + RKISPP_SHARP_CORE_CTRL);
+ 		rkispp_set_bits(base + RKISPP_SHARP_CORE_CTRL,
+@@ -804,6 +857,7 @@ static int config_scl(struct rkispp_stream *stream)
+ 			(in_width - 1) + 1;
+ 	u32 vy_fac = (stream->out_fmt.height - 1) * 8192 /
+ 			(in_height - 1) + 1;
++	u32 value = 0;
+ 	u8 bypass = 0, mult = 1;
+ 
+ 	if (hy_fac == 8193 && vy_fac == 8193)
+@@ -812,7 +866,11 @@ static int config_scl(struct rkispp_stream *stream)
+ 		mult = 2;
+ 	set_vir_stride(stream, ALIGN(stream->out_fmt.width * mult, 16) >> 2);
+ 	set_scl_factor(stream, vy_fac << 16 | hy_fac);
+-	set_ctrl(stream, fmt->wr_fmt << 3 | bypass | SW_SCL_ENABLE);
++	value = SW_SCL_ENABLE | bypass | fmt->wr_fmt << 3 |
++		(fmt->fourcc != V4L2_PIX_FMT_GREY) ? 0 : SW_SCL_WR_UV_DIS |
++		(stream->out_fmt.quantization != V4L2_QUANTIZATION_LIM_RANGE) ?
++		0 : SW_SCL_WR_YUV_LIMIT;
++	set_ctrl(stream, value);
+ 
+ 	v4l2_dbg(1, rkispp_debug, &dev->v4l2_dev,
+ 		 "scl%d ctrl:0x%x stride:0x%x factor:0x%x\n",
+@@ -1154,6 +1212,8 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 			  struct v4l2_pix_format_mplane *pixm,
+ 			  bool try)
+ {
++	struct rkispp_device *dev = stream->isppdev;
++	struct rkispp_subdev *sdev = &dev->ispp_sdev;
+ 	const struct capture_fmt *fmt;
+ 	unsigned int imagsize = 0;
+ 	unsigned int planes;
+@@ -1162,7 +1222,7 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 
+ 	fmt = find_fmt(stream, pixm->pixelformat);
+ 	if (!fmt) {
+-		v4l2_err(&stream->isppdev->v4l2_dev,
++		v4l2_err(&dev->v4l2_dev,
+ 			 "nonsupport pixelformat:%c%c%c%c\n",
+ 			 pixm->pixelformat,
+ 			 pixm->pixelformat >> 8,
+@@ -1171,6 +1231,14 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 		return -EINVAL;
+ 	}
+ 
++	if (stream->id == STREAM_MB &&
++	    (pixm->width != sdev->out_fmt.width &&
++	     pixm->height != sdev->out_fmt.height)) {
++		v4l2_err(&dev->v4l2_dev,
++			 "resolution should euqal to input\n");
++		return -EINVAL;
++	}
++
+ 	pixm->num_planes = fmt->mplanes;
+ 	pixm->field = V4L2_FIELD_NONE;
+ 	if (!pixm->quantization)
+@@ -1181,24 +1249,31 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 	planes = fmt->cplanes ? fmt->cplanes : fmt->mplanes;
+ 	for (i = 0; i < planes; i++) {
+ 		struct v4l2_plane_pix_format *plane_fmt;
+-		unsigned int width, height, bytesperline;
++		unsigned int width, height, bytesperline, w, h;
+ 
+ 		plane_fmt = pixm->plane_fmt + i;
+ 
+-		if (i == 0) {
+-			width = pixm->width;
+-			height = pixm->height;
+-		} else {
+-			width = pixm->width / xsubs;
+-			height = pixm->height / ysubs;
+-		}
++		w = (fmt->wr_fmt & FMT_FBC) ?
++			ALIGN(pixm->width, 16) : pixm->width;
++		h = (fmt->wr_fmt & FMT_FBC) ?
++			ALIGN(pixm->height, 16) : pixm->height;
++		width = i ? w / xsubs : w;
++		height = i ? h / ysubs : h;
+ 
+ 		bytesperline = width * DIV_ROUND_UP(fmt->bpp[i], 8);
+-		if (i != 0 ||
+-		    plane_fmt->bytesperline < bytesperline)
++
++		if (i != 0 || plane_fmt->bytesperline < bytesperline)
+ 			plane_fmt->bytesperline = bytesperline;
+ 
+ 		plane_fmt->sizeimage = plane_fmt->bytesperline * height;
++		/* FBC header: width * height / 16
++		 * FBC payload: yuv420 or yuv422 size
++		 * FBC width and height need 16 align
++		 */
++		if (fmt->wr_fmt & FMT_FBC && i == 0)
++			plane_fmt->sizeimage >>= 4;
++		else if (fmt->wr_fmt & FMT_FBC)
++			plane_fmt->sizeimage += w * h;
+ 
+ 		imagsize += plane_fmt->sizeimage;
+ 	}
+@@ -1211,8 +1286,8 @@ static int rkispp_set_fmt(struct rkispp_stream *stream,
+ 		stream->out_fmt = *pixm;
+ 
+ 		if (stream->id == STREAM_II) {
+-			struct rkispp_subdev *sdev = &stream->isppdev->ispp_sdev;
+-
++			sdev->in_fmt.format.width = pixm->width;
++			sdev->in_fmt.format.height = pixm->height;
+ 			sdev->out_fmt.width = pixm->width;
+ 			sdev->out_fmt.height = pixm->height;
+ 		}
+@@ -1386,7 +1461,7 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 	u32 i, err_mask = NR_LOST_ERR | TNR_LOST_ERR |
+ 		UVNR_MONITOR_ERR | FBCH_EMPTY_NR |
+ 		FBCH_EMPTY_TNR | FBCD_DEC_ERR_NR |
+-		BUS_ERR_NR | BUS_ERR_TNR;
++		FBCD_DEC_ERR_TNR | BUS_ERR_NR | BUS_ERR_TNR;
+ 
+ 	v4l2_dbg(3, rkispp_debug, &dev->v4l2_dev,
+ 		 "isr:0x%x\n", mis_val);
+@@ -1407,12 +1482,12 @@ void rkispp_isr(u32 mis_val, struct rkispp_device *dev)
+ 			rkispp_clear_bits(base + RKISPP_TNR_CTRL,
+ 					  SW_TNR_1ST_FRM);
+ 		if (dev->inp == INP_DDR &&
+-		    dev->module_en[ISPP_2DNR])
++		    vdev->module_ens & (ISPP_MODULE_NR | ISPP_MODULE_SHP))
+ 			writel(NR_SHP_ST, base + RKISPP_CTRL_STRT);
+ 	}
+ 
+ 	if (mis_val & SHP_INT &&
+-	    dev->module_en[ISPP_FEC])
++	    vdev->module_ens & ISPP_MODULE_FEC)
+ 		writel(FEC_ST, base + RKISPP_CTRL_STRT);
+ 
+ 	for (i = 0; i < STREAM_MAX; i++) {
+diff --git a/drivers/media/platform/rockchip/ispp/stream.h b/drivers/media/platform/rockchip/ispp/stream.h
+index 8a7fd6939c4f..f2f5fa88e97a 100644
+--- a/drivers/media/platform/rockchip/ispp/stream.h
++++ b/drivers/media/platform/rockchip/ispp/stream.h
+@@ -144,6 +144,8 @@ struct rkispp_stream_vdev {
+ 	struct in_nr_buf nr_buf;
+ 	struct in_fec_buf fec_buf;
+ 	atomic_t refcnt;
++	u32 module_ens;
++	u8 tnr_mode;
+ };
+ 
+ void rkispp_isr(u32 mis_val, struct rkispp_device *dev);
+diff --git a/include/uapi/linux/rkispp-config.h b/include/uapi/linux/rkispp-config.h
+index 968ace1ce71d..f60d9edbe41a 100644
+--- a/include/uapi/linux/rkispp-config.h
++++ b/include/uapi/linux/rkispp-config.h
+@@ -69,6 +69,7 @@
+ #define FEC_MESH_XY_NUM			5120
+ 
+ struct rkispp_tnr_config {
++	u8 mode;
+ 	u8 opty_en;
+ 	u8 optc_en;
+ 	u8 gain_en;
+-- 
+2.35.3
+

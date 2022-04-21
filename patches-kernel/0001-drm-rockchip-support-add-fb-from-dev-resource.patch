@@ -1,0 +1,264 @@
+From 8b9e68c433dc3d35d3768c3bf973f8f042abb13c Mon Sep 17 00:00:00 2001
+From: Sandy Huang <hjc@rock-chips.com>
+Date: Wed, 5 Jun 2019 20:33:30 +0800
+Subject: [PATCH] drm/rockchip: support add fb from dev resource
+
+Change-Id: I980af965d83de25c433ba5424bab2ad063534bcb
+Signed-off-by: Mark Yao <mark.yao@rock-chips.com>
+Signed-off-by: Sandy Huang <hjc@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.c  | 90 ++++++++++++++++-----
+ drivers/gpu/drm/rockchip/rockchip_drm_fb.h  |  8 ++
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.c | 25 +++---
+ 3 files changed, 87 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+index ea18cb2a76c0..1ec5facd10a6 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.c
+@@ -19,12 +19,42 @@
+ #include <drm/drm_fb_helper.h>
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
++#include <linux/memblock.h>
+ 
+ #include "rockchip_drm_drv.h"
+ #include "rockchip_drm_fb.h"
+ #include "rockchip_drm_gem.h"
+ #include "rockchip_drm_psr.h"
+ 
++#define to_rockchip_fb(x) container_of(x, struct rockchip_drm_fb, fb)
++struct rockchip_drm_fb {
++	struct drm_framebuffer fb;
++	dma_addr_t dma_addr[ROCKCHIP_MAX_FB_BUFFER];
++	struct drm_gem_object *obj[ROCKCHIP_MAX_FB_BUFFER];
++	struct sg_table *sgt;
++	phys_addr_t start;
++	phys_addr_t size;
++};
++
++dma_addr_t rockchip_fb_get_dma_addr(struct drm_framebuffer *fb,
++				    unsigned int plane, struct device *dev)
++{
++	struct rockchip_drm_fb *rk_fb = to_rockchip_fb(fb);
++
++	if (WARN_ON(plane >= ROCKCHIP_MAX_FB_BUFFER))
++		return 0;
++
++	return rk_fb->dma_addr[plane];
++}
++
++static void rockchip_drm_fb_destroy(struct drm_framebuffer *fb)
++{
++	struct rockchip_drm_fb *rockchip_fb = to_rockchip_fb(fb);
++
++	drm_gem_fb_destroy(fb);
++	kfree(rockchip_fb);
++}
++
+ static int rockchip_drm_fb_dirty(struct drm_framebuffer *fb,
+ 				 struct drm_file *file,
+ 				 unsigned int flags, unsigned int color,
+@@ -36,38 +66,58 @@ static int rockchip_drm_fb_dirty(struct drm_framebuffer *fb,
+ }
+ 
+ static const struct drm_framebuffer_funcs rockchip_drm_fb_funcs = {
+-	.destroy       = drm_gem_fb_destroy,
++	.destroy       = rockchip_drm_fb_destroy,
+ 	.create_handle = drm_gem_fb_create_handle,
+ 	.dirty	       = rockchip_drm_fb_dirty,
+ };
+ 
+-static struct drm_framebuffer *
++struct drm_framebuffer *
+ rockchip_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2 *mode_cmd,
+-		  struct drm_gem_object **obj, unsigned int num_planes)
++		  struct drm_gem_object **obj, struct resource *res,
++		  unsigned int num_planes)
+ {
+-	struct drm_framebuffer *fb;
+-	int ret;
++	struct rockchip_drm_fb *rockchip_fb;
++	struct rockchip_gem_object *rk_obj;
++	int ret = 0;
+ 	int i;
+ 
+-	fb = kzalloc(sizeof(*fb), GFP_KERNEL);
+-	if (!fb)
++	rockchip_fb = kzalloc(sizeof(*rockchip_fb), GFP_KERNEL);
++	if (!rockchip_fb)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	drm_helper_mode_fill_fb_struct(dev, fb, mode_cmd);
++	drm_helper_mode_fill_fb_struct(dev, &rockchip_fb->fb, mode_cmd);
+ 
+-	for (i = 0; i < num_planes; i++)
+-		fb->obj[i] = obj[i];
+-
+-	ret = drm_framebuffer_init(dev, fb, &rockchip_drm_fb_funcs);
++	ret = drm_framebuffer_init(dev, &rockchip_fb->fb,
++				   &rockchip_drm_fb_funcs);
+ 	if (ret) {
+-		DRM_DEV_ERROR(dev->dev,
+-			      "Failed to initialize framebuffer: %d\n",
+-			      ret);
+-		kfree(fb);
+-		return ERR_PTR(ret);
++		dev_err(dev->dev, "Failed to initialize framebuffer: %d\n",
++			ret);
++		goto err_free_fb;
+ 	}
+ 
+-	return fb;
++	if (obj) {
++		for (i = 0; i < num_planes; i++)
++			rockchip_fb->obj[i] = obj[i];
++
++		for (i = 0; i < num_planes; i++) {
++			rk_obj = to_rockchip_obj(obj[i]);
++			rockchip_fb->dma_addr[i] = rk_obj->dma_addr;
++		}
++	} else if (res) {
++		/* todo for kernel logo */
++	} else {
++		ret = -EINVAL;
++		dev_err(dev->dev, "Failed to find available buffer\n");
++		goto err_deinit_drm_fb;
++	}
++
++	return &rockchip_fb->fb;
++
++err_deinit_drm_fb:
++	drm_framebuffer_cleanup(&rockchip_fb->fb);
++err_free_fb:
++	kfree(rockchip_fb);
++	return ERR_PTR(ret);
+ }
+ 
+ static struct drm_framebuffer *
+@@ -113,7 +163,7 @@ rockchip_user_fb_create(struct drm_device *dev, struct drm_file *file_priv,
+ 		objs[i] = obj;
+ 	}
+ 
+-	fb = rockchip_fb_alloc(dev, mode_cmd, objs, i);
++	fb = rockchip_fb_alloc(dev, mode_cmd, objs, NULL, i);
+ 	if (IS_ERR(fb)) {
+ 		ret = PTR_ERR(fb);
+ 		goto err_gem_object_unreference;
+@@ -204,7 +254,7 @@ rockchip_drm_framebuffer_init(struct drm_device *dev,
+ {
+ 	struct drm_framebuffer *fb;
+ 
+-	fb = rockchip_fb_alloc(dev, mode_cmd, &obj, 1);
++	fb = rockchip_fb_alloc(dev, mode_cmd, &obj, NULL, 1);
+ 	if (IS_ERR(fb))
+ 		return ERR_CAST(fb);
+ 
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_fb.h b/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
+index f1265cb1aee8..0aea0d949558 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_fb.h
+@@ -22,4 +22,12 @@ rockchip_drm_framebuffer_init(struct drm_device *dev,
+ void rockchip_drm_framebuffer_fini(struct drm_framebuffer *fb);
+ 
+ void rockchip_drm_mode_config_init(struct drm_device *dev);
++
++struct drm_framebuffer *
++rockchip_fb_alloc(struct drm_device *dev, const struct drm_mode_fb_cmd2 *mode_cmd,
++		  struct drm_gem_object **obj, struct resource *res,
++		  unsigned int num_planes);
++
++dma_addr_t rockchip_fb_get_dma_addr(struct drm_framebuffer *fb,
++				    unsigned int plane, struct device *dev);
+ #endif /* _ROCKCHIP_DRM_FB_H */
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+index 538fa34db529..1b210a8f7339 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -776,8 +776,6 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ 	uint32_t act_info, dsp_info, dsp_st;
+ 	struct drm_rect *src = &state->src;
+ 	struct drm_rect *dest = &state->dst;
+-	struct drm_gem_object *obj, *uv_obj;
+-	struct rockchip_gem_object *rk_obj, *rk_uv_obj;
+ 	unsigned long offset;
+ 	dma_addr_t dma_addr;
+ 	uint32_t val;
+@@ -801,9 +799,6 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+-	obj = fb->obj[0];
+-	rk_obj = to_rockchip_obj(obj);
+-
+ 	actual_w = drm_rect_width(src) >> 16;
+ 	actual_h = drm_rect_height(src) >> 16;
+ 	act_info = (actual_h - 1) << 16 | ((actual_w - 1) & 0xffff);
+@@ -817,7 +812,8 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	offset = (src->x1 >> 16) * fb->format->cpp[0];
+ 	offset += (src->y1 >> 16) * fb->pitches[0];
+-	dma_addr = rk_obj->dma_addr + offset + fb->offsets[0];
++	dma_addr = rockchip_fb_get_dma_addr(fb, 0, vop->dev);
++	dma_addr += offset + fb->offsets[0];
+ 
+ 	/*
+ 	 * For y-mirroring we need to move address
+@@ -844,13 +840,12 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
+ 		int vsub = drm_format_vert_chroma_subsampling(fb->format->format);
+ 		int bpp = fb->format->cpp[1];
+ 
+-		uv_obj = fb->obj[1];
+-		rk_uv_obj = to_rockchip_obj(uv_obj);
+-
+ 		offset = (src->x1 >> 16) * bpp / hsub;
+ 		offset += (src->y1 >> 16) * fb->pitches[1] / vsub;
+ 
+-		dma_addr = rk_uv_obj->dma_addr + offset + fb->offsets[1];
++		dma_addr = rockchip_fb_get_dma_addr(fb, 1, vop->dev);
++		dma_addr += offset + fb->offsets[1];
++
+ 		VOP_WIN_SET(vop, win, uv_vir, DIV_ROUND_UP(fb->pitches[1], 4));
+ 		VOP_WIN_SET(vop, win, uv_mst, dma_addr);
+ 
+@@ -1277,7 +1272,7 @@ static void vop_crtc_reset(struct drm_crtc *crtc)
+ 		__drm_atomic_helper_crtc_destroy_state(crtc->state);
+ 	kfree(crtc->state);
+ 
+-	crtc->state = kzalloc(sizeof(struct rockchip_crtc_state), GFP_KERNEL);
++	crtc->state = kzalloc(sizeof(struct drm_crtc_state), GFP_KERNEL);
+ 	if (crtc->state)
+ 		crtc->state->crtc = crtc;
+ }
+@@ -1499,7 +1494,7 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
+ 				   possible_crtcs, &vop_plane_funcs,
+ 				   win->data_formats, win->nformats, win->type);
+ 	if (ret) {
+-		DRM_ERROR("failed to initialize plane\n");
++		DRM_ERROR("failed to initialize plane %d\n", ret);
+ 		return ret;
+ 	}
+ 	drm_plane_helper_add(&win->base, &plane_helper_funcs);
+@@ -1532,8 +1527,7 @@ static int vop_create_crtc(struct vop *vop)
+ 			continue;
+ 
+ 		if (vop_plane_init(vop, win, 0)) {
+-			DRM_DEV_ERROR(vop->dev, "failed to init plane %d\n",
+-				      ret);
++			DRM_DEV_ERROR(vop->dev, "failed to init plane\n");
+ 			goto err_cleanup_planes;
+ 		}
+ 
+@@ -1563,8 +1557,7 @@ static int vop_create_crtc(struct vop *vop)
+ 			continue;
+ 
+ 		if (vop_plane_init(vop, win, possible_crtcs)) {
+-			DRM_DEV_ERROR(vop->dev, "failed to init overlay %d\n",
+-				      ret);
++			DRM_DEV_ERROR(vop->dev, "failed to init overlay\n");
+ 			goto err_cleanup_crtc;
+ 		}
+ 		vop_plane_add_properties(&win->base, win);
+-- 
+2.35.3
+

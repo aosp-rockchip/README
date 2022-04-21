@@ -1,0 +1,256 @@
+From 1f22d94a8b0005ba5426bf717337c793852f320a Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Tue, 18 Aug 2020 21:42:03 +0800
+Subject: [PATCH] media: rockchip: isp: support link with interface of cif
+
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+Change-Id: If41b2b1e8e789f1045c55ed30ce5573c28052257
+---
+ drivers/media/platform/rockchip/isp/bridge.c  |  3 +-
+ drivers/media/platform/rockchip/isp/capture.c |  9 ++-
+ drivers/media/platform/rockchip/isp/csi.c     | 58 ++++++++++++++-----
+ drivers/media/platform/rockchip/isp/dev.c     |  6 +-
+ drivers/media/platform/rockchip/isp/dev.h     |  1 +
+ drivers/media/platform/rockchip/isp/rkisp.c   | 11 ++--
+ 6 files changed, 62 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp/bridge.c b/drivers/media/platform/rockchip/isp/bridge.c
+index 3774ea497fcd..ae08b10c5086 100644
+--- a/drivers/media/platform/rockchip/isp/bridge.c
++++ b/drivers/media/platform/rockchip/isp/bridge.c
+@@ -490,7 +490,8 @@ static int bridge_start_stream(struct v4l2_subdev *sd)
+ 
+ 	if (dev->ispdev->isp_inp & INP_CSI ||
+ 	    dev->ispdev->isp_inp & INP_DVP ||
+-	    dev->ispdev->isp_inp & INP_LVDS) {
++	    dev->ispdev->isp_inp & INP_LVDS ||
++	    dev->ispdev->isp_inp & INP_CIF) {
+ 		/* Always update sensor info in case media topology changed */
+ 		ret = rkisp_update_sensor_info(dev->ispdev);
+ 		if (ret < 0) {
+diff --git a/drivers/media/platform/rockchip/isp/capture.c b/drivers/media/platform/rockchip/isp/capture.c
+index fa73239863cf..ae329b342968 100644
+--- a/drivers/media/platform/rockchip/isp/capture.c
++++ b/drivers/media/platform/rockchip/isp/capture.c
+@@ -1812,7 +1812,8 @@ int hdr_update_dmatx_buf(struct rkisp_device *dev)
+ 
+ 	if (!dev->active_sensor ||
+ 	    (dev->active_sensor &&
+-	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2))
++	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2) ||
++	    (dev->isp_inp & INP_CIF))
+ 		return 0;
+ 
+ 	dmatx = &dev->cap_dev.stream[RKISP_STREAM_DMATX0];
+@@ -1877,7 +1878,8 @@ int hdr_config_dmatx(struct rkisp_device *dev)
+ 	if (atomic_inc_return(&dev->hdr.refcnt) > 1 ||
+ 	    !dev->active_sensor ||
+ 	    (dev->active_sensor &&
+-	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2))
++	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2) ||
++	    (dev->isp_inp & INP_CIF))
+ 		return 0;
+ 
+ 	rkisp_create_hdr_buf(dev);
+@@ -1910,7 +1912,8 @@ void hdr_stop_dmatx(struct rkisp_device *dev)
+ 	if (atomic_dec_return(&dev->hdr.refcnt) ||
+ 	    !dev->active_sensor ||
+ 	    (dev->active_sensor &&
+-	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2))
++	     dev->active_sensor->mbus.type != V4L2_MBUS_CSI2) ||
++	    (dev->isp_inp & INP_CIF))
+ 		return;
+ 
+ 	if (dev->hdr.op_mode == HDR_FRAMEX2_DDR ||
+diff --git a/drivers/media/platform/rockchip/isp/csi.c b/drivers/media/platform/rockchip/isp/csi.c
+index be04730461c0..a4d33f99fb8a 100644
+--- a/drivers/media/platform/rockchip/isp/csi.c
++++ b/drivers/media/platform/rockchip/isp/csi.c
+@@ -14,7 +14,7 @@
+ #include "regs.h"
+ 
+ static void get_remote_mipi_sensor(struct rkisp_device *dev,
+-				  struct v4l2_subdev **sensor_sd)
++				  struct v4l2_subdev **sensor_sd, u32 function)
+ {
+ 	struct media_graph graph;
+ 	struct media_entity *entity = &dev->isp_sdev.sd.entity;
+@@ -32,7 +32,7 @@ static void get_remote_mipi_sensor(struct rkisp_device *dev,
+ 
+ 	media_graph_walk_start(&graph, entity);
+ 	while ((entity = media_graph_walk_next(&graph))) {
+-		if (entity->function == MEDIA_ENT_F_CAM_SENSOR)
++		if (entity->function == function)
+ 			break;
+ 	}
+ 	mutex_unlock(&mdev->graph_mutex);
+@@ -206,7 +206,7 @@ static int csi_config(struct rkisp_csi_device *csi)
+ 	emd_vc = 0xFF;
+ 	emd_dt = 0;
+ 	dev->hdr.sensor = NULL;
+-	get_remote_mipi_sensor(dev, &mipi_sensor);
++	get_remote_mipi_sensor(dev, &mipi_sensor, MEDIA_ENT_F_CAM_SENSOR);
+ 	if (mipi_sensor) {
+ 		ctrl = v4l2_ctrl_find(mipi_sensor->ctrl_handler,
+ 				      CIFISP_CID_EMB_VC);
+@@ -399,25 +399,51 @@ static int csi_config(struct rkisp_csi_device *csi)
+ int rkisp_csi_config_patch(struct rkisp_device *dev)
+ {
+ 	int val = 0, ret = 0;
++	struct v4l2_subdev *mipi_sensor;
+ 
+ 	if (dev->isp_inp & INP_CSI) {
+ 		dev->hw_dev->mipi_dev_id = dev->dev_id;
+ 		ret = csi_config(&dev->csi_dev);
+ 	} else {
+-		switch (dev->isp_inp & 0x7) {
+-		case INP_RAWRD2 | INP_RAWRD0:
+-			dev->hdr.op_mode = HDR_RDBK_FRAME2;
+-			val = SW_HDRMGE_EN |
+-				SW_HDRMGE_MODE_FRAMEX2;
+-			break;
+-		case INP_RAWRD2 | INP_RAWRD1 | INP_RAWRD0:
+-			dev->hdr.op_mode = HDR_RDBK_FRAME3;
+-			val = SW_HDRMGE_EN |
+-				SW_HDRMGE_MODE_FRAMEX3;
+-			break;
+-		default: //INP_RAWRD2
+-			dev->hdr.op_mode = HDR_RDBK_FRAME1;
++		if (dev->isp_inp & INP_CIF) {
++			struct rkmodule_hdr_cfg hdr_cfg;
++
++			get_remote_mipi_sensor(dev, &mipi_sensor, MEDIA_ENT_F_PROC_VIDEO_COMPOSER);
++			dev->hdr.op_mode = HDR_NORMAL;
++			dev->hdr.esp_mode = HDR_NORMAL_VC;
++			if (mipi_sensor) {
++				ret = v4l2_subdev_call(mipi_sensor,
++						       core, ioctl,
++						       RKMODULE_GET_HDR_CFG,
++						       &hdr_cfg);
++				if (!ret) {
++					dev->hdr.op_mode = hdr_cfg.hdr_mode;
++					dev->hdr.esp_mode = hdr_cfg.esp.mode;
++				}
++			}
++
++			/* normal read back mode */
++			if (dev->hdr.op_mode == HDR_NORMAL &&
++			    (dev->isp_inp & INP_RAWRD2 || !dev->hw_dev->is_single))
++				dev->hdr.op_mode = HDR_RDBK_FRAME1;
++		} else {
++			switch (dev->isp_inp & 0x7) {
++			case INP_RAWRD2 | INP_RAWRD0:
++				dev->hdr.op_mode = HDR_RDBK_FRAME2;
++				break;
++			case INP_RAWRD2 | INP_RAWRD1 | INP_RAWRD0:
++				dev->hdr.op_mode = HDR_RDBK_FRAME3;
++				break;
++			default: //INP_RAWRD2
++				dev->hdr.op_mode = HDR_RDBK_FRAME1;
++			}
+ 		}
++
++		if (dev->hdr.op_mode == HDR_RDBK_FRAME2)
++			val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX2;
++		else if (dev->hdr.op_mode == HDR_RDBK_FRAME3)
++			val = SW_HDRMGE_EN | SW_HDRMGE_MODE_FRAMEX3;
++
+ 		if (!dev->hw_dev->is_mi_update)
+ 			rkisp_write(dev, CSI2RX_CTRL0,
+ 				    SW_IBUF_OP_MODE(dev->hdr.op_mode), true);
+diff --git a/drivers/media/platform/rockchip/isp/dev.c b/drivers/media/platform/rockchip/isp/dev.c
+index c64bf682fe5d..ca5bef93bab7 100644
+--- a/drivers/media/platform/rockchip/isp/dev.c
++++ b/drivers/media/platform/rockchip/isp/dev.c
+@@ -219,7 +219,7 @@ static int rkisp_pipeline_open(struct rkisp_pipeline *p,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (dev->isp_inp & (INP_CSI | INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2))
++	if (dev->isp_inp & (INP_CSI | INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2 | INP_CIF))
+ 		rkisp_csi_config_patch(dev);
+ 	return 0;
+ }
+@@ -304,6 +304,10 @@ static int rkisp_create_links(struct rkisp_device *dev)
+ 			dev->isp_inp = INP_DVP;
+ 			ret = media_create_pad_link(&sensor->sd->entity, pad,
+ 				&dev->isp_sdev.sd.entity, RKISP_ISP_PAD_SINK, en);
++		} else if (type == MEDIA_ENT_F_PROC_VIDEO_COMPOSER) {
++			dev->isp_inp = INP_CIF;
++			ret = media_create_pad_link(&sensor->sd->entity, pad,
++				&dev->isp_sdev.sd.entity, RKISP_ISP_PAD_SINK, en);
+ 		} else {
+ 			v4l2_subdev_call(sensor->sd, video,
+ 					 g_mbus_config, &sensor->mbus);
+diff --git a/drivers/media/platform/rockchip/isp/dev.h b/drivers/media/platform/rockchip/isp/dev.h
+index 72c8e1946e93..6ab92f1498eb 100644
+--- a/drivers/media/platform/rockchip/isp/dev.h
++++ b/drivers/media/platform/rockchip/isp/dev.h
+@@ -95,6 +95,7 @@ enum rkisp_isp_inp {
+ 	INP_DVP = BIT(5),
+ 	INP_DMARX_ISP = BIT(6),
+ 	INP_LVDS = BIT(7),
++	INP_CIF = BIT(8),
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/rockchip/isp/rkisp.c b/drivers/media/platform/rockchip/isp/rkisp.c
+index 22d512cc5291..d320d63f8ecd 100644
+--- a/drivers/media/platform/rockchip/isp/rkisp.c
++++ b/drivers/media/platform/rockchip/isp/rkisp.c
+@@ -739,7 +739,7 @@ static int rkisp_config_path(struct rkisp_device *dev)
+ 		ret = rkisp_config_dvp(dev);
+ 		dpcl |= CIF_VI_DPCL_IF_SEL_PARALLEL;
+ 	} else if ((sensor && sensor->mbus.type == V4L2_MBUS_CSI2) ||
+-		   dev->isp_inp & (INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2)) {
++		   dev->isp_inp & (INP_RAWRD0 | INP_RAWRD1 | INP_RAWRD2 | INP_CIF)) {
+ 		dpcl |= CIF_VI_DPCL_IF_SEL_MIPI;
+ 	} else if (dev->isp_inp == INP_DMARX_ISP) {
+ 		dpcl |= CIF_VI_DPCL_DMA_SW_ISP;
+@@ -1624,6 +1624,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	dev = sd_to_isp_dev(sd);
+ 	if (!dev)
+ 		return -ENODEV;
++
+ 	if (!strcmp(remote->entity->name, DMA_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_DMARX];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+@@ -1637,7 +1638,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 		}
+ 	} else if (!strcmp(remote->entity->name, CSI_DEV_NAME)) {
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp & ~(INP_CSI | rawrd))
++			if (dev->isp_inp & ~(INP_CSI | INP_CIF | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_CSI;
+ 		} else {
+@@ -1648,7 +1649,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX0_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD0];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp & ~(INP_CSI | rawrd))
++			if (dev->isp_inp & ~(INP_CSI | INP_CIF | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD0;
+ 		} else {
+@@ -1657,7 +1658,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX1_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD1];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp & ~(INP_CSI | rawrd))
++			if (dev->isp_inp & ~(INP_CSI | INP_CIF | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD1;
+ 		} else {
+@@ -1666,7 +1667,7 @@ static int rkisp_subdev_link_setup(struct media_entity *entity,
+ 	} else if (!strcmp(remote->entity->name, DMARX2_VDEV_NAME)) {
+ 		stream = &dev->dmarx_dev.stream[RKISP_STREAM_RAWRD2];
+ 		if (flags & MEDIA_LNK_FL_ENABLED) {
+-			if (dev->isp_inp & ~(INP_CSI | rawrd))
++			if (dev->isp_inp & ~(INP_CSI | INP_CIF | rawrd))
+ 				goto err;
+ 			dev->isp_inp |= INP_RAWRD2;
+ 		} else {
+-- 
+2.35.3
+

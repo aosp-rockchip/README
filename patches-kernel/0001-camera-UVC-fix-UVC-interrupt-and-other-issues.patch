@@ -1,0 +1,218 @@
+From 86a0db3527512070e60bb7d28d08d744c56ec72b Mon Sep 17 00:00:00 2001
+From: "dalon.zhang" <dalon.zhang@rock-chips.com>
+Date: Mon, 15 Dec 2014 16:25:18 +0800
+Subject: [PATCH] camera: UVC: fix UVC interrupt and other issues
+
+---
+ drivers/media/usb/uvc/uvc_ctrl.c  |  9 ++++
+ drivers/media/usb/uvc/uvc_video.c | 88 +++++++++++++++++++++++++++++--
+ drivers/media/usb/uvc/uvcvideo.h  |  8 +++
+ 3 files changed, 102 insertions(+), 3 deletions(-)
+ mode change 100644 => 100755 drivers/media/usb/uvc/uvc_ctrl.c
+ mode change 100644 => 100755 drivers/media/usb/uvc/uvc_video.c
+ mode change 100644 => 100755 drivers/media/usb/uvc/uvcvideo.h
+
+diff --git a/drivers/media/usb/uvc/uvc_ctrl.c b/drivers/media/usb/uvc/uvc_ctrl.c
+old mode 100644
+new mode 100755
+index a2f4501c23ca..71b98ae499a8
+--- a/drivers/media/usb/uvc/uvc_ctrl.c
++++ b/drivers/media/usb/uvc/uvc_ctrl.c
+@@ -694,7 +694,11 @@ static struct uvc_control_mapping uvc_ctrl_mappings[] = {
+ 
+ static inline __u8 *uvc_ctrl_data(struct uvc_control *ctrl, int id)
+ {
++	#if 0       /* ddl@rock-chips.com: address must align to 4-bytes */
+ 	return ctrl->uvc_data + id * ctrl->info.size;
++	#else
++	return ctrl->uvc_data + id * ((ctrl->info.size+3)/4*4);
++	#endif
+ }
+ 
+ static inline int uvc_test_bit(const __u8 *data, int bit)
+@@ -1842,8 +1846,13 @@ static int uvc_ctrl_add_info(struct uvc_device *dev, struct uvc_control *ctrl,
+ 	INIT_LIST_HEAD(&ctrl->info.mappings);
+ 
+ 	/* Allocate an array to save control values (cur, def, max, etc.) */
++	#if 0           /* ddl@rock-chips.com: address must align to 4-bytes */
+ 	ctrl->uvc_data = kzalloc(ctrl->info.size * UVC_CTRL_DATA_LAST + 1,
+ 				 GFP_KERNEL);
++	#else
++	ctrl->uvc_data = kzalloc(((ctrl->info.size+3)/4*4) * UVC_CTRL_DATA_LAST + 1,
++				 GFP_KERNEL);
++	#endif
+ 	if (ctrl->uvc_data == NULL) {
+ 		ret = -ENOMEM;
+ 		goto done;
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+old mode 100644
+new mode 100755
+index c081812ac5c0..956ebb96292a
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -1297,14 +1297,18 @@ static void uvc_video_encode_bulk(struct urb *urb, struct uvc_streaming *stream,
+ 
+ 	urb->transfer_buffer_length = stream->urb_size - len;
+ }
+-
+-static void uvc_video_complete(struct urb *urb)
+-{
++/* ddl@rock-chips.com : uvc_video_complete is run in_interrupt(), so uvc decode operation delay run in tasklet for
++*    usb host reenable interrupt soon
++*/
++static void uvc_video_complete_fun (struct urb *urb)
++{    
+ 	struct uvc_streaming *stream = urb->context;
+ 	struct uvc_video_queue *queue = &stream->queue;
+ 	struct uvc_buffer *buf = NULL;
+ 	unsigned long flags;
+ 	int ret;
++	int i;
++	atomic_t *urb_state=NULL;
+ 
+ 	switch (urb->status) {
+ 	case 0:
+@@ -1324,6 +1328,27 @@ static void uvc_video_complete(struct urb *urb)
+ 		return;
+ 	}
+ 
++	for (i = 0; i < UVC_URBS; ++i) {    
++		if (stream->urb[i] == urb) {
++			urb_state = &stream->urb_state[i];
++			break;
++		}
++	}
++
++	if (urb_state == NULL) {
++		printk("urb(%p) cann't be finded in stream->urb(%p, %p, %p, %p, %p)\n",
++			urb,stream->urb[0],stream->urb[1],stream->urb[2],stream->urb[3],stream->urb[4]);
++		/* BUG(); */
++		uvc_queue_cancel(queue, urb->status == -ESHUTDOWN);
++		return;
++	}
++
++	if (atomic_read(urb_state)==UrbDeactive) {
++		printk(KERN_DEBUG "urb is deactive, this urb complete cancel!");
++		uvc_queue_cancel(queue, urb->status == -ESHUTDOWN);
++		return;
++	}
++
+ 	spin_lock_irqsave(&queue->irqlock, flags);
+ 	if (!list_empty(&queue->irqqueue))
+ 		buf = list_first_entry(&queue->irqqueue, struct uvc_buffer,
+@@ -1335,6 +1360,37 @@ static void uvc_video_complete(struct urb *urb)
+ 	if ((ret = usb_submit_urb(urb, GFP_ATOMIC)) < 0) {
+ 		uvc_printk(KERN_ERR, "Failed to resubmit video URB (%d).\n",
+ 			ret);
++		uvc_queue_cancel(queue, urb->status == -ESHUTDOWN);
++		return;
++	}
++}
++static void uvc_video_complete_tasklet(unsigned long data)
++{
++	struct urb *urb = (struct urb*)data;
++
++	uvc_video_complete_fun(urb);    
++
++	return;
++}
++static void uvc_video_complete(struct urb *urb)
++{
++	int i;
++	struct uvc_streaming *stream = urb->context;
++	struct tasklet_struct *tasklet = NULL;
++	atomic_t *urb_state;
++
++	for (i = 0; i < UVC_URBS; ++i) {    
++		if (stream->urb[i] == urb) {
++			tasklet = stream->tasklet[i];
++			urb_state = &stream->urb_state[i];
++			break;
++		}
++	}
++
++	if ((tasklet != NULL)&&(atomic_read(urb_state)==UrbActive)) {
++		tasklet_hi_schedule(tasklet);
++	} else {
++		uvc_video_complete_fun(urb);
+ 	}
+ }
+ 
+@@ -1433,6 +1489,14 @@ static void uvc_uninit_video(struct uvc_streaming *stream, int free_buffers)
+ 		urb = stream->urb[i];
+ 		if (urb == NULL)
+ 			continue;
++		else
++			atomic_set(&stream->urb_state[i],UrbDeactive);
++
++		if (stream->tasklet[i]) {
++			tasklet_kill(stream->tasklet[i]);
++			kfree(stream->tasklet[i]);
++			stream->tasklet[i] = NULL;
++		}
+ 
+ 		usb_kill_urb(urb);
+ 		usb_free_urb(urb);
+@@ -1513,6 +1577,15 @@ static int uvc_init_video_isoc(struct uvc_streaming *stream,
+ 		}
+ 
+ 		stream->urb[i] = urb;
++		/* ddl@rock-chips.com  */
++		atomic_set(&stream->urb_state[i],UrbActive);
++		stream->tasklet[i] = kmalloc(sizeof(struct tasklet_struct), GFP_KERNEL);
++		if (stream->tasklet[i] == NULL) {
++			uvc_printk(KERN_ERR, "device %s requested tasklet memory fail!\n",
++				stream->dev->name);
++		} else {
++			tasklet_init(stream->tasklet[i], uvc_video_complete_tasklet, (unsigned long)urb);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1566,6 +1639,15 @@ static int uvc_init_video_bulk(struct uvc_streaming *stream,
+ #endif
+ 
+ 		stream->urb[i] = urb;
++
++		/* ddl@rock-chips.com  */
++		stream->tasklet[i] = kmalloc(sizeof(struct tasklet_struct), GFP_KERNEL);
++		if (stream->tasklet[i] == NULL) {
++			uvc_printk(KERN_ERR, "device %s requested tasklet memory fail!\n",
++				stream->dev->name);
++		} else {
++			tasklet_init(stream->tasklet[i], uvc_video_complete_tasklet, (unsigned long)urb);
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+old mode 100644
+new mode 100755
+index af505fdd9b3f..033c7757b608
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -425,6 +425,11 @@ struct uvc_stats_stream {
+ 	unsigned int max_sof;		/* Maximum STC.SOF value */
+ };
+ 
++enum uvc_urb_state {
++	UrbActive,
++	UrbDeactive
++};
++
+ struct uvc_streaming {
+ 	struct list_head list;
+ 	struct uvc_device *dev;
+@@ -474,6 +479,9 @@ struct uvc_streaming {
+ 	__u32 sequence;
+ 	__u8 last_fid;
+ 
++	struct tasklet_struct *tasklet[UVC_URBS];     /* ddl@rock-chips.com */
++	atomic_t urb_state[UVC_URBS];
++
+ 	/* debugfs */
+ 	struct dentry *debugfs_dir;
+ 	struct {
+-- 
+2.35.3
+

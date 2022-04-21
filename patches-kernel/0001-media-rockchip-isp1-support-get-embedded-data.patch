@@ -1,0 +1,463 @@
+From c39d9b99cdc9a96f3d84b05ae352541498d0c018 Mon Sep 17 00:00:00 2001
+From: Hu Kejun <william.hu@rock-chips.com>
+Date: Fri, 19 Oct 2018 16:13:33 +0800
+Subject: [PATCH] media: rockchip: isp1: support get embedded data
+
+support get embedded data on rk3399/rk3288
+
+Change-Id: I2ee2be79d23917384661173714f3e5cb6482ae04
+Signed-off-by: Hu Kejun <william.hu@rock-chips.com>
+---
+ drivers/media/platform/rockchip/isp1/common.h |   2 +
+ drivers/media/platform/rockchip/isp1/dev.h    |   4 +
+ .../media/platform/rockchip/isp1/isp_stats.c  |  65 +++++++++-
+ .../media/platform/rockchip/isp1/isp_stats.h  |   2 +
+ drivers/media/platform/rockchip/isp1/regs.h   |   1 +
+ drivers/media/platform/rockchip/isp1/rkisp1.c | 122 +++++++++++++++++-
+ drivers/media/platform/rockchip/isp1/rkisp1.h |   7 +
+ include/uapi/linux/rkisp1-config.h            |  23 ++++
+ 8 files changed, 224 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/isp1/common.h b/drivers/media/platform/rockchip/isp1/common.h
+index 5f212090b9a1..bda09cc07717 100644
+--- a/drivers/media/platform/rockchip/isp1/common.h
++++ b/drivers/media/platform/rockchip/isp1/common.h
+@@ -53,6 +53,8 @@
+ #define RKISP1_PLANE_CB			1
+ #define RKISP1_PLANE_CR			2
+ 
++#define RKISP1_EMDDATA_FIFO_MAX		4
++
+ enum rkisp1_sd_type {
+ 	RKISP1_SD_SENSOR,
+ 	RKISP1_SD_PHY_CSI,
+diff --git a/drivers/media/platform/rockchip/isp1/dev.h b/drivers/media/platform/rockchip/isp1/dev.h
+index 01e09fd3c912..70630f2fe0cf 100644
+--- a/drivers/media/platform/rockchip/isp1/dev.h
++++ b/drivers/media/platform/rockchip/isp1/dev.h
+@@ -128,6 +128,10 @@ struct rkisp1_device {
+ 	const unsigned int *clk_rate_tbl;
+ 	int num_clk_rate_tbl;
+ 	atomic_t open_cnt;
++	struct rkisp1_emd_data emd_data_fifo[RKISP1_EMDDATA_FIFO_MAX];
++	unsigned int emd_data_idx;
++	unsigned int emd_vc;
++	unsigned int emd_dt;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/rockchip/isp1/isp_stats.c b/drivers/media/platform/rockchip/isp1/isp_stats.c
+index aedee172213f..2decab6e379f 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_stats.c
++++ b/drivers/media/platform/rockchip/isp1/isp_stats.c
+@@ -32,6 +32,7 @@
+  * SOFTWARE.
+  */
+ 
++#include <linux/kfifo.h>
+ #include <media/v4l2-common.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/videobuf2-core.h>
+@@ -290,7 +291,7 @@ static void rkisp1_stats_get_afc_meas(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	void __iomem *base_addr;
+ 	struct cifisp_af_stat *af;
+ 
+-	pbuf->meas_type = CIFISP_STAT_AFM_FIN;
++	pbuf->meas_type |= CIFISP_STAT_AFM_FIN;
+ 
+ 	af = &pbuf->params.af;
+ 	base_addr = stats_vdev->dev->base_addr;
+@@ -361,12 +362,70 @@ static void rkisp1_stats_get_bls_meas(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	}
+ }
+ 
++static void rkisp1_stats_get_emb_data(struct rkisp1_isp_stats_vdev *stats_vdev,
++				      struct rkisp1_stat_buffer *pbuf)
++{
++	unsigned int i;
++	struct rkisp1_device *dev = stats_vdev->dev;
++	unsigned int ph = 0, out = 0, packet_len = 0, playload_len = 0;
++	unsigned int mipi_kfifo_len;
++	unsigned int idx;
++	unsigned char *fifo_data;
++
++	idx = RKISP1_EMDDATA_FIFO_MAX;
++	for (i = 0; i < RKISP1_EMDDATA_FIFO_MAX; i++) {
++		if (dev->emd_data_fifo[i].frame_id == pbuf->frame_id) {
++			idx = i;
++			break;
++		}
++	}
++
++	if (idx == RKISP1_EMDDATA_FIFO_MAX)
++		return;
++
++	if (kfifo_is_empty(&dev->emd_data_fifo[idx].mipi_kfifo))
++		return;
++
++	mipi_kfifo_len = dev->emd_data_fifo[idx].data_len;
++	fifo_data = &pbuf->params.emd.data[0];
++	for (i = 0; i < mipi_kfifo_len;) {
++		/* handle the package header */
++		out = kfifo_out(&dev->emd_data_fifo[idx].mipi_kfifo,
++				&ph, sizeof(ph));
++		if (!out)
++			break;
++		packet_len = (ph >> 8) & 0xfff;
++		i += sizeof(ph);
++
++		/* handle the package data */
++		out = kfifo_out(&dev->emd_data_fifo[idx].mipi_kfifo,
++				fifo_data, packet_len);
++		if (!out)
++			break;
++
++		i += packet_len;
++		playload_len += packet_len;
++		fifo_data += packet_len;
++
++		v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
++			 "packet_len: 0x%x, ph: 0x%x\n",
++			 packet_len, ph);
++	}
++
++	pbuf->meas_type |= CIFISP_STAT_EMB_DATA;
++
++	v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
++		 "playload_len: %d, pbuf->frame_id %d\n",
++		 playload_len, pbuf->frame_id);
++}
++
+ static struct rkisp1_stats_ops rkisp1_v10_stats_ops = {
+ 	.get_awb_meas = rkisp1_stats_get_awb_meas_v10,
+ 	.get_aec_meas = rkisp1_stats_get_aec_meas_v10,
+ 	.get_afc_meas = rkisp1_stats_get_afc_meas,
+ 	.get_hst_meas = rkisp1_stats_get_hst_meas_v10,
+ 	.get_bls_meas = rkisp1_stats_get_bls_meas,
++	.get_emb_data = rkisp1_stats_get_emb_data,
+ };
+ 
+ static struct rkisp1_stats_ops rkisp1_v12_stats_ops = {
+@@ -419,6 +478,7 @@ rkisp1_stats_send_measurement(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 	cur_stat_buf =
+ 		(struct rkisp1_stat_buffer *)(cur_buf->vaddr[0]);
+ 
++	cur_stat_buf->frame_id = cur_frame_id;
+ 	if (meas_work->isp_ris & CIF_ISP_AWB_DONE) {
+ 		ops->get_awb_meas(stats_vdev, cur_stat_buf);
+ 		cur_stat_buf->meas_type |= CIFISP_STAT_AWB;
+@@ -440,6 +500,9 @@ rkisp1_stats_send_measurement(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 		cur_stat_buf->meas_type |= CIFISP_STAT_HIST;
+ 	}
+ 
++	if (ops->get_emb_data)
++		ops->get_emb_data(stats_vdev, cur_stat_buf);
++
+ 	vb2_set_plane_payload(&cur_buf->vb.vb2_buf, 0,
+ 			      sizeof(struct rkisp1_stat_buffer));
+ 	cur_buf->vb.sequence = cur_frame_id;
+diff --git a/drivers/media/platform/rockchip/isp1/isp_stats.h b/drivers/media/platform/rockchip/isp1/isp_stats.h
+index 54fec490a53e..1f674bc3a3fb 100644
+--- a/drivers/media/platform/rockchip/isp1/isp_stats.h
++++ b/drivers/media/platform/rockchip/isp1/isp_stats.h
+@@ -66,6 +66,8 @@ struct rkisp1_stats_ops {
+ 			     struct rkisp1_stat_buffer *pbuf);
+ 	void (*get_bls_meas)(struct rkisp1_isp_stats_vdev *stats_vdev,
+ 			     struct rkisp1_stat_buffer *pbuf);
++	void (*get_emb_data)(struct rkisp1_isp_stats_vdev *stats_vdev,
++			     struct rkisp1_stat_buffer *pbuf);
+ };
+ 
+ struct rkisp1_stats_config {
+diff --git a/drivers/media/platform/rockchip/isp1/regs.h b/drivers/media/platform/rockchip/isp1/regs.h
+index fb12304a76fa..bda9f749dd96 100644
+--- a/drivers/media/platform/rockchip/isp1/regs.h
++++ b/drivers/media/platform/rockchip/isp1/regs.h
+@@ -357,6 +357,7 @@
+ 
+ /* MIPI_CTRL */
+ #define CIF_MIPI_CTRL_OUTPUT_ENA		BIT(0)
++#define CIF_MIPI_CTRL_FLUSH_FIFO		BIT(1)
+ #define CIF_MIPI_CTRL_SHUTDOWNLANES(a)		(((a) & 0xF) << 8)
+ #define CIF_MIPI_CTRL_NUM_LANES(a)		(((a) & 0x3) << 12)
+ #define CIF_MIPI_CTRL_ERR_SOT_HS_SKIP		BIT(16)
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.c b/drivers/media/platform/rockchip/isp1/rkisp1.c
+index 19742d24eb61..2d8a8533bb8d 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.c
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.c
+@@ -37,7 +37,9 @@
+ #include <linux/regmap.h>
+ #include <linux/videodev2.h>
+ #include <linux/vmalloc.h>
++#include <linux/kfifo.h>
+ #include <media/v4l2-event.h>
++#include <media/media-entity.h>
+ 
+ #include "common.h"
+ #include "regs.h"
+@@ -54,6 +56,7 @@
+ #define CIF_ISP_OUTPUT_H_MAX		CIF_ISP_INPUT_H_MAX
+ #define CIF_ISP_OUTPUT_W_MIN		CIF_ISP_INPUT_W_MIN
+ #define CIF_ISP_OUTPUT_H_MIN		CIF_ISP_INPUT_H_MIN
++#define CIF_ISP_ADD_DATA_VC_MAX		3
+ 
+ /*
+  * NOTE: MIPI controller and input MUX are also configured in this file,
+@@ -101,6 +104,28 @@ static struct v4l2_subdev *get_remote_sensor(struct v4l2_subdev *sd)
+ 	return media_entity_to_v4l2_subdev(sensor_me);
+ }
+ 
++static void get_remote_mipi_sensor(struct rkisp1_device *dev,
++				  struct v4l2_subdev **sensor_sd)
++{
++	struct media_entity_graph graph;
++	struct media_entity *entity = &dev->isp_sdev.sd.entity;
++	struct media_device *mdev = entity->parent;
++
++	/* Walk the graph to locate sensor nodes. */
++	mutex_lock(&mdev->graph_mutex);
++	media_entity_graph_walk_start(&graph, entity);
++	while ((entity = media_entity_graph_walk_next(&graph))) {
++		if (entity->type == MEDIA_ENT_T_V4L2_SUBDEV_SENSOR)
++			break;
++	}
++	mutex_unlock(&mdev->graph_mutex);
++
++	if (entity)
++		*sensor_sd = media_entity_to_v4l2_subdev(entity);
++	else
++		*sensor_sd = NULL;
++}
++
+ static struct rkisp1_sensor_info *sd_to_sensor(struct rkisp1_device *dev,
+ 					       struct v4l2_subdev *sd)
+ {
+@@ -295,7 +320,10 @@ static int rkisp1_config_mipi(struct rkisp1_device *dev)
+ 	void __iomem *base = dev->base_addr;
+ 	struct ispsd_in_fmt *in_fmt = &dev->isp_sdev.in_fmt;
+ 	struct rkisp1_sensor_info *sensor = dev->active_sensor;
+-	int lanes;
++	struct v4l2_subdev *mipi_sensor;
++	struct v4l2_ctrl *ctrl;
++	u32 emd_vc, emd_dt;
++	int lanes, ret, i;
+ 
+ 	/*
+ 	 * sensor->mbus is set in isp or d-phy notifier_bound function
+@@ -317,6 +345,38 @@ static int rkisp1_config_mipi(struct rkisp1_device *dev)
+ 		return -EINVAL;
+ 	}
+ 
++	emd_vc = 0xFF;
++	emd_dt = 0;
++	get_remote_mipi_sensor(dev, &mipi_sensor);
++	if (mipi_sensor) {
++		ctrl = v4l2_ctrl_find(mipi_sensor->ctrl_handler,
++				      CIFISP_CID_EMB_VC);
++		if (ctrl)
++			emd_vc = v4l2_ctrl_g_ctrl(ctrl);
++
++		ctrl = v4l2_ctrl_find(mipi_sensor->ctrl_handler,
++				      CIFISP_CID_EMB_DT);
++		if (ctrl)
++			emd_dt = v4l2_ctrl_g_ctrl(ctrl);
++	}
++
++	dev->emd_dt = emd_dt;
++	dev->emd_vc = emd_vc;
++	dev->emd_data_idx = 0;
++	if (emd_vc <= CIF_ISP_ADD_DATA_VC_MAX) {
++		for (i = 0; i < RKISP1_EMDDATA_FIFO_MAX; i++) {
++			ret = kfifo_alloc(&dev->emd_data_fifo[i].mipi_kfifo,
++					  CIFISP_ADD_DATA_FIFO_SIZE,
++					  GFP_ATOMIC);
++			if (ret) {
++				v4l2_err(&dev->v4l2_dev,
++					 "kfifo_alloc failed with error %d\n",
++					 ret);
++				return ret;
++			}
++		}
++	}
++
+ 	if (dev->isp_ver == ISP_V13) {
+ 		/* csi2host enable */
+ 		writel(1, base + CIF_ISP_CSI0_CTRL0);
+@@ -350,6 +410,15 @@ static int rkisp1_config_mipi(struct rkisp1_device *dev)
+ 		writel(CIF_MIPI_DATA_SEL_DT(in_fmt->mipi_dt) | CIF_MIPI_DATA_SEL_VC(0),
+ 		       base + CIF_MIPI_IMG_DATA_SEL);
+ 
++		writel(CIF_MIPI_DATA_SEL_DT(emd_dt) | CIF_MIPI_DATA_SEL_VC(emd_vc),
++		       base + CIF_MIPI_ADD_DATA_SEL_1);
++		writel(CIF_MIPI_DATA_SEL_DT(emd_dt) | CIF_MIPI_DATA_SEL_VC(emd_vc),
++		       base + CIF_MIPI_ADD_DATA_SEL_2);
++		writel(CIF_MIPI_DATA_SEL_DT(emd_dt) | CIF_MIPI_DATA_SEL_VC(emd_vc),
++		       base + CIF_MIPI_ADD_DATA_SEL_3);
++		writel(CIF_MIPI_DATA_SEL_DT(emd_dt) | CIF_MIPI_DATA_SEL_VC(emd_vc),
++		       base + CIF_MIPI_ADD_DATA_SEL_4);
++
+ 		/* Clear MIPI interrupts */
+ 		writel(~0, base + CIF_MIPI_ICR);
+ 		/*
+@@ -424,6 +493,7 @@ static int rkisp1_isp_stop(struct rkisp1_device *dev)
+ {
+ 	void __iomem *base = dev->base_addr;
+ 	u32 val;
++	u32 i;
+ 
+ 	v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
+ 		 "SP streaming = %d, MP streaming = %d\n",
+@@ -465,6 +535,12 @@ static int rkisp1_isp_stop(struct rkisp1_device *dev)
+ 
+ 	writel(CIF_IRCL_CIF_SW_RST, base + CIF_IRCL);
+ 
++	if (dev->emd_vc <= CIF_ISP_ADD_DATA_VC_MAX) {
++		for (i = 0; i < RKISP1_EMDDATA_FIFO_MAX; i++)
++			kfifo_free(&dev->emd_data_fifo[i].mipi_kfifo);
++		dev->emd_vc = 0xFF;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1030,6 +1106,46 @@ static int rkisp1_isp_sd_set_selection(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++static void rkisp1_isp_read_add_fifo_data(struct rkisp1_device *dev)
++{
++	struct v4l2_device *v4l2_dev = &dev->v4l2_dev;
++	void __iomem *base = dev->base_addr;
++	u32 mipi_status = 0;
++	u32 data_len = 0;
++	u32 fifo_data = 0;
++	u32 i, idx, cur_frame_id;
++
++	cur_frame_id = atomic_read(&dev->isp_sdev.frm_sync_seq) - 1;
++	idx = dev->emd_data_idx;
++	dev->emd_data_fifo[idx].frame_id = 0;
++	kfifo_reset_out(&dev->emd_data_fifo[idx].mipi_kfifo);
++	for (i = 0; i < CIFISP_ADD_DATA_FIFO_SIZE / 4; i++) {
++		mipi_status = readl(base + CIF_MIPI_STATUS);
++		if (!(mipi_status & 0x01))
++			break;
++
++		fifo_data = readl(base + CIF_MIPI_ADD_DATA_FIFO);
++		kfifo_in(&dev->emd_data_fifo[idx].mipi_kfifo,
++			 &fifo_data, sizeof(fifo_data));
++		data_len += 4;
++
++		if (kfifo_is_full(&dev->emd_data_fifo[idx].mipi_kfifo))
++			v4l2_warn(v4l2_dev, "%s: mipi_kfifo is full!\n",
++				  __func__);
++	}
++
++	if (data_len) {
++		dev->emd_data_fifo[idx].frame_id = cur_frame_id;
++		dev->emd_data_fifo[idx].data_len = data_len;
++		dev->emd_data_idx = (idx + 1) % RKISP1_EMDDATA_FIFO_MAX;
++	}
++
++	v4l2_dbg(1, rkisp1_debug, &dev->v4l2_dev,
++		 "emd kfifo size: %d, frame_id %d\n",
++		 kfifo_len(&dev->emd_data_fifo[idx].mipi_kfifo),
++		 dev->emd_data_fifo[idx].frame_id);
++}
++
+ static int rkisp1_isp_sd_s_stream(struct v4l2_subdev *sd, int on)
+ {
+ 	struct rkisp1_device *isp_dev = sd_to_isp_dev(sd);
+@@ -1272,6 +1388,8 @@ void rkisp1_mipi_isr(unsigned int mis, struct rkisp1_device *dev)
+ 		}
+ 	} else {
+ 		v4l2_warn(v4l2_dev, "MIPI mis error: 0x%08x\n", mis);
++		val = readl(base + CIF_MIPI_CTRL);
++		writel(val | CIF_MIPI_CTRL_FLUSH_FIFO, base + CIF_MIPI_CTRL);
+ 	}
+ }
+ 
+@@ -1337,6 +1455,8 @@ void rkisp1_isp_isr(unsigned int isp_mis, struct rkisp1_device *dev)
+ 			v4l2_err(&dev->v4l2_dev,
+ 				 "isp icr frame end err: 0x%x\n", isp_mis_tmp);
+ 
++		rkisp1_isp_read_add_fifo_data(dev);
++
+ 		isp_ris = readl(base + CIF_ISP_RIS);
+ 		if (isp_ris & (CIF_ISP_AWB_DONE | CIF_ISP_AFM_FIN |
+ 				CIF_ISP_EXP_END | CIF_ISP_HIST_MEASURE_RDY))
+diff --git a/drivers/media/platform/rockchip/isp1/rkisp1.h b/drivers/media/platform/rockchip/isp1/rkisp1.h
+index 054235be88e7..d96f314ba205 100644
+--- a/drivers/media/platform/rockchip/isp1/rkisp1.h
++++ b/drivers/media/platform/rockchip/isp1/rkisp1.h
+@@ -35,6 +35,7 @@
+ #ifndef _RKISP1_H
+ #define _RKISP1_H
+ 
++#include <linux/kfifo.h>
+ #include <linux/platform_device.h>
+ #include <media/v4l2-fwnode.h>
+ #include "common.h"
+@@ -102,6 +103,12 @@ struct rkisp1_isp_subdev {
+ 	enum v4l2_quantization quantization;
+ };
+ 
++struct rkisp1_emd_data {
++	struct kfifo mipi_kfifo;
++	unsigned int data_len;
++	unsigned int frame_id;
++};
++
+ int rkisp1_register_isp_subdev(struct rkisp1_device *isp_dev,
+ 			       struct v4l2_device *v4l2_dev);
+ 
+diff --git a/include/uapi/linux/rkisp1-config.h b/include/uapi/linux/rkisp1-config.h
+index fbeb6b5dba03..393f4449e1d4 100644
+--- a/include/uapi/linux/rkisp1-config.h
++++ b/include/uapi/linux/rkisp1-config.h
+@@ -107,6 +107,18 @@
+ #define CIFISP_STAT_AUTOEXP       (1 << 1)
+ #define CIFISP_STAT_AFM_FIN       (1 << 2)
+ #define CIFISP_STAT_HIST          (1 << 3)
++#define CIFISP_STAT_EMB_DATA      (1 << 4)
++
++#define CIFISP_ADD_DATA_FIFO_SIZE (2048 * 4)
++
++/*
++ * private control id
++ */
++enum cifisp_ctrl_id {
++	CIFISP_CID_EMB_VC = (V4L2_CTRL_CLASS_CAMERA | 0x1001),
++	CIFISP_CID_EMB_DT,
++	CIFISP_CID_LAST
++};
+ 
+ enum cifisp_histogram_mode {
+ 	CIFISP_HISTOGRAM_MODE_DISABLE,
+@@ -726,6 +738,16 @@ struct cifisp_hist_stat {
+ 	unsigned int hist_bins[CIFISP_HIST_BIN_N_MAX];
+ } __attribute__ ((packed));
+ 
++/**
++ * struct cifisp_embedded_data - embedded data
++ *
++ * @data: embedded data
++ *
++ */
++struct cifisp_embedded_data {
++	unsigned char data[CIFISP_ADD_DATA_FIFO_SIZE];
++} __attribute__ ((packed));
++
+ /**
+  * struct rkisp1_stat_buffer - Rockchip ISP1 Statistics Data
+  *
+@@ -739,6 +761,7 @@ struct cifisp_stat {
+ 	struct cifisp_ae_stat ae;
+ 	struct cifisp_af_stat af;
+ 	struct cifisp_hist_stat hist;
++	struct cifisp_embedded_data emd;
+ } __attribute__ ((packed));
+ 
+ /**
+-- 
+2.35.3
+

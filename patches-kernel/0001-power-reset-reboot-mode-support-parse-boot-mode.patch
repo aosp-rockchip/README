@@ -1,0 +1,177 @@
+From da7c615bc42d17dea1bb165807dcc490cf415092 Mon Sep 17 00:00:00 2001
+From: Andy Yan <andy.yan@rock-chips.com>
+Date: Fri, 22 Feb 2019 19:08:19 +0800
+Subject: [PATCH] power: reset: reboot-mode: support parse boot mode
+
+Parse boot mode on system bootup, and export it to
+userspace by sysfs: sys/kernel/boot_mode
+
+Change-Id: I0158fc28f4dae51c798806006e49cead4ce2e923
+Signed-off-by: Andy Yan <andy.yan@rock-chips.com>
+---
+ drivers/power/reset/reboot-mode.c        | 65 +++++++++++++++++++++---
+ drivers/power/reset/syscon-reboot-mode.c | 12 +++++
+ include/linux/reboot-mode.h              |  2 +
+ 3 files changed, 72 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/reset/reboot-mode.c b/drivers/power/reset/reboot-mode.c
+index 08dda42f4e3d..3c915e61494c 100644
+--- a/drivers/power/reset/reboot-mode.c
++++ b/drivers/power/reset/reboot-mode.c
+@@ -10,10 +10,12 @@
+ #include <linux/device.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
++#include <linux/kobject.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/reboot.h>
+ #include <linux/reboot-mode.h>
++#include <linux/sysfs.h>
+ 
+ #define PREFIX "mode-"
+ 
+@@ -23,8 +25,18 @@ struct mode_info {
+ 	struct list_head list;
+ };
+ 
+-static unsigned int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
+-					  const char *cmd)
++static const char *boot_mode = "coldboot";
++
++static ssize_t boot_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
++			      char *buf)
++{
++	return scnprintf(buf, PAGE_SIZE, "%s\n", boot_mode);
++}
++
++static struct kobj_attribute kobj_boot_mode = __ATTR_RO(boot_mode);
++
++static int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
++				 const char *cmd)
+ {
+ 	const char *normal = "normal";
+ 	int magic = 0;
+@@ -43,20 +55,54 @@ static unsigned int get_reboot_mode_magic(struct reboot_mode_driver *reboot,
+ 	return magic;
+ }
+ 
++static void reboot_mode_write(struct reboot_mode_driver *reboot,
++			      const void *cmd)
++{
++	int magic;
++
++	magic = get_reboot_mode_magic(reboot, cmd);
++	if (magic)
++		reboot->write(reboot, magic);
++}
++
+ static int reboot_mode_notify(struct notifier_block *this,
+ 			      unsigned long mode, void *cmd)
+ {
+ 	struct reboot_mode_driver *reboot;
+-	unsigned int magic;
+ 
+ 	reboot = container_of(this, struct reboot_mode_driver, reboot_notifier);
+-	magic = get_reboot_mode_magic(reboot, cmd);
+-	if (magic)
+-		reboot->write(reboot, magic);
++	reboot_mode_write(reboot, cmd);
+ 
+ 	return NOTIFY_DONE;
+ }
+ 
++static int reboot_mode_panic_notify(struct notifier_block *this,
++				      unsigned long ev, void *ptr)
++{
++	struct reboot_mode_driver *reboot;
++	const char *cmd = "panic";
++
++	reboot = container_of(this, struct reboot_mode_driver, panic_notifier);
++	reboot_mode_write(reboot, cmd);
++
++	return NOTIFY_DONE;
++}
++
++static int boot_mode_parse(struct reboot_mode_driver *reboot)
++{
++	struct mode_info *info;
++	unsigned int magic = reboot->read(reboot);
++
++	list_for_each_entry(info, &reboot->head, list) {
++		if (info->magic == magic) {
++			boot_mode = info->mode;
++			break;
++		}
++	}
++
++	return 0;
++}
++
+ /**
+  * reboot_mode_register - register a reboot mode driver
+  * @reboot: reboot mode driver
+@@ -105,10 +151,15 @@ int reboot_mode_register(struct reboot_mode_driver *reboot)
+ 		list_add_tail(&info->list, &reboot->head);
+ 	}
+ 
++	boot_mode_parse(reboot);
+ 	reboot->reboot_notifier.notifier_call = reboot_mode_notify;
++	reboot->panic_notifier.notifier_call = reboot_mode_panic_notify;
+ 	register_reboot_notifier(&reboot->reboot_notifier);
++	atomic_notifier_chain_register(&panic_notifier_list,
++				       &reboot->panic_notifier);
++	ret = sysfs_create_file(kernel_kobj, &kobj_boot_mode.attr);
+ 
+-	return 0;
++	return ret;
+ 
+ error:
+ 	list_for_each_entry(info, &reboot->head, list)
+diff --git a/drivers/power/reset/syscon-reboot-mode.c b/drivers/power/reset/syscon-reboot-mode.c
+index 563a97d7f73e..12392cdd8d65 100644
+--- a/drivers/power/reset/syscon-reboot-mode.c
++++ b/drivers/power/reset/syscon-reboot-mode.c
+@@ -40,6 +40,17 @@ static int syscon_reboot_mode_write(struct reboot_mode_driver *reboot,
+ 	return ret;
+ }
+ 
++static int syscon_reboot_mode_read(struct reboot_mode_driver *reboot)
++{
++	struct syscon_reboot_mode *syscon_rbm;
++	u32 val = 0;
++
++	syscon_rbm = container_of(reboot, struct syscon_reboot_mode, reboot);
++	regmap_read(syscon_rbm->map, syscon_rbm->offset, &val);
++
++	return val;
++}
++
+ static int syscon_reboot_mode_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+@@ -51,6 +62,7 @@ static int syscon_reboot_mode_probe(struct platform_device *pdev)
+ 
+ 	syscon_rbm->reboot.dev = &pdev->dev;
+ 	syscon_rbm->reboot.write = syscon_reboot_mode_write;
++	syscon_rbm->reboot.read = syscon_reboot_mode_read;
+ 	syscon_rbm->mask = 0xffffffff;
+ 
+ 	syscon_rbm->map = syscon_node_to_regmap(pdev->dev.parent->of_node);
+diff --git a/include/linux/reboot-mode.h b/include/linux/reboot-mode.h
+index 4a2abb38d1d6..a7aa69d004c4 100644
+--- a/include/linux/reboot-mode.h
++++ b/include/linux/reboot-mode.h
+@@ -6,7 +6,9 @@ struct reboot_mode_driver {
+ 	struct device *dev;
+ 	struct list_head head;
+ 	int (*write)(struct reboot_mode_driver *reboot, unsigned int magic);
++	int (*read)(struct reboot_mode_driver *reboot);
+ 	struct notifier_block reboot_notifier;
++	struct notifier_block panic_notifier;
+ };
+ 
+ int reboot_mode_register(struct reboot_mode_driver *reboot);
+-- 
+2.35.3
+

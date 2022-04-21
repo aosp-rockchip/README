@@ -1,0 +1,1996 @@
+From 3ac12c41e122e4fdb6cc5f4833b67a250a63efba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=BC=A0=E6=98=8A?= <zhanghao@rock-chips.com>
+Date: Tue, 22 Nov 2011 21:16:20 +0800
+Subject: [PATCH] Driver : add new driver al3006/bma023 & fix gc0309 building
+ error
+
+---
+ arch/arm/mach-rk29/include/mach/board.h |  11 +
+ drivers/input/gsensor/Kconfig           |   7 +
+ drivers/input/gsensor/Makefile          |   3 +-
+ drivers/input/gsensor/bma023.c          | 920 ++++++++++++++++++++++++
+ drivers/input/misc/Kconfig              |   3 +
+ drivers/input/misc/Makefile             |   1 +
+ drivers/input/misc/al3006.c             | 833 +++++++++++++++++++++
+ drivers/input/misc/al3006.h             |  33 +
+ drivers/media/video/gc0309.c            |  20 +-
+ 9 files changed, 1820 insertions(+), 11 deletions(-)
+ create mode 100644 drivers/input/gsensor/bma023.c
+ create mode 100644 drivers/input/misc/al3006.c
+ create mode 100644 drivers/input/misc/al3006.h
+
+diff --git a/arch/arm/mach-rk29/include/mach/board.h b/arch/arm/mach-rk29/include/mach/board.h
+index 3fdad366bcd7..d9c9068afcaf 100755
+--- a/arch/arm/mach-rk29/include/mach/board.h
++++ b/arch/arm/mach-rk29/include/mach/board.h
+@@ -248,6 +248,17 @@ struct mma8452_platform_data {
+     int     (*mma8452_platform_wakeup)(void);
+     void    (*exit_platform_hw)(void);
+ };
++struct bma023_platform_data {
++    u16     model;
++	u16     swap_xy;
++	u16		swap_xyz;
++	signed char orientation[9];
++    int     (*get_pendown_state)(void);
++    int     (*init_platform_hw)(void);
++    int     (*mma8452_platform_sleep)(void);
++    int     (*mma8452_platform_wakeup)(void);
++    void    (*exit_platform_hw)(void);
++};
+ 
+ struct cm3202_platform_data {
+ 	int CM3202_SD_IOPIN;
+diff --git a/drivers/input/gsensor/Kconfig b/drivers/input/gsensor/Kconfig
+index efb19a016b38..30cda547ea2f 100755
+--- a/drivers/input/gsensor/Kconfig
++++ b/drivers/input/gsensor/Kconfig
+@@ -53,4 +53,11 @@ config GS_L3G4200D
+ 	  To have support for your specific gsesnor you will have to
+ 	  select the proper drivers which depend on this option.
+ 
++config GS_BMA023
++  bool "gs_bma023"
++  depends on G_SENSOR_DEVICE
++  default n
++  help
++    To have support for your specific gsesnor you will have to
++    select the proper drivers which depend on this option.
+ endif
+diff --git a/drivers/input/gsensor/Makefile b/drivers/input/gsensor/Makefile
+index 2f7f9c0ad14c..f1bdebf8c1f8 100755
+--- a/drivers/input/gsensor/Makefile
++++ b/drivers/input/gsensor/Makefile
+@@ -4,4 +4,5 @@ obj-$(CONFIG_GS_MMA7660) 	+= mma7660.o
+ obj-$(CONFIG_GS_MMA8452) 	+= mma8452.o
+ obj-$(CONFIG_GS_L3G4200D) 	+= l3g4200d.o
+ obj-$(CONFIG_GS_KXTF9)		+= kxtf9.o
+-obj-$(CONFIG_GS_LIS3DH)		+= lis3dh_acc_misc.o
+\ No newline at end of file
++obj-$(CONFIG_GS_LIS3DH)		+= lis3dh_acc_misc.o
++obj-$(CONFIG_GS_BMA023) 	+= bma023.o
+diff --git a/drivers/input/gsensor/bma023.c b/drivers/input/gsensor/bma023.c
+new file mode 100644
+index 000000000000..d4d66cb0301c
+--- /dev/null
++++ b/drivers/input/gsensor/bma023.c
+@@ -0,0 +1,920 @@
++/* drivers/i2c/chips/bma023.c - bma023 compass driver
++ *
++ * Copyright (C) 2007-2008 HTC Corporation.
++ * Author: Hou-Kun Chen <houkun.chen@gmail.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/mutex.h>
++#include <linux/freezer.h>
++#include <mach/gpio.h>
++#include <mach/board.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++
++#define SENSOR_NAME 			"bma150"
++#define GRAVITY_EARTH                   9806550
++#define ABSMIN_2G                       (-GRAVITY_EARTH * 2)
++#define ABSMAX_2G                       (GRAVITY_EARTH * 2)
++#define BMA150_MAX_DELAY		200
++#define BMA150_CHIP_ID			2
++#define BMA150_RANGE_SET		0
++#define BMA150_BW_SET			4
++
++
++
++#define BMA150_CHIP_ID_REG			0x00
++#define BMA150_X_AXIS_LSB_REG		0x02
++#define BMA150_X_AXIS_MSB_REG		0x03
++#define BMA150_Y_AXIS_LSB_REG		0x04
++#define BMA150_Y_AXIS_MSB_REG		0x05
++#define BMA150_Z_AXIS_LSB_REG		0x06
++#define BMA150_Z_AXIS_MSB_REG		0x07
++#define BMA150_STATUS_REG	0x09
++#define BMA150_CTRL_REG		0x0a
++#define BMA150_CONF1_REG	0x0b
++
++#define BMA150_CUSTOMER1_REG		0x12
++#define BMA150_CUSTOMER2_REG		0x13
++#define BMA150_RANGE_BWIDTH_REG	0x14
++#define BMA150_CONF2_REG	0x15
++
++#define BMA150_OFFS_GAIN_X_REG		0x16
++#define BMA150_OFFS_GAIN_Y_REG		0x17
++#define BMA150_OFFS_GAIN_Z_REG		0x18
++#define BMA150_OFFS_GAIN_T_REG		0x19
++#define BMA150_OFFSET_X_REG		0x1a
++#define BMA150_OFFSET_Y_REG		0x1b
++#define BMA150_OFFSET_Z_REG		0x1c
++#define BMA150_OFFSET_T_REG		0x1d
++
++#define BMA150_CHIP_ID__POS		0
++#define BMA150_CHIP_ID__MSK		0x07
++#define BMA150_CHIP_ID__LEN		3
++#define BMA150_CHIP_ID__REG		BMA150_CHIP_ID_REG
++
++/* DATA REGISTERS */
++
++#define BMA150_NEW_DATA_X__POS  	0
++#define BMA150_NEW_DATA_X__LEN  	1
++#define BMA150_NEW_DATA_X__MSK  	0x01
++#define BMA150_NEW_DATA_X__REG		BMA150_X_AXIS_LSB_REG
++
++#define BMA150_ACC_X_LSB__POS   	6
++#define BMA150_ACC_X_LSB__LEN   	2
++#define BMA150_ACC_X_LSB__MSK		0xC0
++#define BMA150_ACC_X_LSB__REG		BMA150_X_AXIS_LSB_REG
++
++#define BMA150_ACC_X_MSB__POS   	0
++#define BMA150_ACC_X_MSB__LEN   	8
++#define BMA150_ACC_X_MSB__MSK		0xFF
++#define BMA150_ACC_X_MSB__REG		BMA150_X_AXIS_MSB_REG
++
++#define BMA150_ACC_Y_LSB__POS   	6
++#define BMA150_ACC_Y_LSB__LEN   	2
++#define BMA150_ACC_Y_LSB__MSK   	0xC0
++#define BMA150_ACC_Y_LSB__REG		BMA150_Y_AXIS_LSB_REG
++
++#define BMA150_ACC_Y_MSB__POS   	0
++#define BMA150_ACC_Y_MSB__LEN   	8
++#define BMA150_ACC_Y_MSB__MSK   	0xFF
++#define BMA150_ACC_Y_MSB__REG		BMA150_Y_AXIS_MSB_REG
++
++#define BMA150_ACC_Z_LSB__POS   	6
++#define BMA150_ACC_Z_LSB__LEN   	2
++#define BMA150_ACC_Z_LSB__MSK		0xC0
++#define BMA150_ACC_Z_LSB__REG		BMA150_Z_AXIS_LSB_REG
++
++#define BMA150_ACC_Z_MSB__POS   	0
++#define BMA150_ACC_Z_MSB__LEN   	8
++#define BMA150_ACC_Z_MSB__MSK		0xFF
++#define BMA150_ACC_Z_MSB__REG		BMA150_Z_AXIS_MSB_REG
++
++/* CONTROL BITS */
++
++#define BMA150_SLEEP__POS			0
++#define BMA150_SLEEP__LEN			1
++#define BMA150_SLEEP__MSK			0x01
++#define BMA150_SLEEP__REG			BMA150_CTRL_REG
++
++#define BMA150_SOFT_RESET__POS		1
++#define BMA150_SOFT_RESET__LEN		1
++#define BMA150_SOFT_RESET__MSK		0x02
++#define BMA150_SOFT_RESET__REG		BMA150_CTRL_REG
++
++#define BMA150_EE_W__POS			4
++#define BMA150_EE_W__LEN			1
++#define BMA150_EE_W__MSK			0x10
++#define BMA150_EE_W__REG			BMA150_CTRL_REG
++
++#define BMA150_UPDATE_IMAGE__POS	5
++#define BMA150_UPDATE_IMAGE__LEN	1
++#define BMA150_UPDATE_IMAGE__MSK	0x20
++#define BMA150_UPDATE_IMAGE__REG	BMA150_CTRL_REG
++
++#define BMA150_RESET_INT__POS		6
++#define BMA150_RESET_INT__LEN		1
++#define BMA150_RESET_INT__MSK		0x40
++#define BMA150_RESET_INT__REG		BMA150_CTRL_REG
++
++/* BANDWIDTH dependend definitions */
++
++#define BMA150_BANDWIDTH__POS				0
++#define BMA150_BANDWIDTH__LEN			 	3
++#define BMA150_BANDWIDTH__MSK			 	0x07
++#define BMA150_BANDWIDTH__REG				BMA150_RANGE_BWIDTH_REG
++
++/* RANGE */
++
++#define BMA150_RANGE__POS				3
++#define BMA150_RANGE__LEN				2
++#define BMA150_RANGE__MSK				0x18
++#define BMA150_RANGE__REG				BMA150_RANGE_BWIDTH_REG
++
++/* WAKE UP */
++
++#define BMA150_WAKE_UP__POS			0
++#define BMA150_WAKE_UP__LEN			1
++#define BMA150_WAKE_UP__MSK			0x01
++#define BMA150_WAKE_UP__REG			BMA150_CONF2_REG
++
++#define BMA150_WAKE_UP_PAUSE__POS		1
++#define BMA150_WAKE_UP_PAUSE__LEN		2
++#define BMA150_WAKE_UP_PAUSE__MSK		0x06
++#define BMA150_WAKE_UP_PAUSE__REG		BMA150_CONF2_REG
++
++#define BMA150_GET_BITSLICE(regvar, bitname)\
++	((regvar & bitname##__MSK) >> bitname##__POS)
++
++
++#define BMA150_SET_BITSLICE(regvar, bitname, val)\
++	((regvar & ~bitname##__MSK) | ((val<<bitname##__POS)&bitname##__MSK))
++
++/* range and bandwidth */
++
++#define BMA150_RANGE_2G			0
++#define BMA150_RANGE_4G			1
++#define BMA150_RANGE_8G			2
++
++#define BMA150_BW_25HZ		0
++#define BMA150_BW_50HZ		1
++#define BMA150_BW_100HZ		2
++#define BMA150_BW_190HZ		3
++#define BMA150_BW_375HZ		4
++#define BMA150_BW_750HZ		5
++#define BMA150_BW_1500HZ	6
++
++/* mode settings */
++
++#define BMA150_MODE_NORMAL      0
++#define BMA150_MODE_SLEEP       2
++#define BMA150_MODE_WAKE_UP     3
++
++struct bma150acc{
++	s16	x,
++		y,
++		z;
++} ;
++static struct  {
++	int x;
++	int y;
++	int z;
++}sense_data;
++struct bma150_data {
++	struct i2c_client *bma150_client;
++	atomic_t delay;
++	atomic_t enable;
++	unsigned char mode;
++	struct input_dev *input;
++	struct bma150acc value;
++	struct mutex value_mutex;
++	struct mutex enable_mutex;
++	struct mutex mode_mutex;
++	struct delayed_work work;
++	struct work_struct irq_work;
++	struct early_suspend early_suspend;
++};
++#define RBUFF_SIZE		12	/* Rx buffer size */
++#define BMAIO				0xA1
++
++/* IOCTLs for MMA8452 library */
++#define BMA_IOCTL_INIT                  _IO(BMAIO, 0x01)
++#define BMA_IOCTL_RESET      	          _IO(BMAIO, 0x04)
++#define BMA_IOCTL_CLOSE		           _IO(BMAIO, 0x02)
++#define BMA_IOCTL_START		             _IO(BMAIO, 0x03)
++#define BMA_IOCTL_GETDATA               _IOR(BMAIO, 0x08, char[RBUFF_SIZE+1])
++
++static int bma023_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
++	   unsigned long arg);
++static void bma150_early_suspend(struct early_suspend *h);
++static void bma150_late_resume(struct early_suspend *h);
++
++static int bma150_smbus_read_byte(struct i2c_client *client,
++		unsigned char reg_addr, unsigned char *data)
++{
++	s32 dummy;
++	dummy = i2c_smbus_read_byte_data(client, reg_addr);
++	if (dummy < 0)
++		return -1;
++	*data = dummy & 0x000000ff;
++
++	return 0;
++}
++
++static int bma150_smbus_write_byte(struct i2c_client *client,
++		unsigned char reg_addr, unsigned char *data)
++{
++	s32 dummy;
++	dummy = i2c_smbus_write_byte_data(client, reg_addr, *data);
++	if (dummy < 0)
++		return -1;
++	return 0;
++}
++
++static int bma150_smbus_read_byte_block(struct i2c_client *client,
++		unsigned char reg_addr, unsigned char *data, unsigned char len)
++{
++	s32 dummy;
++	dummy = i2c_smbus_read_i2c_block_data(client, reg_addr, len, data);
++	if (dummy < 0)
++		return -1;
++	return 0;
++}
++
++static int bma150_set_mode(struct i2c_client *client, unsigned char Mode)
++{
++	int comres = 0;
++	unsigned char data1, data2;
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	if (client == NULL) {
++		comres = -1;
++	} else{
++		if (Mode < 4 && Mode != 1) {
++
++			comres = bma150_smbus_read_byte(client,
++						BMA150_WAKE_UP__REG, &data1);
++			data1 = BMA150_SET_BITSLICE(data1,
++						BMA150_WAKE_UP, Mode);
++			comres += bma150_smbus_read_byte(client,
++						BMA150_SLEEP__REG, &data2);
++			data2 = BMA150_SET_BITSLICE(data2,
++						BMA150_SLEEP, (Mode>>1));
++			comres += bma150_smbus_write_byte(client,
++						BMA150_WAKE_UP__REG, &data1);
++			comres += bma150_smbus_write_byte(client,
++						BMA150_SLEEP__REG, &data2);
++			mutex_lock(&bma150->mode_mutex);
++			bma150->mode = (unsigned char) Mode;
++			mutex_unlock(&bma150->mode_mutex);
++
++		} else{
++			comres = -1;
++		}
++	}
++
++	return comres;
++}
++
++
++static int bma150_set_range(struct i2c_client *client, unsigned char Range)
++{
++	int comres = 0;
++	unsigned char data;
++
++	if (client == NULL) {
++		comres = -1;
++	} else{
++		if (Range < 3) {
++
++			comres = bma150_smbus_read_byte(client,
++						BMA150_RANGE__REG, &data);
++			data = BMA150_SET_BITSLICE(data, BMA150_RANGE, Range);
++			comres += bma150_smbus_write_byte(client,
++						BMA150_RANGE__REG, &data);
++
++		} else{
++			comres = -1;
++		}
++	}
++
++	return comres;
++}
++
++static int bma150_get_range(struct i2c_client *client, unsigned char *Range)
++{
++	int comres = 0;
++	unsigned char data;
++
++	if (client == NULL) {
++		comres = -1;
++	} else{
++		comres = bma150_smbus_read_byte(client,
++						BMA150_RANGE__REG, &data);
++
++		*Range = BMA150_GET_BITSLICE(data, BMA150_RANGE);
++
++	}
++
++	return comres;
++}
++
++
++
++static int bma150_set_bandwidth(struct i2c_client *client, unsigned char BW)
++{
++	int comres = 0;
++	unsigned char data;
++
++	if (client == NULL) {
++		comres = -1;
++	} else{
++		if (BW < 8) {
++			comres = bma150_smbus_read_byte(client,
++						BMA150_BANDWIDTH__REG, &data);
++			data = BMA150_SET_BITSLICE(data, BMA150_BANDWIDTH, BW);
++			comres += bma150_smbus_write_byte(client,
++						BMA150_BANDWIDTH__REG, &data);
++
++		} else{
++			comres = -1;
++		}
++	}
++
++	return comres;
++}
++
++static int bma150_get_bandwidth(struct i2c_client *client, unsigned char *BW)
++{
++	int comres = 0;
++	unsigned char data;
++
++	if (client == NULL) {
++		comres = -1;
++	} else{
++
++
++		comres = bma150_smbus_read_byte(client,
++						BMA150_BANDWIDTH__REG, &data);
++
++		*BW = BMA150_GET_BITSLICE(data, BMA150_BANDWIDTH);
++
++
++	}
++
++	return comres;
++}
++
++static int bma150_read_accel_xyz(struct i2c_client *client,
++		struct bma150acc *acc)
++{
++	int comres;
++	unsigned char data[6];
++	if (client == NULL) {
++		comres = -1;
++	} else{
++
++
++		comres = bma150_smbus_read_byte_block(client,
++					BMA150_ACC_X_LSB__REG, &data[0], 6);
++
++		acc->x = BMA150_GET_BITSLICE(data[0], BMA150_ACC_X_LSB) |
++			(BMA150_GET_BITSLICE(data[1], BMA150_ACC_X_MSB)<<
++							BMA150_ACC_X_LSB__LEN);
++		acc->x = acc->x << (sizeof(short)*8-(BMA150_ACC_X_LSB__LEN+
++							BMA150_ACC_X_MSB__LEN));
++		acc->x = acc->x >> (sizeof(short)*8-(BMA150_ACC_X_LSB__LEN+
++							BMA150_ACC_X_MSB__LEN));
++
++		acc->y = BMA150_GET_BITSLICE(data[2], BMA150_ACC_Y_LSB) |
++			(BMA150_GET_BITSLICE(data[3], BMA150_ACC_Y_MSB)<<
++							BMA150_ACC_Y_LSB__LEN);
++		acc->y = acc->y << (sizeof(short)*8-(BMA150_ACC_Y_LSB__LEN +
++							BMA150_ACC_Y_MSB__LEN));
++		acc->y = acc->y >> (sizeof(short)*8-(BMA150_ACC_Y_LSB__LEN +
++							BMA150_ACC_Y_MSB__LEN));
++
++
++		acc->z = BMA150_GET_BITSLICE(data[4], BMA150_ACC_Z_LSB);
++		acc->z |= (BMA150_GET_BITSLICE(data[5], BMA150_ACC_Z_MSB)<<
++							BMA150_ACC_Z_LSB__LEN);
++		acc->z = acc->z << (sizeof(short)*8-(BMA150_ACC_Z_LSB__LEN+
++							BMA150_ACC_Z_MSB__LEN));
++		acc->z = acc->z >> (sizeof(short)*8-(BMA150_ACC_Z_LSB__LEN+
++							BMA150_ACC_Z_MSB__LEN));
++
++	}
++
++	return comres;
++}
++
++static void bma150_work_func(struct work_struct *work)
++{
++	struct bma150_data *bma150 = container_of((struct delayed_work *)work,
++			struct bma150_data, work);
++	static struct bma150acc acc;
++	s16	x,y,z;
++	unsigned long delay = msecs_to_jiffies(atomic_read(&bma150->delay));
++	struct bma023_platform_data *pdata = pdata = (bma150->bma150_client)->dev.platform_data;
++
++	bma150_read_accel_xyz(bma150->bma150_client, &acc);
++	if (pdata->swap_xyz) {
++		x = (pdata->orientation[0])*acc.x + (pdata->orientation[1])*acc.y + (pdata->orientation[2])*acc.z;
++		y = (pdata->orientation[3])*acc.x + (pdata->orientation[4])*acc.y + (pdata->orientation[5])*acc.z;
++		z = (pdata->orientation[6])*acc.x + (pdata->orientation[7])*acc.y + (pdata->orientation[8])*acc.z;
++	}
++	else {
++		x = acc.x;
++		y = acc.y;
++		z = acc.z;
++	}
++	input_report_abs(bma150->input, ABS_X, x);
++	input_report_abs(bma150->input, ABS_Y, y);
++	input_report_abs(bma150->input, ABS_Z, z);
++	input_sync(bma150->input);
++	mutex_lock(&bma150->value_mutex);
++	bma150->value = acc;
++	mutex_unlock(&bma150->value_mutex);
++	//printk("bma150_work_func   acc.x=%d,acc.y=%d,acc.z=%d\n",acc.x,acc.y,acc.z);
++	schedule_delayed_work(&bma150->work, delay);
++
++}
++
++static ssize_t bma150_mode_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	unsigned char data;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	mutex_lock(&bma150->mode_mutex);
++	data = bma150->mode;
++	mutex_unlock(&bma150->mode_mutex);
++
++	return sprintf(buf, "%d\n", data);
++}
++
++static ssize_t bma150_mode_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	if (bma150_set_mode(bma150->bma150_client, (unsigned char) data) < 0)
++		return -EINVAL;
++
++
++	return count;
++}
++static ssize_t bma150_range_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	unsigned char data;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	if (bma150_get_range(bma150->bma150_client, &data) < 0)
++		return sprintf(buf, "Read error\n");
++
++	return sprintf(buf, "%d\n", data);
++}
++
++static ssize_t bma150_range_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	if (bma150_set_range(bma150->bma150_client, (unsigned char) data) < 0)
++		return -EINVAL;
++
++	return count;
++}
++
++static ssize_t bma150_bandwidth_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	unsigned char data;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	if (bma150_get_bandwidth(bma150->bma150_client, &data) < 0)
++		return sprintf(buf, "Read error\n");
++
++	return sprintf(buf, "%d\n", data);
++
++}
++
++static ssize_t bma150_bandwidth_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	if (bma150_set_bandwidth(bma150->bma150_client,
++				(unsigned char) data) < 0)
++		return -EINVAL;
++
++	return count;
++}
++
++static ssize_t bma150_value_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct input_dev *input = to_input_dev(dev);
++	struct bma150_data *bma150 = input_get_drvdata(input);
++	struct bma150acc acc_value;
++
++	mutex_lock(&bma150->value_mutex);
++	acc_value = bma150->value;
++	mutex_unlock(&bma150->value_mutex);
++
++	return sprintf(buf, "%d %d %d\n", acc_value.x, acc_value.y,
++			acc_value.z);
++}
++
++
++
++static ssize_t bma150_delay_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	return sprintf(buf, "%d\n", atomic_read(&bma150->delay));
++
++}
++
++static ssize_t bma150_delay_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	if (data > BMA150_MAX_DELAY)
++		data = BMA150_MAX_DELAY;
++	atomic_set(&bma150->delay, (unsigned int) data);
++
++	return count;
++}
++
++static ssize_t bma150_enable_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++
++	return sprintf(buf, "%d\n", atomic_read(&bma150->enable));
++
++}
++
++static void bma150_set_enable(struct device *dev, int enable)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);
++	int pre_enable = atomic_read(&bma150->enable);
++
++	mutex_lock(&bma150->enable_mutex);
++	if (enable) {
++		if (pre_enable ==0) {
++			bma150_set_mode(bma150->bma150_client,
++							BMA150_MODE_NORMAL);
++			schedule_delayed_work(&bma150->work,
++				msecs_to_jiffies(atomic_read(&bma150->delay)));
++			atomic_set(&bma150->enable, 1);
++		}
++
++	} else {
++		if (pre_enable ==1) {
++			bma150_set_mode(bma150->bma150_client,
++							BMA150_MODE_SLEEP);
++			cancel_delayed_work_sync(&bma150->work);
++			atomic_set(&bma150->enable, 0);
++		}
++	}
++	mutex_unlock(&bma150->enable_mutex);
++
++}
++
++static ssize_t bma150_enable_store(struct device *dev,
++		struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	unsigned long data;
++	int error;
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++	if ((data == 0)||(data==1)) {
++		bma150_set_enable(dev,data);
++	}
++
++	return count;
++}
++
++static DEVICE_ATTR(range, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		bma150_range_show, bma150_range_store);
++static DEVICE_ATTR(bandwidth, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		bma150_bandwidth_show, bma150_bandwidth_store);
++static DEVICE_ATTR(mode, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		bma150_mode_show, bma150_mode_store);
++static DEVICE_ATTR(value, S_IRUGO|S_IWUSR|S_IWGRP,
++		bma150_value_show, NULL);
++static DEVICE_ATTR(delay, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		bma150_delay_show, bma150_delay_store);
++static DEVICE_ATTR(enable, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		bma150_enable_show, bma150_enable_store);
++
++static struct attribute *bma150_attributes[] = {
++	&dev_attr_range.attr,
++	&dev_attr_bandwidth.attr,
++	&dev_attr_mode.attr,
++	&dev_attr_value.attr,
++	&dev_attr_delay.attr,
++	&dev_attr_enable.attr,
++	NULL
++};
++
++static struct attribute_group bma150_attribute_group = {
++	.attrs = bma150_attributes
++};
++
++static int bma150_input_init(struct bma150_data *bma150)
++{
++	struct input_dev *dev;
++	int err;
++
++	dev = input_allocate_device();
++	if (!dev)
++		return -ENOMEM;
++	dev->name = "gsensor";//SENSOR_NAME;
++	dev->id.bustype = BUS_I2C;
++
++	input_set_capability(dev, EV_ABS, ABS_MISC);
++	input_set_abs_params(dev, ABS_X, ABSMIN_2G, ABSMAX_2G, 0, 0);
++	input_set_abs_params(dev, ABS_Y, ABSMIN_2G, ABSMAX_2G, 0, 0);
++	input_set_abs_params(dev, ABS_Z, ABSMIN_2G, ABSMAX_2G, 0, 0);
++	input_set_drvdata(dev, bma150);
++
++	err = input_register_device(dev);
++	if (err < 0) {
++		input_free_device(dev);
++		return err;
++	}
++	bma150->input = dev;
++
++	return 0;
++}
++
++static void bma150_input_delete(struct bma150_data *bma150)
++{
++	struct input_dev *dev = bma150->input;
++
++	input_unregister_device(dev);
++	input_free_device(dev);
++}
++
++
++static int bma023_open(struct inode *inode, struct file *file)
++{
++	return 0;//nonseekable_open(inode, file);
++}
++
++static int bma023_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++static struct file_operations bma023_fops = {
++	.owner = THIS_MODULE,
++	.open = bma023_open,
++	.release = bma023_release,
++	.unlocked_ioctl = bma023_ioctl,
++};
++static struct miscdevice bma023_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "mma8452_daemon",//"mma8452_daemon",
++	.fops = &bma023_fops,
++};
++static int bma023_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
++	   unsigned long arg)
++{
++	void __user *argp = (void __user *)arg;
++
++	struct i2c_client *client = container_of(bma023_device.parent, struct i2c_client, dev);
++	struct bma150_data *bma150 = i2c_get_clientdata(client);;
++	switch (cmd) {
++	case BMA_IOCTL_GETDATA:
++		mutex_lock(&bma150->value_mutex);
++		if(abs(sense_data.x-bma150->value.x)>10)//·À¶¶¶¯
++			sense_data.x=bma150->value.x;
++		if(abs(sense_data.y+(bma150->value.z))>10)//·À¶¶¶¯
++			sense_data.y=-(bma150->value.z);
++		if(abs(sense_data.z+(bma150->value.y))>10)//·À¶¶¶¯
++			sense_data.z=-(bma150->value.y);
++	       //bma150->value = acc;
++		mutex_unlock(&bma150->value_mutex);
++
++		if ( copy_to_user(argp, &sense_data, sizeof(sense_data) ) ) {
++            printk("failed to copy sense data to user space.");
++			return -EFAULT;
++        }
++			break;
++	default:
++		break;
++		}
++	return 0;
++}
++
++static int bma150_probe(struct i2c_client *client,
++		const struct i2c_device_id *id)
++{
++	int err = 0;
++	int tempvalue;
++	struct bma150_data *data;
++	printk(KERN_INFO "bma150_probe  \n");
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
++		printk(KERN_INFO "i2c_check_functionality error\n");
++		goto exit;
++	}
++	data = kzalloc(sizeof(struct bma150_data), GFP_KERNEL);
++	if (!data) {
++		err = -ENOMEM;
++		goto exit;
++	}
++
++	tempvalue = 0;
++	tempvalue = i2c_smbus_read_word_data(client, BMA150_CHIP_ID_REG);
++
++	if ((tempvalue&0x00FF) == BMA150_CHIP_ID) {
++		printk(KERN_INFO "Bosch Sensortec Device detected!\n" \
++				"BMA150 registered I2C driver!\n");
++	} else{
++		printk(KERN_INFO "Bosch Sensortec Device not found" \
++				"i2c error %d \n", tempvalue);
++		err = -1;
++		goto kfree_exit;
++	}
++	i2c_set_clientdata(client, data);
++	data->bma150_client = client;
++	mutex_init(&data->value_mutex);
++	mutex_init(&data->mode_mutex);
++	mutex_init(&data->enable_mutex);
++	bma150_set_bandwidth(client, BMA150_BW_SET);
++	bma150_set_range(client, BMA150_RANGE_SET);
++
++
++	INIT_DELAYED_WORK(&data->work, bma150_work_func);
++	atomic_set(&data->delay, BMA150_MAX_DELAY);
++	atomic_set(&data->enable, 0);
++	err = bma150_input_init(data);
++	if (err < 0)
++		goto kfree_exit;
++
++	err = sysfs_create_group(&data->input->dev.kobj,
++			&bma150_attribute_group);
++	if (err < 0)
++		goto error_sysfs;
++
++	data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
++	data->early_suspend.suspend = bma150_early_suspend;
++	data->early_suspend.resume = bma150_late_resume;
++	register_early_suspend(&data->early_suspend);
++	bma023_device.parent = &client->dev;
++	misc_register(&bma023_device);
++	return 0;
++
++error_sysfs:
++	bma150_input_delete(data);
++
++kfree_exit:
++	kfree(data);
++exit:
++	return err;
++}
++
++
++static int bma150_remove(struct i2c_client *client)
++{
++	struct bma150_data *data = i2c_get_clientdata(client);
++
++	bma150_set_enable(&client->dev, 0);
++	unregister_early_suspend(&data->early_suspend);
++	sysfs_remove_group(&data->input->dev.kobj, &bma150_attribute_group);
++	bma150_input_delete(data);
++	kfree(data);
++
++	return 0;
++}
++
++
++
++
++static void bma150_early_suspend(struct early_suspend *h)
++{
++	struct bma150_data *data =
++		container_of(h, struct bma150_data, early_suspend);
++
++	mutex_lock(&data->enable_mutex);
++	if (atomic_read(&data->enable)==1) {
++		bma150_set_mode(data->bma150_client, BMA150_MODE_SLEEP);
++		cancel_delayed_work_sync(&data->work);
++	}
++	mutex_unlock(&data->enable_mutex);
++}
++
++
++static void bma150_late_resume(struct early_suspend *h)
++{
++	struct bma150_data *data =
++		container_of(h, struct bma150_data, early_suspend);
++
++	mutex_lock(&data->enable_mutex);
++	if (atomic_read(&data->enable)==1) {
++		bma150_set_mode(data->bma150_client, BMA150_MODE_NORMAL);
++		schedule_delayed_work(&data->work,
++			msecs_to_jiffies(atomic_read(&data->delay)));
++	}
++	mutex_unlock(&data->enable_mutex);
++}
++
++static const struct i2c_device_id bma150_id[] = {
++	{ SENSOR_NAME, 0 },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(i2c, bma150_id);
++
++static struct i2c_driver bma150_driver = {
++	.driver = {
++		.owner	= THIS_MODULE,
++		.name	= SENSOR_NAME,
++	},
++	.id_table	= bma150_id,
++	.probe		= bma150_probe,
++	.remove		= bma150_remove,
++
++};
++
++static int __init BMA150_init(void)
++{
++	return i2c_add_driver(&bma150_driver);
++}
++
++static void __exit BMA150_exit(void)
++{
++	i2c_del_driver(&bma150_driver);
++}
++
++MODULE_AUTHOR("Lan Bin Yuan <lby@rock-chips.com>");
++MODULE_DESCRIPTION("BMA150 driver");
++MODULE_LICENSE("GPL");
++
++module_init(BMA150_init);
++module_exit(BMA150_exit);
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 46651a249695..1a362c11bf68 100755
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -18,6 +18,9 @@ config INPUT_LPSENSOR_ISL29028
+ config INPUT_LPSENSOR_CM3602
+ 	tristate "l/p sensor input support"
+ 
++config INPUT_LPSENSOR_AL3006
++	tristate "al3006 l/p sensor input support"
++
+ config INPUT_88PM860X_ONKEY
+ 	tristate "88PM860x ONKEY support"
+ 	depends on MFD_88PM860X
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index d17fcab89d61..3b6e7b0e262b 100755
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -49,4 +49,5 @@ obj-$(CONFIG_INPUT_WISTRON_BTNS)	+= wistron_btns.o
+ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
+ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
++obj-$(CONFIG_INPUT_LPSENSOR_AL3006)	+= al3006.o
+ 
+diff --git a/drivers/input/misc/al3006.c b/drivers/input/misc/al3006.c
+new file mode 100644
+index 000000000000..e11291b0bf2f
+--- /dev/null
++++ b/drivers/input/misc/al3006.c
+@@ -0,0 +1,833 @@
++/* drivers/input/misc/al3006.c
++ *
++ * Copyright (C) 2010 ROCK-CHIPS, Inc.
++ * Author: eric <hc@rock-chips.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/i2c.h>
++#include <linux/irq.h>
++#include <linux/gpio.h>
++#include <linux/input.h>
++#include <linux/platform_device.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/miscdevice.h>
++#include <linux/circ_buf.h>
++#include <linux/interrupt.h>
++#include "al3006.h"
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++
++#include <linux/delay.h>
++#include <linux/wait.h>
++
++#define AL3006_DBG 0
++
++#if AL3006_DBG
++#define AL3006_DEBUG(x...) printk(x)
++#else
++#define AL3006_DEBUG(x...)
++#endif
++
++#define CONFIG_REG        (0x00)
++#define TIM_CTL_REG       (0x01)
++#define ALS_CTL_REG       (0x02)
++#define INT_STATUS_REG    (0x03)
++#define PS_CTL_REG        (0x04)
++#define PS_ALS_DATA_REG   (0x05)
++#define ALS_WINDOWS_REG   (0x08)
++
++//enable bit[ 0-1], in register CONFIG_REG
++#define ONLY_ALS_EN       (0x00)
++#define ONLY_PROX_EN      (0x01)
++#define ALL_PROX_ALS_EN   (0x02)
++#define ALL_IDLE          (0x03)
++
++#define POWER_MODE_MASK   (0x0C)
++#define POWER_UP_MODE     (0x00)
++#define POWER_DOWN_MODE   (0x08)
++#define POWER_RESET_MODE  (0x0C)
++
++struct al3006_data {
++	struct input_dev         *psensor_input_dev;
++	struct input_dev         *lsensor_input_dev;
++	struct i2c_client        *client;
++	struct delayed_work      dwork; //for l/psensor
++	//struct delayed_work 	 l_work; //for light sensor
++	struct mutex lock;
++	int enabled;
++	int irq;
++};
++static struct al3006_data al3006_struct_data;
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static struct early_suspend al3006_early_suspend;
++#endif
++
++int g_lightlevel = 8;
++
++static const int luxValues[8] = {
++		10, 160, 225, 320,
++		640, 1280, 2600, 4095
++};
++
++
++static int al3006_read_reg(struct i2c_client *client, char reg, char *value)
++{
++	int ret = 0;
++	struct i2c_msg msg[2];
++	struct i2c_adapter *adap = client->adapter;
++
++	msg[0].addr  = client->addr;
++	msg[0].flags = client->flags;
++	msg[0].len = 1;
++	msg[0].buf = (char *)&reg;
++	msg[0].scl_rate = 400 * 1000;
++
++	msg[1].addr  = client->addr;
++	msg[1].flags = client->flags | I2C_M_RD;
++	msg[1].len = 1;
++	msg[1].buf = (char *)value;
++	msg[1].scl_rate = 400 * 1000;
++
++	if ((ret = i2c_transfer(adap, (struct i2c_msg *)&msg, 2)) < 2) {
++		AL3006_DEBUG("%s: read al3006 register  %#x failure\n", __FUNCTION__, reg);
++		return -EIO;
++	}
++
++	return 1;
++}
++
++static int al3006_write_reg(struct i2c_client *client, char reg, char value)
++{
++	int ret = 0;
++	char buf[2];
++	struct i2c_msg msg;
++	struct i2c_adapter *adap = client->adapter;
++
++	buf[0] = reg;
++	buf[1] = value;
++
++	msg.addr  = client->addr;
++	msg.flags = client->flags;
++	msg.len = 2;
++	msg.buf = (char *)&buf;
++	msg.scl_rate = 400 * 1000;
++
++
++	if ((ret = i2c_transfer(adap, (struct i2c_msg *)&msg, 1)) < 1) {
++		AL3006_DEBUG("%s: read al3006 register  %#x failure\n", __FUNCTION__, reg);
++		return -EIO;
++	}
++
++	return 1;
++}
++
++static void al3006_change_ps_threshold(struct i2c_client *client)
++{
++	struct al3006_data *al3006 = i2c_get_clientdata(client);
++	char reg, value;
++
++	AL3006_DEBUG("%s:\n", __FUNCTION__);
++	mutex_lock(&al3006->lock);
++	reg = PS_ALS_DATA_REG;
++	al3006_read_reg(client, reg, &value);
++	mutex_unlock(&al3006->lock);
++
++	value >>= 7;  //bit7 is ps data ; bit7 = 1, object is detected
++	printk("%s: psensor's data is %#x\n", __FUNCTION__, value);
++
++	input_report_abs(al3006->psensor_input_dev, ABS_DISTANCE, value?0:1);
++	input_sync(al3006->psensor_input_dev);
++}
++
++static void al3006_change_ls_threshold(struct i2c_client *client)
++{
++	struct al3006_data *al3006 = i2c_get_clientdata(client);
++	char reg, value;
++
++	AL3006_DEBUG("%s:\n", __FUNCTION__);
++	mutex_lock(&al3006->lock);
++	reg = PS_ALS_DATA_REG;
++	al3006_read_reg(client, reg, &value);
++	mutex_unlock(&al3006->lock);
++
++	value &= 0x3F; // bit0-5  is ls data;
++	printk("%s: lightsensor's level is %#x\n", __FUNCTION__, value);
++
++	if(value > 8) value = 8;
++	input_report_abs(al3006->lsensor_input_dev, ABS_MISC, value);
++	input_sync(al3006->lsensor_input_dev);
++}
++
++static void al3006_work_handler(struct work_struct *work)
++{
++	struct al3006_data *al3006 = (struct al3006_data *)container_of(work, struct al3006_data, dwork.work);
++	char reg, value;
++
++	mutex_lock(&al3006->lock);
++	reg = INT_STATUS_REG;
++	al3006_read_reg(al3006->client, reg, &value);
++	mutex_unlock(&al3006->lock);
++	AL3006_DEBUG("%s: INT_STATUS_REG is %#x\n", __FUNCTION__, value);
++
++	value &= 0x03;
++	if(value == 0x02) {        //ps int
++		al3006_change_ps_threshold(al3006->client);
++	}
++	else if(value == 0x01) {   //ls int
++		al3006_change_ls_threshold(al3006->client);
++	}
++	else if(value == 0x03) {   //ps and ls int
++		al3006_change_ps_threshold(al3006->client);
++		al3006_change_ls_threshold(al3006->client);
++	}
++	//enable_irq(al3006->irq);
++}
++
++static void al3006_reschedule_work(struct al3006_data *data,
++					  unsigned long delay)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&data->lock, flags);
++
++	/*
++	 * If work is already scheduled then subsequent schedules will not
++	 * change the scheduled time that's why we have to cancel it first.
++	 */
++	__cancel_delayed_work(&data->dwork);
++	schedule_delayed_work(&data->dwork, delay);
++
++	spin_unlock_irqrestore(&data->lock, flags);
++}
++
++static irqreturn_t al3006_irq_handler(int irq, void *data)
++{
++	struct al3006_data *al3006 = (struct al3006_data *)data;
++	AL3006_DEBUG("%s\n", __FUNCTION__);
++	//input_report_abs(al3006->psensor_input_dev, ABS_DISTANCE, 0);
++	//input_sync(al3006->psensor_input_dev);
++
++	//disable_irq_nosync(al3006->irq);
++	al3006_reschedule_work(al3006, 0);//msecs_to_jiffies(420)
++
++	return IRQ_HANDLED;
++}
++
++static int al3006_psensor_enable(struct i2c_client *client)
++{
++	char reg, value;
++	int ret;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++       AL3006_DEBUG("%s:\n", __FUNCTION__);
++	mutex_lock(&al3006->lock);
++	reg = CONFIG_REG;
++	ret = al3006_read_reg(client, reg, &value);
++	if( (value & 0x03) == ONLY_ALS_EN ){
++		value &= ~0x03;
++		value |= ALL_PROX_ALS_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++	else if( (value & 0x03) == ALL_IDLE ){
++		value &= ~0x03;
++		value |= ONLY_PROX_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++#ifdef AL3006_DBG
++	ret = al3006_read_reg(client, reg, &value);
++	AL3006_DEBUG("%s: configure reg value %#x ...\n", __FUNCTION__, value);
++#endif
++
++	reg = PS_ALS_DATA_REG;
++	al3006_read_reg(client, reg, &value);
++
++	value >>= 7;  //bit7 is ps data ; bit7 = 1, object is detected
++	printk("%s: psensor's data is %#x\n", __FUNCTION__, value);
++
++	input_report_abs(al3006->psensor_input_dev, ABS_DISTANCE, value?0:1);
++	input_sync(al3006->psensor_input_dev);
++	mutex_unlock(&al3006->lock);
++
++	//enable_irq(al3006->irq);
++
++	return ret;
++}
++
++static int al3006_psensor_disable(struct i2c_client *client)
++{
++	char ret, reg, value;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++	mutex_lock(&al3006->lock);
++	reg = CONFIG_REG;
++	ret = al3006_read_reg(client, reg, &value);
++	if( (value & 0x03) == ONLY_PROX_EN ){
++		value &= ~0x03;
++		value |= ALL_IDLE;
++		ret = al3006_write_reg(client, reg, value);
++	}
++	else if( (value & 0x03) == ALL_PROX_ALS_EN ){
++		value &= ~0x03;
++		value |= ONLY_ALS_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++#ifdef AL3006_DBG
++	ret = al3006_read_reg(client, reg, &value);
++	AL3006_DEBUG("%s: configure reg value %#x ...\n", __FUNCTION__, value);
++#endif
++	mutex_unlock(&al3006->lock);
++
++	//disable_irq(al3006->irq);
++	//cancel_delayed_work_sync(&al3006->dwork);
++	//enable_irq(al3006->irq);
++
++	return ret;
++}
++
++static int misc_ps_opened = 0;
++
++static int al3006_psensor_open(struct inode *inode, struct file *file)
++{
++//	struct i2c_client *client =
++//		       container_of (al3006_psensor_misc.parent, struct i2c_client, dev);
++	printk("%s\n", __func__);
++	if (misc_ps_opened)
++		return -EBUSY;
++	misc_ps_opened = 1;
++	return 0;
++}
++
++static int al3006_psensor_release(struct inode *inode, struct file *file)
++{
++//	struct i2c_client *client =
++//		       container_of (al3006_psensor_misc.parent, struct i2c_client, dev);
++	printk("%s\n", __func__);
++	misc_ps_opened = 0;
++	return 0;
++}
++
++static long al3006_psensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	char reg, val, enabled;
++	struct al3006_data *al3006 = &al3006_struct_data;
++	struct i2c_client *client = al3006->client;
++
++	printk("%s cmd %d\n", __func__, _IOC_NR(cmd));
++	switch (cmd) {
++	case PSENSOR_IOCTL_ENABLE:
++		if (get_user(val, (unsigned long __user *)arg))
++			return -EFAULT;
++		if (val)
++			return al3006_psensor_enable(client);
++		else
++			return al3006_psensor_disable(client);
++		break;
++	case PSENSOR_IOCTL_GET_ENABLED:
++		mutex_lock(&al3006->lock);
++		reg = CONFIG_REG;
++		al3006_read_reg(client, reg, &val);
++		mutex_unlock(&al3006->lock);
++		val &= 0x03;
++		if(val == ONLY_PROX_EN || val == ALL_PROX_ALS_EN)
++			enabled = 1;
++		else
++			enabled = 0;
++		return put_user(enabled, (unsigned long __user *)arg);
++		break;
++	default:
++		pr_err("%s: invalid cmd %d\n", __func__, _IOC_NR(cmd));
++		return -EINVAL;
++	}
++}
++
++static struct file_operations al3006_psensor_fops = {
++	.owner = THIS_MODULE,
++	.open = al3006_psensor_open,
++	.release = al3006_psensor_release,
++	.unlocked_ioctl = al3006_psensor_ioctl
++};
++
++static struct miscdevice al3006_psensor_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "psensor",
++	.fops = &al3006_psensor_fops
++};
++
++static int register_psensor_device(struct i2c_client *client, struct al3006_data *data)
++{
++	struct input_dev *input_dev = data->psensor_input_dev;
++	int rc;
++
++	AL3006_DEBUG("%s: allocating input device psensor\n", __func__);
++	input_dev = input_allocate_device();
++	if (!input_dev) {
++		dev_err(&client->dev,"%s: could not allocate input device for psensor\n", __FUNCTION__);
++		rc = -ENOMEM;
++		goto done;
++	}
++	data->psensor_input_dev = input_dev;
++	input_set_drvdata(input_dev, data);
++
++	input_set_drvdata(input_dev, data);
++	input_dev->name = "proximity";
++	set_bit(EV_ABS, input_dev->evbit);
++	input_set_abs_params(input_dev, ABS_DISTANCE, 0, 1, 0, 0);
++
++	AL3006_DEBUG("%s: registering input device psensor\n", __FUNCTION__);
++	rc = input_register_device(input_dev);
++	if (rc < 0) {
++		pr_err("%s: could not register input device for psensor\n", __FUNCTION__);
++		goto done;
++	}
++
++	AL3006_DEBUG("%s: registering misc device for psensor\n", __FUNCTION__);
++	rc = misc_register(&al3006_psensor_misc);
++	if (rc < 0) {
++		pr_err("%s: could not register misc device psensor\n", __FUNCTION__);
++		goto err_unregister_input_device;
++	}
++	al3006_psensor_misc.parent = &client->dev;
++
++	//INIT_DELAYED_WORK(&data->p_work, al3006_psensor_work_handler);
++
++	return 0;
++
++err_unregister_input_device:
++	input_unregister_device(input_dev);
++done:
++	return rc;
++}
++
++static void unregister_psensor_device(struct i2c_client *client, struct al3006_data *data)
++{
++	misc_deregister(&al3006_psensor_misc);
++	input_unregister_device(data->psensor_input_dev);
++}
++
++#define LSENSOR_POLL_PROMESHUTOK   1000
++
++static int al3006_lsensor_enable(struct i2c_client *client)
++{
++	char reg, value;
++	int ret;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++	mutex_lock(&al3006->lock);
++
++	reg = CONFIG_REG;
++	ret = al3006_read_reg(client, reg, &value);
++	if( (value & 0x03) == ONLY_PROX_EN ){
++		value &= ~0x03;
++		value |= ALL_PROX_ALS_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++	else if( (value & 0x03) == ALL_IDLE ){
++		value &= ~0x03;
++		value |= ONLY_ALS_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++#ifdef AL3006_DBG
++	ret = al3006_read_reg(client, reg, &value);
++	AL3006_DEBUG("%s: configure reg value %#x ...\n", __FUNCTION__, value);
++#endif
++
++	mutex_unlock(&al3006->lock);
++
++	//schedule_delayed_work(&(al3006->l_work), msecs_to_jiffies(LSENSOR_POLL_PROMESHUTOK));
++
++	return ret;
++}
++
++static int al3006_lsensor_disable(struct i2c_client *client)
++{
++	char ret, reg, value;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++	//cancel_delayed_work_sync(&(al3006->l_work));
++
++	mutex_lock(&al3006->lock);
++	reg = CONFIG_REG;
++	ret = al3006_read_reg(client, reg, &value);
++	if( (value & 0x03) == ONLY_ALS_EN ){
++		value &= ~0x03;
++		value |= ALL_IDLE;
++		ret = al3006_write_reg(client, reg, value);
++	}
++	else if( (value & 0x03) == ALL_PROX_ALS_EN ){
++		value &= ~0x03;
++		value |= ONLY_PROX_EN;
++		ret = al3006_write_reg(client, reg, value);
++	}
++#ifdef AL3006_DBG
++	ret = al3006_read_reg(client, reg, &value);
++	AL3006_DEBUG("%s: configure reg value %#x ...\n", __FUNCTION__, value);
++#endif
++	mutex_unlock(&al3006->lock);
++
++	return ret;
++}
++
++static int luxValue_to_level(int value)
++{
++	int i;
++	if (value >= luxValues[7])
++		return 7;
++	if (value <= luxValues[0])
++		return 0;
++	for (i=0;i<7;i++)
++		if (value>=luxValues[i] && value<luxValues[i+1])
++			return i;
++	return -1;
++}
++
++static int misc_ls_opened = 0;
++
++static int al3006_lsensor_open(struct inode *inode, struct file *file)
++{
++//	struct i2c_client *client =
++//		       container_of (al3006_lsensor_misc.parent, struct i2c_client, dev);
++	printk("%s\n", __func__);
++	if (misc_ls_opened)
++		return -EBUSY;
++	misc_ls_opened = 1;
++	return 0;
++}
++
++static int al3006_lsensor_release(struct inode *inode, struct file *file)
++{
++
++//	struct i2c_client *client =
++//		       container_of (al3006_lsensor_misc.parent, struct i2c_client, dev);
++	printk("%s\n", __func__);
++	misc_ls_opened = 0;
++	return 0;
++}
++
++static long al3006_lsensor_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	char reg, val, enabled;
++	struct al3006_data *al3006 = &al3006_struct_data;
++	struct i2c_client *client = al3006->client;
++
++	printk("%s cmd %d\n", __FUNCTION__, _IOC_NR(cmd));
++	switch (cmd) {
++	case LIGHTSENSOR_IOCTL_ENABLE:
++		if (get_user(val, (unsigned long __user *)arg))
++			return -EFAULT;
++		if (val)
++			return al3006_lsensor_enable(client);
++		else
++			return al3006_lsensor_disable(client);
++		break;
++	case LIGHTSENSOR_IOCTL_GET_ENABLED:
++		mutex_lock(&al3006->lock);
++		reg =CONFIG_REG;
++		al3006_read_reg(client, reg, &val);
++		mutex_unlock(&al3006->lock);
++		val &= 0x03;
++		if(val == ONLY_ALS_EN || val == ALL_PROX_ALS_EN)
++			enabled = 1;
++		else
++			enabled = 0;
++		return put_user(enabled, (unsigned long __user *)arg);
++		break;
++	default:
++		pr_err("%s: invalid cmd %d\n", __func__, _IOC_NR(cmd));
++		return -EINVAL;
++	}
++}
++
++static struct file_operations al3006_lsensor_fops = {
++	.owner = THIS_MODULE,
++	.open = al3006_lsensor_open,
++	.release = al3006_lsensor_release,
++	.unlocked_ioctl = al3006_lsensor_ioctl
++};
++
++static struct miscdevice al3006_lsensor_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "lightsensor",
++	.fops = &al3006_lsensor_fops
++};
++
++static int register_lsensor_device(struct i2c_client *client, struct al3006_data *data)
++{
++	struct input_dev *input_dev = data->lsensor_input_dev;
++	int rc;
++
++	AL3006_DEBUG("%s: allocating input device lsensor\n", __func__);
++	input_dev = input_allocate_device();
++	if (!input_dev) {
++		dev_err(&client->dev,"%s: could not allocate input device for lsensor\n", __FUNCTION__);
++		rc = -ENOMEM;
++		goto done;
++	}
++	data->lsensor_input_dev = input_dev;
++	input_set_drvdata(input_dev, data);
++
++	input_set_drvdata(input_dev, data);
++	input_dev->name = "lightsensor-level";
++	set_bit(EV_ABS, input_dev->evbit);
++	input_set_abs_params(input_dev, ABS_MISC, 0, 8, 0, 0);
++
++	AL3006_DEBUG("%s: registering input device al3006 lsensor\n", __FUNCTION__);
++	rc = input_register_device(input_dev);
++	if (rc < 0) {
++		pr_err("%s: could not register input device for lsensor\n", __FUNCTION__);
++		goto done;
++	}
++
++	AL3006_DEBUG("%s: registering misc device for al3006's lsensor\n", __FUNCTION__);
++	rc = misc_register(&al3006_lsensor_misc);
++	if (rc < 0) {
++		pr_err("%s: could not register misc device lsensor\n", __FUNCTION__);
++		goto err_unregister_input_device;
++	}
++
++	al3006_lsensor_misc.parent = &client->dev;
++
++	//INIT_DELAYED_WORK(&data->l_work, al3006_lsensor_work_handler);
++
++	return 0;
++
++err_unregister_input_device:
++	input_unregister_device(input_dev);
++done:
++	return rc;
++}
++
++static void unregister_lsensor_device(struct i2c_client *client, struct al3006_data *al3006)
++{
++	misc_deregister(&al3006_lsensor_misc);
++	input_unregister_device(al3006->lsensor_input_dev);
++}
++
++static int al3006_config(struct i2c_client *client)
++{
++	char value;
++	//struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++	AL3006_DEBUG("%s: init al3006 all register\n", __FUNCTION__);
++
++    /***********************config**************************/
++	value = 0x41;//The ADC effective resolution = 9;  Low lux threshold level = 1;
++	//value = 0x69; //The ADC effective resolution = 17;  Low lux threshold level = 9;
++	al3006_write_reg(client, ALS_CTL_REG, value);
++
++	//value = 0x04;//0x01-0x0f; 17%->93.5% if value = 0x04,then Compensate Loss 52%
++	value = 0x02;//0x01-0x0f; 17%->93.5% if value = 0x02,then Compensate Loss 31%
++	al3006_write_reg(client, ALS_WINDOWS_REG, value);
++
++	return 0;
++}
++void disable_al3006_device(struct i2c_client *client)
++{
++	char value;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++#if 0
++	mutex_lock(&al3006->lock);
++	al3006_read_reg(client, CONFIG_REG, &value);
++	value &= ~POWER_MODE_MASK;
++	value |= POWER_DOWN_MODE;
++	al3006_write_reg(client, CONFIG_REG, value);
++	mutex_unlock(&al3006->lock);
++#endif
++	mutex_lock(&al3006->lock);
++	al3006_write_reg(client, CONFIG_REG, 0x0B);
++	al3006_read_reg(client, CONFIG_REG, &value);
++	mutex_unlock(&al3006->lock);
++	AL3006_DEBUG("%s: value = 0x%x\n", __FUNCTION__,value);
++}
++
++void enable_al3006_device(struct i2c_client *client)
++{
++	char value;
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++
++	mutex_lock(&al3006->lock);
++	al3006_read_reg(client, CONFIG_REG, &value);
++	value &= ~POWER_MODE_MASK;
++	value |= POWER_UP_MODE;
++	al3006_write_reg(client, CONFIG_REG, value);
++	al3006_read_reg(client, CONFIG_REG, &value);
++	mutex_unlock(&al3006->lock);
++
++	AL3006_DEBUG("%s: value = 0x%x\n", __FUNCTION__,value);
++#if 0
++	mutex_lock(&al3006->lock);
++	al3006_write_reg(client, CONFIG_REG, 0x03);
++	mutex_unlock(&al3006->lock);
++#endif
++
++}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void al3006_suspend(struct early_suspend *h)
++{
++	struct i2c_client *client = container_of(al3006_psensor_misc.parent, struct i2c_client, dev);
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++	printk("al3006 early suspend ========================= \n");
++
++	if (misc_ls_opened)
++		al3006_lsensor_disable(client);
++	if (misc_ps_opened)
++		//al3006_psensor_disable(client);
++		enable_irq_wake(al3006->irq);
++	else
++		disable_al3006_device(client);
++
++
++	//disable_al3006_device(client);
++}
++
++static void al3006_resume(struct early_suspend *h)
++{
++	struct i2c_client *client = container_of(al3006_psensor_misc.parent, struct i2c_client, dev);
++	struct al3006_data *al3006 = (struct al3006_data *)i2c_get_clientdata(client);
++    printk("al3006 early resume ======================== \n");
++
++	if (misc_ps_opened)
++		//al3006_psensor_enable(client);
++		disable_irq_wake(al3006->irq);
++	if (misc_ls_opened)
++		al3006_lsensor_enable(client);
++
++	enable_al3006_device(client);
++}
++#else
++#define al3006_suspend NULL
++#define al3006_resume NULL
++#endif
++
++static int al3006_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct al3006_data *al3006 = &al3006_struct_data;
++	int rc = -EIO;
++	char value = 0;
++
++	printk("\n%s: al3006 i2c client probe\n\n", __FUNCTION__);
++	al3006_read_reg(client, CONFIG_REG, &value);
++	printk("\n%s: al3006's CONFIG_REG value =  0x%x\n", __FUNCTION__, value);
++
++	al3006->client = client;
++	i2c_set_clientdata(client, al3006);
++	mutex_init(&al3006->lock);
++
++	rc = register_psensor_device(client, al3006);
++	if (rc) {
++		dev_err(&client->dev, "failed to register_psensor_device\n");
++		goto done;
++	}
++
++	rc = register_lsensor_device(client, al3006);
++	if (rc) {
++		dev_err(&client->dev, "failed to register_lsensor_device\n");
++		goto unregister_device1;
++	}
++
++	rc = al3006_config(client);
++	if (rc) {
++		dev_err(&client->dev, "failed to al3006_config\n");
++		goto unregister_device2;
++	}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	al3006_early_suspend.suspend = al3006_suspend;
++	al3006_early_suspend.resume  = al3006_resume;
++	al3006_early_suspend.level   = 0x02;
++	register_early_suspend(&al3006_early_suspend);
++#endif
++
++	INIT_DELAYED_WORK(&al3006->dwork, al3006_work_handler);
++
++	rc = gpio_request(client->irq, "al3006 irq");
++	if (rc) {
++		pr_err("%s: request gpio %d for al3006 irq failed \n", __FUNCTION__, client->irq);
++		goto unregister_device2;
++	}
++	rc = gpio_direction_input(client->irq);
++	if (rc) {
++		pr_err("%s: failed set gpio input\n", __FUNCTION__);
++	}
++	gpio_pull_updown(client->irq, GPIOPullUp);
++	al3006->irq = gpio_to_irq(client->irq);
++	mdelay(1);
++	rc = request_irq(al3006->irq, al3006_irq_handler,
++					IRQ_TYPE_EDGE_FALLING, client->name, (void *)al3006);//IRQ_TYPE_LEVEL_LOW
++	if (rc < 0) {
++		dev_err(&client->dev,"request_irq failed for gpio %d (%d)\n", client->irq, rc);
++		goto err_free_gpio;
++	}
++
++	//al3006_psensor_enable(client);
++	//al3006_lsensor_enable(client);
++
++	return 0;
++
++err_free_gpio:
++	gpio_free(client->irq);
++unregister_device2:
++	unregister_lsensor_device(client, &al3006_struct_data);
++unregister_device1:
++	unregister_psensor_device(client, &al3006_struct_data);
++done:
++	return rc;
++}
++
++static int al3006_remove(struct i2c_client *client)
++{
++	struct al3006_data *data = i2c_get_clientdata(client);
++
++	unregister_psensor_device(client, data);
++	unregister_lsensor_device(client, data);
++#ifdef CONFIG_HAS_EARLYSUSPEND
++    unregister_early_suspend(&al3006_early_suspend);
++#endif
++	return 0;
++}
++
++static const struct i2c_device_id al3006_id[] = {
++		{"al3006", 0},
++		{ }
++};
++
++static struct i2c_driver al3006_driver = {
++	.driver = {
++		.name = "al3006",
++	},
++	.probe    = al3006_probe,
++	.remove   = al3006_remove,
++	.id_table = al3006_id,
++
++};
++
++static int __init al3006_init(void)
++{
++
++	return i2c_add_driver(&al3006_driver);
++}
++
++static void __exit al3006_exit(void)
++{
++	return i2c_del_driver(&al3006_driver);
++}
++
++module_init(al3006_init);
++module_exit(al3006_exit);
+diff --git a/drivers/input/misc/al3006.h b/drivers/input/misc/al3006.h
+new file mode 100644
+index 000000000000..30e084c64634
+--- /dev/null
++++ b/drivers/input/misc/al3006.h
+@@ -0,0 +1,33 @@
++/* include/linux/isl29028.h
++ *
++ * Copyright (C) 2009 Google, Inc.
++ * Author: Iliyan Malchev <malchev@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __LINUX_AL3006_H
++#define __LINUX_AL3006_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define PSENSOR_IOCTL_MAGIC 'c'
++#define PSENSOR_IOCTL_GET_ENABLED \
++		_IOR(PSENSOR_IOCTL_MAGIC, 1, int *)
++#define PSENSOR_IOCTL_ENABLE \
++		_IOW(PSENSOR_IOCTL_MAGIC, 2, int *)
++
++#define LIGHTSENSOR_IOCTL_MAGIC 'l'
++#define LIGHTSENSOR_IOCTL_GET_ENABLED _IOR(LIGHTSENSOR_IOCTL_MAGIC, 1, int *)
++#define LIGHTSENSOR_IOCTL_ENABLE _IOW(LIGHTSENSOR_IOCTL_MAGIC, 2, int *)
++
++#endif
+diff --git a/drivers/media/video/gc0309.c b/drivers/media/video/gc0309.c
+index 6c458ae808a7..7ef21f43d2d3 100755
+--- a/drivers/media/video/gc0309.c
++++ b/drivers/media/video/gc0309.c
+@@ -1447,7 +1447,7 @@ static int sensor_ioctrl(struct soc_camera_device *icd,enum rk29sensor_power_cmd
+ }
+ static int sensor_init(struct v4l2_subdev *sd, u32 val)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     struct sensor *sensor = to_sensor(client);
+ 	const struct v4l2_queryctrl *qctrl;
+@@ -1643,7 +1643,7 @@ static unsigned long sensor_query_bus_param(struct soc_camera_device *icd)
+ 
+ static int sensor_g_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     struct sensor *sensor = to_sensor(client);
+ 
+@@ -1692,7 +1692,7 @@ static bool sensor_fmt_videochk(struct v4l2_subdev *sd, struct v4l2_mbus_framefm
+ }
+ static int sensor_s_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     const struct sensor_datafmt *fmt;
+     struct sensor *sensor = to_sensor(client);
+ 	const struct v4l2_queryctrl *qctrl;
+@@ -1835,7 +1835,7 @@ static int sensor_s_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ 
+ static int sensor_try_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct sensor *sensor = to_sensor(client);
+     const struct sensor_datafmt *fmt;
+     int ret = 0;
+@@ -1864,7 +1864,7 @@ static int sensor_try_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+ 
+  static int sensor_g_chip_ident(struct v4l2_subdev *sd, struct v4l2_dbg_chip_ident *id)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 
+     if (id->match.type != V4L2_CHIP_MATCH_I2C_ADDR)
+         return -EINVAL;
+@@ -2148,7 +2148,7 @@ static int sensor_set_flash(struct soc_camera_device *icd, const struct v4l2_que
+ 
+ static int sensor_g_control(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct sensor *sensor = to_sensor(client);
+     const struct v4l2_queryctrl *qctrl;
+ 
+@@ -2207,7 +2207,7 @@ static int sensor_g_control(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
+ 
+ static int sensor_s_control(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct sensor *sensor = to_sensor(client);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     const struct v4l2_queryctrl *qctrl;
+@@ -2497,7 +2497,7 @@ static int sensor_s_ext_control(struct soc_camera_device *icd, struct v4l2_ext_c
+ 
+ static int sensor_g_ext_controls(struct v4l2_subdev *sd, struct v4l2_ext_controls *ext_ctrl)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     int i, error_cnt=0, error_idx=-1;
+ 
+@@ -2522,7 +2522,7 @@ static int sensor_g_ext_controls(struct v4l2_subdev *sd, struct v4l2_ext_control
+ 
+ static int sensor_s_ext_controls(struct v4l2_subdev *sd, struct v4l2_ext_controls *ext_ctrl)
+ {
+-    struct i2c_client *client = sd->priv;
++    struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     int i, error_cnt=0, error_idx=-1;
+ 
+@@ -2599,7 +2599,7 @@ static int sensor_video_probe(struct soc_camera_device *icd,
+ }
+ static long sensor_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+ {
+-	struct i2c_client *client = sd->priv;
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct soc_camera_device *icd = client->dev.platform_data;
+     struct sensor *sensor = to_sensor(client);
+     int ret = 0;
+-- 
+2.35.3
+

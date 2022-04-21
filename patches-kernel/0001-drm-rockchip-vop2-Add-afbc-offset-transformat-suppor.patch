@@ -1,0 +1,229 @@
+From 278370effb1896e41a0c572cec6482121a38cf41 Mon Sep 17 00:00:00 2001
+From: Andy Yan <andy.yan@rock-chips.com>
+Date: Sat, 5 Dec 2020 16:29:41 +0800
+Subject: [PATCH] drm/rockchip: vop2: Add afbc offset transformat support
+
+This is a transformat of non-16 pixel align.
+
+Change-Id: If132f4f049cb4514c9684e0f1d5103da64abe03a
+Signed-off-by: Andy Yan <andy.yan@rock-chips.com>
+---
+ drivers/gpu/drm/rockchip/rockchip_drm_vop.h  |   1 +
+ drivers/gpu/drm/rockchip/rockchip_drm_vop2.c | 119 +++++++++++++++++++
+ drivers/gpu/drm/rockchip/rockchip_vop2_reg.c |   2 +
+ drivers/gpu/drm/rockchip/rockchip_vop_reg.h  |   2 +
+ 4 files changed, 124 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+index 7d8aec930c64..74dade90a649 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.h
+@@ -321,6 +321,7 @@ struct vop_afbc {
+ 	struct vop_reg pic_offset;
+ 	struct vop_reg pic_size;
+ 	struct vop_reg dsp_offset;
++	struct vop_reg transform_offset;
+ 	struct vop_reg hdr_ptr;
+ 	struct vop_reg half_block_en;
+ 	struct vop_reg xmirror;
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+index 175688a35cbc..fbe08a80270b 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+@@ -218,6 +218,7 @@ struct vop2_plane_state {
+ 	uint8_t ymirror_en;
+ 	uint8_t rotate_90_en;
+ 	uint8_t rotate_270_en;
++	uint8_t afbc_half_block_en;
+ 	int eotf;
+ 	int color_space;
+ 	int global_alpha;
+@@ -914,6 +915,120 @@ static int vop2_afbc_half_block_enable(struct vop2_plane_state *vpstate)
+ 		return 1;
+ }
+ 
++static uint32_t vop2_afbc_transform_offset(struct vop2_plane_state *vpstate)
++{
++	struct drm_rect *src = &vpstate->src;
++	struct drm_framebuffer *fb = vpstate->base.fb;
++	uint32_t bpp = fb->format->bpp[0];
++	uint32_t vir_width = (fb->pitches[0] << 3) / bpp;
++	uint32_t width = drm_rect_width(src) >> 16;
++	uint32_t height = drm_rect_height(src) >> 16;
++	uint32_t act_xoffset = src->x1 >> 16;
++	uint32_t act_yoffset = src->y1 >> 16;
++	uint32_t align16_crop = 0;
++	uint32_t align64_crop = 0;
++	uint32_t height_tmp = 0;
++	uint32_t transform_tmp = 0;
++	uint8_t transform_xoffset = 0;
++	uint8_t transform_yoffset = 0;
++	uint8_t top_crop = 0;
++	uint8_t top_crop_line_num = 0;
++	uint8_t bottom_crop_line_num = 0;
++
++	/* 16 pixel align */
++	if (height & 0xf)
++		align16_crop = 16 - (height & 0xf);
++
++	height_tmp = height + align16_crop;
++
++	/* 64 pixel align */
++	if (height_tmp & 0x3f)
++		align64_crop = 64 - (height_tmp & 0x3f);
++
++	top_crop_line_num = top_crop << 2;
++	if (top_crop == 0)
++		bottom_crop_line_num = align16_crop + align64_crop;
++	else if (top_crop == 1)
++		bottom_crop_line_num = align16_crop + align64_crop + 12;
++	else if (top_crop == 2)
++		bottom_crop_line_num = align16_crop + align64_crop + 8;
++
++	if (vpstate->xmirror_en) {
++		if (vpstate->ymirror_en) {
++			if (vpstate->afbc_half_block_en) {
++				transform_tmp = act_xoffset + width;
++				transform_xoffset = 16 - (transform_tmp & 0xf);
++				transform_tmp = bottom_crop_line_num - act_yoffset;
++				transform_yoffset = transform_tmp & 0x7;
++			} else { //FULL MODEL
++				transform_tmp = act_xoffset + width;
++				transform_xoffset = 16 - (transform_tmp & 0xf);
++				transform_tmp = bottom_crop_line_num - act_yoffset;
++				transform_yoffset = (transform_tmp & 0xf);
++			}
++		} else if (vpstate->rotate_90_en) {
++			transform_tmp = bottom_crop_line_num - act_yoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = vir_width - width - act_xoffset;
++			transform_yoffset = transform_tmp & 0xf;
++		} else if (vpstate->rotate_270_en) {
++			transform_tmp = top_crop_line_num + act_yoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = act_xoffset;
++			transform_yoffset = transform_tmp & 0xf;
++
++		} else { //xmir
++			if (vpstate->afbc_half_block_en) {
++				transform_tmp = act_xoffset + width;
++				transform_xoffset = 16 - (transform_tmp & 0xf);
++				transform_tmp = top_crop_line_num + act_yoffset;
++				transform_yoffset = transform_tmp & 0x7;
++			} else {
++				transform_tmp = act_xoffset + width;
++				transform_xoffset = 16 - (transform_tmp & 0xf);
++				transform_tmp = top_crop_line_num + act_yoffset;
++				transform_yoffset = transform_tmp & 0xf;
++			}
++		}
++	} else if (vpstate->ymirror_en) {
++		if (vpstate->afbc_half_block_en) {
++			transform_tmp = act_xoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = bottom_crop_line_num - act_yoffset;
++			transform_yoffset = transform_tmp & 0x7;
++		} else { //full_mode
++			transform_tmp = act_xoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = bottom_crop_line_num - act_yoffset;
++			transform_yoffset = transform_tmp & 0xf;
++		}
++	} else if (vpstate->rotate_90_en) {
++		transform_tmp = bottom_crop_line_num - act_yoffset;
++		transform_xoffset = transform_tmp & 0xf;
++		transform_tmp = act_xoffset;
++		transform_yoffset = transform_tmp & 0xf;
++	} else if (vpstate->rotate_270_en) {
++		transform_tmp = top_crop_line_num + act_yoffset;
++		transform_xoffset = transform_tmp & 0xf;
++		transform_tmp = vir_width - width - act_xoffset;
++		transform_yoffset = transform_tmp & 0xf;
++	} else { //normal
++		if (vpstate->afbc_half_block_en) {
++			transform_tmp = act_xoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = top_crop_line_num + act_yoffset;
++			transform_yoffset = transform_tmp & 0x7;
++		} else { //full_mode
++			transform_tmp = act_xoffset;
++			transform_xoffset = transform_tmp & 0xf;
++			transform_tmp = top_crop_line_num + act_yoffset;
++			transform_yoffset = transform_tmp & 0xf;
++		}
++	}
++
++	return (transform_xoffset & 0xf) | ((transform_yoffset & 0xf) << 16);
++}
++
+ /*
+  * A Cluster window has 2048 x 16 line buffer, which can
+  * works at 2048 x 16(Full) or 4096 x 8 (Half) mode.
+@@ -1700,6 +1815,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane, struct drm_plane_s
+ 	uint32_t afbc_half_block_en;
+ 	uint32_t lb_mode;
+ 	uint32_t stride;
++	uint32_t transform_offset;
+ 
+ #if defined(CONFIG_ROCKCHIP_DRM_DEBUG)
+ 	bool AFBC_flag = false;
+@@ -1779,6 +1895,8 @@ static void vop2_plane_atomic_update(struct drm_plane *plane, struct drm_plane_s
+ 			format = VOP2_CLUSTER_YUV444_10;
+ 
+ 		afbc_half_block_en = vop2_afbc_half_block_enable(vpstate);
++		vpstate->afbc_half_block_en = afbc_half_block_en;
++		transform_offset = vop2_afbc_transform_offset(vpstate);
+ 		VOP_CLUSTER_SET(vop2, win, afbc_enable, 1);
+ 		VOP_AFBC_SET(vop2, win, format, afbc_format);
+ 		VOP_AFBC_SET(vop2, win, rb_swap, rb_swap);
+@@ -1788,6 +1906,7 @@ static void vop2_plane_atomic_update(struct drm_plane *plane, struct drm_plane_s
+ 		VOP_AFBC_SET(vop2, win, half_block_en, afbc_half_block_en);
+ 		VOP_AFBC_SET(vop2, win, hdr_ptr, vpstate->yrgb_mst);
+ 		VOP_AFBC_SET(vop2, win, pic_size, act_info);
++		VOP_AFBC_SET(vop2, win, transform_offset, transform_offset);
+ 		VOP_AFBC_SET(vop2, win, pic_offset, ((src->x1 >> 16) | src->y1));
+ 		VOP_AFBC_SET(vop2, win, dsp_offset, (dest->x1 | (dest->y1 << 16)));
+ 		VOP_AFBC_SET(vop2, win, pic_vir_width, stride);
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+index c3308966e303..e6b558c308d2 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+@@ -617,6 +617,7 @@ static const struct vop_afbc rk3568_cluster0_afbc = {
+ 	.tile_num = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_VIR_WIDTH, 0xffff, 16),
+ 	.pic_offset = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_PIC_OFFSET, 0xffffffff, 0),
+ 	.dsp_offset = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_DSP_OFFSET, 0xffffffff, 0),
++	.transform_offset = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_TRANSFORM_OFFSET, 0xffffffff, 0),
+ 	.rotate_90 = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_ROTATE_MODE, 0x1, 0),
+ 	.rotate_270 = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_ROTATE_MODE, 0x1, 1),
+ 	.xmirror = VOP_REG(RK3568_CLUSTER0_WIN0_AFBCD_ROTATE_MODE, 0x1, 2),
+@@ -646,6 +647,7 @@ static const struct vop_afbc rk3568_cluster1_afbc = {
+ 	.tile_num = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_VIR_WIDTH, 0xffff, 16),
+ 	.pic_offset = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_PIC_OFFSET, 0xffffffff, 0),
+ 	.dsp_offset = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_DSP_OFFSET, 0xffffffff, 0),
++	.transform_offset = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_TRANSFORM_OFFSET, 0xffffffff, 0),
+ 	.rotate_90 = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_ROTATE_MODE, 0x1, 0),
+ 	.rotate_270 = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_ROTATE_MODE, 0x1, 1),
+ 	.xmirror = VOP_REG(RK3568_CLUSTER1_WIN0_AFBCD_ROTATE_MODE, 0x1, 2),
+diff --git a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+index 08171ef21de6..69365ef83fd3 100644
+--- a/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
++++ b/drivers/gpu/drm/rockchip/rockchip_vop_reg.h
+@@ -1174,6 +1174,7 @@
+ #define RK3568_CLUSTER0_WIN0_DSP_INFO		0x1024
+ #define RK3568_CLUSTER0_WIN0_DSP_ST		0x1028
+ #define RK3568_CLUSTER0_WIN0_SCL_FACTOR_YRGB	0x1030
++#define RK3568_CLUSTER0_WIN0_AFBCD_TRANSFORM_OFFSET	0x103C
+ #define RK3568_CLUSTER0_WIN0_AFBCD_OUTPUT_CTRL	0x1050
+ #define RK3568_CLUSTER0_WIN0_AFBCD_ROTATE_MODE	0x1054
+ #define RK3568_CLUSTER0_WIN0_AFBCD_HDR_PTR	0x1058
+@@ -1212,6 +1213,7 @@
+ #define RK3568_CLUSTER1_WIN0_DSP_INFO		0x1224
+ #define RK3568_CLUSTER1_WIN0_DSP_ST		0x1228
+ #define RK3568_CLUSTER1_WIN0_SCL_FACTOR_YRGB	0x1230
++#define RK3568_CLUSTER1_WIN0_AFBCD_TRANSFORM_OFFSET	0x123C
+ #define RK3568_CLUSTER1_WIN0_AFBCD_OUTPUT_CTRL	0x1250
+ #define RK3568_CLUSTER1_WIN0_AFBCD_ROTATE_MODE	0x1254
+ #define RK3568_CLUSTER1_WIN0_AFBCD_HDR_PTR	0x1258
+-- 
+2.35.3
+

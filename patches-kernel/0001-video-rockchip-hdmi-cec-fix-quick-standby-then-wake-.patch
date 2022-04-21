@@ -1,0 +1,211 @@
+From 3033968f1b848b1f7cf0e17d8e9e9528d82e6208 Mon Sep 17 00:00:00 2001
+From: Shen Zhenyi <szy@rock-chips.com>
+Date: Mon, 6 Jun 2016 10:40:11 +0800
+Subject: [PATCH] video: rockchip: hdmi-cec: fix quick standby then wake-up
+ crash
+
+code sync from kernel-3.10
+
+Change-Id: I45d69e3901ea5c94fc148b1ef9761562ae465961
+Signed-off-by: Shen Zhenyi <szy@rock-chips.com>
+---
+ .../video/rockchip/hdmi/rockchip-hdmi-cec.c   | 51 ++++++++++++-------
+ .../video/rockchip/hdmi/rockchip-hdmi-core.c  |  1 +
+ drivers/video/rockchip/hdmi/rockchip-hdmi.h   |  1 +
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c    | 10 ++--
+ .../hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h    |  6 +++
+ .../rockchip-hdmiv2/rockchip_hdmiv2_cec.c     |  6 ++-
+ 6 files changed, 49 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-cec.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-cec.c
+index 59965cdaed9a..4bfe2413e66b 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-cec.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-cec.c
+@@ -1,33 +1,48 @@
+-#include <linux/kernel.h>
+-#include <linux/slab.h>
+-#include <linux/workqueue.h>
+ #include <linux/delay.h>
+-#include <linux/module.h>
+-#include <linux/kernel.h>
+ #include <linux/errno.h>
++#include <linux/firmware.h>
++#include <linux/ioctl.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pagemap.h>
++#include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/workqueue.h>
+-#include <linux/firmware.h>
+ #include "rockchip-hdmi-cec.h"
+-#include "linux/ioctl.h"
+-#include "linux/pagemap.h"
+ 
+ static struct cec_device *cec_dev;
+ 
+ static int cecreadframe(struct cec_framedata *frame)
+ {
+-	if (!frame || !cec_dev || !cec_dev->readframe || !cec_dev->enable)
+-		return -1;
+-	else
+-		return cec_dev->readframe(cec_dev->hdmi, frame);
++	int ret = -1;
++
++	if (frame && cec_dev && cec_dev->readframe && cec_dev->enable) {
++		mutex_lock(&cec_dev->hdmi->pclk_lock);
++		ret = cec_dev->readframe(cec_dev->hdmi, frame);
++		mutex_unlock(&cec_dev->hdmi->pclk_lock);
++	}
++	return ret;
+ }
+ 
+ static int cecsendframe(struct cec_framedata *frame)
+ {
+-	if (!frame || !cec_dev || !cec_dev->readframe)
+-		return -1;
+-	else
+-		return cec_dev->sendframe(cec_dev->hdmi, frame);
++	int ret = -1;
++
++	if (frame && cec_dev && cec_dev->sendframe) {
++		mutex_lock(&cec_dev->hdmi->pclk_lock);
++		ret = cec_dev->sendframe(cec_dev->hdmi, frame);
++		mutex_unlock(&cec_dev->hdmi->pclk_lock);
++	}
++	return ret;
++}
++
++static void cecsetlogicaddr(int addr)
++{
++	if (cec_dev && cec_dev->setceclogicaddr) {
++		mutex_lock(&cec_dev->hdmi->pclk_lock);
++		cec_dev->setceclogicaddr(cec_dev->hdmi, addr);
++		mutex_unlock(&cec_dev->hdmi->pclk_lock);
++	}
+ }
+ 
+ static void cecworkfunc(struct work_struct *work)
+@@ -190,9 +205,7 @@ static long cec_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case HDMI_IOCTL_CECSETLA:
+ 		ret = copy_from_user(&cec_dev->address_logic,
+ 				     argp, sizeof(int));
+-		if (cec_dev->setceclogicaddr)
+-			cec_dev->setceclogicaddr(cec_dev->hdmi,
+-						 cec_dev->address_logic);
++		cecsetlogicaddr(cec_dev->address_logic);
+ 		break;
+ 	case HDMI_IOCTL_CECSEND:
+ 		ret = copy_from_user(&cecsendtemp, argp,
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+index 0a88285cc84c..fa1a00d91d39 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi-core.c
+@@ -487,6 +487,7 @@ struct hdmi *rockchip_hdmi_register(struct hdmi_property *property,
+ 
+ 	memset(hdmi, 0, sizeof(struct hdmi));
+ 	mutex_init(&hdmi->lock);
++	mutex_init(&hdmi->pclk_lock);
+ 
+ 	hdmi->property = property;
+ 	hdmi->ops = ops;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmi.h b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+index 4826a0935419..4e09eef6a1c2 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmi.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmi.h
+@@ -396,6 +396,7 @@ struct hdmi {
+ 	struct hdmi_ops *ops;
+ 
+ 	struct mutex lock;			/* mutex for hdmi operation */
++	struct mutex pclk_lock;			/* mutex for pclk operation */
+ 	struct workqueue_struct *workqueue;
+ 
+ 	bool uboot;	/* if true, HDMI is initialized in uboot*/
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+index bc5244f453a1..c5a757b75fb2 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.c
+@@ -198,12 +198,6 @@ void ext_pll_set_27m_out(void)
+ 				  0x1d);
+ }
+ 
+-#define HDMI_PD_ON		BIT(0)
+-#define HDMI_PCLK_ON		BIT(1)
+-#define HDMI_HDCPCLK_ON		BIT(2)
+-#define HDMI_CECCLK_ON		BIT(3)
+-#define HDMI_EXT_PHY_CLK_ON	BIT(4)
+-
+ static int rockchip_hdmiv2_clk_enable(struct hdmi_dev *hdmi_dev)
+ {
+ 	if ((hdmi_dev->clk_on & HDMI_PD_ON) == 0) {
+@@ -332,7 +326,9 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 						 0, 1);
+ 				if (hdmi_dev->hdcp2_en)
+ 					hdmi_dev->hdcp2_en(0);
++				mutex_lock(&hdmi->pclk_lock);
+ 				rockchip_hdmiv2_clk_disable(hdmi_dev);
++				mutex_unlock(&hdmi->pclk_lock);
+ 				#ifdef CONFIG_PINCTRL
+ 				if (hdmi_dev->soctype == HDMI_SOC_RK3288)
+ 					gpio_state =
+@@ -357,7 +353,9 @@ static int rockchip_hdmiv2_fb_event_notify(struct notifier_block *self,
+ 				pinctrl_select_state(pins->p,
+ 						     pins->default_state);
+ 				#endif
++				mutex_lock(&hdmi->pclk_lock);
+ 				rockchip_hdmiv2_clk_enable(hdmi_dev);
++				mutex_unlock(&hdmi->pclk_lock);
+ 				rockchip_hdmiv2_dev_initial(hdmi_dev);
+ 				if (hdmi->ops->hdcp_power_on_cb)
+ 					hdmi->ops->hdcp_power_on_cb();
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+index 77f2c9da35f0..8f97c4c6f13f 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2.h
+@@ -15,6 +15,12 @@
+ #define HDMIDBG(format, ...)
+ #endif
+ 
++#define HDMI_PD_ON		BIT(0)
++#define HDMI_PCLK_ON		BIT(1)
++#define HDMI_HDCPCLK_ON		BIT(2)
++#define HDMI_CECCLK_ON		BIT(3)
++#define HDMI_EXT_PHY_CLK_ON	BIT(4)
++
+ struct hdmi_dev_phy_para {
+ 	u32 maxfreq;
+ 	int pre_emphasis;
+diff --git a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_cec.c b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_cec.c
+index 3c546d5fdfe4..fb7eba309b9d 100644
+--- a/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_cec.c
++++ b/drivers/video/rockchip/hdmi/rockchip-hdmiv2/rockchip_hdmiv2_cec.c
+@@ -21,7 +21,7 @@ static int rockchip_hdmiv2_cec_readframe(struct hdmi *hdmi,
+ 	int i, count;
+ 	char *data = (char *)frame;
+ 
+-	if (!frame)
++	if (((hdmi_dev->clk_on & HDMI_PCLK_ON) == 0) || !frame)
+ 		return -1;
+ 	count = hdmi_readl(hdmi_dev, CEC_RX_CNT);
+ 	CECDBG("%s count %d\n", __func__, count);
+@@ -39,6 +39,8 @@ void rockchip_hdmiv2_cec_setcecla(struct hdmi *hdmi, int ceclgaddr)
+ 	struct hdmi_dev *hdmi_dev = hdmi->property->priv;
+ 	short val;
+ 
++	if ((hdmi_dev->clk_on & HDMI_PCLK_ON) == 0)
++		return;
+ 	if (ceclgaddr < 0 || ceclgaddr > 16)
+ 		return;
+ 	val = 1 << ceclgaddr;
+@@ -52,6 +54,8 @@ static int rockchip_hdmiv2_cec_sendframe(struct hdmi *hdmi,
+ 	struct hdmi_dev *hdmi_dev = hdmi->property->priv;
+ 	int i, interrupt;
+ 
++	if ((hdmi_dev->clk_on & HDMI_PCLK_ON) == 0)
++		return CEC_SEND_NACK;
+ 	CECDBG("TX srcdestaddr %02x opcode %02x ",
+ 	       frame->srcdestaddr, frame->opcode);
+ 	if (frame->argcount) {
+-- 
+2.35.3
+

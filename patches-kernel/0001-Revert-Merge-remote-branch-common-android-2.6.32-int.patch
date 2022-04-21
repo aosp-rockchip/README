@@ -1,0 +1,309 @@
+From c69559f6a65f10520c6aea8731da6fb115cbd9a6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=BB=84=E6=B6=9B?= <huangtao@rock-chips.com>
+Date: Sat, 30 Jul 2011 16:25:42 +0800
+Subject: [PATCH] Revert "Merge remote branch 'common/android-2.6.32' into
+ develop"
+
+This reverts commit c7e039e278f094a51d706b217cfdb92a7bfb37a6, reversing
+changes made to d00e5f74ae65f54f401f66efea3d734b6b136cab.
+---
+ drivers/usb/gadget/android.c   | 17 +++++---
+ drivers/usb/gadget/composite.c | 80 ++--------------------------------
+ drivers/usb/gadget/f_adb.c     |  2 +-
+ drivers/usb/gadget/f_rndis.c   |  2 +-
+ include/linux/usb/composite.h  | 14 +-----
+ 5 files changed, 19 insertions(+), 96 deletions(-)
+
+diff --git a/drivers/usb/gadget/android.c b/drivers/usb/gadget/android.c
+index 4d1c3fbecfe5..3c4d44d663c0 100755
+--- a/drivers/usb/gadget/android.c
++++ b/drivers/usb/gadget/android.c
+@@ -208,7 +208,7 @@ static int product_matches_functions(struct android_usb_product *p)
+ {
+ 	struct usb_function		*f;
+ 	list_for_each_entry(f, &android_config_driver.functions, list) {
+-		if (product_has_function(p, f) == !!f->disabled)
++		if (product_has_function(p, f) == !!f->hidden)
+ 			return 0;
+ 	}
+ 	return 1;
+@@ -323,8 +323,8 @@ void android_enable_function(struct usb_function *f, int enable)
+ 	int disable = !enable;
+ 	int product_id;
+ 
+-	if (!!f->disabled != disable) {
+-		usb_function_set_enabled(f, !disable);
++	if (!!f->hidden != disable) {
++		f->hidden = disable;
+ 
+ #ifdef CONFIG_USB_ANDROID_RNDIS
+ 		if (!strcmp(f->name, "rndis")) {
+@@ -347,7 +347,7 @@ void android_enable_function(struct usb_function *f, int enable)
+ 			 */
+ 			list_for_each_entry(func, &android_config_driver.functions, list) {
+ 				if (!strcmp(func->name, "usb_mass_storage")) {
+-					usb_function_set_enabled(func, !enable);
++					func->hidden = enable;
+ 					break;
+ 				}
+ 			}
+@@ -358,7 +358,14 @@ void android_enable_function(struct usb_function *f, int enable)
+ 		device_desc.idProduct = __constant_cpu_to_le16(product_id);
+ 		if (dev->cdev)
+ 			dev->cdev->desc.idProduct = device_desc.idProduct;
+-		usb_composite_force_reset(dev->cdev);
++
++		/* force reenumeration */
++		if (dev->cdev && dev->cdev->gadget &&
++				dev->cdev->gadget->speed != USB_SPEED_UNKNOWN) {
++			usb_gadget_disconnect(dev->cdev->gadget);
++			msleep(10);
++			usb_gadget_connect(dev->cdev->gadget);
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/usb/gadget/composite.c b/drivers/usb/gadget/composite.c
+index ec83040cd449..08bcecbb934c 100755
+--- a/drivers/usb/gadget/composite.c
++++ b/drivers/usb/gadget/composite.c
+@@ -75,7 +75,7 @@ static ssize_t enable_show(struct device *dev, struct device_attribute *attr,
+ 		char *buf)
+ {
+ 	struct usb_function *f = dev_get_drvdata(dev);
+-	return sprintf(buf, "%d\n", !f->disabled);
++	return sprintf(buf, "%d\n", !f->hidden);
+ }
+ 
+ static ssize_t enable_store(
+@@ -90,39 +90,13 @@ static ssize_t enable_store(
+ 	if (driver->enable_function)
+ 		driver->enable_function(f, value);
+ 	else
+-		usb_function_set_enabled(f, value);
++		f->hidden = !value;
+ 
+ 	return size;
+ }
+ 
+ static DEVICE_ATTR(enable, S_IRUGO | S_IWUSR, enable_show, enable_store);
+ 
+-void usb_function_set_enabled(struct usb_function *f, int enabled)
+-{
+-	f->disabled = !enabled;
+-	kobject_uevent(&f->dev->kobj, KOBJ_CHANGE);
+-}
+-
+-
+-void usb_composite_force_reset(struct usb_composite_dev *cdev)
+-{
+-	unsigned long			flags;
+-
+-	spin_lock_irqsave(&cdev->lock, flags);
+-	/* force reenumeration */
+-	if (cdev && cdev->gadget &&
+-			cdev->gadget->speed != USB_SPEED_UNKNOWN) {
+-		/* avoid sending a disconnect switch event until after we disconnect */
+-		cdev->mute_switch = 1;
+-		spin_unlock_irqrestore(&cdev->lock, flags);
+-
+-		usb_gadget_disconnect(cdev->gadget);
+-		msleep(10);
+-		usb_gadget_connect(cdev->gadget);
+-	} else {
+-		spin_unlock_irqrestore(&cdev->lock, flags);
+-	}
+-}
+ 
+ /**
+  * usb_add_function() - add a function to a configuration
+@@ -337,7 +311,7 @@ static int config_buf(struct usb_configuration *config,
+ 			descriptors = f->hs_descriptors;
+ 		else
+ 			descriptors = f->descriptors;
+-		if (f->disabled || !descriptors || descriptors[0] == NULL)
++		if (f->hidden || !descriptors || descriptors[0] == NULL)
+ 			continue;
+ 		status = usb_descriptor_fillbuf(next, len,
+ 			(const struct usb_descriptor_header **) descriptors);
+@@ -508,7 +482,7 @@ static int set_config(struct usb_composite_dev *cdev,
+ 
+ 		if (!f)
+ 			break;
+-		if (f->disabled)
++		if (f->hidden)
+ 			continue;
+ 
+ 		result = f->set_alt(f, tmp, 0);
+@@ -525,8 +499,6 @@ static int set_config(struct usb_composite_dev *cdev,
+ 	power = c->bMaxPower ? (2 * c->bMaxPower) : CONFIG_USB_GADGET_VBUS_DRAW;
+ done:
+ 	usb_gadget_vbus_draw(gadget, power);
+-
+-	schedule_work(&cdev->switch_work);
+ 	return result;
+ }
+ 
+@@ -968,11 +940,6 @@ static void composite_disconnect(struct usb_gadget *gadget)
+ 	spin_lock_irqsave(&cdev->lock, flags);
+ 	if (cdev->config)
+ 		reset_config(cdev);
+-
+-	if (cdev->mute_switch)
+-		cdev->mute_switch = 0;
+-	else
+-		schedule_work(&cdev->switch_work);
+ 	spin_unlock_irqrestore(&cdev->lock, flags);
+ }
+ 
+@@ -1022,8 +989,6 @@ composite_unbind(struct usb_gadget *gadget)
+ 		kfree(cdev->req->buf);
+ 		usb_ep_free_request(gadget->ep0, cdev->req);
+ 	}
+-
+-	switch_dev_unregister(&cdev->sdev);
+ 	kfree(cdev);
+ 	set_gadget_data(gadget, NULL);
+ 	composite = NULL;
+@@ -1051,19 +1016,6 @@ string_override(struct usb_gadget_strings **tab, u8 id, const char *s)
+ 	}
+ }
+ 
+-static void
+-composite_switch_work(struct work_struct *data)
+-{
+-	struct usb_composite_dev	*cdev =
+-		container_of(data, struct usb_composite_dev, switch_work);
+-	struct usb_configuration *config = cdev->config;
+-
+-	if (config)
+-		switch_set_state(&cdev->sdev, config->bConfigurationValue);
+-	else
+-		switch_set_state(&cdev->sdev, 0);
+-}
+-
+ static int __init composite_bind(struct usb_gadget *gadget)
+ {
+ 	struct usb_composite_dev	*cdev;
+@@ -1107,12 +1059,6 @@ static int __init composite_bind(struct usb_gadget *gadget)
+ 	if (status < 0)
+ 		goto fail;
+ 
+-	cdev->sdev.name = "usb_configuration";
+-	status = switch_dev_register(&cdev->sdev);
+-	if (status < 0)
+-		goto fail;
+-	INIT_WORK(&cdev->switch_work, composite_switch_work);
+-
+ 	cdev->desc = *composite->dev;
+ 	cdev->desc.bMaxPacketSize0 = gadget->ep0->maxpacket;
+ 
+@@ -1187,23 +1133,6 @@ composite_resume(struct usb_gadget *gadget)
+ 	}
+ }
+ 
+-static int
+-composite_uevent(struct device *dev, struct kobj_uevent_env *env)
+-{
+-	struct usb_function *f = dev_get_drvdata(dev);
+-
+-	if (!f) {
+-		/* this happens when the device is first created */
+-		return 0;
+-	}
+-
+-	if (add_uevent_var(env, "FUNCTION=%s", f->name))
+-		return -ENOMEM;
+-	if (add_uevent_var(env, "ENABLED=%d", !f->disabled))
+-		return -ENOMEM;
+-	return 0;
+-}
+-
+ /*-------------------------------------------------------------------------*/
+ 
+ static struct usb_gadget_driver composite_driver = {
+@@ -1252,7 +1181,6 @@ int __init usb_composite_register(struct usb_composite_driver *driver)
+ 	driver->class = class_create(THIS_MODULE, "usb_composite");
+ 	if (IS_ERR(driver->class))
+ 		return PTR_ERR(driver->class);
+-	driver->class->dev_uevent = composite_uevent;
+ 
+ 	return usb_gadget_register_driver(&composite_driver);
+ }
+diff --git a/drivers/usb/gadget/f_adb.c b/drivers/usb/gadget/f_adb.c
+index a0b0774b9556..8ea6b3bec313 100644
+--- a/drivers/usb/gadget/f_adb.c
++++ b/drivers/usb/gadget/f_adb.c
+@@ -613,7 +613,7 @@ static int adb_bind_config(struct usb_configuration *c)
+ 	dev->function.disable = adb_function_disable;
+ 
+ 	/* start disabled */
+-	dev->function.disabled = 1;
++	dev->function.hidden = 0;
+ 
+ 	/* _adb_dev must be set before calling usb_gadget_register_driver */
+ 	_adb_dev = dev;
+diff --git a/drivers/usb/gadget/f_rndis.c b/drivers/usb/gadget/f_rndis.c
+index 8486ade79e42..7c4fb4d022ab 100644
+--- a/drivers/usb/gadget/f_rndis.c
++++ b/drivers/usb/gadget/f_rndis.c
+@@ -840,7 +840,7 @@ int __init rndis_bind_config(struct usb_configuration *c, u8 ethaddr[ETH_ALEN])
+ 
+ #ifdef CONFIG_USB_ANDROID_RNDIS
+ 	/* start disabled */
+-	rndis->port.func.disabled = 1;
++	rndis->port.func.hidden = 1;
+ #endif
+ 
+ 	status = usb_add_function(c, &rndis->port.func);
+diff --git a/include/linux/usb/composite.h b/include/linux/usb/composite.h
+index 080365ba3b21..66884030c58a 100644
+--- a/include/linux/usb/composite.h
++++ b/include/linux/usb/composite.h
+@@ -36,10 +36,8 @@
+ 
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/gadget.h>
+-#include <linux/switch.h>
+ 
+ 
+-struct usb_composite_dev;
+ struct usb_configuration;
+ 
+ /**
+@@ -102,9 +100,7 @@ struct usb_function {
+ 	struct usb_descriptor_header	**hs_descriptors;
+ 
+ 	struct usb_configuration	*config;
+-
+-	/* disabled is zero if the function is enabled */
+-	int				disabled;
++	int				hidden;
+ 
+ 	/* REVISIT:  bind() functions can be marked __init, which
+ 	 * makes trouble for section mismatch analysis.  See if
+@@ -142,9 +138,6 @@ int usb_function_activate(struct usb_function *);
+ 
+ int usb_interface_id(struct usb_configuration *, struct usb_function *);
+ 
+-void usb_function_set_enabled(struct usb_function *, int);
+-void usb_composite_force_reset(struct usb_composite_dev *);
+-
+ /**
+  * ep_choose - select descriptor endpoint at current device speed
+  * @g: gadget, connected and running at some speed
+@@ -351,11 +344,6 @@ struct usb_composite_dev {
+ 
+ 	/* protects at least deactivation count */
+ 	spinlock_t			lock;
+-
+-	struct switch_dev sdev;
+-	/* used by usb_composite_force_reset to avoid signalling switch changes */
+-	bool				mute_switch;
+-	struct work_struct switch_work;
+ };
+ 
+ extern int usb_string_id(struct usb_composite_dev *c);
+-- 
+2.35.3
+

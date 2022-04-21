@@ -1,0 +1,247 @@
+From 2447df1bef7b6d37dc7ccce3a7b81b2b393d8794 Mon Sep 17 00:00:00 2001
+From: Yao Xiao <xiaoyao@rock-chips.com>
+Date: Wed, 30 Sep 2020 10:03:58 +0800
+Subject: [PATCH] mmc: support logic_card and alive_card for sdio
+
+Signed-off-by: Yao Xiao <xiaoyao@rock-chips.com>
+Change-Id: Ic51f0dfb3bb2de2e1f52ab5e24dbeaebc729ec99
+---
+ drivers/mmc/core/Kconfig      |  5 ++++
+ drivers/mmc/core/core.c       | 19 +++++++++++++++
+ drivers/mmc/core/host.c       |  7 ++++++
+ drivers/mmc/core/sdio.c       | 46 +++++++++++++++++++++++++++++++++++
+ drivers/mmc/host/dw_mmc.c     | 10 ++++++++
+ include/linux/mmc/host.h      |  6 +++++
+ include/linux/mmc/sdio_func.h |  4 +++
+ 7 files changed, 97 insertions(+)
+
+diff --git a/drivers/mmc/core/Kconfig b/drivers/mmc/core/Kconfig
+index ed68de663f6d..98330c258b3d 100644
+--- a/drivers/mmc/core/Kconfig
++++ b/drivers/mmc/core/Kconfig
+@@ -88,3 +88,8 @@ config MMC_CRYPTO
+ 	  Enabling this makes it possible for the kernel to use the crypto
+ 	  capabilities of the MMC device (if present) to perform crypto
+ 	  operations on data being transferred to/from the device.
++
++config SDIO_KEEPALIVE
++	bool "SDIO KEEPALIVE"
++	help
++	  support sdio keepalive during host poweroff
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 55818e942764..dbe4c5f0b277 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -2505,6 +2505,20 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 	mmc_hw_reset_for_init(host);
+ #endif
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (host->support_chip_alive) {
++		host->chip_alive = 1;
++		if (!mmc_attach_sdio(host)) {
++			return 0;
++		} else {
++			pr_err("%s: chip_alive attach sdio failed.\n", mmc_hostname(host));
++			host->chip_alive = 0;
++		}
++	} else {
++		host->chip_alive = 0;
++	}
++#endif
++
+ 	/*
+ 	 * sdio_reset sends CMD52 to reset card.  Since we do not know
+ 	 * if the card is being re-initialized, just send it.  CMD52
+@@ -2532,9 +2546,14 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+ 	if (!(host->caps2 & MMC_CAP2_NO_MMC))
+ 		if (!mmc_attach_mmc(host))
+ 			return 0;
++#else
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if ((!(host->chip_alive)) && (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO))
++		sdio_reset(host);
+ #else
+ 	if (host->restrict_caps & RESTRICT_CARD_TYPE_SDIO)
+ 		sdio_reset(host);
++#endif
+ 
+ 	mmc_go_idle(host);
+ 
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index 8433efa34823..b18ca91156fc 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -342,6 +342,13 @@ int mmc_of_parse(struct mmc_host *host)
+ 	if (device_property_read_bool(dev, "supports-emmc"))
+ 		host->restrict_caps |= RESTRICT_CARD_TYPE_EMMC;
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	host->support_chip_alive =
++		device_property_read_bool(dev, "supports-chip-alive");
++	host->logic_remove_card =
++		device_property_read_bool(dev, "logic-remove-card");
++#endif
++
+ 	host->dsr_req = !device_property_read_u32(dev, "dsr", &host->dsr);
+ 	if (host->dsr_req && (host->dsr & ~0xffff)) {
+ 		dev_err(host->parent,
+diff --git a/drivers/mmc/core/sdio.c b/drivers/mmc/core/sdio.c
+index ffb5e7664ce3..3b061cb9b981 100644
+--- a/drivers/mmc/core/sdio.c
++++ b/drivers/mmc/core/sdio.c
+@@ -587,11 +587,25 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+ 	/*
+ 	 * Inform the card of the voltage
+ 	 */
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (!(host->chip_alive)) {
++		if (!powered_resume) {
++			err = mmc_send_io_op_cond(host, ocr, &rocr);
++			if (err) {
++				pr_err("%s: mmc_send_io_op_cond() err=%d\n", __func__, err);
++				goto err;
++			}
++		}
++	} else {
++		rocr = 0xa0ffff00;
++	}
++#else
+ 	if (!powered_resume) {
+ 		err = mmc_send_io_op_cond(host, ocr, &rocr);
+ 		if (err)
+ 			goto err;
+ 	}
++#endif
+ 
+ 	/*
+ 	 * For SPI, enable CRC as appropriate.
+@@ -661,9 +675,19 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+ 	 * For native busses:  set card RCA and quit open drain mode.
+ 	 */
+ 	if (!powered_resume && !mmc_host_is_spi(host)) {
++#ifdef CONFIG_SDIO_KEEPALIVE
++		if (!(host->chip_alive)) {
++			err = mmc_send_relative_addr(host, &card->rca);
++			if (err)
++				goto remove;
++		} else {
++			card->rca = 1;
++		}
++#else
+ 		err = mmc_send_relative_addr(host, &card->rca);
+ 		if (err)
+ 			goto remove;
++#endif
+ 
+ 		/*
+ 		 * Update oldcard with the new RCA received from the SDIO
+@@ -1104,9 +1128,21 @@ int mmc_attach_sdio(struct mmc_host *host)
+ 
+ 	WARN_ON(!host->claimed);
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (!(host->chip_alive)) {
++		err = mmc_send_io_op_cond(host, 0, &ocr);
++		if (err) {
++			pr_err("%s mmc_send_io_op_cond err: %d\n", mmc_hostname(host), err);
++			return err;
++		}
++	} else {
++		ocr = 0x20ffff00;
++	}
++#else
+ 	err = mmc_send_io_op_cond(host, 0, &ocr);
+ 	if (err)
+ 		return err;
++#endif
+ 
+ 	mmc_attach_bus(host, &mmc_sdio_ops);
+ 	if (host->ocr_avail_sdio)
+@@ -1177,6 +1213,11 @@ int mmc_attach_sdio(struct mmc_host *host)
+ 			pm_runtime_enable(&card->sdio_func[i]->dev);
+ 	}
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (host->card->sdio_func[1])
++		host->card->sdio_func[1]->card_alive = host->chip_alive;
++#endif
++
+ 	/*
+ 	 * First add the card to the driver model...
+ 	 */
+@@ -1228,6 +1269,11 @@ int sdio_reset_comm(struct mmc_card *card)
+ 	u32 rocr;
+ 	int err;
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (host->chip_alive)
++		host->chip_alive = 0;
++#endif
++
+ 	printk("%s():\n", __func__);
+ 	mmc_claim_host(host);
+ 
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+index 649505c318df..02cbd6a47906 100644
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -1005,6 +1005,11 @@ static int dw_mci_get_cd(struct mmc_host *mmc)
+ 	struct dw_mci *host = slot->host;
+ 	int gpio_cd = mmc_gpio_get_cd(mmc);
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (mmc->logic_remove_card)
++		return test_bit(DW_MMC_CARD_PRESENT, &slot->flags);
++#endif
++
+ 	/* Use platform get_cd function, else try onboard card detect */
+ 	if (((mmc->caps & MMC_CAP_NEEDS_POLL)
+ 				|| !mmc_card_is_removable(mmc))) {
+@@ -2944,6 +2949,11 @@ static int dw_mci_init_slot(struct dw_mci *host)
+ 
+ 	dw_mci_get_cd(mmc);
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	if (mmc->logic_remove_card)
++		clear_bit(DW_MMC_CARD_PRESENT, &slot->flags);
++#endif
++
+ 	ret = mmc_add_host(mmc);
+ 	if (ret)
+ 		goto err_host_allocated;
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index f88f83e38de0..62ec61e5fe83 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -379,6 +379,12 @@ struct mmc_host {
+ #define RESTRICT_CARD_TYPE_SDIO (1 << 1)        /* Can support Secure-Digital I/O Card or Combo-Mem */
+ #define RESTRICT_CARD_TYPE_EMMC (1 << 2)        /* Can support embedded Multi-Media Card */
+ 
++#ifdef CONFIG_SDIO_KEEPALIVE
++	bool		support_chip_alive;
++	bool		chip_alive;
++	bool		logic_remove_card;
++#endif
++
+ 	/* host specific block data */
+ 	unsigned int		max_seg_size;	/* see blk_queue_max_segment_size */
+ 	unsigned short		max_segs;	/* see blk_queue_max_segments */
+diff --git a/include/linux/mmc/sdio_func.h b/include/linux/mmc/sdio_func.h
+index 6905f3f641cc..258f535fff69 100644
+--- a/include/linux/mmc/sdio_func.h
++++ b/include/linux/mmc/sdio_func.h
+@@ -59,6 +59,10 @@ struct sdio_func {
+ 	const char		**info;		/* info strings */
+ 
+ 	struct sdio_func_tuple *tuples;
++
++#ifdef CONFIG_SDIO_KEEPALIVE
++	u8 card_alive;
++#endif
+ };
+ 
+ #define sdio_func_present(f)	((f)->state & SDIO_STATE_PRESENT)
+-- 
+2.35.3
+
