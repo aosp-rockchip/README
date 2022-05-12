@@ -33,5 +33,5 @@ By default, the pinenote comes with a vfat partition labled "device" that stores
 ```
 ./upgrade_tool uf path/to/update.img
 ```
-This will take a while, and your device will reboot a few times after the upgrade tool finishes to handle repartitioning and actually flashing the update.
+This will take a while, and your device will reboot a few times after the upgrade tool finishes to handle repartitioning and actually flashing the update. YOU CANNOT FLASH THE IMAGE WITH rkdeveloptool.
 To flash new builds after this, use fastboot to flash the super.img and boot.img located in `out/target/product/pinenote/`. This is pretty standard on android devices, so you can find a million guides for that elsewhere.
