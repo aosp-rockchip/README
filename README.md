@@ -24,7 +24,7 @@ lunch aosp_pinenote-userdebug
 ```
 The first time you compile the code, you'll need to build everything
 ```
-./build.sh -UAu
+./build.sh -UCAu
 ```
 After you flash the device with your custom fimrware the first time, you can use `./build -A` to only compile android and just flash the images with fastboot.
 
